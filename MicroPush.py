@@ -8,10 +8,11 @@ from _Framework.TransportComponent import TransportComponent
 from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
-from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+# from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
 mixer, transport = None, None
+
 
 class MicroPush(ControlSurface):
 
@@ -25,21 +26,18 @@ class MicroPush(ControlSurface):
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             self._initialize_mixer()
-            self._initialize_transport()
-            self._update_mixer_track_count()
+            self._initialize_buttons()
+            self._update_mixer_and_tracks()
             # self._on_selected_track_changed.subject = self.song().tracks
 
-            self.song().add_tracks_listener(self._on_track_number_changed) # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()
-            
-
-
+            self.song().add_tracks_listener(self._on_track_number_changed) # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()         
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
         mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 8, 7))
         mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 9, 7, Live.MidiMap.MapMode.absolute))
 
-    def _initialize_transport(self):
+    def _initialize_buttons(self):
         transport.set_record_button(ButtonElement(1, MIDI_CC_TYPE, 0, 119))
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
         transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
@@ -49,12 +47,11 @@ class MicroPush(ControlSurface):
     # def _on_selected_track_changed(self):
     #     pass #some track changed logic here
 
-
     def _on_track_number_changed(self):
-        self._update_mixer_track_count()
+        self._update_mixer_and_tracks()
 
     # Updating names and number of tracks
-    def _update_mixer_track_count(self):
+    def _update_mixer_and_tracks(self):
         track_count = len(self.song().tracks)
         # mixer.set_track_count(track_count)
         self.show_message("Track Count: {}".format(track_count))
