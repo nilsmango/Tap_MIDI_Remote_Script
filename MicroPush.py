@@ -8,11 +8,13 @@ from _Framework.TransportComponent import TransportComponent
 from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
+from _Framework.InputControlElement import MIDI_NOTE_TYPE
+
 # from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
 mixer, transport = None, None
-
+capture_button = None
 
 class MicroPush(ControlSurface):
 
@@ -30,7 +32,7 @@ class MicroPush(ControlSurface):
             self._update_mixer_and_tracks()
             # self._on_selected_track_changed.subject = self.song().tracks
 
-            self.song().add_tracks_listener(self._on_track_number_changed) # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()         
+            self.song().add_tracks_listener(self._on_track_number_changed)  # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()         
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
@@ -42,6 +44,13 @@ class MicroPush(ControlSurface):
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
         transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
+        capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
+        capture_button.add_value_listener(self._capture_button_value)
+
+    def _capture_button_value(self, value):
+        self.show_message("Capture pressed, value: {}".format(value))
+        if value != 0:
+            self.song().capture_midi()
 
     # @subject_slot('selected_track')
     # def _on_selected_track_changed(self):
@@ -70,6 +79,6 @@ class MicroPush(ControlSurface):
             # strip.set_volume_control(...)
 
     def disconnect(self):
+        capture_button.remove_value_listener(self._capture_button_value)
         self.song().remove_tracks_listener(self._on_track_number_changed)
-        self._on_track_number_changed.subject = None
         super(MicroPush, self).disconnect()
