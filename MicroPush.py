@@ -13,8 +13,8 @@ from _Framework.InputControlElement import MIDI_NOTE_TYPE
 # from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
-mixer, transport = None, None
-capture_button = None
+mixer, transport, capture_button, quantize_button, duplicate_button = None, None, None, None, None
+
 
 class MicroPush(ControlSurface):
 
@@ -31,8 +31,7 @@ class MicroPush(ControlSurface):
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             # self._on_selected_track_changed.subject = self.song().tracks
-
-            self.song().add_tracks_listener(self._on_track_number_changed)  # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()         
+            self.song().add_tracks_listener(self._on_track_number_changed)  # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()      
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
@@ -46,11 +45,56 @@ class MicroPush(ControlSurface):
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
         capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
         capture_button.add_value_listener(self._capture_button_value)
+        quantize_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 99)
+        quantize_button.add_value_listener(self._quantize_button_value)
+        # duplicate the active clip to a free slot
+        duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
+        duplicate_button.add_value_listener(self._duplicate_button_value)
 
     def _capture_button_value(self, value):
-        self.show_message("Capture pressed, value: {}".format(value))
         if value != 0:
             self.song().capture_midi()
+
+    def _quantize_button_value(self, value):
+        if value != 0:
+            clip = self.song().view.detail_clip
+            if clip:
+                # grid (1 = 1/16), strength (0.5 = 50%)
+                clip.quantize(2, 1.0)
+                # add some groove if wanted, didn't work
+                # clip.groove_amount = 0.5
+
+    def _duplicate_button_value(self, value):
+        if value != 0:
+            self._duplicate_clip()
+
+    def _duplicate_clip(self):
+        selected_track = self.song().view.selected_track
+
+        if selected_track is None:
+            return
+        
+        song = self.song()
+        selected_scene = song.view.selected_scene
+        all_scenes = song.scenes
+        current_index = list(all_scenes).index(selected_scene)
+
+        duplicated_id = selected_track.duplicate_clip_slot(
+            current_index
+        )
+
+        duplicated_slot = self.song().scenes[duplicated_id]
+
+        if self.song().view.highlighted_clip_slot.is_playing:
+            # move to the duplicated clip_slot
+            self.song().view.selected_scene = duplicated_slot
+
+            if not self.song().view.highlighted_clip_slot.is_playing:
+                # force legato ensures that the playing-position of the duplicated
+                # loop is continued from the previous clip
+                self.song().view.highlighted_clip_slot.fire(force_legato=True)
+        else:
+            self.song().view.selected_scene = duplicated_slot
 
     # @subject_slot('selected_track')
     # def _on_selected_track_changed(self):
@@ -80,5 +124,7 @@ class MicroPush(ControlSurface):
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
+        quantize_button.remove_value_listener(self._quantize_button_value)
+        duplicate_button.remove_value_listener(self._duplicate_button_value)
         self.song().remove_tracks_listener(self._on_track_number_changed)
         super(MicroPush, self).disconnect()
