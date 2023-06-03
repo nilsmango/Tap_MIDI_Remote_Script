@@ -13,6 +13,7 @@ from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, 
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
+
 mixer, transport, capture_button, quantize_button, duplicate_button = None, None, None, None, None
 
 
@@ -114,7 +115,7 @@ class MicroPush(ControlSurface):
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
         selected_track = self.song().view.selected_track
-        if selected_track:
+        if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
         self._set_other_tracks_implicit_arm()
 
@@ -122,6 +123,9 @@ class MicroPush(ControlSurface):
         selected_track = self.song().view.selected_track
         if selected_track:
             selected_track.implicit_arm = True
+        else:
+            self.show_message("trying to arm track")
+            self.song().tracks[0].implicit_arm = True
 
     def _set_other_tracks_implicit_arm(self):
         for track in self.song().tracks:
