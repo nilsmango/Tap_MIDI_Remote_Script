@@ -8,9 +8,9 @@ from _Framework.TransportComponent import TransportComponent
 from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
-from _Framework.InputControlElement import MIDI_NOTE_TYPE
+from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
 
-# from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
 mixer, transport, capture_button, quantize_button, duplicate_button = None, None, None, None, None
@@ -30,8 +30,9 @@ class MicroPush(ControlSurface):
             self._initialize_mixer()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
-            # self._on_selected_track_changed.subject = self.song().tracks
-            self.song().add_tracks_listener(self._on_track_number_changed)  # vielleicht noch einmal song davor. hier für return tracks: .add_return_tracks_listener()      
+            self._set_selected_track_implicit_arm
+            self._on_selected_track_changed.subject = self.song().view
+            self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
@@ -51,6 +52,22 @@ class MicroPush(ControlSurface):
         duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
         duplicate_button.add_value_listener(self._duplicate_button_value)
 
+    def receive_midi(self, midi_bytes):
+        if len(midi_bytes) == 3:
+            status = midi_bytes[0] & 0xF0
+            data1 = midi_bytes[1]
+            data2 = midi_bytes[2]
+
+            channel = (midi_bytes[0] & 0x0F) + 1  # MIDI channels are 1-based
+            note = data1
+            velocity = data2
+
+            if status == MIDI_NOTE_ON_STATUS and channel == 15 and note == 100:
+                # self.quantize_grid = velocity
+                pass
+
+        super(MicroPush, self).receive_midi(midi_bytes)
+
     def _capture_button_value(self, value):
         if value != 0:
             self.song().capture_midi()
@@ -59,10 +76,10 @@ class MicroPush(ControlSurface):
         if value != 0:
             clip = self.song().view.detail_clip
             if clip:
-                # grid (1 = 1/16), strength (0.5 = 50%)
+                # need to set the swing amount first (0.00-1.00)
+                self.song().swing_amount = 0.1
+                # grid (int 1 == 1/4, 2 == 1/8, 5 == 1/16), strength (0.50 == 50%)
                 clip.quantize(2, 1.0)
-                # add some groove if wanted, didn't work
-                # clip.groove_amount = 0.5
 
     def _duplicate_button_value(self, value):
         if value != 0:
@@ -73,15 +90,13 @@ class MicroPush(ControlSurface):
 
         if selected_track is None:
             return
-        
+
         song = self.song()
         selected_scene = song.view.selected_scene
         all_scenes = song.scenes
         current_index = list(all_scenes).index(selected_scene)
 
-        duplicated_id = selected_track.duplicate_clip_slot(
-            current_index
-        )
+        duplicated_id = selected_track.duplicate_clip_slot(current_index)
 
         duplicated_slot = self.song().scenes[duplicated_id]
 
@@ -96,9 +111,22 @@ class MicroPush(ControlSurface):
         else:
             self.song().view.selected_scene = duplicated_slot
 
-    # @subject_slot('selected_track')
-    # def _on_selected_track_changed(self):
-    #     pass #some track changed logic here
+    @subject_slot('selected_track')
+    def _on_selected_track_changed(self):
+        selected_track = self.song().view.selected_track
+        if selected_track:
+            self._set_selected_track_implicit_arm()
+        self._set_other_tracks_implicit_arm()
+
+    def _set_selected_track_implicit_arm(self):
+        selected_track = self.song().view.selected_track
+        if selected_track:
+            selected_track.implicit_arm = True
+
+    def _set_other_tracks_implicit_arm(self):
+        for track in self.song().tracks:
+            if track != self.song().view.selected_track:
+                track.implicit_arm = False
 
     def _on_track_number_changed(self):
         self._update_mixer_and_tracks()
@@ -127,4 +155,6 @@ class MicroPush(ControlSurface):
         quantize_button.remove_value_listener(self._quantize_button_value)
         duplicate_button.remove_value_listener(self._duplicate_button_value)
         self.song().remove_tracks_listener(self._on_track_number_changed)
+        # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
+        self.remove_midi_listener(self._midi_listener)
         super(MicroPush, self).disconnect()
