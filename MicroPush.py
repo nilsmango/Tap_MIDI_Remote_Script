@@ -14,7 +14,7 @@ from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
 
-mixer, transport, capture_button, quantize_button, duplicate_button = None, None, None, None, None
+mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button = None, None, None, None, None, None
 
 
 class MicroPush(ControlSurface):
@@ -41,7 +41,6 @@ class MicroPush(ControlSurface):
         mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 9, 7, Live.MidiMap.MapMode.absolute))
 
     def _initialize_buttons(self):
-        transport.set_record_button(ButtonElement(1, MIDI_CC_TYPE, 0, 119))
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
         transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
@@ -52,6 +51,9 @@ class MicroPush(ControlSurface):
         # duplicate the active clip to a free slot
         duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
         duplicate_button.add_value_listener(self._duplicate_button_value)
+        # a session recording button
+        sesh_record_button = ButtonElement(1, MIDI_CC_TYPE, 0, 119)
+        sesh_record_button.add_value_listener(self._sesh_record_value)
 
     def receive_midi(self, midi_bytes):
         if len(midi_bytes) == 3:
@@ -68,6 +70,15 @@ class MicroPush(ControlSurface):
                 pass
 
         super(MicroPush, self).receive_midi(midi_bytes)
+
+    def _sesh_record_value(self, value):
+        self.show_message("recording button")
+        if value != 0:
+            record = self.song().session_record
+            if record == False:
+                self.song().session_record = True
+            else:
+                self.song().session_record = False
 
     def _capture_button_value(self, value):
         if value != 0:
@@ -158,6 +169,7 @@ class MicroPush(ControlSurface):
         capture_button.remove_value_listener(self._capture_button_value)
         quantize_button.remove_value_listener(self._quantize_button_value)
         duplicate_button.remove_value_listener(self._duplicate_button_value)
+        sesh_record_button.remove_value_listener(self._sesh_record_value)
         self.song().remove_tracks_listener(self._on_track_number_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self.remove_midi_listener(self._midi_listener)
