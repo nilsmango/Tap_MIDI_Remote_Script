@@ -31,7 +31,7 @@ class MicroPush(ControlSurface):
             self._initialize_mixer()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
-            self._set_selected_track_implicit_arm
+            self._set_selected_track_implicit_arm()
             self._on_selected_track_changed.subject = self.song().view
             self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
 
@@ -72,7 +72,6 @@ class MicroPush(ControlSurface):
         super(MicroPush, self).receive_midi(midi_bytes)
 
     def _sesh_record_value(self, value):
-        self.show_message("recording button")
         if value != 0:
             record = self.song().session_record
             if record == False:
@@ -135,7 +134,6 @@ class MicroPush(ControlSurface):
         if selected_track:
             selected_track.implicit_arm = True
         else:
-            self.show_message("trying to arm track")
             self.song().tracks[0].implicit_arm = True
 
     def _set_other_tracks_implicit_arm(self):
