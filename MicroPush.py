@@ -9,13 +9,10 @@ from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
-
+from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
-
-
 mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button = None, None, None, None, None, None, None, None, None
-
 quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
@@ -38,6 +35,23 @@ class MicroPush(ControlSurface):
             self._set_selected_track_implicit_arm()
             self._on_selected_track_changed.subject = self.song().view
             self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
+            self._setup_device_control()
+
+    def _setup_device_control(self):
+        self._device = DeviceComponent()
+        self._device.name = 'Device_Component'
+        device_controls = []
+        for index in range(16):
+            control = EncoderElement(MIDI_CC_TYPE, index, 20, Live.MidiMap.MapMode.absolute)
+            control.name = 'Ctrl_' + str(index)
+            device_controls.append(control)
+        self._device.set_parameter_controls(device_controls)
+        self._on_device_changed.subject = self._device
+        self.set_device_component(self._device)
+
+    @subject_slot('device')
+    def _on_device_changed(self):
+        pass
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
@@ -67,22 +81,7 @@ class MicroPush(ControlSurface):
         # swing percentage button
         swing_amount_button = ButtonElement(1, MIDI_CC_TYPE, 1, 2)
         swing_amount_button.add_value_listener(self._swing_amount_value)
-
-    def receive_midi(self, midi_bytes):
-        if len(midi_bytes) == 3:
-            status = midi_bytes[0] & 0xF0
-            data1 = midi_bytes[1]
-            data2 = midi_bytes[2]
-
-            channel = (midi_bytes[0] & 0x0F) + 1  # MIDI channels are 1-based
-            note = data1
-            velocity = data2
-
-            if status == MIDI_NOTE_ON_STATUS and channel == 15 and note == 90:
-                # self.quantize_grid_button = velocity
-                self.show_message("received MIDI from channel 16, note 90")
-
-        super(MicroPush, self).receive_midi(midi_bytes)
+       
 
     def _sesh_record_value(self, value):
         if value != 0:
@@ -115,7 +114,7 @@ class MicroPush(ControlSurface):
             if clip:
                 # need to set the swing amount first (0.00-1.00)
                 self.song().swing_amount = swing_amount_value
-                # grid (int 1 == 1/4, 2 == 1/8, 5 == 1/16), strength (0.50 == 50%)
+                # grid (int 1 == 1/4, 2 == 1/8, 5 == 1/16, 8 = 1/32), strength (0.50 == 50%)
                 clip.quantize(quantize_grid_value, quantize_strength_value)
 
     def _duplicate_button_value(self, value):
