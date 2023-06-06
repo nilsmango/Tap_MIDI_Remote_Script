@@ -14,7 +14,11 @@ from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
 
-mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button = None, None, None, None, None, None
+mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button = None, None, None, None, None, None, None, None, None
+
+quantize_grid_value = 5
+quantize_strength_value = 1.0
+swing_amount_value = 0.0
 
 
 class MicroPush(ControlSurface):
@@ -54,6 +58,15 @@ class MicroPush(ControlSurface):
         # a session recording button
         sesh_record_button = ButtonElement(1, MIDI_CC_TYPE, 0, 119)
         sesh_record_button.add_value_listener(self._sesh_record_value)
+        # quantize grid size button
+        quantize_grid_button = ButtonElement(1, MIDI_CC_TYPE, 1, 0)
+        quantize_grid_button.add_value_listener(self._quantize_grid_value)
+        # quantize strength
+        quantize_strength_button = ButtonElement(1, MIDI_CC_TYPE, 1, 1)
+        quantize_strength_button.add_value_listener(self._quantize_strength_value)
+        # swing percentage button
+        swing_amount_button = ButtonElement(1, MIDI_CC_TYPE, 1, 2)
+        swing_amount_button.add_value_listener(self._swing_amount_value)
 
     def receive_midi(self, midi_bytes):
         if len(midi_bytes) == 3:
@@ -65,9 +78,9 @@ class MicroPush(ControlSurface):
             note = data1
             velocity = data2
 
-            if status == MIDI_NOTE_ON_STATUS and channel == 15 and note == 100:
-                # self.quantize_grid = velocity
-                pass
+            if status == MIDI_NOTE_ON_STATUS and channel == 15 and note == 90:
+                # self.quantize_grid_button = velocity
+                self.show_message("received MIDI from channel 16, note 90")
 
         super(MicroPush, self).receive_midi(midi_bytes)
 
@@ -83,14 +96,27 @@ class MicroPush(ControlSurface):
         if value != 0:
             self.song().capture_midi()
 
+    def _quantize_grid_value(self, value):
+        global quantize_grid_value
+        quantize_grid_value = value
+
+    def _quantize_strength_value(self, value):
+        global quantize_strength_value
+        quantize_strength_value = value / 100.0
+
+    def _swing_amount_value(self, value):
+        global swing_amount_value
+        # 100% swing amount did strange things, so I went down to 10% max
+        swing_amount_value = value / 1000.0
+
     def _quantize_button_value(self, value):
         if value != 0:
             clip = self.song().view.detail_clip
             if clip:
                 # need to set the swing amount first (0.00-1.00)
-                self.song().swing_amount = 0.1
+                self.song().swing_amount = swing_amount_value
                 # grid (int 1 == 1/4, 2 == 1/8, 5 == 1/16), strength (0.50 == 50%)
-                clip.quantize(2, 1.0)
+                clip.quantize(quantize_grid_value, quantize_strength_value)
 
     def _duplicate_button_value(self, value):
         if value != 0:
