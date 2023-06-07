@@ -46,12 +46,20 @@ class MicroPush(ControlSurface):
             control.name = 'Ctrl_' + str(index)
             device_controls.append(control)
         self._device.set_parameter_controls(device_controls)
+        self._device.set_bank_nav_buttons(ButtonElement(1, MIDI_CC_TYPE, 0, 33), ButtonElement(1, MIDI_CC_TYPE, 0, 32))
         self._on_device_changed.subject = self._device
         self.set_device_component(self._device)
 
     @subject_slot('device')
     def _on_device_changed(self):
-        pass
+        self.log_message("device changed")
+        if liveobj_valid(self._device):
+            device = self._device.device()  # Retrieve the Device object
+            device_parameters = device.parameters
+            parameter_names = [parameter.name for parameter in device_parameters]
+            # Do something with the parameter names
+            self.log_message("Parameters: {}".format(parameter_names))
+
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
