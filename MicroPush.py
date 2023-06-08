@@ -12,10 +12,12 @@ from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, 
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
+
 mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button = None, None, None, None, None, None, None, None, None
 quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
+
 
 
 class MicroPush(ControlSurface):
@@ -29,6 +31,9 @@ class MicroPush(ControlSurface):
             return_count = 24  # Maximum of 12 Sends and 12 Returns
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
+            self._last_can_redo = self.song().can_redo
+            self._last_can_undo = self.song().can_undo
+            self.first_periodic_check = True
             self._initialize_mixer()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
@@ -36,6 +41,7 @@ class MicroPush(ControlSurface):
             self._on_selected_track_changed.subject = self.song().view
             self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
             self._setup_device_control()
+
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -59,7 +65,9 @@ class MicroPush(ControlSurface):
             parameter_names = [parameter.name for parameter in device_parameters]
             # Do something with the parameter names
             self.log_message("Parameters: {}".format(parameter_names))
-
+            # send a midi message just to check
+            midi_event_bytes = (0x90 | 0x02, 0x01, 0x64)
+            self._send_midi(midi_event_bytes)
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
@@ -89,7 +97,51 @@ class MicroPush(ControlSurface):
         # swing percentage button
         swing_amount_button = ButtonElement(1, MIDI_CC_TYPE, 1, 2)
         swing_amount_button.add_value_listener(self._swing_amount_value)
-       
+        # periodic check
+        periodic_check_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 97)
+        periodic_check_button.add_value_listener(self._periodic_check)
+        # redo button
+        redo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 102)
+        redo_button.add_value_listener(self._redo_button_value)
+        # undo button
+        undo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 101)
+        undo_button.add_value_listener(self._undo_button_value)
+
+    def _periodic_check(self, value):
+        if value != 0:
+            can_redo = self.song().can_redo
+            can_undo = self.song().can_undo
+            if can_redo != self._last_can_redo or self.first_periodic_check is True:
+                self._last_can_redo = can_redo
+                if can_redo:
+                    midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
+                    self._send_midi(midi_event_bytes)
+                else:
+                    midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
+                    self._send_midi(midi_event_bytes)
+            if can_undo != self._last_can_undo or self.first_periodic_check is True:
+                self._last_can_undo = can_undo
+                if can_undo:
+                    midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
+                    self._send_midi(midi_event_bytes)
+                else:
+                    midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
+                    self._send_midi(midi_event_bytes)
+            self.first_periodic_check = False
+
+    def _redo_button_value(self, value):
+        if value != 0:
+            song = self.song()
+            if song.can_redo:
+                song.redo()
+                self._periodic_check(1)
+
+    def _undo_button_value(self, value):
+        if value != 0:
+            song = self.song()
+            if song.can_undo:
+                song.undo()
+                self._periodic_check(1)
 
     def _sesh_record_value(self, value):
         if value != 0:
@@ -201,6 +253,10 @@ class MicroPush(ControlSurface):
         quantize_button.remove_value_listener(self._quantize_button_value)
         duplicate_button.remove_value_listener(self._duplicate_button_value)
         sesh_record_button.remove_value_listener(self._sesh_record_value)
+        redo_button.remove_value_listener(self._redo_button_value)
+        undo_button.remove_value_listener(self._undo_button_value)
+        periodic_check_button.remove_value_listener(self._periodic_check)
+        
         self.song().remove_tracks_listener(self._on_track_number_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self.remove_midi_listener(self._midi_listener)
