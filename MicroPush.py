@@ -58,16 +58,31 @@ class MicroPush(ControlSurface):
 
     @subject_slot('device')
     def _on_device_changed(self):
-        self.log_message("device changed")
         if liveobj_valid(self._device):
             device = self._device.device()  # Retrieve the Device object
-            device_parameters = device.parameters
-            parameter_names = [parameter.name for parameter in device_parameters]
-            # Do something with the parameter names
-            self.log_message("Parameters: {}".format(parameter_names))
-            # send a midi message just to check
-            midi_event_bytes = (0x90 | 0x02, 0x01, 0x64)
-            self._send_midi(midi_event_bytes)
+            if hasattr(device, 'parameters') and device.parameters:
+                device_parameters = device.parameters
+                parameter_names = [parameter.name for parameter in device_parameters]
+                # Do something with the parameter names
+                self.log_message("Parameters: {}".format(parameter_names))
+                # send a MIDI SysEx message with the names
+                self._send_parameter_names(parameter_names)
+            else:
+                self.log_message("Device has no parameters.")
+
+    def _send_parameter_names(self, parameter_names):
+        name_string = ''.join(parameter_names)
+        self._send_sys_ex_message(name_string)
+
+    def _send_sys_ex_message(self, name_string):
+        status_byte = 0xF0  # SysEx message start
+        manufacturer_id = 0x7D  # Replace with your manufacturer ID
+        device_id = 0x01  # Replace with your device ID
+        data = name_string.encode('ascii')
+        end_byte = 0xF7  # SysEx message end
+        sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
+        self._send_midi(sys_ex_message)
+
 
     def _initialize_mixer(self):
         self.show_message("Loading Micro Push mappings")
