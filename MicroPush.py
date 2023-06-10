@@ -56,23 +56,41 @@ class MicroPush(ControlSurface):
             control.name = 'Ctrl_' + str(index)
             device_controls.append(control)
         self._device.set_parameter_controls(device_controls)
-        self._device.set_bank_nav_buttons(ButtonElement(1, MIDI_CC_TYPE, 0, 33), ButtonElement(1, MIDI_CC_TYPE, 0, 32))
+        nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
+        nav_right_button = ButtonElement(1, MIDI_CC_TYPE, 0, 32)
+        self._device.set_bank_nav_buttons(nav_left_button, nav_right_button)
         self._on_device_changed.subject = self._device
         self.set_device_component(self._device)
+        # Register button listeners for navigation buttons
+        nav_left_button.add_value_listener(self._on_nav_button_pressed)
+        nav_right_button.add_value_listener(self._on_nav_button_pressed)
+
+
+    def _on_nav_button_pressed(self, value):
+        if value:
+            self._on_device_changed()
 
     @subject_slot('device')
     def _on_device_changed(self):
         if liveobj_valid(self._device):
             device = self._device.device()  # Retrieve the Device object
             if hasattr(device, 'parameters') and device.parameters:
-                device_parameters = device.parameters
-                parameter_names = [parameter.name for parameter in device_parameters]
-                # Do something with the parameter names
-                self.log_message("Parameters: {}".format(parameter_names))
-                # send a MIDI SysEx message with the names
-                self._send_parameter_names(parameter_names)
+                # TODO: make this prettier!
+                parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
+                                for control in self._device._parameter_controls]
+                parameter_names = [name for name in parameter_names if name]  # Remove empty names
+                if parameter_names:
+                    # Do something with the parameter names
+                    self.log_message("Ordered Parameter Names: {}".format(parameter_names))
+                    self.log_message("Device Name: {}".format(device.name))
+                    # send a MIDI SysEx message with the names
+                    self._send_parameter_names(parameter_names)
+                else:
+                    self.log_message("No parameter names found in the device controls.")
             else:
                 self.log_message("Device has no parameters.")
+        else:
+            self.log_message("Invalid device.")
 
     def _send_parameter_names(self, parameter_names):
         name_string = ','.join(parameter_names)
