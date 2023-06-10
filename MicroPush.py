@@ -39,15 +39,19 @@ class MicroPush(ControlSurface):
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
             self._on_selected_track_changed.subject = self.song().view
+            # track = self.song().view.selected_track
+            # track.view.add_selected_device_listener(self._on_selected_device_changed)
             self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
             self._setup_device_control()
 
+    # def _on_selected_device_changed(self):
+    #     self.log_message("device changed!!")
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
         self._device.name = 'Device_Component'
         device_controls = []
-        for index in range(16):
+        for index in range(8):
             control = EncoderElement(MIDI_CC_TYPE, index, 20, Live.MidiMap.MapMode.absolute)
             control.name = 'Ctrl_' + str(index)
             device_controls.append(control)
@@ -71,7 +75,7 @@ class MicroPush(ControlSurface):
                 self.log_message("Device has no parameters.")
 
     def _send_parameter_names(self, parameter_names):
-        name_string = ''.join(parameter_names)
+        name_string = ','.join(parameter_names)
         self._send_sys_ex_message(name_string)
 
     def _send_sys_ex_message(self, name_string):
@@ -228,6 +232,12 @@ class MicroPush(ControlSurface):
         if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
         self._set_other_tracks_implicit_arm()
+        device_to_select = selected_track.view.selected_device
+        if device_to_select == None and len(selected_track.devices) > 0:
+            device_to_select = selected_track.devices[0]
+        if device_to_select != None:
+            self.song().view.select_device(device_to_select)
+        self._device_component.set_device(device_to_select)
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
