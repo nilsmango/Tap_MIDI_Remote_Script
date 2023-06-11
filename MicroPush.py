@@ -74,15 +74,25 @@ class MicroPush(ControlSurface):
     def _on_device_changed(self):
         if liveobj_valid(self._device):
             device = self._device.device()  # Retrieve the Device object
+            # get and send name of bank and device
+            selected_track = self.song().view.selected_track
+            selected_device = selected_track.view.selected_device
+            device_name = selected_device.name
+            bank_name = self._device._bank_name
+            bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
+            # sending sysex of bank name, device name, bank names
+            self._send_sys_ex_message(bank_name, 0x6D)
+            self._send_sys_ex_message(bank_names_list, 0x5D)
+            self._send_sys_ex_message(device_name, 0x4D)
             if hasattr(device, 'parameters') and device.parameters:
+                
                 # TODO: make this prettier!
                 parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
                                 for control in self._device._parameter_controls]
                 parameter_names = [name for name in parameter_names if name]  # Remove empty names
                 if parameter_names:
                     # Do something with the parameter names
-                    self.log_message("Ordered Parameter Names: {}".format(parameter_names))
-                    self.log_message("Device Name: {}".format(device.name))
+                    self.log_message("Parameter Names: {}".format(parameter_names))
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
@@ -94,12 +104,12 @@ class MicroPush(ControlSurface):
 
     def _send_parameter_names(self, parameter_names):
         name_string = ','.join(parameter_names)
-        self._send_sys_ex_message(name_string)
+        self._send_sys_ex_message(name_string, 0x7D)
 
-    def _send_sys_ex_message(self, name_string):
+    def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
-        manufacturer_id = 0x7D  # Replace with your manufacturer ID
-        device_id = 0x01  # Replace with your device ID
+        # parameter names: 0x7D, bank name: 0x6D
+        device_id = 0x01  
         data = name_string.encode('ascii')
         end_byte = 0xF7  # SysEx message end
         sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
