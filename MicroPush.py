@@ -84,15 +84,19 @@ class MicroPush(ControlSurface):
             self._send_sys_ex_message(bank_name, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(device_name, 0x4D)
+            # Get all available devices of the selected track
+            available_devices = [device.name for device in selected_track.devices]
+            available_devices_string = ','.join(available_devices)
+            self.log_message("devices: {}".format(available_devices))
+            self._send_sys_ex_message(available_devices_string, 0x01)
+
             if hasattr(device, 'parameters') and device.parameters:
-                
                 # TODO: make this prettier!
                 parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
                                 for control in self._device._parameter_controls]
                 parameter_names = [name for name in parameter_names if name]  # Remove empty names
                 if parameter_names:
-                    # Do something with the parameter names
-                    self.log_message("Parameter Names: {}".format(parameter_names))
+                    # self.log_message("Parameter Names: {}".format(parameter_names))
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
