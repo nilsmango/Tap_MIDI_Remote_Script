@@ -78,16 +78,22 @@ class MicroPush(ControlSurface):
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
             device_name = selected_device.name
+            available_devices = selected_track.devices
+            # find index of device
+            selected_device_index = self._find_device_index(selected_device, available_devices)
+            self.log_message("Selected Device Index: {}".format(selected_device_index))
+            # bank names etc.
             bank_name = self._device._bank_name
             bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
             # sending sysex of bank name, device name, bank names
             self._send_sys_ex_message(bank_name, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
-            self._send_sys_ex_message(device_name, 0x4D)
+            # sending the index instead of name for device.
+            self._send_sys_ex_message(selected_device_index, 0x4D)
             # Get all available devices of the selected track
             available_devices = [device.name for device in selected_track.devices]
             available_devices_string = ','.join(available_devices)
-            self.log_message("devices: {}".format(available_devices))
+            # self.log_message("devices: {}".format(available_devices))
             self._send_sys_ex_message(available_devices_string, 0x01)
 
             if hasattr(device, 'parameters') and device.parameters:
@@ -105,6 +111,12 @@ class MicroPush(ControlSurface):
                 self.log_message("Device has no parameters.")
         else:
             self.log_message("Invalid device.")
+
+    def _find_device_index(self, device, device_list):
+        for index, d in enumerate(device_list):
+            if device == d:
+                return str(index)
+        return "not found"  # Device not found
 
     def _send_parameter_names(self, parameter_names):
         name_string = ','.join(parameter_names)
