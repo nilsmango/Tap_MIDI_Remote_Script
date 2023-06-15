@@ -81,7 +81,7 @@ class MicroPush(ControlSurface):
             available_devices = selected_track.devices
             # find index of device
             selected_device_index = self._find_device_index(selected_device, available_devices)
-            self.log_message("Selected Device Index: {}".format(selected_device_index))
+            # self.log_message("Selected Device Index: {}".format(selected_device_index))
             # bank names etc.
             bank_name = self._device._bank_name
             bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
@@ -169,6 +169,9 @@ class MicroPush(ControlSurface):
         # undo button
         undo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 101)
         undo_button.add_value_listener(self._undo_button_value)
+        # device selection
+        device_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 3)
+        device_selection_button.add_value_listener(self._select_device_by_index)
 
     def _periodic_check(self, value):
         if value != 0:
@@ -276,12 +279,27 @@ class MicroPush(ControlSurface):
         if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
         self._set_other_tracks_implicit_arm()
+        # TODO: this part doesn't seem to work!
         device_to_select = selected_track.view.selected_device
         if device_to_select == None and len(selected_track.devices) > 0:
             device_to_select = selected_track.devices[0]
         if device_to_select != None:
             self.song().view.select_device(device_to_select)
         self._device_component.set_device(device_to_select)
+
+    def _select_device_by_index(self, value):
+        self.log_message("Setting new device Index: {}".format(value))
+        device_to_select = self.song().view.selected_track.devices[value]
+        self.song().view.select_device(device_to_select)
+        # self._device_component.set_device(device_to_select)
+
+    # def _select_device_by_index(self, device_index):
+    #     selected_track = self.song().view.selected_track
+    #     devices = selected_track.devices
+    #     if device_index >= 0 and device_index < len(devices):
+    #         selected_track.view.select_device(devices[device_index])
+    #     else:
+    #         self.log_message("Invalid device index: {}".format(device_index))
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
