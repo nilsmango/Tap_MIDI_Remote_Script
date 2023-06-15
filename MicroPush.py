@@ -291,15 +291,6 @@ class MicroPush(ControlSurface):
         self.log_message("Setting new device Index: {}".format(value))
         device_to_select = self.song().view.selected_track.devices[value]
         self.song().view.select_device(device_to_select)
-        # self._device_component.set_device(device_to_select)
-
-    # def _select_device_by_index(self, device_index):
-    #     selected_track = self.song().view.selected_track
-    #     devices = selected_track.devices
-    #     if device_index >= 0 and device_index < len(devices):
-    #         selected_track.view.select_device(devices[device_index])
-    #     else:
-    #         self.log_message("Invalid device index: {}".format(device_index))
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
