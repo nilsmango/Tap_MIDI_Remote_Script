@@ -31,13 +31,15 @@ class MicroPush(ControlSurface):
             return_count = 24  # Maximum of 12 Sends and 12 Returns
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
+            # set up undo redo
             self._last_can_redo = self.song().can_redo
             self._last_can_undo = self.song().can_undo
-            self.first_periodic_check = True
+            self._setup_undo_redo()
             self._initialize_mixer()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
+            self._send_selected_track_index(self.song().view.selected_track)
             self._on_selected_track_changed.subject = self.song().view
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
@@ -77,7 +79,7 @@ class MicroPush(ControlSurface):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
-            device_name = selected_device.name
+            # device_name = selected_device.name
             available_devices = selected_track.devices
             # find index of device
             selected_device_index = self._find_device_index(selected_device, available_devices)
@@ -172,12 +174,26 @@ class MicroPush(ControlSurface):
         # device selection
         device_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 3)
         device_selection_button.add_value_listener(self._select_device_by_index)
+        # track selection
+        track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 4)
+        track_selection_button.add_value_listener(self._select_track_by_index)
+
+    def _setup_undo_redo(self):
+        can_redo = self.song().can_redo
+        can_undo = self.song().can_undo
+        if can_redo:
+            midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
+            self._send_midi(midi_event_bytes)
+        if can_undo:
+            midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
+            self._send_midi(midi_event_bytes)
+
 
     def _periodic_check(self, value):
         if value != 0:
             can_redo = self.song().can_redo
             can_undo = self.song().can_undo
-            if can_redo != self._last_can_redo or self.first_periodic_check is True:
+            if can_redo != self._last_can_redo:
                 self._last_can_redo = can_redo
                 if can_redo:
                     midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
@@ -185,7 +201,7 @@ class MicroPush(ControlSurface):
                 else:
                     midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
                     self._send_midi(midi_event_bytes)
-            if can_undo != self._last_can_undo or self.first_periodic_check is True:
+            if can_undo != self._last_can_undo:
                 self._last_can_undo = can_undo
                 if can_undo:
                     midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
@@ -279,7 +295,9 @@ class MicroPush(ControlSurface):
         if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
         self._set_other_tracks_implicit_arm()
-        # TODO: this part doesn't seem to work!
+        # send new index of selected track
+        self._send_selected_track_index(selected_track)
+        # TODO: this part doesn't seem to work?
         device_to_select = selected_track.view.selected_device
         if device_to_select == None and len(selected_track.devices) > 0:
             device_to_select = selected_track.devices[0]
@@ -287,10 +305,29 @@ class MicroPush(ControlSurface):
             self.song().view.select_device(device_to_select)
         self._device_component.set_device(device_to_select)
 
+    def _send_selected_track_index(self, selected_track):
+        track_list = self.song().tracks
+        track_index = self._find_track_index(selected_track, track_list)
+        self._send_sys_ex_message(track_index, 0x03)
+
+    def _find_track_index(self, track, track_list):
+        for index, t in enumerate(track_list):
+            if track == t:
+                return str(index)
+        return "not found" # Track not found
+
     def _select_device_by_index(self, value):
-        self.log_message("Setting new device Index: {}".format(value))
+        # self.log_message("Setting new device Index: {}".format(value))
         device_to_select = self.song().view.selected_track.devices[value]
         self.song().view.select_device(device_to_select)
+
+    def _select_track_by_index(self, track_index):
+        # self.log_message("Getting track: {}".format(track_index))
+        song = self.song()
+        if track_index >= 0 and track_index < len(song.tracks):
+            song.view.selected_track = song.tracks[track_index]
+        else:
+            self.log_message("Invalid track index: {}".format(track_index))
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
@@ -309,11 +346,9 @@ class MicroPush(ControlSurface):
 
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
-        track_count = len(self.song().tracks)
-        # mixer.set_track_count(track_count)
-        self.show_message("Track Count: {}".format(track_count))
+        # send track names
         track_names = ", ".join([track.name for track in self.song().tracks])
-        self.show_message("Track Count: {}\nTrack Names: {}".format(track_count, track_names))
+        self._send_sys_ex_message(track_names, 0x02)
 
         # Channels
         for index, track in enumerate(self.song().tracks):
