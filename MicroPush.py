@@ -43,7 +43,7 @@ class MicroPush(ControlSurface):
             self._on_selected_track_changed.subject = self.song().view
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
-            self.song().add_tracks_listener(self._on_track_number_changed)  # hier für return tracks: .add_return_tracks_listener()
+            self.song().add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
             self._setup_device_control()
 
     # def _on_selected_device_changed(self):
@@ -341,14 +341,57 @@ class MicroPush(ControlSurface):
             if track != self.song().view.selected_track:
                 track.implicit_arm = False
 
-    def _on_track_number_changed(self):
+    def _on_tracks_changed(self):
         self._update_mixer_and_tracks()
 
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
+        # tracks = self.song().tracks
+        # # send track names
+        # track_names = ",".join([track.name for track in tracks])
+        # self._send_sys_ex_message(track_names, 0x02)
+
+        track_names = []
+        track_colors = []
+        track_clips = []
+        for track in self.song().tracks:
+            # track names
+            track_names.append(track.name)
+
+            # track colors
+            color = track.color
+            red = (color >> 16) & 255
+            green = (color >> 8) & 255
+            blue = color & 255
+            color_string = "({},{},{})".format(red, green, blue)
+            track_colors.append(color_string)
+
+            # track clip slots
+            clip_slots = []
+            for clip_slot in track.clip_slots:
+                clip_data = {
+                    'hasClip': clip_slot.has_clip,
+                    'isPlaying': clip_slot.is_playing
+                }
+                has_clip_value = 1 if clip_data['hasClip'] else 0
+                is_playing_value = 1 if clip_data['isPlaying'] else 0
+                clip_string = "{}{}".format(has_clip_value, is_playing_value)
+                clip_slots.append(clip_string)
+            clip_slots_string = "-".join(clip_slots)
+            track_clips.append(clip_slots_string)
+        
         # send track names
-        track_names = ", ".join([track.name for track in self.song().tracks])
-        self._send_sys_ex_message(track_names, 0x02)
+        track_names_string = ",".join(track_names)
+        self._send_sys_ex_message(track_names_string, 0x02)
+
+        # send track colors
+        track_colors_string = "-".join(track_colors)
+        self._send_sys_ex_message(track_colors_string, 0x04)
+
+        # send track clips
+        track_clips_string = "/".join(track_clips)
+        self._send_sys_ex_message(track_clips_string, 0x05)
+
 
         # Channels
         for index, track in enumerate(self.song().tracks):
@@ -370,7 +413,7 @@ class MicroPush(ControlSurface):
         undo_button.remove_value_listener(self._undo_button_value)
         periodic_check_button.remove_value_listener(self._periodic_check)
         
-        self.song().remove_tracks_listener(self._on_track_number_changed)
+        self.song().remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self.remove_midi_listener(self._midi_listener)
         super(MicroPush, self).disconnect()
