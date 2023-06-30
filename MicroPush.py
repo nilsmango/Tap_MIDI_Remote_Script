@@ -396,13 +396,36 @@ class MicroPush(ControlSurface):
         # Channels
         for index, track in enumerate(self.song().tracks):
             strip = mixer.channel_strip(index)
+            
             # Configure strip controls for each channel track
-            # strip.set_mute_button(...)
-            # strip.set_solo_button(...)
+            
+            # VolumeSlider control
+            volume_slider = SliderElement(MIDI_CC_TYPE, index, 7)  # Replace 7 with the appropriate MIDI CC number for volume control
+            strip.set_volume_control(volume_slider)
+            
+            # Send1Knob control
+            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 40, Live.MidiMap.MapMode.absolute)  # Replace 40 with the appropriate MIDI CC number for Send A control
+            
+            
+            # Send2Knob control
+            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 41, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
+            strip.set_send_controls((send1_knob, send2_knob,))
+            
+            # Pan
+            pan_knob = EncoderElement(MIDI_CC_TYPE, index, 42, Live.MidiMap.MapMode.absolute)
+            strip.set_pan_control(pan_knob)
+
+            # TrackMuteButton control
+            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 44)  # channel and identifier missing
+            strip.set_mute_button(mute_button)
+
+            # Solo button control
+            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 43)  # channel and identifier missing
+            strip.set_solo_button(solo_button)
+            
+            # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
             # strip.set_shift_button(...)
-            # strip.set_pan_control(...)
-            # strip.set_volume_control(...)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
