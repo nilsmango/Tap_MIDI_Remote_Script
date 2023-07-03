@@ -454,6 +454,7 @@ class MicroPush(ControlSurface):
         # Master / channel 7 cc 127
         mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
         mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
+        mixer.master_strip().set_pan_control(EncoderElement(MIDI_CC_TYPE, 0, 125, Live.MidiMap.MapMode.absolute))
 
         # Return Tracks
         for index, returnTrack in enumerate(self.song().return_tracks):
@@ -471,6 +472,17 @@ class MicroPush(ControlSurface):
             solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 9)
             strip.set_solo_button(solo_button)
 
+            # Send1Knob control
+            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 11, Live.MidiMap.MapMode.absolute)  # Replace 40 with the appropriate MIDI CC number for Send A control
+            
+            
+            # Send2Knob control
+            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 12, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
+            strip.set_send_controls((send1_knob, send2_knob,))
+
+            # Pan
+            pan_knob = EncoderElement(MIDI_CC_TYPE, index, 13, Live.MidiMap.MapMode.absolute)
+            strip.set_pan_control(pan_knob)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
