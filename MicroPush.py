@@ -35,7 +35,6 @@ class MicroPush(ControlSurface):
             self._last_can_redo = self.song().can_redo
             self._last_can_undo = self.song().can_undo
             self._setup_undo_redo()
-            self._initialize_mixer()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
@@ -132,12 +131,6 @@ class MicroPush(ControlSurface):
         end_byte = 0xF7  # SysEx message end
         sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
         self._send_midi(sys_ex_message)
-
-
-    def _initialize_mixer(self):
-        self.show_message("Loading Micro Push mappings")
-        mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 8, 7))
-        mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 9, 7, Live.MidiMap.MapMode.absolute))
 
     def _initialize_buttons(self):
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
@@ -297,7 +290,7 @@ class MicroPush(ControlSurface):
         self._set_other_tracks_implicit_arm()
         # send new index of selected track
         self._send_selected_track_index(selected_track)
-        # TODO: this part doesn't seem to work?
+        # TODO: this part doesn't seem to work? how can I make this work with master and return?
         device_to_select = selected_track.view.selected_device
         if device_to_select == None and len(selected_track.devices) > 0:
             device_to_select = selected_track.devices[0]
@@ -354,6 +347,7 @@ class MicroPush(ControlSurface):
         track_names = []
         track_colors = []
         track_clips = []
+
         for track in self.song().tracks:
             # track names
             track_names.append(track.name)
@@ -392,6 +386,36 @@ class MicroPush(ControlSurface):
         track_clips_string = "/".join(track_clips)
         self._send_sys_ex_message(track_clips_string, 0x05)
 
+        return_track_names = []
+        return_track_colors = []
+        
+        for return_track in self.song().return_tracks:
+            return_track_names.append(return_track.name)
+
+            color = return_track.color
+            red = (color >> 16) & 255
+            green = (color >> 8) & 255
+            blue = color & 255
+            color_string = "({},{},{})".format(red, green, blue)
+            return_track_colors.append(color_string)
+        
+        # add master track color to the mix:
+        master_track = self.song().master_track
+        master_channel_color = master_track.color
+        red = (master_channel_color >> 16) & 255
+        green = (master_channel_color >> 8) & 255
+        blue = master_channel_color & 255
+        color_string = "({},{},{})".format(red, green, blue)
+        return_track_colors.append(color_string)
+
+        # send return track names
+        return_track_names_string = ",".join(return_track_names)
+        self._send_sys_ex_message(return_track_names_string, 0x06)
+
+        # send return track colors + master track
+        track_colors_string = "-".join(return_track_colors)
+        self._send_sys_ex_message(track_colors_string, 0x07)
+
 
         # Channels
         for index, track in enumerate(self.song().tracks):
@@ -416,16 +440,37 @@ class MicroPush(ControlSurface):
             strip.set_pan_control(pan_knob)
 
             # TrackMuteButton control
-            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 44)  # channel and identifier missing
+            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 44)
             strip.set_mute_button(mute_button)
 
             # Solo button control
-            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 43)  # channel and identifier missing
+            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 43)
             strip.set_solo_button(solo_button)
             
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
             # strip.set_shift_button(...)
+        
+        # Master / channel 7 cc 127
+        mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
+        mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
+
+        # Return Tracks
+        for index, returnTrack in enumerate(self.song().return_tracks):
+            strip = mixer.return_strip(index)
+
+            # VolumeSlider
+            return_volume_slider = SliderElement(MIDI_CC_TYPE, index, 8)  # Replace 7 with the appropriate MIDI CC number for return track volume control
+            strip.set_volume_control(return_volume_slider)
+
+            # TrackMuteButton control
+            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 10)
+            strip.set_mute_button(mute_button)
+
+            # Solo button control
+            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 9)
+            strip.set_solo_button(solo_button)
+
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
