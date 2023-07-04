@@ -302,6 +302,14 @@ class MicroPush(ControlSurface):
         track_list = self.song().tracks
         track_index = self._find_track_index(selected_track, track_list)
         self._send_sys_ex_message(track_index, 0x03)
+        if track_index == "not found":
+            return_tracks_list = self.song().return_tracks
+            return_track_index = self._find_track_index(selected_track, return_tracks_list)
+            if return_track_index == "not found":
+                return_track_index = str(len(return_tracks_list))
+            self._send_sys_ex_message(return_track_index, 0x08)
+        else:
+            self._send_sys_ex_message("none selected", 0x08)
 
     def _find_track_index(self, track, track_list):
         for index, t in enumerate(track_list):
@@ -428,7 +436,7 @@ class MicroPush(ControlSurface):
             strip.set_volume_control(volume_slider)
             
             # Send1Knob control
-            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 40, Live.MidiMap.MapMode.absolute)  # Replace 40 with the appropriate MIDI CC number for Send A control
+            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 40, Live.MidiMap.MapMode.absolute)
             
             
             # Send2Knob control
