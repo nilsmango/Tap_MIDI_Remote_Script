@@ -170,6 +170,9 @@ class MicroPush(ControlSurface):
         # track selection
         track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 4)
         track_selection_button.add_value_listener(self._select_track_by_index)
+        # return and master track selection
+        return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 5)
+        return_track_selection_button.add_value_listener(self._select_return_track_by_index)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -329,6 +332,16 @@ class MicroPush(ControlSurface):
             song.view.selected_track = song.tracks[track_index]
         else:
             self.log_message("Invalid track index: {}".format(track_index))
+
+    def _select_return_track_by_index(self, track_index):
+        song = self.song()
+        if track_index < len(song.return_tracks):
+            return_track = song.return_tracks[track_index] 
+            song.view.selected_track = return_track
+        else:
+            master_track = song.master_track 
+            song.view.selected_track = master_track
+
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
