@@ -371,11 +371,13 @@ class MicroPush(ControlSurface):
             for clip_slot in track.clip_slots:
                 clip_data = {
                     'hasClip': clip_slot.has_clip,
-                    'isPlaying': clip_slot.is_playing
+                    'isPlaying': clip_slot.is_playing,
+                    'isRecording': clip_slot.is_recording
                 }
                 has_clip_value = 1 if clip_data['hasClip'] else 0
                 is_playing_value = 1 if clip_data['isPlaying'] else 0
-                clip_string = "{}{}".format(has_clip_value, is_playing_value)
+                is_recording_value = 1 if clip_data['isRecording'] else 0
+                clip_string = "{}{}{}".format(has_clip_value, is_playing_value, is_recording_value)
                 clip_slots.append(clip_string)
             clip_slots_string = "-".join(clip_slots)
             track_clips.append(clip_slots_string)
