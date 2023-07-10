@@ -5,6 +5,7 @@ import Live
 from _Framework.ControlSurface import ControlSurface
 from _Framework.MixerComponent import MixerComponent
 from _Framework.TransportComponent import TransportComponent
+from _Framework.SessionComponent import SessionComponent
 from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
@@ -13,7 +14,7 @@ from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
-mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button = None, None, None, None, None, None, None, None, None
+mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button, session_component = None, None, None, None, None, None, None, None, None, None
 quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
@@ -27,10 +28,12 @@ class MicroPush(ControlSurface):
         with self.component_guard():
             global mixer
             global transport
+            global session_component
             track_count = 8
             return_count = 24  # Maximum of 12 Sends and 12 Returns
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
+            session_component = SessionComponent()
             # set up undo redo
             self._last_can_redo = self.song().can_redo
             self._last_can_undo = self.song().can_undo
@@ -136,6 +139,7 @@ class MicroPush(ControlSurface):
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
         transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
+        session_component.set_stop_all_clips_button(ButtonElement(1, MIDI_NOTE_TYPE, 15, 96))
         capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
         capture_button.add_value_listener(self._capture_button_value)
         quantize_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 99)
@@ -358,29 +362,10 @@ class MicroPush(ControlSurface):
     def _on_tracks_changed(self):
         self._update_mixer_and_tracks()
 
-    # Updating names and number of tracks
-    def _update_mixer_and_tracks(self):
-        # tracks = self.song().tracks
-        # # send track names
-        # track_names = ",".join([track.name for track in tracks])
-        # self._send_sys_ex_message(track_names, 0x02)
-
-        track_names = []
-        track_colors = []
+    def _update_clip_slots(self):
         track_clips = []
 
         for track in self.song().tracks:
-            # track names
-            track_names.append(track.name)
-
-            # track colors
-            color = track.color
-            red = (color >> 16) & 255
-            green = (color >> 8) & 255
-            blue = color & 255
-            color_string = "({},{},{})".format(red, green, blue)
-            track_colors.append(color_string)
-
             # track clip slots
             clip_slots = []
             for clip_slot in track.clip_slots:
@@ -394,7 +379,36 @@ class MicroPush(ControlSurface):
                 clip_slots.append(clip_string)
             clip_slots_string = "-".join(clip_slots)
             track_clips.append(clip_slots_string)
+            
+        # send track clips
+        track_clips_string = "/".join(track_clips)
+        self._send_sys_ex_message(track_clips_string, 0x05)
+
+
+    # Updating names and number of tracks
+    def _update_mixer_and_tracks(self):
+        # tracks = self.song().tracks
+        # # send track names
+        # track_names = ",".join([track.name for track in tracks])
+        # self._send_sys_ex_message(track_names, 0x02)
+        self._update_clip_slots()
+        track_names = []
+        track_colors = []
         
+
+        for track in self.song().tracks:
+            # track names
+            track_names.append(track.name)
+
+            # track colors
+            color = track.color
+            red = (color >> 16) & 255
+            green = (color >> 8) & 255
+            blue = color & 255
+            color_string = "({},{},{})".format(red, green, blue)
+            track_colors.append(color_string)
+
+
         # send track names
         track_names_string = ",".join(track_names)
         self._send_sys_ex_message(track_names_string, 0x02)
@@ -402,10 +416,6 @@ class MicroPush(ControlSurface):
         # send track colors
         track_colors_string = "-".join(track_colors)
         self._send_sys_ex_message(track_colors_string, 0x04)
-
-        # send track clips
-        track_clips_string = "/".join(track_clips)
-        self._send_sys_ex_message(track_clips_string, 0x05)
 
         return_track_names = []
         return_track_colors = []
