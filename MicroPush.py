@@ -47,6 +47,7 @@ class MicroPush(ControlSurface):
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
             self.song().add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
             self._setup_device_control()
+            self._register_clip_listeners()
 
     # def _on_selected_device_changed(self):
     #     self.log_message("device changed!!")
@@ -361,31 +362,8 @@ class MicroPush(ControlSurface):
 
     def _on_tracks_changed(self):
         self._update_mixer_and_tracks()
-
-    def _update_clip_slots(self):
-        track_clips = []
-
-        for track in self.song().tracks:
-            # track clip slots
-            clip_slots = []
-            for clip_slot in track.clip_slots:
-                clip_data = {
-                    'hasClip': clip_slot.has_clip,
-                    'isPlaying': clip_slot.is_playing,
-                    'isRecording': clip_slot.is_recording
-                }
-                has_clip_value = 1 if clip_data['hasClip'] else 0
-                is_playing_value = 1 if clip_data['isPlaying'] else 0
-                is_recording_value = 1 if clip_data['isRecording'] else 0
-                clip_string = "{}{}{}".format(has_clip_value, is_playing_value, is_recording_value)
-                clip_slots.append(clip_string)
-            clip_slots_string = "-".join(clip_slots)
-            track_clips.append(clip_slots_string)
-            
-        # send track clips
-        track_clips_string = "/".join(track_clips)
-        self._send_sys_ex_message(track_clips_string, 0x05)
-
+        self._register_clip_listeners()
+        self._update_clip_slots()
 
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
@@ -393,10 +371,8 @@ class MicroPush(ControlSurface):
         # # send track names
         # track_names = ",".join([track.name for track in tracks])
         # self._send_sys_ex_message(track_names, 0x02)
-        self._update_clip_slots()
         track_names = []
         track_colors = []
-        
 
         for track in self.song().tracks:
             # track names
@@ -517,6 +493,63 @@ class MicroPush(ControlSurface):
             pan_knob = EncoderElement(MIDI_CC_TYPE, index, 13, Live.MidiMap.MapMode.absolute)
             strip.set_pan_control(pan_knob)
 
+    # clipSlots
+    def _register_clip_listeners(self):
+        for track in self.song().tracks:
+            for clip_slot in track.clip_slots:
+
+                if clip_slot == None:
+                    continue
+                # do this to ignore return-tracks
+                # if not clip_slot.has_stop_button:
+                #     continue
+
+                if not clip_slot.has_clip_has_listener(self._on_clip_has_clip_changed):
+                    clip_slot.add_has_clip_listener(self._on_clip_has_clip_changed)
+                # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
+                #     self.log_message("adding a playing status listener")
+                #     clip_slot.add_playing_status_listener(self._on_clip_playing_status_changed)
+                if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
+                    clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
+
+    def _unregister_clip_listeners(self):
+        for track in self.song().tracks:
+            for clip_slot in track.clip_slots:
+                clip_slot.remove_playing_status_listener(self._on_clip_playing_status_changed)
+                clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
+
+    def _on_clip_playing_status_changed(self):
+        # self.log_message("clip playing status changed")
+        self._update_clip_slots()
+
+    def _on_clip_has_clip_changed(self):
+        # self.log_message("has clip status changed")
+        self._update_clip_slots()
+
+    def _update_clip_slots(self):
+        track_clips = []
+
+        for track in self.song().tracks:
+            # track clip slots
+            clip_slots = []
+            for clip_slot in track.clip_slots:
+                clip_data = {
+                    'hasClip': clip_slot.has_clip,
+                    'isPlaying': clip_slot.is_playing,
+                    'isRecording': clip_slot.is_recording
+                }
+                has_clip_value = 1 if clip_data['hasClip'] else 0
+                is_playing_value = 1 if clip_data['isPlaying'] else 0
+                is_recording_value = 1 if clip_data['isRecording'] else 0
+                clip_string = "{}{}{}".format(has_clip_value, is_playing_value, is_recording_value)
+                clip_slots.append(clip_string)
+            clip_slots_string = "-".join(clip_slots)
+            track_clips.append(clip_slots_string)
+            
+        # send track clips
+        track_clips_string = "/".join(track_clips)
+        self._send_sys_ex_message(track_clips_string, 0x05)
+
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
         quantize_button.remove_value_listener(self._quantize_button_value)
@@ -528,5 +561,6 @@ class MicroPush(ControlSurface):
         
         self.song().remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
+        self._unregister_clip_listeners()
         self.remove_midi_listener(self._midi_listener)
         super(MicroPush, self).disconnect()
