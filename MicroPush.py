@@ -46,6 +46,7 @@ class MicroPush(ControlSurface):
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
             self.song().add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
+            # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
             self._setup_device_control()
             self._register_clip_listeners()
 
@@ -181,6 +182,9 @@ class MicroPush(ControlSurface):
         # scene launch
         scene_launch_button = ButtonElement(1, MIDI_CC_TYPE, 1, 6)
         scene_launch_button.add_value_listener(self._fire_scene)
+        # clip / scene select
+        clip_scene_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 7)
+        clip_scene_select_button.add_value_listener(self._select_clip_scene)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -302,6 +306,7 @@ class MicroPush(ControlSurface):
         self._set_other_tracks_implicit_arm()
         # send new index of selected track
         self._send_selected_track_index(selected_track)
+        self._on_selected_scene_changed()
         # TODO: this part doesn't seem to work? how can I make this work with master and return?
         device_to_select = selected_track.view.selected_device
         if device_to_select == None and len(selected_track.devices) > 0:
@@ -350,7 +355,6 @@ class MicroPush(ControlSurface):
         else:
             master_track = song.master_track 
             song.view.selected_track = master_track
-
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
@@ -585,12 +589,30 @@ class MicroPush(ControlSurface):
                 clip_slot.set_fire_button_state(1)
         # else:
             # create new clip
-    
+
     def _fire_scene(self, value):
         scenes = self.song().scenes
         if value < len(scenes):
             scene = scenes[value]
             scene.fire()
+
+    def _select_clip_scene(self, value):
+        scenes = self.song().scenes
+        if value < len(scenes):
+            self.song().view.selected_scene = scenes[value]
+        track = self.song().view.selected_track
+        if value < len(track.clip_slots):
+            self.song().view.highlighted_clip_slot = track.clip_slots[value]
+        self._send_selected_clip_slot(value)
+
+    def _on_selected_scene_changed(self):
+        selected_scene = self.song().view.selected_scene
+        scenes_list = self.song().scenes
+        new_index = self._find_track_index(selected_scene, scenes_list)
+        self._send_selected_clip_slot(new_index)
+
+    def _send_selected_clip_slot(self, clip_index):
+        self._send_sys_ex_message(clip_index, 0x10)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
@@ -600,9 +622,9 @@ class MicroPush(ControlSurface):
         redo_button.remove_value_listener(self._redo_button_value)
         undo_button.remove_value_listener(self._undo_button_value)
         periodic_check_button.remove_value_listener(self._periodic_check)
-        
         self.song().remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self._unregister_clip_listeners()
         self.remove_midi_listener(self._midi_listener)
+        # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         super(MicroPush, self).disconnect()
