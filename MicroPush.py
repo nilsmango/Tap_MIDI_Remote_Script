@@ -178,6 +178,9 @@ class MicroPush(ControlSurface):
         # return and master track selection
         return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 5)
         return_track_selection_button.add_value_listener(self._select_return_track_by_index)
+        # scene launch
+        scene_launch_button = ButtonElement(1, MIDI_CC_TYPE, 1, 6)
+        scene_launch_button.add_value_listener(self._fire_scene)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -192,6 +195,7 @@ class MicroPush(ControlSurface):
 
     def _periodic_check(self, value):
         if value != 0:
+            self._update_clip_slots()
             can_redo = self.song().can_redo
             can_undo = self.song().can_undo
             if can_redo != self._last_can_redo:
@@ -506,17 +510,22 @@ class MicroPush(ControlSurface):
 
                 if not clip_slot.has_clip_has_listener(self._on_clip_has_clip_changed):
                     clip_slot.add_has_clip_listener(self._on_clip_has_clip_changed)
-                # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
-                #     self.log_message("adding a playing status listener")
-                #     clip_slot.add_playing_status_listener(self._on_clip_playing_status_changed)
+                # BUG: Ableton never fires the playing status listener,
+                # TODO: workaround for now is that periodic check
+                # also updates clips.
+                if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
+                    # self.log_message("adding a playing status listener")
+                    clip_slot.add_playing_status_listener(self._on_clip_playing_status_changed)
+                
                 if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
                     clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
 
     def _unregister_clip_listeners(self):
         for track in self.song().tracks:
             for clip_slot in track.clip_slots:
-                clip_slot.remove_playing_status_listener(self._on_clip_playing_status_changed)
+                clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
                 clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
+                clip_slot.remove_playing_status_listener(self._on_clip_playing_status_changed)
 
     def _on_clip_playing_status_changed(self):
         # self.log_message("clip playing status changed")
@@ -549,6 +558,39 @@ class MicroPush(ControlSurface):
         # send track clips
         track_clips_string = "/".join(track_clips)
         self._send_sys_ex_message(track_clips_string, 0x05)
+
+    def handle_sysex(self, message):
+        # self.log_message(str(message))
+        if len(message) >= 2 and message[1] == 9:
+            values = self.extract_values_from_sysex_message(message)
+            self.log_message("Values received: {}".format(values))
+            if len(values) == 3:
+                self.fire_clip(values[0], values[1], values[2])
+
+    def extract_values_from_sysex_message(self, message):
+        # Extract the values from the SysEx message based on the message format
+        # Replace this with your own logic to extract the desired values
+        # For example, if your message is [0xF0, 0x09, value1, value2, ..., 0xF7]
+        # you can extract values starting from index 2: values = message[2:-1]
+        values = message[2:-1]
+        return values
+
+    def fire_clip(self, fire, track_index, clip_index):
+        track = self.song().tracks[track_index]
+        clip_slot = track.clip_slots[clip_index]
+        if fire == 1:
+            if clip_slot.is_playing:
+                clip_slot.stop()
+            else:
+                clip_slot.set_fire_button_state(1)
+        # else:
+            # create new clip
+    
+    def _fire_scene(self, value):
+        scenes = self.song().scenes
+        if value < len(scenes):
+            scene = scenes[value]
+            scene.fire()
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
