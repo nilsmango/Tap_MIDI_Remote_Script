@@ -177,10 +177,10 @@ class MicroPush(ControlSurface):
         track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 4)
         track_selection_button.add_value_listener(self._select_track_by_index)
         # return and master track selection
-        return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 5)
+        return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 15)
         return_track_selection_button.add_value_listener(self._select_return_track_by_index)
         # scene launch
-        scene_launch_button = ButtonElement(1, MIDI_CC_TYPE, 1, 6)
+        scene_launch_button = ButtonElement(1, MIDI_CC_TYPE, 1, 14)
         scene_launch_button.add_value_listener(self._fire_scene)
         # clip / scene select
         clip_scene_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 7)
