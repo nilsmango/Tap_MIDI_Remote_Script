@@ -12,6 +12,7 @@ from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+import time, threading
 
 
 mixer, transport, session_component = None, None, None
@@ -49,6 +50,8 @@ class MicroPush(ControlSurface):
             # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
             self._setup_device_control()
             self._register_clip_listeners()
+            self._periodic_execution()
+
 
     # def _on_selected_device_changed(self):
     #     self.log_message("device changed!!")
@@ -70,6 +73,7 @@ class MicroPush(ControlSurface):
         # Register button listeners for navigation buttons
         nav_left_button.add_value_listener(self._on_nav_button_pressed)
         nav_right_button.add_value_listener(self._on_nav_button_pressed)
+
 
 
     def _on_nav_button_pressed(self, value):
@@ -164,9 +168,9 @@ class MicroPush(ControlSurface):
         # swing percentage button
         swing_amount_button = ButtonElement(1, MIDI_CC_TYPE, 1, 2)
         swing_amount_button.add_value_listener(self._swing_amount_value)
-        # periodic check
-        periodic_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 97)
-        periodic_check_button.add_value_listener(self._periodic_check)
+        # # periodic check
+        # periodic_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 97)
+        # periodic_check_button.add_value_listener(self._periodic_check)
         # redo button
         redo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 102)
         redo_button.add_value_listener(self._redo_button_value)
@@ -199,43 +203,48 @@ class MicroPush(ControlSurface):
             midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
             self._send_midi(midi_event_bytes)
 
+    def _periodic_execution(self):
+        # Do something here
+        self._periodic_check()
+        threading.Timer(0.3, self._periodic_execution).start()
 
-    def _periodic_check(self, value):
-        if value != 0:
-            self._update_clip_slots()
-            can_redo = self.song().can_redo
-            can_undo = self.song().can_undo
-            if can_redo != self._last_can_redo:
-                self._last_can_redo = can_redo
-                if can_redo:
-                    midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
-                    self._send_midi(midi_event_bytes)
-                else:
-                    midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
-                    self._send_midi(midi_event_bytes)
-            if can_undo != self._last_can_undo:
-                self._last_can_undo = can_undo
-                if can_undo:
-                    midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
-                    self._send_midi(midi_event_bytes)
-                else:
-                    midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
-                    self._send_midi(midi_event_bytes)
-            self.first_periodic_check = False
+    def _periodic_check(self):
+        self._update_clip_slots()
+        can_redo = self.song().can_redo
+        can_undo = self.song().can_undo
+        if can_redo != self._last_can_redo:
+            self._last_can_redo = can_redo
+            if can_redo:
+                midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
+                self._send_midi(midi_event_bytes)
+            else:
+                midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
+                self._send_midi(midi_event_bytes)
+
+        if can_undo != self._last_can_undo:
+            self._last_can_undo = can_undo
+            if can_undo:
+                midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
+                self._send_midi(midi_event_bytes)
+            else:
+                midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
+                self._send_midi(midi_event_bytes)
+        # TODO: clean this whole thing up, never works I think and the next line is for what?
+        self.first_periodic_check = False
 
     def _redo_button_value(self, value):
         if value != 0:
             song = self.song()
             if song.can_redo:
                 song.redo()
-                self._periodic_check(1)
+                # self._periodic_check()
 
     def _undo_button_value(self, value):
         if value != 0:
             song = self.song()
             if song.can_undo:
                 song.undo()
-                self._periodic_check(1)
+                # self._periodic_check()
 
     def _sesh_record_value(self, value):
         if value != 0:
@@ -653,7 +662,7 @@ class MicroPush(ControlSurface):
         sesh_record_button.remove_value_listener(self._sesh_record_value)
         redo_button.remove_value_listener(self._redo_button_value)
         undo_button.remove_value_listener(self._undo_button_value)
-        periodic_check_button.remove_value_listener(self._periodic_check)
+        # periodic_check_button.remove_value_listener(self._periodic_check)
         self.song().remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self._unregister_clip_listeners()
