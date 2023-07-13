@@ -14,7 +14,7 @@ from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 
-mixer, transport, capture_button, quantize_button, duplicate_button, sesh_record_button, quantize_grid_button, quantize_strength_button, swing_amount_button, session_component = None, None, None, None, None, None, None, None, None, None
+mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
@@ -149,6 +149,9 @@ class MicroPush(ControlSurface):
         # duplicate the active clip to a free slot
         duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
         duplicate_button.add_value_listener(self._duplicate_button_value)
+        # duplicate scene
+        duplicate_scene_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 95)
+        duplicate_scene_button.add_value_listener(self._duplicate_scene_button_value)
         # a session recording button
         sesh_record_button = ButtonElement(1, MIDI_CC_TYPE, 0, 119)
         sesh_record_button.add_value_listener(self._sesh_record_value)
@@ -162,7 +165,7 @@ class MicroPush(ControlSurface):
         swing_amount_button = ButtonElement(1, MIDI_CC_TYPE, 1, 2)
         swing_amount_button.add_value_listener(self._swing_amount_value)
         # periodic check
-        periodic_check_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 97)
+        periodic_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 97)
         periodic_check_button.add_value_listener(self._periodic_check)
         # redo button
         redo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 102)
@@ -177,13 +180,13 @@ class MicroPush(ControlSurface):
         track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 4)
         track_selection_button.add_value_listener(self._select_track_by_index)
         # return and master track selection
-        return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 15)
+        return_track_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 5)
         return_track_selection_button.add_value_listener(self._select_return_track_by_index)
         # scene launch
         scene_launch_button = ButtonElement(1, MIDI_CC_TYPE, 1, 14)
         scene_launch_button.add_value_listener(self._fire_scene)
         # clip / scene select
-        clip_scene_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 7)
+        clip_scene_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 15)
         clip_scene_select_button.add_value_listener(self._select_clip_scene)
 
     def _setup_undo_redo(self):
@@ -271,6 +274,14 @@ class MicroPush(ControlSurface):
     def _duplicate_button_value(self, value):
         if value != 0:
             self._duplicate_clip()
+    
+    def _duplicate_scene_button_value(self, value):
+        if value != 0:
+            song = self.song()
+            selected_scene = song.view.selected_scene
+            all_scenes = song.scenes
+            current_index = list(all_scenes).index(selected_scene)
+            song.duplicate_scene(current_index)
 
     def _duplicate_clip(self):
         selected_track = self.song().view.selected_track
@@ -514,22 +525,32 @@ class MicroPush(ControlSurface):
 
                 if not clip_slot.has_clip_has_listener(self._on_clip_has_clip_changed):
                     clip_slot.add_has_clip_listener(self._on_clip_has_clip_changed)
-                # BUG: Ableton never fires the playing status listener,
-                # TODO: workaround for now is that periodic check
-                # also updates clips.
-                if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
-                    # self.log_message("adding a playing status listener")
-                    clip_slot.add_playing_status_listener(self._on_clip_playing_status_changed)
-                
+
                 if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
                     clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
+
+                # if clip_slot.has_clip:
+                #     if not clip_slot.clip.playing_position_has_listener(self._on_playing_position_changed):
+                #         clip_slot.clip.add_playing_position_listener(self._on_playing_position_changed)
+
+
+                                #     # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
+                #     #     # self.log_message("adding a playing status listener")
+                #     #     clip_slot.clip.add_playing_status_listener(self._on_clip_playing_status_changed)
+ 
 
     def _unregister_clip_listeners(self):
         for track in self.song().tracks:
             for clip_slot in track.clip_slots:
                 clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
                 clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
-                clip_slot.remove_playing_status_listener(self._on_clip_playing_status_changed)
+                # if clip_slot.has_clip:
+                #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
+                #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
+
+    # def _on_playing_position_changed(self):
+    #     # self.log_message("trying to log the playing position")
+    #     self._update_clip_slots()
 
     def _on_clip_playing_status_changed(self):
         # self.log_message("clip playing status changed")
@@ -549,12 +570,22 @@ class MicroPush(ControlSurface):
                 clip_data = {
                     'hasClip': clip_slot.has_clip,
                     'isPlaying': clip_slot.is_playing,
-                    'isRecording': clip_slot.is_recording
+                    'isRecording': clip_slot.is_recording,
+                    'isTriggered': clip_slot.is_triggered
                 }
                 has_clip_value = 1 if clip_data['hasClip'] else 0
                 is_playing_value = 1 if clip_data['isPlaying'] else 0
                 is_recording_value = 1 if clip_data['isRecording'] else 0
-                clip_string = "{}{}{}".format(has_clip_value, is_playing_value, is_recording_value)
+                is_triggered_value = 1 if clip_data['isTriggered'] else 0
+                # if clip_slot.has_clip:
+                #     playing_position = clip_slot.clip.playing_position
+                #     length = clip_slot.clip.length
+                #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
+                # else:
+                #     playing_position = 0.0
+                #     length = 0.0
+                
+                clip_string = "{}{}{}{}".format(has_clip_value, is_playing_value, is_recording_value, is_triggered_value)
                 clip_slots.append(clip_string)
             clip_slots_string = "-".join(clip_slots)
             track_clips.append(clip_slots_string)
@@ -618,6 +649,7 @@ class MicroPush(ControlSurface):
         capture_button.remove_value_listener(self._capture_button_value)
         quantize_button.remove_value_listener(self._quantize_button_value)
         duplicate_button.remove_value_listener(self._duplicate_button_value)
+        duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
         sesh_record_button.remove_value_listener(self._sesh_record_value)
         redo_button.remove_value_listener(self._redo_button_value)
         undo_button.remove_value_listener(self._undo_button_value)
