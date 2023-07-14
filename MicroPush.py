@@ -192,6 +192,9 @@ class MicroPush(ControlSurface):
         # clip / scene select
         clip_scene_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 15)
         clip_scene_select_button.add_value_listener(self._select_clip_scene)
+        # scene delete
+        scene_delete_button = ButtonElement(1, MIDI_CC_TYPE, 1, 16)
+        scene_delete_button.add_value_listener(self._delete_scene)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -604,12 +607,23 @@ class MicroPush(ControlSurface):
         self._send_sys_ex_message(track_clips_string, 0x05)
 
     def handle_sysex(self, message):
-        # self.log_message(str(message))
+        # start stop clip
         if len(message) >= 2 and message[1] == 9:
             values = self.extract_values_from_sysex_message(message)
-            self.log_message("Values received: {}".format(values))
             if len(values) == 3:
-                self.fire_clip(values[0], values[1], values[2])
+                self._fire_clip(values[0], values[1], values[2])
+        # delete clip
+        if len(message) >= 2 and message[1] == 10:
+            values = self.extract_values_from_sysex_message(message)
+            if len(values) == 2:
+                self._delete_clip(values[0], values[1])
+        # copy paste clip
+        if len(message) >= 2 and message[1] == 11:
+            values = self.extract_values_from_sysex_message(message)
+            if len(values) == 4:
+                self._copy_paste_clip(values[0], values[1], values[2], values[3])
+
+
 
     def extract_values_from_sysex_message(self, message):
         # Extract the values from the SysEx message based on the message format
@@ -619,7 +633,7 @@ class MicroPush(ControlSurface):
         values = message[2:-1]
         return values
 
-    def fire_clip(self, fire, track_index, clip_index):
+    def _fire_clip(self, fire, track_index, clip_index):
         track = self.song().tracks[track_index]
         clip_slot = track.clip_slots[clip_index]
         if fire == 1:
@@ -629,6 +643,22 @@ class MicroPush(ControlSurface):
                 clip_slot.set_fire_button_state(1)
         # else:
             # create new clip
+
+    def _delete_clip(self, track_index, clip_index):
+        track = self.song().tracks[track_index]
+        clip_slot = track.clip_slots[clip_index]
+        clip_slot.delete_clip()
+
+    def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
+        tracks = self.song().tracks
+
+        copy_track = tracks[from_track]
+        copy_clip_slot = copy_track.clip_slots[from_clip]
+
+        paste_track = tracks[to_track]
+        paste_clip_slot = paste_track.clip_slots[to_clip]
+
+        copy_clip_slot.duplicate_clip_to(paste_clip_slot)
 
     def _fire_scene(self, value):
         scenes = self.song().scenes
@@ -645,6 +675,9 @@ class MicroPush(ControlSurface):
             self.song().view.highlighted_clip_slot = track.clip_slots[value]
         self._send_selected_clip_slot(value)
 
+    def _delete_scene(self, value):
+        self.song().delete_scene(value)
+
     def _on_selected_scene_changed(self):
         selected_scene = self.song().view.selected_scene
         scenes_list = self.song().scenes
@@ -652,7 +685,7 @@ class MicroPush(ControlSurface):
         self._send_selected_clip_slot(new_index)
 
     def _send_selected_clip_slot(self, clip_index):
-        self._send_sys_ex_message(clip_index, 0x10)
+        self._send_sys_ex_message(str(clip_index), 0x10)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
