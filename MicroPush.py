@@ -35,19 +35,23 @@ class MicroPush(ControlSurface):
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
+            song = self.song()
             # set up undo redo
-            self._last_can_redo = self.song().can_redo
-            self._last_can_undo = self.song().can_undo
+            self._last_can_redo = song.can_redo
+            self._last_can_undo = song.can_undo
             self._setup_undo_redo()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
-            self._send_selected_track_index(self.song().view.selected_track)
-            self._on_selected_track_changed.subject = self.song().view
+            self._send_selected_track_index(song.view.selected_track)
+            self._on_selected_track_changed.subject = song.view
+            
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
-            self.song().add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
+            song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
             # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
+            song.add_scale_name_listener(self._on_scale_changed)
+            song.add_root_note_listener(self._on_scale_changed)
             self._setup_device_control()
             self._register_clip_listeners()
             self._periodic_execution()
@@ -620,6 +624,13 @@ class MicroPush(ControlSurface):
         track_clips_string = "/".join(track_clips)
         self._send_sys_ex_message(track_clips_string, 0x05)
 
+    def _on_scale_changed(self):
+        song = self.song()
+        scale = song.scale_name
+        root = song.root_note
+        scale_string = "{};{}".format(scale, root)
+        self._send_sys_ex_message(scale_string, 0x0A)
+
     def handle_sysex(self, message):
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
@@ -636,8 +647,18 @@ class MicroPush(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 4:
                 self._copy_paste_clip(values[0], values[1], values[2], values[3])
+        # scale and rootnote
+        if len(message) >= 2 and message[1] == 12:
+            values = self.decode_sys_ex_scale_root(message)
+            if len(values) == 2:
+                self._set_scale_root_note(values[0], values[1])
 
-
+    def decode_sys_ex_scale_root(self, message):
+        scale_name_bytes = message[2:-2]
+        scale_name_bytes = bytes(message[2:-2])
+        scale_name = scale_name_bytes.decode('utf-8')
+        root_note_index = message[-2]
+        return scale_name, root_note_index
 
     def extract_values_from_sysex_message(self, message):
         # Extract the values from the SysEx message based on the message format
@@ -674,6 +695,11 @@ class MicroPush(ControlSurface):
 
         copy_clip_slot.duplicate_clip_to(paste_clip_slot)
 
+    def _set_scale_root_note(self, scale, root):
+        song = self.song()
+        song.scale_name = scale
+        song.root_note = root
+
     def _fire_scene(self, value):
         scenes = self.song().scenes
         if value < len(scenes):
@@ -709,10 +735,13 @@ class MicroPush(ControlSurface):
         sesh_record_button.remove_value_listener(self._sesh_record_value)
         redo_button.remove_value_listener(self._redo_button_value)
         undo_button.remove_value_listener(self._undo_button_value)
+        song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
-        self.song().remove_tracks_listener(self._on_tracks_changed)
+        song.remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         self._unregister_clip_listeners()
         self.remove_midi_listener(self._midi_listener)
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
+        song.remove_scale_name_listener(self._on_scale_changed)
+        song.remove_root_note_listener(self._on_scale_changed)
         super(MicroPush, self).disconnect()
