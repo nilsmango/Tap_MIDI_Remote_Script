@@ -396,6 +396,13 @@ class MicroPush(ControlSurface):
         self._register_clip_listeners()
         self._update_clip_slots()
 
+    def _make_color_string(self, color):
+        red = (color >> 16) & 255
+        green = (color >> 8) & 255
+        blue = color & 255
+        color_string = "({},{},{})".format(red, green, blue)
+        return color_string
+
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
         # tracks = self.song().tracks
@@ -410,11 +417,7 @@ class MicroPush(ControlSurface):
             track_names.append(track.name)
 
             # track colors
-            color = track.color
-            red = (color >> 16) & 255
-            green = (color >> 8) & 255
-            blue = color & 255
-            color_string = "({},{},{})".format(red, green, blue)
+            color_string = self._make_color_string(track.color)
             track_colors.append(color_string)
 
 
@@ -432,20 +435,12 @@ class MicroPush(ControlSurface):
         for return_track in self.song().return_tracks:
             return_track_names.append(return_track.name)
 
-            color = return_track.color
-            red = (color >> 16) & 255
-            green = (color >> 8) & 255
-            blue = color & 255
-            color_string = "({},{},{})".format(red, green, blue)
+            color_string = color_string = self._make_color_string(return_track.color)
             return_track_colors.append(color_string)
         
         # add master track color to the mix:
         master_track = self.song().master_track
-        master_channel_color = master_track.color
-        red = (master_channel_color >> 16) & 255
-        green = (master_channel_color >> 8) & 255
-        blue = master_channel_color & 255
-        color_string = "({},{},{})".format(red, green, blue)
+        color_string = self._make_color_string(master_track.color)
         return_track_colors.append(color_string)
 
         # send return track names
@@ -540,6 +535,9 @@ class MicroPush(ControlSurface):
 
                 if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
                     clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
+                
+                if clip_slot.has_clip and not clip_slot.clip.color_has_listener(self._on_clip_has_clip_changed):
+                    clip_slot.clip.add_color_listener(self._on_clip_has_clip_changed)
 
                 # if clip_slot.has_clip:
                 #     if not clip_slot.clip.playing_position_has_listener(self._on_playing_position_changed):
@@ -556,6 +554,8 @@ class MicroPush(ControlSurface):
             for clip_slot in track.clip_slots:
                 clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
                 clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
+                if clip_slot.has_clip:
+                    clip_slot.clip.remove_color_listener(self._on_clip_has_clip_changed)
                 # if clip_slot.has_clip:
                 #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
                 #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
@@ -589,6 +589,9 @@ class MicroPush(ControlSurface):
                 is_playing_value = 1 if clip_data['isPlaying'] else 0
                 is_recording_value = 1 if clip_data['isRecording'] else 0
                 is_triggered_value = 1 if clip_data['isTriggered'] else 0
+                color_string_value = "0"
+                if has_clip_value == 1:
+                    color_string_value = self._make_color_string(clip_slot.clip.color)
                 # if clip_slot.has_clip:
                 #     playing_position = clip_slot.clip.playing_position
                 #     length = clip_slot.clip.length
@@ -597,7 +600,7 @@ class MicroPush(ControlSurface):
                 #     playing_position = 0.0
                 #     length = 0.0
                 
-                clip_string = "{}{}{}{}".format(has_clip_value, is_playing_value, is_recording_value, is_triggered_value)
+                clip_string = "{}{}{}{}:{}".format(has_clip_value, is_playing_value, is_recording_value, is_triggered_value, color_string_value)
                 clip_slots.append(clip_string)
             clip_slots_string = "-".join(clip_slots)
             track_clips.append(clip_slots_string)
