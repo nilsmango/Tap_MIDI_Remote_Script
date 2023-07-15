@@ -286,7 +286,7 @@ class MicroPush(ControlSurface):
     def _duplicate_button_value(self, value):
         if value != 0:
             self._duplicate_clip()
-    
+
     def _duplicate_scene_button_value(self, value):
         if value != 0:
             song = self.song()
@@ -296,30 +296,41 @@ class MicroPush(ControlSurface):
             song.duplicate_scene(current_index)
 
     def _duplicate_clip(self):
-        selected_track = self.song().view.selected_track
+        song = self.song()
+        selected_track = song.view.selected_track
 
         if selected_track is None:
             return
 
-        song = self.song()
         selected_scene = song.view.selected_scene
         all_scenes = song.scenes
-        current_index = list(all_scenes).index(selected_scene)
+        scene_index = list(all_scenes).index(selected_scene)
+        track_index = list(song.tracks).index(selected_track)
+        destination_scene_index = len(all_scenes)
 
-        duplicated_id = selected_track.duplicate_clip_slot(current_index)
+        # checking if clip was playing
+        was_playing = song.view.highlighted_clip_slot.is_playing == 1
 
-        duplicated_slot = self.song().scenes[duplicated_id]
+        # check if there is a free clip slot after the current clip
+        for index, clip_slot in enumerate(selected_track.clip_slots):
+            if index <= scene_index:
+                continue
+            if clip_slot.has_clip:
+                continue
+            destination_scene_index = index
+            break
 
-        if self.song().view.highlighted_clip_slot.is_playing:
-            # move to the duplicated clip_slot
-            self.song().view.selected_scene = duplicated_slot
+        if destination_scene_index == len(all_scenes):
+            # create a new scene if there is no free slot after the current slot
+            song.create_scene(-1)
 
-            if not self.song().view.highlighted_clip_slot.is_playing:
-                # force legato ensures that the playing-position of the duplicated
-                # loop is continued from the previous clip
-                self.song().view.highlighted_clip_slot.fire(force_legato=True)
-        else:
-            self.song().view.selected_scene = duplicated_slot
+        self._copy_paste_clip(track_index, scene_index, track_index, destination_scene_index)
+
+        # select newly created clip
+        song.view.selected_scene = song.scenes[destination_scene_index]
+        # fire the new clip if the old clip was playing
+        if was_playing:
+            song.view.highlighted_clip_slot.fire(force_legato=True)
 
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
