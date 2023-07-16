@@ -79,7 +79,6 @@ class MicroPush(ControlSurface):
         nav_right_button.add_value_listener(self._on_nav_button_pressed)
 
 
-
     def _on_nav_button_pressed(self, value):
         if value:
             self._on_device_changed()
@@ -93,14 +92,19 @@ class MicroPush(ControlSurface):
             selected_device = selected_track.view.selected_device
             # device_name = selected_device.name
             available_devices = selected_track.devices
+            # find out if track has a drum rack.
+            track_has_drums = 0
+            for device in available_devices:
+                if device.can_have_drum_pads:
+                    track_has_drums = 1
             # find index of device
             selected_device_index = self._find_device_index(selected_device, available_devices)
             # self.log_message("Selected Device Index: {}".format(selected_device_index))
-            # bank names etc.
-            bank_name = self._device._bank_name
+            # bank names, list and if has drum
+            bank_name_drum = self._device._bank_name + ";" + str(track_has_drums)
             bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
             # sending sysex of bank name, device name, bank names
-            self._send_sys_ex_message(bank_name, 0x6D)
+            self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
             # sending the index instead of name for device.
             self._send_sys_ex_message(selected_device_index, 0x4D)
@@ -120,11 +124,11 @@ class MicroPush(ControlSurface):
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
-                    self.log_message("No parameter names found in the device controls.")
+                    # self.log_message("No parameter names found in the device controls.")
             else:
-                self.log_message("Device has no parameters.")
+                # self.log_message("Device has no parameters.")
         else:
-            self.log_message("Invalid device.")
+            # self.log_message("Invalid device.")
 
     def _find_device_index(self, device, device_list):
         for index, d in enumerate(device_list):
