@@ -20,8 +20,6 @@ quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
 
-
-
 class MicroPush(ControlSurface):
 
     def __init__(self, c_instance):
@@ -39,7 +37,7 @@ class MicroPush(ControlSurface):
             # set up undo redo
             self._last_can_redo = song.can_redo
             self._last_can_undo = song.can_undo
-            self._setup_undo_redo()
+            # self._setup_undo_redo()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
@@ -54,6 +52,7 @@ class MicroPush(ControlSurface):
             song.add_root_note_listener(self._on_scale_changed)
             self._setup_device_control()
             self._register_clip_listeners()
+            self.first_periodic_check = True
             self._periodic_execution()
 
 
@@ -123,12 +122,12 @@ class MicroPush(ControlSurface):
                     # self.log_message("Parameter Names: {}".format(parameter_names))
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
-                else:
-                    # self.log_message("No parameter names found in the device controls.")
-            else:
-                # self.log_message("Device has no parameters.")
-        else:
-            # self.log_message("Invalid device.")
+                # else:
+                #     # self.log_message("No parameter names found in the device controls.")
+        #     else:
+        #         # self.log_message("Device has no parameters.")
+        # else:
+        #     # self.log_message("Invalid device.")
 
     def _find_device_index(self, device, device_list):
         for index, d in enumerate(device_list):
@@ -203,6 +202,20 @@ class MicroPush(ControlSurface):
         # scene delete
         scene_delete_button = ButtonElement(1, MIDI_CC_TYPE, 1, 16)
         scene_delete_button.add_value_listener(self._delete_scene)
+        # connection check button
+        connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
+        connection_check_button.add_value_listener(self._connection_established)
+
+    def _connection_established(self, value):
+        self.log_message("connection app ableton works!")
+        # send all the channel names, colors, current device, undo redo, etc.
+        self._on_tracks_changed()
+        self._setup_undo_redo()
+        # TODO: do I need to send this?
+        self._send_selected_track_index(self.song().view.selected_track)
+        # send midi note on channel 3, note number 1 to confirm handshake
+        midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
+        self._send_midi(midi_event_bytes)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -220,10 +233,12 @@ class MicroPush(ControlSurface):
         threading.Timer(0.3, self._periodic_execution).start()
 
     def _periodic_check(self):
+        # update clip slots
         self._update_clip_slots()
+        # check if redo undo changed
         can_redo = self.song().can_redo
         can_undo = self.song().can_undo
-        if can_redo != self._last_can_redo:
+        if can_redo != self._last_can_redo or self.first_periodic_check:
             self._last_can_redo = can_redo
             if can_redo:
                 midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
@@ -232,7 +247,7 @@ class MicroPush(ControlSurface):
                 midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
                 self._send_midi(midi_event_bytes)
 
-        if can_undo != self._last_can_undo:
+        if can_undo != self._last_can_undo or self.first_periodic_check:
             self._last_can_undo = can_undo
             if can_undo:
                 midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
