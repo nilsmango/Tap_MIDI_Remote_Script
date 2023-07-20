@@ -205,6 +205,9 @@ class MicroPush(ControlSurface):
         # connection check button
         connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
         connection_check_button.add_value_listener(self._connection_established)
+        # random device add button
+        random_device_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 93)
+        random_device_button.add_value_listener(self._add_random_device)
 
     def _connection_established(self, value):
         self.log_message("connection app ableton works!")
@@ -745,6 +748,12 @@ class MicroPush(ControlSurface):
 
     def _send_selected_clip_slot(self, clip_index):
         self._send_sys_ex_message(str(clip_index), 0x10)
+
+    def _add_random_device(self, value):
+        browser = self.application().browser
+        sounds = browser.sounds
+        number_of_sounds = len(sounds.children)
+        self.log_message("Number of sounds: {}".format(number_of_sounds))
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
