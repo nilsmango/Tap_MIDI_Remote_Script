@@ -12,7 +12,9 @@ from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+
 import time, threading
+import random
 
 
 mixer, transport, session_component = None, None, None
@@ -751,9 +753,16 @@ class MicroPush(ControlSurface):
 
     def _add_random_device(self, value):
         browser = self.application().browser
+        # selecting a random device from the sounds folder
         sounds = browser.sounds
         number_of_sounds = len(sounds.children)
         self.log_message("Number of sounds: {}".format(number_of_sounds))
+        random_index = random.randint(0, number_of_sounds - 1)
+        selected_sounds_folder = sounds.children[random_index]
+        number_of_sounds = len(selected_sounds_folder.children)
+        random_sound_index = random.randint(0, number_of_sounds - 1)
+        selected_sound = selected_sounds_folder.children[random_sound_index]
+        browser.load_item(selected_sound)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
