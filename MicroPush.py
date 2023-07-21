@@ -210,17 +210,21 @@ class MicroPush(ControlSurface):
         # random device add button
         random_device_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 93)
         random_device_button.add_value_listener(self._add_random_device)
+        # random audio effect button
+        random_effect_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 92)
+        random_effect_button.add_value_listener(self._add_random_effect)
 
     def _connection_established(self, value):
-        self.log_message("connection app ableton works!")
-        # send all the channel names, colors, current device, undo redo, etc.
-        self._on_tracks_changed()
-        self._setup_undo_redo()
-        # TODO: do I need to send this?
-        self._send_selected_track_index(self.song().view.selected_track)
-        # send midi note on channel 3, note number 1 to confirm handshake
-        midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
-        self._send_midi(midi_event_bytes)
+        if value:
+            self.log_message("connection app ableton works!")
+            # send all the channel names, colors, current device, undo redo, etc.
+            self._on_tracks_changed()
+            self._setup_undo_redo()
+            # TODO: do I need to send this?
+            self._send_selected_track_index(self.song().view.selected_track)
+            # send midi note on channel 3, note number 1 to confirm handshake
+            midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
+            self._send_midi(midi_event_bytes)
 
     def _setup_undo_redo(self):
         can_redo = self.song().can_redo
@@ -470,7 +474,7 @@ class MicroPush(ControlSurface):
 
         return_track_names = []
         return_track_colors = []
-        
+
         for return_track in self.song().return_tracks:
             return_track_names.append(return_track.name)
 
@@ -752,17 +756,43 @@ class MicroPush(ControlSurface):
         self._send_sys_ex_message(str(clip_index), 0x10)
 
     def _add_random_device(self, value):
-        browser = self.application().browser
-        # selecting a random device from the sounds folder
-        sounds = browser.sounds
-        number_of_sounds = len(sounds.children)
-        self.log_message("Number of sounds: {}".format(number_of_sounds))
-        random_index = random.randint(0, number_of_sounds - 1)
-        selected_sounds_folder = sounds.children[random_index]
-        number_of_sounds = len(selected_sounds_folder.children)
-        random_sound_index = random.randint(0, number_of_sounds - 1)
-        selected_sound = selected_sounds_folder.children[random_sound_index]
-        browser.load_item(selected_sound)
+        if value:
+            browser = self.application().browser
+            # selecting a random device from the sounds folder
+            sounds = browser.sounds
+            number_of_sounds = len(sounds.children)
+            random_index = random.randint(0, number_of_sounds - 1)
+            selected_sounds_folder = sounds.children[random_index]
+            number_of_sounds = len(selected_sounds_folder.children)
+            random_sound_index = random.randint(0, number_of_sounds - 1)
+            selected_sound = selected_sounds_folder.children[random_sound_index]
+            browser.load_item(selected_sound)
+
+    def _add_random_effect(self, value):
+        if value:
+            browser = self.application().browser
+            effects = browser.audio_effects
+            effect_children = effects.children
+            number_of_effects = len(effect_children)
+            self.log_message("Effects number: {}".format(number_of_effects))
+            # check if effects are in folders or not
+            if number_of_effects >= 10:
+                random_effect_index = random.randint(0, number_of_effects - 1)
+                selected_effect = effect_children[random_effect_index]
+            else:
+                finished = False
+                while not finished:
+                    random_folder_index = random.randint(0, number_of_effects - 1)
+                    selected_folder = effect_children[random_folder_index]
+                    if selected_folder.name != 'Utilities':
+                        if selected_folder.name != 'Modulators':
+                            finished = True
+
+                folder_children = selected_folder.children
+                number_folder_children = len(folder_children)
+                random_folder_child_index = random.randint(0, number_folder_children - 1)
+                selected_effect = folder_children[random_folder_child_index]
+            browser.load_item(selected_effect)
 
     def disconnect(self):
         capture_button.remove_value_listener(self._capture_button_value)
