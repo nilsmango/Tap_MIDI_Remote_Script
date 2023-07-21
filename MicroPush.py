@@ -87,7 +87,7 @@ class MicroPush(ControlSurface):
     @subject_slot('device')
     def _on_device_changed(self):
         if liveobj_valid(self._device):
-            device = self._device.device()  # Retrieve the Device object
+            # device = self._device.device()  # Retrieve the Device object
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
@@ -115,7 +115,7 @@ class MicroPush(ControlSurface):
             # self.log_message("devices: {}".format(available_devices))
             self._send_sys_ex_message(available_devices_string, 0x01)
 
-            if hasattr(device, 'parameters') and device.parameters:
+            if hasattr(selected_device, 'parameters') and selected_device.parameters:
                 # TODO: make this prettier!
                 parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
                                 for control in self._device._parameter_controls]
@@ -126,10 +126,20 @@ class MicroPush(ControlSurface):
                     self._send_parameter_names(parameter_names)
                 # else:
                 #     # self.log_message("No parameter names found in the device controls.")
-        #     else:
-        #         # self.log_message("Device has no parameters.")
-        # else:
-        #     # self.log_message("Invalid device.")
+            else:
+                parameter_names = ""
+                self._send_parameter_names(parameter_names)
+        else:
+            # no device
+            # sending sysex of bank name, device name, bank names
+            bank_name_drum = ";0"
+            bank_names_list = ""
+            available_devices_string = ""
+            parameter_names = ""
+            self._send_sys_ex_message(bank_name_drum, 0x6D)
+            self._send_sys_ex_message(bank_names_list, 0x5D)
+            self._send_sys_ex_message(available_devices_string, 0x01)
+            self._send_parameter_names(parameter_names)
 
     def _find_device_index(self, device, device_list):
         for index, d in enumerate(device_list):
@@ -138,7 +148,10 @@ class MicroPush(ControlSurface):
         return "not found"  # Device not found
 
     def _send_parameter_names(self, parameter_names):
-        name_string = ','.join(parameter_names)
+        if parameter_names == "":
+            name_string = ""
+        else:
+            name_string = ','.join(parameter_names)
         self._send_sys_ex_message(name_string, 0x7D)
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
@@ -367,17 +380,25 @@ class MicroPush(ControlSurface):
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
         selected_track = self.song().view.selected_track
+        track_has_midi_input = 0
         if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
+            track_has_midi_input = 1
+        # update device thing when we have no device on the selected track
+        # TODO: check if wee need this!
+        if selected_track.has_midi_output or not selected_track.has_midi_input:
+            self._on_device_changed()
         self._set_other_tracks_implicit_arm()
         # send new index of selected track
         self._send_selected_track_index(selected_track)
         self._on_selected_scene_changed()
+        # send sys ex of track midi input status.
+        self._send_sys_ex_message(str(track_has_midi_input), 0x0B)
         # TODO: this part doesn't seem to work? how can I make this work with master and return?
         device_to_select = selected_track.view.selected_device
-        if device_to_select == None and len(selected_track.devices) > 0:
+        if device_to_select is None and len(selected_track.devices) > 0:
             device_to_select = selected_track.devices[0]
-        if device_to_select != None:
+        if device_to_select is not None:
             self.song().view.select_device(device_to_select)
         self._device_component.set_device(device_to_select)
 
@@ -528,7 +549,7 @@ class MicroPush(ControlSurface):
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
             # strip.set_shift_button(...)
-        
+
         # Master / channel 7 cc 127
         mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
         mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
@@ -552,8 +573,7 @@ class MicroPush(ControlSurface):
 
             # Send1Knob control
             send1_knob = EncoderElement(MIDI_CC_TYPE, index, 11, Live.MidiMap.MapMode.absolute)  # Replace 40 with the appropriate MIDI CC number for Send A control
-            
-            
+
             # Send2Knob control
             send2_knob = EncoderElement(MIDI_CC_TYPE, index, 12, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
             strip.set_send_controls((send1_knob, send2_knob,))
@@ -578,7 +598,7 @@ class MicroPush(ControlSurface):
 
                 if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
                     clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
-                
+
                 if clip_slot.has_clip and not clip_slot.clip.color_has_listener(self._on_clip_has_clip_changed):
                     clip_slot.clip.add_color_listener(self._on_clip_has_clip_changed)
 
@@ -590,7 +610,7 @@ class MicroPush(ControlSurface):
                                 #     # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
                 #     #     # self.log_message("adding a playing status listener")
                 #     #     clip_slot.clip.add_playing_status_listener(self._on_clip_playing_status_changed)
- 
+
 
     def _unregister_clip_listeners(self):
         for track in self.song().tracks:
