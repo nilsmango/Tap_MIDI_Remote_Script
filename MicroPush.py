@@ -84,6 +84,18 @@ class MicroPush(ControlSurface):
         if value:
             self._on_device_changed()
 
+    def _find_drum_rack_in_track(self, track):
+        for device in track.devices:
+            if device.can_have_drum_pads:
+                return device
+            elif isinstance(device, Live.RackDevice.RackDevice):
+                # If the device is a RackDevice (e.g., Instrument Rack), recursively search inside its chains
+                for chain in device.chains:
+                    drum_rack = self._find_drum_rack_in_track(chain)
+                    if drum_rack is not None:
+                        return drum_rack
+        return None
+
     @subject_slot('device')
     def _on_device_changed(self):
         if liveobj_valid(self._device):
@@ -95,9 +107,10 @@ class MicroPush(ControlSurface):
             available_devices = selected_track.devices
             # find out if track has a drum rack.
             track_has_drums = 0
-            for device in available_devices:
-                if device.can_have_drum_pads:
-                    track_has_drums = 1
+            drum_rack_device = self._find_drum_rack_in_track(selected_track)
+            if drum_rack_device is not None:
+                track_has_drums = 1
+
             # find index of device
             selected_device_index = self._find_device_index(selected_device, available_devices)
             # self.log_message("Selected Device Index: {}".format(selected_device_index))
