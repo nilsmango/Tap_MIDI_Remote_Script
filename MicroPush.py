@@ -57,10 +57,6 @@ class MicroPush(ControlSurface):
             self.first_periodic_check = True
             self._periodic_execution()
 
-
-    # def _on_selected_device_changed(self):
-    #     self.log_message("device changed!!")
-
     def _setup_device_control(self):
         self._device = DeviceComponent()
         self._device.name = 'Device_Component'
@@ -78,7 +74,6 @@ class MicroPush(ControlSurface):
         # Register button listeners for navigation buttons
         nav_left_button.add_value_listener(self._on_nav_button_pressed)
         nav_right_button.add_value_listener(self._on_nav_button_pressed)
-
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -791,15 +786,48 @@ class MicroPush(ControlSurface):
     def _add_random_device(self, value):
         if value:
             browser = self.application().browser
-            # selecting a random device from the sounds folder
-            sounds = browser.sounds
-            number_of_sounds = len(sounds.children)
-            random_index = random.randint(0, number_of_sounds - 1)
-            selected_sounds_folder = sounds.children[random_index]
-            number_of_sounds = len(selected_sounds_folder.children)
-            random_sound_index = random.randint(0, number_of_sounds - 1)
-            selected_sound = selected_sounds_folder.children[random_sound_index]
-            browser.load_item(selected_sound)
+            folder_selection = random.randint(0, 2)
+            if folder_selection == 0:
+                # selecting a random device from the sounds folder
+                sounds = browser.sounds
+                number_of_sounds = len(sounds.children)
+                random_index = random.randint(0, number_of_sounds - 1)
+                selected_sounds_folder = sounds.children[random_index]
+                number_of_sounds = len(selected_sounds_folder.children)
+                random_sound_index = random.randint(0, number_of_sounds - 1)
+                selected_sound = selected_sounds_folder.children[random_sound_index]
+                browser.load_item(selected_sound)
+            elif folder_selection == 1:
+                # selecting an instrument from the instrument folder
+                found_instrument = False
+                instruments = browser.instruments
+                inst_children = instruments.children
+                while not found_instrument:
+                    random_number = random.randint(0, len(inst_children) - 1)
+                    rand_instrument = inst_children[random_number]
+                    if rand_instrument.name is not "CV Instrument" or "CV Triggers" or "External Instrument" or "Ext. Instrument" or "Drum Rack" or "Instrument Rack" or "Sampler":
+                        if rand_instrument.is_device:
+                            found_instrument = True
+                        else:
+                            # open folder
+                            children = rand_instrument.children
+                            rand_index = random.randint(0, len(children) - 1)
+                            rand_instrument = rand_instrument[rand_index]
+                            found_instrument = True
+
+                browser.load_item(rand_instrument)
+            else:
+                # selecting a drum rack
+                drums = browser.drums.children
+                number_of_drums = len(drums)
+                found_drum = False
+                while not found_drum:
+                    random_index = random.randint(0, number_of_drums - 1)
+                    random_drum = drums[random_index]
+                    if random_drum.name is not "Drum Hits" or "Drum Rack":
+                        found_drum = True
+                browser.load_item(random_drum)
+            self._on_tracks_changed()
 
     def _add_random_effect(self, value):
         if value:
