@@ -802,10 +802,11 @@ class MicroPush(ControlSurface):
                 found_instrument = False
                 instruments = browser.instruments
                 inst_children = instruments.children
+
                 while not found_instrument:
                     random_number = random.randint(0, len(inst_children) - 1)
                     rand_instrument = inst_children[random_number]
-                    if rand_instrument.name is not "CV Instrument" or "CV Triggers" or "External Instrument" or "Ext. Instrument" or "Drum Rack" or "Instrument Rack" or "Sampler":
+                    if rand_instrument.name not in ["CV Instrument", "CV Triggers", "External Instrument", "Ext. Instrument", "Drum Rack", "Instrument Rack", "Sampler", "Simpler"]:
                         if rand_instrument.is_device:
                             found_instrument = True
                         else:
@@ -828,6 +829,7 @@ class MicroPush(ControlSurface):
                         found_drum = True
                 browser.load_item(random_drum)
             self._on_tracks_changed()
+            self._on_device_changed()
 
     def _add_random_effect(self, value):
         if value:
