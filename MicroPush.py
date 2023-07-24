@@ -834,27 +834,38 @@ class MicroPush(ControlSurface):
     def _add_random_effect(self, value):
         if value:
             browser = self.application().browser
-            effects = browser.audio_effects
-            effect_children = effects.children
-            number_of_effects = len(effect_children)
-            self.log_message("Effects number: {}".format(number_of_effects))
-            # check if effects are in folders or not
-            if number_of_effects >= 10:
-                random_effect_index = random.randint(0, number_of_effects - 1)
-                selected_effect = effect_children[random_effect_index]
-            else:
+            random_index = random.randint(0, 1)
+            if random_index == 0:
+                max_effects = browser.max_for_live.children[0].children
+                max_number = len(max_effects)
                 finished = False
                 while not finished:
-                    random_folder_index = random.randint(0, number_of_effects - 1)
-                    selected_folder = effect_children[random_folder_index]
-                    if selected_folder.name != 'Utilities':
-                        if selected_folder.name != 'Modulators':
-                            finished = True
+                    random_max = random.randint(0, max_number - 1)
+                    selected_effect = max_effects[random_max]
+                    if not any(substring.lower() in selected_effect.name.lower() for substring in ["IR", "Api", "Map8" "Max Audio Effect"]):
+                        finished = True
 
-                folder_children = selected_folder.children
-                number_folder_children = len(folder_children)
-                random_folder_child_index = random.randint(0, number_folder_children - 1)
-                selected_effect = folder_children[random_folder_child_index]
+            else:
+                effects = browser.audio_effects
+                effect_children = effects.children
+                number_of_effects = len(effect_children)
+                # check if effects are in folders or not
+                if number_of_effects >= 10:
+                    random_effect_index = random.randint(0, number_of_effects - 1)
+                    selected_effect = effect_children[random_effect_index]
+                else:
+                    finished = False
+                    while not finished:
+                        random_folder_index = random.randint(0, number_of_effects - 1)
+                        selected_folder = effect_children[random_folder_index]
+                        if selected_folder.name != 'Utilities':
+                            if selected_folder.name != 'Modulators':
+                                finished = True
+
+                    folder_children = selected_folder.children
+                    number_folder_children = len(folder_children)
+                    random_folder_child_index = random.randint(0, number_folder_children - 1)
+                    selected_effect = folder_children[random_folder_child_index]
             browser.load_item(selected_effect)
 
     def disconnect(self):
