@@ -234,6 +234,16 @@ class MicroPush(ControlSurface):
         # random audio effect button
         random_effect_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 92)
         random_effect_button.add_value_listener(self._add_random_effect)
+        # delete device button
+        delete_device_button = ButtonElement(1, MIDI_CC_TYPE, 1, 17)
+        delete_device_button.add_value_listener(self._delete_device)
+        # move device left
+        move_device_left_button = ButtonElement(1, MIDI_CC_TYPE, 1, 18)
+        move_device_left_button.add_value_listener(self._move_device_left)
+        # move device right
+        move_device_right_button = ButtonElement(1, MIDI_CC_TYPE, 1, 19)
+        move_device_right_button.add_value_listener(self._move_device_right)
+
 
     def _connection_established(self, value):
         if value:
@@ -782,6 +792,25 @@ class MicroPush(ControlSurface):
 
     def _send_selected_clip_slot(self, clip_index):
         self._send_sys_ex_message(str(clip_index), 0x10)
+
+    def _delete_device(self, value):
+        selected_track = self.song().view.selected_track
+        selected_track.delete_device(value)
+        self._on_device_changed()
+
+    def _move_device_left(self, value):
+        song = self.song()
+        selected_track = song.view.selected_track
+        selected_device = selected_track.devices[value]
+        self.log_message("Trying to move device right. Value: {}".format(value))
+        song.move_device(selected_device, selected_track, value - 1)
+
+    def _move_device_right(self, value):
+        song = self.song()
+        selected_track = song.view.selected_track
+        selected_device = selected_track.devices[value]
+        self.log_message("Trying to move device right. Value: {}".format(value))
+        song.move_device(selected_device, selected_track, value + 2)
 
     def _add_random_device(self, value):
         if value:
