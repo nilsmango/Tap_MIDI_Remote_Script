@@ -243,7 +243,18 @@ class MicroPush(ControlSurface):
         # move device right
         move_device_right_button = ButtonElement(1, MIDI_CC_TYPE, 1, 19)
         move_device_right_button.add_value_listener(self._move_device_right)
-
+        # add midi track
+        add_midi_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 21)
+        add_midi_track_button.add_value_listener(self._add_midi_track)
+        # delete midi track
+        delete_midi_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 22)
+        delete_midi_track_button.add_value_listener(self._delete_midi_track)
+        # add return track
+        add_return_track_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 91)
+        add_return_track_button.add_value_listener(self._add_return_track)
+        # delete return track
+        delete_return_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 23)
+        delete_return_track_button.add_value_listener(self._delete_return_track)
 
     def _connection_established(self, value):
         if value:
@@ -802,15 +813,29 @@ class MicroPush(ControlSurface):
         song = self.song()
         selected_track = song.view.selected_track
         selected_device = selected_track.devices[value]
-        self.log_message("Trying to move device right. Value: {}".format(value))
         song.move_device(selected_device, selected_track, value - 1)
 
     def _move_device_right(self, value):
         song = self.song()
         selected_track = song.view.selected_track
         selected_device = selected_track.devices[value]
-        self.log_message("Trying to move device right. Value: {}".format(value))
         song.move_device(selected_device, selected_track, value + 2)
+
+    def _add_midi_track(self, value):
+        song = self.song()
+        song.create_midi_track(value)
+
+    def _delete_midi_track(self, value):
+        song = self.song()
+        song.delete_track(value)
+
+    def _add_return_track(self, value):
+        if value:
+            self.song().create_return_track()
+
+    def _delete_return_track(self, value):
+        song = self.song()
+        song.delete_return_track(value)
 
     def _add_random_device(self, value):
         if value:
