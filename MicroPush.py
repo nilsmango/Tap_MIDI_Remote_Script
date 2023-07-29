@@ -506,12 +506,17 @@ class MicroPush(ControlSurface):
         # track_names = ",".join([track.name for track in tracks])
         # self._send_sys_ex_message(track_names, 0x02)
         track_names = []
+        track_is_audio = []
         track_colors = []
 
         for track in self.song().tracks:
             # track names
             track_names.append(track.name)
-
+            # is audio track
+            if track.has_audio_input:
+                track_is_audio.append("1")
+            else:
+                track_is_audio.append("0")
             # track colors
             color_string = self._make_color_string(track.color)
             track_colors.append(color_string)
@@ -520,6 +525,10 @@ class MicroPush(ControlSurface):
         # send track names
         track_names_string = ",".join(track_names)
         self._send_sys_ex_message(track_names_string, 0x02)
+
+        # send is audio tracks
+        has_audio_string = ",".join(track_is_audio)
+        self._send_sys_ex_message(has_audio_string, 0x0C)
 
         # send track colors
         track_colors_string = "-".join(track_colors)
