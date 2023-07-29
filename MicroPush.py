@@ -132,9 +132,12 @@ class MicroPush(ControlSurface):
                     # self.log_message("Parameter Names: {}".format(parameter_names))
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
-                # else:
-                #     # self.log_message("No parameter names found in the device controls.")
+                else:
+                    self.log_message("No parameter names found in the device controls. Sending empty")
+                    parameter_names = ""
+                    self._send_parameter_names(parameter_names)
             else:
+                self.log_message("No parameters on other level. sending empty")
                 parameter_names = ""
                 self._send_parameter_names(parameter_names)
         else:
@@ -860,7 +863,7 @@ class MicroPush(ControlSurface):
                 while not found_instrument:
                     random_number = random.randint(0, len(inst_children) - 1)
                     rand_instrument = inst_children[random_number]
-                    if rand_instrument.name not in ["CV Instrument", "CV Triggers", "External Instrument", "Ext. Instrument", "Drum Rack", "Instrument Rack", "Sampler", "Simpler"]:
+                    if rand_instrument.name not in ["CV Instrument", "CV Triggers", "External Instrument", "Ext. Instrument", "Drum Rack", "Instrument Rack", "Sampler", "Simpler", "Impulse"]:
                         if rand_instrument.is_device:
                             found_instrument = True
                         else:
