@@ -521,6 +521,12 @@ class MicroPush(ControlSurface):
             color_string = self._make_color_string(track.color)
             track_colors.append(color_string)
 
+            # output meter listeners
+            if track.has_audio_output:
+                if not track.output_meter_left_has_listener(self._on_output_level_changed):
+                    track.add_output_meter_left_listener(self._on_output_level_changed)
+                if not track.output_meter_right_has_listener(self._on_output_level_changed):
+                    track.add_output_meter_right_listener(self._on_output_level_changed)
 
         # send track names
         track_names_string = ",".join(track_names)
@@ -542,9 +548,21 @@ class MicroPush(ControlSurface):
 
             color_string = color_string = self._make_color_string(return_track.color)
             return_track_colors.append(color_string)
+
+            # output meter listeners
+            if not return_track.output_meter_left_has_listener(self._on_output_level_changed):
+                return_track.add_output_meter_left_listener(self._on_output_level_changed)
+            if not return_track.output_meter_right_has_listener(self._on_output_level_changed):
+                return_track.add_output_meter_right_listener(self._on_output_level_changed)
         
-        # add master track color to the mix:
+        # output meter listeners master track
         master_track = self.song().master_track
+        if not master_track.output_meter_left_has_listener(self._on_output_level_changed):
+                master_track.add_output_meter_left_listener(self._on_output_level_changed)
+        if not master_track.output_meter_right_has_listener(self._on_output_level_changed):
+            master_track.add_output_meter_right_listener(self._on_output_level_changed)
+
+        # add master track color to the mix:
         color_string = self._make_color_string(master_track.color)
         return_track_colors.append(color_string)
 
@@ -569,7 +587,6 @@ class MicroPush(ControlSurface):
             
             # Send1Knob control
             send1_knob = EncoderElement(MIDI_CC_TYPE, index, 40, Live.MidiMap.MapMode.absolute)
-            
             
             # Send2Knob control
             send2_knob = EncoderElement(MIDI_CC_TYPE, index, 41, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
@@ -601,7 +618,7 @@ class MicroPush(ControlSurface):
             strip = mixer.return_strip(index)
 
             # VolumeSlider
-            return_volume_slider = SliderElement(MIDI_CC_TYPE, index, 8)  # Replace 7 with the appropriate MIDI CC number for return track volume control
+            return_volume_slider = SliderElement(MIDI_CC_TYPE, index, 8)
             strip.set_volume_control(return_volume_slider)
 
             # TrackMuteButton control
@@ -612,16 +629,43 @@ class MicroPush(ControlSurface):
             solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 9)
             strip.set_solo_button(solo_button)
 
-            # Send1Knob control
-            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 11, Live.MidiMap.MapMode.absolute)  # Replace 40 with the appropriate MIDI CC number for Send A control
+            # Send1Knob control (A)
+            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 11, Live.MidiMap.MapMode.absolute)
 
-            # Send2Knob control
-            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 12, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
+            # Send2Knob control (B)
+            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 12, Live.MidiMap.MapMode.absolute)
             strip.set_send_controls((send1_knob, send2_knob,))
 
             # Pan
             pan_knob = EncoderElement(MIDI_CC_TYPE, index, 13, Live.MidiMap.MapMode.absolute)
             strip.set_pan_control(pan_knob)
+
+    def _on_output_level_changed(self):
+        song = self.song()
+        audio_levels = []
+        for track in song.tracks:
+            if track.has_audio_output:
+                left_channel = track.output_meter_left
+                right_channel = track.output_meter_right
+            else:
+                left_channel = 0.0
+                right_channel = 0.0
+            stereo = "{}:{}".format(left_channel, right_channel)
+            audio_levels.append(stereo)
+
+        for return_track in song.return_tracks:
+            left_channel = return_track.output_meter_left
+            right_channel = return_track.output_meter_right
+            stereo = "{}:{}".format(left_channel, right_channel)
+            audio_levels.append(stereo)
+
+        master_left = song.master_track.output_meter_left
+        master_right = song.master_track.output_meter_right
+        master_stereo = "{}:{}".format(master_left, master_right)
+        audio_levels.append(master_stereo)
+
+        audio_levels_string = ",".join(audio_levels)
+        self._send_sys_ex_message(audio_levels_string, 0x0D)
 
     # clipSlots
     def _register_clip_listeners(self):
@@ -652,8 +696,7 @@ class MicroPush(ControlSurface):
                 #     #     # self.log_message("adding a playing status listener")
                 #     #     clip_slot.clip.add_playing_status_listener(self._on_clip_playing_status_changed)
 
-
-    def _unregister_clip_listeners(self):
+    def _unregister_clip_and_audio_listeners(self):
         for track in self.song().tracks:
             for clip_slot in track.clip_slots:
                 clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
@@ -663,6 +706,18 @@ class MicroPush(ControlSurface):
                 # if clip_slot.has_clip:
                 #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
                 #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
+            # output meter listeners
+            if track.has_audio_output:
+                if track.output_meter_left_has_listener(self._on_output_level_changed):
+                    track.remove_output_meter_left_listener(self._on_output_level_changed)
+                if track.output_meter_right_has_listener(self._on_output_level_changed):
+                    track.remove_output_meter_right_listener(self._on_output_level_changed)
+
+        for return_track in self.song().return_tracks:
+            if return_track.output_meter_left_has_listener(self._on_output_level_changed):
+                return_track.remove_output_meter_left_listener(self._on_output_level_changed)
+            if return_track.output_meter_right_has_listener(self._on_output_level_changed):
+                return_track.remove_output_meter_right_listener(self._on_output_level_changed)
 
     # def _on_playing_position_changed(self):
     #     # self.log_message("trying to log the playing position")
@@ -946,7 +1001,7 @@ class MicroPush(ControlSurface):
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
-        self._unregister_clip_listeners()
+        self._unregister_clip_and_audio_listeners()
         self.remove_midi_listener(self._midi_listener)
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
