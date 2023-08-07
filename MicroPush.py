@@ -30,8 +30,8 @@ class MicroPush(ControlSurface):
             global mixer
             global transport
             global session_component
-            track_count = 8
-            return_count = 24  # Maximum of 12 Sends and 12 Returns
+            track_count = 127
+            return_count = 12  # Maximum of 12 Sends and 12 Returns
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -62,7 +62,7 @@ class MicroPush(ControlSurface):
         self._device.name = 'Device_Component'
         device_controls = []
         for index in range(8):
-            control = EncoderElement(MIDI_CC_TYPE, index, 20, Live.MidiMap.MapMode.absolute)
+            control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
             control.name = 'Ctrl_' + str(index)
             device_controls.append(control)
         self._device.set_parameter_controls(device_controls)
@@ -577,33 +577,34 @@ class MicroPush(ControlSurface):
 
         # Channels
         for index, track in enumerate(self.song().tracks):
+
             strip = mixer.channel_strip(index)
-            
+
             # Configure strip controls for each channel track
-            
+
             # VolumeSlider control
-            volume_slider = SliderElement(MIDI_CC_TYPE, index, 7)  # Replace 7 with the appropriate MIDI CC number for volume control
+            volume_slider = SliderElement(MIDI_CC_TYPE, 2, index)  # MIDI CC channel 2, index == CC number
             strip.set_volume_control(volume_slider)
-            
+
             # Send1Knob control
-            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 40, Live.MidiMap.MapMode.absolute)
-            
+            send1_knob = EncoderElement(MIDI_CC_TYPE, 3, index, Live.MidiMap.MapMode.absolute)
+
             # Send2Knob control
-            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 41, Live.MidiMap.MapMode.absolute)  # Replace 48 with the appropriate MIDI CC number for Send B control
+            send2_knob = EncoderElement(MIDI_CC_TYPE, 4, index, Live.MidiMap.MapMode.absolute)
             strip.set_send_controls((send1_knob, send2_knob,))
-            
+
             # Pan
-            pan_knob = EncoderElement(MIDI_CC_TYPE, index, 42, Live.MidiMap.MapMode.absolute)
+            pan_knob = EncoderElement(MIDI_CC_TYPE, 5, index, Live.MidiMap.MapMode.absolute)
             strip.set_pan_control(pan_knob)
 
             # TrackMuteButton control
-            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 44)
+            mute_button = ButtonElement(1, MIDI_CC_TYPE, 6, index)
             strip.set_mute_button(mute_button)
 
             # Solo button control
-            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 43)
+            solo_button = ButtonElement(1, MIDI_CC_TYPE, 7, index)
             strip.set_solo_button(solo_button)
-            
+
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
             # strip.set_shift_button(...)
@@ -618,26 +619,26 @@ class MicroPush(ControlSurface):
             strip = mixer.return_strip(index)
 
             # VolumeSlider
-            return_volume_slider = SliderElement(MIDI_CC_TYPE, index, 8)
+            return_volume_slider = SliderElement(MIDI_CC_TYPE, 8, index)
             strip.set_volume_control(return_volume_slider)
 
             # TrackMuteButton control
-            mute_button = ButtonElement(1, MIDI_CC_TYPE, index, 10)
+            mute_button = ButtonElement(1, MIDI_CC_TYPE, 8, index + 12)
             strip.set_mute_button(mute_button)
 
             # Solo button control
-            solo_button = ButtonElement(1, MIDI_CC_TYPE, index, 9)
+            solo_button = ButtonElement(1, MIDI_CC_TYPE, 8, index + 24)
             strip.set_solo_button(solo_button)
 
             # Send1Knob control (A)
-            send1_knob = EncoderElement(MIDI_CC_TYPE, index, 11, Live.MidiMap.MapMode.absolute)
+            send1_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 36, Live.MidiMap.MapMode.absolute)
 
             # Send2Knob control (B)
-            send2_knob = EncoderElement(MIDI_CC_TYPE, index, 12, Live.MidiMap.MapMode.absolute)
+            send2_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 48, Live.MidiMap.MapMode.absolute)
             strip.set_send_controls((send1_knob, send2_knob,))
 
             # Pan
-            pan_knob = EncoderElement(MIDI_CC_TYPE, index, 13, Live.MidiMap.MapMode.absolute)
+            pan_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute)
             strip.set_pan_control(pan_knob)
 
     def _on_output_level_changed(self):
