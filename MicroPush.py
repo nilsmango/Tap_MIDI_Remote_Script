@@ -666,7 +666,8 @@ class MicroPush(ControlSurface):
         value_left = int(round(left_channel * 100))
         value_right = int(round(right_channel * 100))
 
-        # send midi cc left on channel 9, right on channel 10, cc == index, value == Int(left_channel * 100)
+        # send midi cc left on channel 9, right on channel 10, cc == index, 
+        # value == Int(left_channel * 100)
 
         status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
         midi_cc_message_left = (status_byte_left, index, value_left)
@@ -674,32 +675,6 @@ class MicroPush(ControlSurface):
         status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
         midi_cc_message_right = (status_byte_right, index, value_right)
         self._send_midi(midi_cc_message_right)
-
-        # old implementation
-        # audio_levels = []
-        # for track in song.tracks:
-        #     if track.has_audio_output:
-        #         left_channel = track.output_meter_left
-        #         right_channel = track.output_meter_right
-        #     else:
-        #         left_channel = 0.0
-        #         right_channel = 0.0
-        #     stereo = "{}:{}".format(left_channel, right_channel)
-        #     audio_levels.append(stereo)
-
-        # for return_track in song.return_tracks:
-        #     left_channel = return_track.output_meter_left
-        #     right_channel = return_track.output_meter_right
-        #     stereo = "{}:{}".format(left_channel, right_channel)
-        #     audio_levels.append(stereo)
-
-        # master_left = song.master_track.output_meter_left
-        # master_right = song.master_track.output_meter_right
-        # master_stereo = "{}:{}".format(master_left, master_right)
-        # audio_levels.append(master_stereo)
-
-        # audio_levels_string = ",".join(audio_levels)
-        # self._send_sys_ex_message(audio_levels_string, 0x0D)
 
     # clipSlots
     def _register_clip_listeners(self):
