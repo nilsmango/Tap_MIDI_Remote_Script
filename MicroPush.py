@@ -45,7 +45,7 @@ class MicroPush(ControlSurface):
             self._set_selected_track_implicit_arm()
             self._send_selected_track_index(song.view.selected_track)
             self._on_selected_track_changed.subject = song.view
-            
+
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
             song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
@@ -133,11 +133,9 @@ class MicroPush(ControlSurface):
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
-                    self.log_message("No parameter names found in the device controls. Sending empty")
                     parameter_names = ""
                     self._send_parameter_names(parameter_names)
             else:
-                self.log_message("No parameters on other level. sending empty")
                 parameter_names = ""
                 self._send_parameter_names(parameter_names)
         else:
@@ -261,7 +259,7 @@ class MicroPush(ControlSurface):
 
     def _connection_established(self, value):
         if value:
-            self.log_message("connection app ableton works!")
+            self.log_message("Connection App to Ableton works!")
             # send all the channel names, colors, current device, undo redo, etc.
             self._on_tracks_changed()
             self._setup_undo_redo()
@@ -501,7 +499,8 @@ class MicroPush(ControlSurface):
 
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
-        # tracks = self.song().tracks
+        tracks = self.song().tracks
+        tracks_length = len(tracks)
         # # send track names
         # track_names = ",".join([track.name for track in tracks])
         # self._send_sys_ex_message(track_names, 0x02)
@@ -509,7 +508,7 @@ class MicroPush(ControlSurface):
         track_is_audio = []
         track_colors = []
 
-        for track in self.song().tracks:
+        for index, track in enumerate(self.song().tracks):
             # track names
             track_names.append(track.name)
             # is audio track
@@ -523,10 +522,11 @@ class MicroPush(ControlSurface):
 
             # output meter listeners
             if track.has_audio_output:
-                if not track.output_meter_left_has_listener(self._on_output_level_changed):
-                    track.add_output_meter_left_listener(self._on_output_level_changed)
-                if not track.output_meter_right_has_listener(self._on_output_level_changed):
-                    track.add_output_meter_right_listener(self._on_output_level_changed)
+                # self.log_message("Adding listener at {}".format(index))
+                if not track.output_meter_left_has_listener(self._on_output_level_changed(index)):
+                    track.add_output_meter_left_listener(lambda index=index: self._on_output_level_changed(index))
+                if not track.output_meter_right_has_listener(self._on_output_level_changed(index)):
+                    track.add_output_meter_right_listener(lambda index=index: self._on_output_level_changed(index))
 
         # send track names
         track_names_string = ",".join(track_names)
@@ -543,24 +543,27 @@ class MicroPush(ControlSurface):
         return_track_names = []
         return_track_colors = []
 
-        for return_track in self.song().return_tracks:
+        for index, return_track in enumerate(self.song().return_tracks):
             return_track_names.append(return_track.name)
 
             color_string = color_string = self._make_color_string(return_track.color)
             return_track_colors.append(color_string)
 
             # output meter listeners
-            if not return_track.output_meter_left_has_listener(self._on_output_level_changed):
-                return_track.add_output_meter_left_listener(self._on_output_level_changed)
-            if not return_track.output_meter_right_has_listener(self._on_output_level_changed):
-                return_track.add_output_meter_right_listener(self._on_output_level_changed)
+            return_index = index + tracks_length
+            if not return_track.output_meter_left_has_listener(self._on_output_level_changed(return_index)):
+                return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
+            if not return_track.output_meter_right_has_listener(self._on_output_level_changed(return_index)):
+                return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
         
-        # output meter listeners master track
+        # TODO: output meter listeners master track
+        master_index = len(self.song().return_tracks) + tracks_length
+        # self.log_message("master index: {}".format(master_index))
         master_track = self.song().master_track
-        if not master_track.output_meter_left_has_listener(self._on_output_level_changed):
-                master_track.add_output_meter_left_listener(self._on_output_level_changed)
+        if not master_track.output_meter_left_has_listener(self._on_output_level_changed(master_index)):
+                master_track.add_output_meter_left_listener(lambda index=master_index: self._on_output_level_changed(index))
         if not master_track.output_meter_right_has_listener(self._on_output_level_changed):
-            master_track.add_output_meter_right_listener(self._on_output_level_changed)
+            master_track.add_output_meter_right_listener(lambda index=master_index: self._on_output_level_changed(index))
 
         # add master track color to the mix:
         color_string = self._make_color_string(master_track.color)
@@ -641,32 +644,62 @@ class MicroPush(ControlSurface):
             pan_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute)
             strip.set_pan_control(pan_knob)
 
-    def _on_output_level_changed(self):
+    def _on_output_level_changed(self, index):
+        # self.log_message("output level sending: {}".format(index))
         song = self.song()
-        audio_levels = []
-        for track in song.tracks:
-            if track.has_audio_output:
-                left_channel = track.output_meter_left
-                right_channel = track.output_meter_right
-            else:
-                left_channel = 0.0
-                right_channel = 0.0
-            stereo = "{}:{}".format(left_channel, right_channel)
-            audio_levels.append(stereo)
+        tracks = song.tracks
+        return_tracks = song.return_tracks
+        if index < len(tracks):
+            track = tracks[index]
+        elif index - len(tracks) < len(return_tracks):
+            track = return_tracks[index - len(tracks)]
+        else:
+            track = song.master_track
 
-        for return_track in song.return_tracks:
-            left_channel = return_track.output_meter_left
-            right_channel = return_track.output_meter_right
-            stereo = "{}:{}".format(left_channel, right_channel)
-            audio_levels.append(stereo)
+        if track.has_audio_output:
+            left_channel = track.output_meter_left
+            right_channel = track.output_meter_right
+        else:
+            left_channel = 0.0
+            right_channel = 0.0
 
-        master_left = song.master_track.output_meter_left
-        master_right = song.master_track.output_meter_right
-        master_stereo = "{}:{}".format(master_left, master_right)
-        audio_levels.append(master_stereo)
+        value_left = int(round(left_channel * 100))
+        value_right = int(round(right_channel * 100))
 
-        audio_levels_string = ",".join(audio_levels)
-        self._send_sys_ex_message(audio_levels_string, 0x0D)
+        # send midi cc left on channel 9, right on channel 10, cc == index, value == Int(left_channel * 100)
+
+        status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
+        midi_cc_message_left = (status_byte_left, index, value_left)
+        self._send_midi(midi_cc_message_left)
+        status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
+        midi_cc_message_right = (status_byte_right, index, value_right)
+        self._send_midi(midi_cc_message_right)
+
+        # old implementation
+        # audio_levels = []
+        # for track in song.tracks:
+        #     if track.has_audio_output:
+        #         left_channel = track.output_meter_left
+        #         right_channel = track.output_meter_right
+        #     else:
+        #         left_channel = 0.0
+        #         right_channel = 0.0
+        #     stereo = "{}:{}".format(left_channel, right_channel)
+        #     audio_levels.append(stereo)
+
+        # for return_track in song.return_tracks:
+        #     left_channel = return_track.output_meter_left
+        #     right_channel = return_track.output_meter_right
+        #     stereo = "{}:{}".format(left_channel, right_channel)
+        #     audio_levels.append(stereo)
+
+        # master_left = song.master_track.output_meter_left
+        # master_right = song.master_track.output_meter_right
+        # master_stereo = "{}:{}".format(master_left, master_right)
+        # audio_levels.append(master_stereo)
+
+        # audio_levels_string = ",".join(audio_levels)
+        # self._send_sys_ex_message(audio_levels_string, 0x0D)
 
     # clipSlots
     def _register_clip_listeners(self):
