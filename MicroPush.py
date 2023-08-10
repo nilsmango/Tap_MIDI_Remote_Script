@@ -55,6 +55,7 @@ class MicroPush(ControlSurface):
             self._setup_device_control()
             self._register_clip_listeners()
             self.first_periodic_check = True
+            self.periodic_timer = None
             self._periodic_execution()
 
     def _setup_device_control(self):
@@ -293,9 +294,9 @@ class MicroPush(ControlSurface):
             self._send_midi(midi_event_bytes)
 
     def _periodic_execution(self):
-        # Do something here
-        self._periodic_check()
-        threading.Timer(0.3, self._periodic_execution).start()
+        if self.periodic_timer is None:
+            self.periodic_timer = threading.Timer(0.3, self._periodic_execution)
+            self.periodic_timer.start()
 
     def _periodic_check(self):
         # update clip slots
@@ -1028,4 +1029,7 @@ class MicroPush(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
+        if self.periodic_timer is None:
+            self.periodic_timer = threading.Timer(0.3, self._periodic_execution)
+            self.periodic_timer.start()
         super(MicroPush, self).disconnect()
