@@ -555,9 +555,9 @@ class MicroPush(ControlSurface):
                 return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
             if not return_track.output_meter_right_has_listener(self._on_output_level_changed(return_index)):
                 return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
-        
-        # TODO: output meter listeners master track
-        master_index = len(self.song().return_tracks) + tracks_length
+
+        # output meter listeners master track
+        master_index = 127 # len(self.song().return_tracks) + tracks_length
         # self.log_message("master index: {}".format(master_index))
         master_track = self.song().master_track
         if not master_track.output_meter_left_has_listener(self._on_output_level_changed(master_index)):
@@ -775,7 +775,7 @@ class MicroPush(ControlSurface):
             
         # send track clips
         track_clips_string = "/".join(track_clips)
-        self._send_sys_ex_message(track_clips_string, 0x05)
+        # self._send_sys_ex_message(track_clips_string, 0x05)
 
     def _on_scale_changed(self):
         song = self.song()
