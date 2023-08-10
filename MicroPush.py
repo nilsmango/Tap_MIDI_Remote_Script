@@ -165,12 +165,25 @@ class MicroPush(ControlSurface):
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
-        # parameter names: 0x7D, bank name: 0x6D
-        device_id = 0x01  
-        data = name_string.encode('ascii')
         end_byte = 0xF7  # SysEx message end
-        sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
-        self._send_midi(sys_ex_message)
+        device_id = 0x01
+        data = name_string.encode('ascii')
+        max_chunk_length = 250
+        if len(data) <= max_chunk_length:
+            sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
+            self._send_midi(sys_ex_message)
+        else:
+            num_of_chunks = (len(data) + max_chunk_length - 1) // max_chunk_length
+            for chunk_index in range(num_of_chunks):
+                start_index = chunk_index * max_chunk_length
+                end_index = start_index + max_chunk_length
+                prefix = "$"
+                if chunk_index == num_of_chunks - 1:
+                    prefix = "%"
+                chunk_data = prefix.encode('ascii') + data[start_index:end_index]
+
+                sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte, )
+                self._send_midi(sys_ex_message)
 
     def _initialize_buttons(self):
         transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
