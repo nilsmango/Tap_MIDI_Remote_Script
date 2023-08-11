@@ -277,6 +277,7 @@ class MicroPush(ControlSurface):
         if value:
             self.log_message("Connection App to Ableton works!")
             # send all the channel names, colors, current device, undo redo, etc.
+            self.periodic_timer = 1
             self.old_clips_array = []
             self._on_tracks_changed()
             self._setup_undo_redo()
@@ -329,7 +330,8 @@ class MicroPush(ControlSurface):
             self.first_periodic_check = False
 
         except:
-            self.periodic_timer = 0
+            # self.periodic_timer = 0
+            pass
 
     def _redo_button_value(self, value):
         if value != 0:
@@ -823,7 +825,8 @@ class MicroPush(ControlSurface):
                         self._send_sys_ex_message(delete_clips, 0x05)
         except:
             # need to stop threading or we get a fatal error.
-            self.periodic_timer = 0
+            # self.periodic_timer = 0
+            pass
 
     def _on_scale_changed(self):
         song = self.song()
