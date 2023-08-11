@@ -57,7 +57,7 @@ class MicroPush(ControlSurface):
             self._setup_device_control()
             self._register_clip_listeners()
             self.first_periodic_check = True
-            self.periodic_timer = None
+            self.periodic_timer = 1
             self._periodic_execution()
 
     def _setup_device_control(self):
@@ -297,35 +297,39 @@ class MicroPush(ControlSurface):
             self._send_midi(midi_event_bytes)
 
     def _periodic_execution(self):
-        if self.periodic_timer is None:
-            self.periodic_timer = threading.Timer(0.3, self._periodic_execution)
-            self.periodic_timer.start()
+        self._periodic_check()
+        if self.periodic_timer == 1:
+            threading.Timer(0.3, self._periodic_execution).start()
 
     def _periodic_check(self):
         # update clip slots
         self._update_clip_slots()
         # check if redo undo changed
-        can_redo = self.song().can_redo
-        can_undo = self.song().can_undo
-        if can_redo != self._last_can_redo or self.first_periodic_check:
-            self._last_can_redo = can_redo
-            if can_redo:
-                midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
-                self._send_midi(midi_event_bytes)
-            else:
-                midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
-                self._send_midi(midi_event_bytes)
+        try:
+            can_redo = self.song().can_redo
+            can_undo = self.song().can_undo
+            if can_redo != self._last_can_redo or self.first_periodic_check:
+                self._last_can_redo = can_redo
+                if can_redo:
+                    midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
+                    self._send_midi(midi_event_bytes)
+                else:
+                    midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
+                    self._send_midi(midi_event_bytes)
 
-        if can_undo != self._last_can_undo or self.first_periodic_check:
-            self._last_can_undo = can_undo
-            if can_undo:
-                midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
-                self._send_midi(midi_event_bytes)
-            else:
-                midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
-                self._send_midi(midi_event_bytes)
-        # TODO: clean this whole thing up, never works I think and the next line is for what?
-        self.first_periodic_check = False
+            if can_undo != self._last_can_undo or self.first_periodic_check:
+                self._last_can_undo = can_undo
+                if can_undo:
+                    midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
+                    self._send_midi(midi_event_bytes)
+                else:
+                    midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
+                    self._send_midi(midi_event_bytes)
+            # TODO: clean this whole thing up, never works I think and the next line is for what?
+            self.first_periodic_check = False
+
+        except:
+            self.periodic_timer = 0
 
     def _redo_button_value(self, value):
         if value != 0:
@@ -767,55 +771,59 @@ class MicroPush(ControlSurface):
         self._update_clip_slots()
 
     def _update_clip_slots(self):
-        track_clips = []
+        try:
+            track_clips = []
 
-        for track in self.song().tracks:
-            # track clip slots
-            clip_slots = []
-            for clip_slot in track.clip_slots:
-                clip_value = "0"
-                if clip_slot.is_triggered:
-                    clip_value = "4"
-                elif clip_slot.is_recording:
-                    clip_value = "3"
-                elif clip_slot.is_playing:
-                    clip_value = "2"
-                elif clip_slot.has_clip:
-                    clip_value = "1"
+            for track in self.song().tracks:
+                # track clip slots
+                clip_slots = []
+                for clip_slot in track.clip_slots:
+                    clip_value = "0"
+                    if clip_slot.is_triggered:
+                        clip_value = "4"
+                    elif clip_slot.is_recording:
+                        clip_value = "3"
+                    elif clip_slot.is_playing:
+                        clip_value = "2"
+                    elif clip_slot.has_clip:
+                        clip_value = "1"
 
-                color_string_value = "0"
+                    color_string_value = "0"
 
-                if clip_value != "0":
-                    if clip_slot.clip.color is not None:
-                        color_string_value = self._make_color_string(clip_slot.clip.color)
-                #     playing_position = clip_slot.clip.playing_position
-                #     length = clip_slot.clip.length
-                #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
-                # else:
-                #     playing_position = 0.0
-                #     length = 0.0
+                    if clip_value != "0":
+                        if clip_slot.clip.color is not None:
+                            color_string_value = self._make_color_string(clip_slot.clip.color)
+                    #     playing_position = clip_slot.clip.playing_position
+                    #     length = clip_slot.clip.length
+                    #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
+                    # else:
+                    #     playing_position = 0.0
+                    #     length = 0.0
 
-                clip_string = "{}:{}".format(clip_value, color_string_value)
-                clip_slots.append(clip_string)
-            clip_slots_string = "-".join(clip_slots)
-            track_clips.append(clip_slots_string)
+                    clip_string = "{}:{}".format(clip_value, color_string_value)
+                    clip_slots.append(clip_string)
+                clip_slots_string = "-".join(clip_slots)
+                track_clips.append(clip_slots_string)
 
-        # compare old track clips with new
-        clips_difference = self.find_different_indexes(track_clips, self.old_clips_array)
+            # compare old track clips with new
+            clips_difference = self.find_different_indexes(track_clips, self.old_clips_array)
 
-        # safe new values
-        self.old_clips_array = track_clips
+            # safe new values
+            self.old_clips_array = track_clips
 
-        # send different tracks out
-        if clips_difference != []:
-            for track_index in clips_difference:
-                if int(track_index) < len(track_clips):
-                    string_prefix = str(track_index) + "%"
-                    track_string = string_prefix + str(track_clips[track_index])
-                    self._send_sys_ex_message(track_string, 0x05)
-                else:
-                    delete_clips = "DEL" + str(track_index)
-                    self._send_sys_ex_message(delete_clips, 0x05)
+            # send different tracks out
+            if clips_difference != []:
+                for track_index in clips_difference:
+                    if int(track_index) < len(track_clips):
+                        string_prefix = str(track_index) + "%"
+                        track_string = string_prefix + str(track_clips[track_index])
+                        self._send_sys_ex_message(track_string, 0x05)
+                    else:
+                        delete_clips = "DEL" + str(track_index)
+                        self._send_sys_ex_message(delete_clips, 0x05)
+        except:
+            # need to stop threading or we get a fatal error.
+            self.periodic_timer = 0
 
     def _on_scale_changed(self):
         song = self.song()
@@ -1055,7 +1063,5 @@ class MicroPush(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
-        if self.periodic_timer is None:
-            self.periodic_timer = threading.Timer(0.3, self._periodic_execution)
-            self.periodic_timer.start()
+        self.periodic_timer = 0
         super(MicroPush, self).disconnect()
