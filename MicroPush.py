@@ -15,6 +15,7 @@ from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
 import time, threading
 import random
+from itertools import zip_longest
 
 
 mixer, transport, session_component = None, None, None
@@ -39,6 +40,7 @@ class MicroPush(ControlSurface):
             # set up undo redo
             self._last_can_redo = song.can_redo
             self._last_can_undo = song.can_undo
+            self.old_clips_array = []
             # self._setup_undo_redo()
             self._initialize_buttons()
             self._update_mixer_and_tracks()
@@ -275,6 +277,7 @@ class MicroPush(ControlSurface):
         if value:
             self.log_message("Connection App to Ableton works!")
             # send all the channel names, colors, current device, undo redo, etc.
+            self.old_clips_array = []
             self._on_tracks_changed()
             self._setup_undo_redo()
             # TODO: do I need to send this?
@@ -746,6 +749,15 @@ class MicroPush(ControlSurface):
     #     # self.log_message("trying to log the playing position")
     #     self._update_clip_slots()
 
+    def find_different_indexes(self, arrays1, arrays2):
+        different_indexes = []
+
+        for index, (array1, array2) in enumerate(zip_longest(arrays1, arrays2)):
+            if array1 != array2:
+                different_indexes.append(index)
+
+        return different_indexes
+
     def _on_clip_playing_status_changed(self):
         # self.log_message("clip playing status changed")
         self._update_clip_slots()
@@ -761,35 +773,49 @@ class MicroPush(ControlSurface):
             # track clip slots
             clip_slots = []
             for clip_slot in track.clip_slots:
-                clip_data = {
-                    'hasClip': clip_slot.has_clip,
-                    'isPlaying': clip_slot.is_playing,
-                    'isRecording': clip_slot.is_recording,
-                    'isTriggered': clip_slot.is_triggered
-                }
-                has_clip_value = 1 if clip_data['hasClip'] else 0
-                is_playing_value = 1 if clip_data['isPlaying'] else 0
-                is_recording_value = 1 if clip_data['isRecording'] else 0
-                is_triggered_value = 1 if clip_data['isTriggered'] else 0
+                clip_value = "0"
+                if clip_slot.is_triggered:
+                    clip_value = "4"
+                elif clip_slot.is_recording:
+                    clip_value = "3"
+                elif clip_slot.is_playing:
+                    clip_value = "2"
+                elif clip_slot.has_clip:
+                    clip_value = "1"
+
                 color_string_value = "0"
-                if has_clip_value == 1:
-                    color_string_value = self._make_color_string(clip_slot.clip.color)
-                # if clip_slot.has_clip:
+
+                if clip_value != "0":
+                    if clip_slot.clip.color is not None:
+                        color_string_value = self._make_color_string(clip_slot.clip.color)
                 #     playing_position = clip_slot.clip.playing_position
                 #     length = clip_slot.clip.length
                 #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
                 # else:
                 #     playing_position = 0.0
                 #     length = 0.0
-                
-                clip_string = "{}{}{}{}:{}".format(has_clip_value, is_playing_value, is_recording_value, is_triggered_value, color_string_value)
+
+                clip_string = "{}:{}".format(clip_value, color_string_value)
                 clip_slots.append(clip_string)
             clip_slots_string = "-".join(clip_slots)
             track_clips.append(clip_slots_string)
-            
-        # send track clips
-        track_clips_string = "/".join(track_clips)
-        # self._send_sys_ex_message(track_clips_string, 0x05)
+
+        # compare old track clips with new
+        clips_difference = self.find_different_indexes(track_clips, self.old_clips_array)
+
+        # safe new values
+        self.old_clips_array = track_clips
+
+        # send different tracks out
+        if clips_difference != []:
+            for track_index in clips_difference:
+                if int(track_index) < len(track_clips):
+                    string_prefix = str(track_index) + "%"
+                    track_string = string_prefix + str(track_clips[track_index])
+                    self._send_sys_ex_message(track_string, 0x05)
+                else:
+                    delete_clips = "DEL" + str(track_index)
+                    self._send_sys_ex_message(delete_clips, 0x05)
 
     def _on_scale_changed(self):
         song = self.song()
