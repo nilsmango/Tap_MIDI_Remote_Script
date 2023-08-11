@@ -991,10 +991,10 @@ class MicroPush(ControlSurface):
                         if rand_instrument.is_device:
                             found_instrument = True
                         else:
-                            # open folder
+                            # open folder (Drum Synth)
                             children = rand_instrument.children
                             rand_index = random.randint(0, len(children) - 1)
-                            rand_instrument = rand_instrument[rand_index]
+                            rand_instrument = children[rand_index]
                             found_instrument = True
 
                 browser.load_item(rand_instrument)
