@@ -519,6 +519,10 @@ class MicroPush(ControlSurface):
         blue = color & 255
         color_string = "({},{},{})".format(red, green, blue)
         return color_string
+    
+    def _on_color_name_changed(self):
+        self._update_mixer_and_tracks()
+        self._on_selected_track_changed()
 
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
@@ -550,6 +554,13 @@ class MicroPush(ControlSurface):
                     track.add_output_meter_left_listener(lambda index=index: self._on_output_level_changed(index))
                 if not track.output_meter_right_has_listener(self._on_output_level_changed(index)):
                     track.add_output_meter_right_listener(lambda index=index: self._on_output_level_changed(index))
+
+            # other listeners
+            if not track.color_has_listener(self._on_color_name_changed):
+                track.add_color_listener(self._on_color_name_changed)
+
+            if not track.name_has_listener(self._on_color_name_changed):
+                track.add_name_listener(self._on_color_name_changed)
 
         # send track names
         track_names_string = ",".join(track_names)
