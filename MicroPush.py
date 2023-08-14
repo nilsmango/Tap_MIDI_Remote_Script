@@ -182,7 +182,7 @@ class MicroPush(ControlSurface):
                 end_index = start_index + max_chunk_length
                 prefix = "$"
                 if chunk_index == num_of_chunks - 1:
-                    prefix = "%"
+                    prefix = "_"
                 chunk_data = prefix.encode('ascii') + data[start_index:end_index]
 
                 sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte, )
