@@ -23,6 +23,7 @@ quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
 
+
 class MicroPush(ControlSurface):
 
     def __init__(self, c_instance):
@@ -31,6 +32,8 @@ class MicroPush(ControlSurface):
             global mixer
             global transport
             global session_component
+            self.mixer_status = False
+            self.mixer_reset = True
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
             mixer = MixerComponent(track_count, return_count)
@@ -272,6 +275,9 @@ class MicroPush(ControlSurface):
         # delete return track
         delete_return_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 23)
         delete_return_track_button.add_value_listener(self._delete_return_track)
+        # mixer view status
+        mixer_view_status = ButtonElement(1, MIDI_NOTE_TYPE, 15, 90)
+        mixer_view_status.add_value_listener(self._update_mixer_status)
 
     def _connection_established(self, value):
         if value:
@@ -680,35 +686,57 @@ class MicroPush(ControlSurface):
 
     def _on_output_level_changed(self, index):
         # self.log_message("output level sending: {}".format(index))
-        song = self.song()
-        tracks = song.tracks
-        return_tracks = song.return_tracks
-        if index < len(tracks):
-            track = tracks[index]
-        elif index - len(tracks) < len(return_tracks):
-            track = return_tracks[index - len(tracks)]
-        else:
-            track = song.master_track
+        if self.mixer_status:
+            if not self.mixer_reset:
+                self.mixer_reset = True
+            song = self.song()
+            tracks = song.tracks
+            return_tracks = song.return_tracks
+            if index < len(tracks):
+                track = tracks[index]
+            elif index - len(tracks) < len(return_tracks):
+                track = return_tracks[index - len(tracks)]
+            else:
+                track = song.master_track
 
-        if track.has_audio_output:
-            left_channel = track.output_meter_left
-            right_channel = track.output_meter_right
-        else:
-            left_channel = 0.0
-            right_channel = 0.0
+            if track.has_audio_output:
+                left_channel = track.output_meter_left
+                right_channel = track.output_meter_right
+            else:
+                left_channel = 0.0
+                right_channel = 0.0
 
-        value_left = int(round(left_channel * 100))
-        value_right = int(round(right_channel * 100))
+            value_left = int(round(left_channel * 100))
+            value_right = int(round(right_channel * 100))
 
-        # send midi cc left on channel 9, right on channel 10, cc == index, 
-        # value == Int(left_channel * 100)
+            # send midi cc left on channel 9, right on channel 10, cc == index, 
+            # value == Int(left_channel * 100)
 
-        status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
-        midi_cc_message_left = (status_byte_left, index, value_left)
-        self._send_midi(midi_cc_message_left)
-        status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
-        midi_cc_message_right = (status_byte_right, index, value_right)
-        self._send_midi(midi_cc_message_right)
+            status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
+            midi_cc_message_left = (status_byte_left, index, value_left)
+            self._send_midi(midi_cc_message_left)
+            status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
+            midi_cc_message_right = (status_byte_right, index, value_right)
+            self._send_midi(midi_cc_message_right)
+
+        elif self.mixer_reset:
+            self.mixer_reset = False
+
+            song = self.song()
+            tracks = song.tracks
+            return_tracks = song.return_tracks
+            value = 0
+            total_track_number = len(tracks) + len(return_tracks) + 1
+
+            for index in range(total_track_number):
+                status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
+                midi_cc_message_left = (status_byte_left, index, value)
+                self._send_midi(midi_cc_message_left)
+                status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
+                midi_cc_message_right = (status_byte_right, index, value)
+                self._send_midi(midi_cc_message_right)
+
+
 
     # clipSlots
     def _register_clip_listeners(self):
@@ -970,6 +998,12 @@ class MicroPush(ControlSurface):
     def _add_return_track(self, value):
         if value:
             self.song().create_return_track()
+
+    def _update_mixer_status(self, value):
+        if value:
+            self.mixer_status = True
+        else:
+            self.mixer_status = False
 
     def _delete_return_track(self, value):
         song = self.song()
