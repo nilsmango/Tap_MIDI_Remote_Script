@@ -36,6 +36,13 @@ class MicroPush(ControlSurface):
             self.mixer_reset = True
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
+            max_clip_slots = 128  # Adjust this number based on your needs
+            self.playing_position_listeners = [None] * max_clip_slots
+            self.current_clip_notes = []
+            self.current_clip = None
+            self.last_raw_notes = None
+            self.currently_playing_notes = [False] * 128
+            self.last_playing_position = 0.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -279,6 +286,20 @@ class MicroPush(ControlSurface):
         mixer_view_status = ButtonElement(1, MIDI_NOTE_TYPE, 15, 90)
         mixer_view_status.add_value_listener(self._update_mixer_status)
 
+    def send_note_on(self, note_number, channel, velocity):
+        channel_byte = channel & 0x7F
+        note_byte = note_number & 0x7F
+        velocity_byte = velocity & 0x7F
+        midi_note_on_message = (0x90 | channel_byte, note_byte, velocity_byte)
+        self._send_midi(midi_note_on_message)
+
+    def send_note_off(self, note_number, channel, velocity):
+        channel_byte = channel & 0x7F
+        note_byte = note_number & 0x7F
+        velocity_byte = velocity & 0x7F
+        midi_note_off_message = (0x80 | channel_byte, note_byte, velocity_byte)
+        self._send_midi(midi_note_off_message)
+
     def _connection_established(self, value):
         if value:
             self.log_message("Connection App to Ableton works!")
@@ -443,6 +464,7 @@ class MicroPush(ControlSurface):
         if selected_track and selected_track.has_midi_input:
             self._set_selected_track_implicit_arm()
             track_has_midi_input = 1
+        self._set_up_notes_playing(selected_track)
         # update device thing when we have no device on the selected track
         # TODO: check if wee need this!
         if selected_track.has_midi_output or not selected_track.has_midi_input:
@@ -460,6 +482,105 @@ class MicroPush(ControlSurface):
         if device_to_select is not None:
             self.song().view.select_device(device_to_select)
         self._device_component.set_device(device_to_select)
+
+    def _set_up_notes_playing(self, selected_track):
+        # remove old clip playing position listeners
+        for track in self.song().tracks:
+            if track != selected_track:
+                for (clip_index, clip_slot) in enumerate(track.clip_slots):
+                    if clip_slot is not None and clip_slot.has_clip:
+                        if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
+                            # self.log_message("removing pos listener: {}".format(clip_index))
+                            clip_slot.clip.remove_playing_position_listener(self.playing_position_listeners[clip_index])
+
+        if selected_track.has_midi_input:
+            for (clip_index, clip_slot) in enumerate(selected_track.clip_slots):
+                if clip_slot is not None and clip_slot.has_clip:
+                    if not clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
+                        # self.log_message("adding pos listener: {}".format(clip_index))
+                        listener = lambda index=clip_index: self._clip_pos_changed(index)
+                        self.playing_position_listeners[clip_index] = listener
+                        clip_slot.clip.add_playing_position_listener(listener)
+
+    def _clip_pos_changed(self, clip_index):
+        # TODO: only check something if we are in device mode
+        selected_track = self.song().view.selected_track
+        if clip_index < len(selected_track.clip_slots):
+            clip_slot = selected_track.clip_slots[clip_index]
+
+            if clip_slot is not None and clip_slot.has_clip:
+                clip_playing = clip_slot.clip
+
+                start_time = clip_playing.start_marker
+                time_span = clip_playing.length
+
+                # Get all the notes in the clip
+                current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
+
+                # if the current clip has different notes save the new notes.
+                if current_raw_notes != self.last_raw_notes:
+                    self.last_raw_notes = current_raw_notes
+
+                    # Reset the current clip notes array
+                    self.current_clip_notes = []
+                    # add all the notes to the array
+                    for midi_note in current_raw_notes:
+                        pitch = midi_note.pitch
+                        duration = midi_note.duration
+                        start_time = midi_note.start_time
+                        # Process note properties as needed
+                        self.log_message("Note: Pitch {}, Start Time {}, Duration {}".format(pitch, start_time, duration))
+                        end_time = start_time + duration
+                        self.current_clip_notes.append([pitch, start_time, end_time])
+
+                # check which notes are playing at position
+                # if we detect changes send them out to app
+                clip_position = clip_playing.playing_position
+
+                # making sure we have the right starting position
+                if self.last_playing_position > clip_position:
+                    loop_start = clip_playing.loop_start
+                    if clip_position >= loop_start:
+                        self.last_playing_position = loop_start
+                    else:
+                        self.last_playing_position = clip_playing.start_marker
+
+                # check if currently playing notes are still playing in this playing position
+                for (note_index, is_playing) in enumerate(self.currently_playing_notes):
+                    if is_playing:
+                        # Initialize a flag to indicate if a playing note was found
+                        found_playing_note = False
+
+                        # Find the notes that stopped playing in since the last update
+                        for note in self.current_clip_notes:
+                            pitch, start_time, end_time = note
+
+                            if start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
+                                # Note is still playing
+                                found_playing_note = True
+                                break
+
+                        # If no playing note was found, update the state
+                        if not found_playing_note:
+                            self.currently_playing_notes[note_index] = False
+                            # send note off for note_index note.
+                            # self.log_message("Note off: {}".format(note_index))
+                            self.send_note_off(note_index, 0, 100)
+
+                # check current clip notes array which notes are on for that playing position
+                for note in self.current_clip_notes:
+                    pitch, start_time, end_time = note
+                    if self.last_playing_position <= start_time <= clip_position:
+                        # note starts playing
+                        self.currently_playing_notes[pitch] = True
+                        # send midi note on
+                        # self.log_message("Note on: {}".format(pitch))
+                        self.send_note_on(pitch, 0, 100)
+                # update last playing position
+                self.last_playing_position = clip_position
+
+            # else:
+                # self.log_message("No valid clip in the slot.")
 
     def _send_selected_track_index(self, selected_track):
         track_list = self.song().tracks
@@ -810,6 +931,7 @@ class MicroPush(ControlSurface):
     def _on_clip_has_clip_changed(self):
         # self.log_message("has clip status changed")
         self._update_clip_slots()
+        self._set_up_notes_playing(self.song().view.selected_track)
 
     def _update_clip_slots(self):
         try:
