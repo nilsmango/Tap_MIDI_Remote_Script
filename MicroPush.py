@@ -484,14 +484,17 @@ class MicroPush(ControlSurface):
         self._device_component.set_device(device_to_select)
 
     def _set_up_notes_playing(self, selected_track):
-        # remove old clip playing position listeners
-        for track in self.song().tracks:
-            if track != selected_track:
-                for (clip_index, clip_slot) in enumerate(track.clip_slots):
-                    if clip_slot is not None and clip_slot.has_clip:
-                        if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
-                            # self.log_message("removing pos listener: {}".format(clip_index))
-                            clip_slot.clip.remove_playing_position_listener(self.playing_position_listeners[clip_index])
+        if selected_track != "clip":
+            # remove old clip playing position listeners
+            for track in self.song().tracks:
+                if track != selected_track:
+                    for (clip_index, clip_slot) in enumerate(track.clip_slots):
+                        if clip_slot is not None and clip_slot.has_clip:
+                            if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
+                                # self.log_message("removing pos listener: {}".format(clip_index))
+                                clip_slot.clip.remove_playing_position_listener(self.playing_position_listeners[clip_index])
+        else:
+            selected_track = self.song().view.selected_track
 
         if selected_track.has_midi_input:
             for (clip_index, clip_slot) in enumerate(selected_track.clip_slots):
@@ -931,7 +934,7 @@ class MicroPush(ControlSurface):
     def _on_clip_has_clip_changed(self):
         # self.log_message("has clip status changed")
         self._update_clip_slots()
-        self._set_up_notes_playing(self.song().view.selected_track)
+        self._set_up_notes_playing("clip")
 
     def _update_clip_slots(self):
         try:
