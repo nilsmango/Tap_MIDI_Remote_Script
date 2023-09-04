@@ -655,7 +655,7 @@ class MicroPush(ControlSurface):
         blue = color & 255
         color_string = "({},{},{})".format(red, green, blue)
         return color_string
-    
+
     def _on_color_name_changed(self):
         self._update_mixer_and_tracks()
         self._on_selected_track_changed()
@@ -1050,8 +1050,8 @@ class MicroPush(ControlSurface):
                 clip_slot.stop()
             else:
                 clip_slot.set_fire_button_state(1)
-        # else:
-            # create new clip
+        else:
+            clip_slot.set_fire_button_state(1)
 
     def _delete_clip(self, track_index, clip_index):
         track = self.song().tracks[track_index]
