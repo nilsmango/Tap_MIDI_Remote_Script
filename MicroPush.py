@@ -48,11 +48,9 @@ class MicroPush(ControlSurface):
             transport = TransportComponent()
             session_component = SessionComponent()
             song = self.song()
-            # set up undo redo
-            self._last_can_redo = song.can_redo
-            self._last_can_undo = song.can_undo
+
             self.old_clips_array = []
-            # self._setup_undo_redo()
+
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
@@ -67,7 +65,6 @@ class MicroPush(ControlSurface):
             song.add_root_note_listener(self._on_scale_changed)
             self._setup_device_control()
             self._register_clip_listeners()
-            self.first_periodic_check = True
             self.periodic_timer = 1
             self._periodic_execution()
 
@@ -311,21 +308,10 @@ class MicroPush(ControlSurface):
             self.periodic_timer = 1
             self.old_clips_array = []
             self._on_tracks_changed()
-            self._setup_undo_redo()
             # TODO: do I need to send this?
             self._send_selected_track_index(self.song().view.selected_track)
             # send midi note on channel 3, note number 1 to confirm handshake
             midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
-            self._send_midi(midi_event_bytes)
-
-    def _setup_undo_redo(self):
-        can_redo = self.song().can_redo
-        can_undo = self.song().can_undo
-        if can_redo:
-            midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
-            self._send_midi(midi_event_bytes)
-        if can_undo:
-            midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
             self._send_midi(midi_event_bytes)
 
     def _periodic_execution(self):
@@ -336,33 +322,6 @@ class MicroPush(ControlSurface):
     def _periodic_check(self):
         # update clip slots
         self._update_clip_slots()
-        # check if redo undo changed
-        try:
-            can_redo = self.song().can_redo
-            can_undo = self.song().can_undo
-            if can_redo != self._last_can_redo or self.first_periodic_check:
-                self._last_can_redo = can_redo
-                if can_redo:
-                    midi_event_bytes = (0x90 | 0x02, 0x02, 0x64)
-                    self._send_midi(midi_event_bytes)
-                else:
-                    midi_event_bytes = (0x80 | 0x02, 0x02, 0x64)
-                    self._send_midi(midi_event_bytes)
-
-            if can_undo != self._last_can_undo or self.first_periodic_check:
-                self._last_can_undo = can_undo
-                if can_undo:
-                    midi_event_bytes = (0x90 | 0x02, 0x00, 0x64)
-                    self._send_midi(midi_event_bytes)
-                else:
-                    midi_event_bytes = (0x80 | 0x02, 0x00, 0x64)
-                    self._send_midi(midi_event_bytes)
-            # TODO: clean this whole thing up, never works I think and the next line is for what?
-            self.first_periodic_check = False
-
-        except:
-            # self.periodic_timer = 0
-            pass
 
     def _redo_button_value(self, value):
         if value != 0:
