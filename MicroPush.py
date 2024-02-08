@@ -831,8 +831,6 @@ class MicroPush(ControlSurface):
                 midi_cc_message_right = (status_byte_right, index, value)
                 self._send_midi(midi_cc_message_right)
 
-
-
     # clipSlots
     def _register_clip_listeners(self):
         for track in self.song().tracks:
@@ -991,6 +989,11 @@ class MicroPush(ControlSurface):
             values = self.decode_sys_ex_scale_root(message)
             if len(values) == 2:
                 self._set_scale_root_note(values[0], values[1])
+        # duplicate loop
+        if len(message) >= 2 and message[1] == 13:
+            values = self.extract_values_from_sysex_message(message)
+            if len(values) == 2:
+                self._duplicate_loop(values[0], values[1])
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
@@ -1022,6 +1025,12 @@ class MicroPush(ControlSurface):
         track = self.song().tracks[track_index]
         clip_slot = track.clip_slots[clip_index]
         clip_slot.delete_clip()
+
+    def _duplicate_loop(self, track_index, clip_index):
+        track = self.song().tracks[track_index]
+        clip_slot = track.clip_slots[clip_index]
+        if clip_slot.has_clip:
+            clip_slot.clip.duplicate_loop()
 
     def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
         tracks = self.song().tracks
