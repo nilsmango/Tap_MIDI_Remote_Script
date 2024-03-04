@@ -1,4 +1,4 @@
-# MicroPush
+# project7IIITap
 
 from __future__ import with_statement
 import Live
@@ -24,7 +24,7 @@ quantize_strength_value = 1.0
 swing_amount_value = 0.0
 
 
-class MicroPush(ControlSurface):
+class project7IIITap(ControlSurface):
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
@@ -1109,7 +1109,7 @@ class MicroPush(ControlSurface):
             self.mixer_status = True
         else:
             self.mixer_status = False
-    
+
     def _update_device_status(self, value):
         if value:
             self.device_status = True
@@ -1231,4 +1231,4 @@ class MicroPush(ControlSurface):
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
         self.periodic_timer = 0
-        super(MicroPush, self).disconnect()
+        super(project7IIITap, self).disconnect()
