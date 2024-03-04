@@ -1,4 +1,4 @@
-# project7IIITap
+# 7III Tap
 
 from __future__ import with_statement
 import Live
@@ -24,7 +24,7 @@ quantize_strength_value = 1.0
 swing_amount_value = 0.0
 
 
-class project7IIITap(ControlSurface):
+class Tap(ControlSurface):
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
@@ -1231,4 +1231,4 @@ class project7IIITap(ControlSurface):
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
         self.periodic_timer = 0
-        super(project7IIITap, self).disconnect()
+        super(Tap, self).disconnect()
