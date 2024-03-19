@@ -56,6 +56,8 @@ class Tap(ControlSurface):
             self._set_selected_track_implicit_arm()
             self._send_selected_track_index(song.view.selected_track)
             self._on_selected_track_changed.subject = song.view
+            # updating scale
+            self._on_scale_changed()
 
             # track = self.song().view.selected_track
             # track.view.add_selected_device_listener(self._on_selected_device_changed)
