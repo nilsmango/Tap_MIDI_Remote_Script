@@ -13,7 +13,8 @@ from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, 
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 
-import time, threading
+import time
+import threading
 import random
 from itertools import zip_longest
 
@@ -203,19 +204,19 @@ class Tap(ControlSurface):
         transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
         session_component.set_stop_all_clips_button(ButtonElement(1, MIDI_NOTE_TYPE, 15, 96))
-        capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
-        capture_button.add_value_listener(self._capture_button_value)
-        quantize_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 99)
-        quantize_button.add_value_listener(self._quantize_button_value)
+        self.capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
+        self.capture_button.add_value_listener(self._capture_button_value)
+        self.quantize_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 99)
+        self.quantize_button.add_value_listener(self._quantize_button_value)
         # duplicate the active clip to a free slot
-        duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
-        duplicate_button.add_value_listener(self._duplicate_button_value)
+        self.duplicate_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 98)
+        self.duplicate_button.add_value_listener(self._duplicate_button_value)
         # duplicate scene
-        duplicate_scene_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 95)
-        duplicate_scene_button.add_value_listener(self._duplicate_scene_button_value)
+        self.duplicate_scene_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 95)
+        self.duplicate_scene_button.add_value_listener(self._duplicate_scene_button_value)
         # a session recording button
-        sesh_record_button = ButtonElement(1, MIDI_CC_TYPE, 0, 119)
-        sesh_record_button.add_value_listener(self._sesh_record_value)
+        self.sesh_record_button = ButtonElement(1, MIDI_CC_TYPE, 0, 119)
+        self.sesh_record_button.add_value_listener(self._sesh_record_value)
         # quantize grid size button
         quantize_grid_button = ButtonElement(1, MIDI_CC_TYPE, 1, 0)
         quantize_grid_button.add_value_listener(self._quantize_grid_value)
@@ -229,11 +230,11 @@ class Tap(ControlSurface):
         # periodic_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 97)
         # periodic_check_button.add_value_listener(self._periodic_check)
         # redo button
-        redo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 102)
-        redo_button.add_value_listener(self._redo_button_value)
+        self.redo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 102)
+        self.redo_button.add_value_listener(self._redo_button_value)
         # undo button
-        undo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 101)
-        undo_button.add_value_listener(self._undo_button_value)
+        self.undo_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 101)
+        self.undo_button.add_value_listener(self._undo_button_value)
         # device selection
         device_selection_button = ButtonElement(1, MIDI_CC_TYPE, 1, 3)
         device_selection_button.add_value_listener(self._select_device_by_index)
@@ -486,75 +487,77 @@ class Tap(ControlSurface):
 
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
-
+                    
                     start_time = clip_playing.start_marker
                     time_span = clip_playing.length
 
-                    # Get all the notes in the clip
-                    current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
+                    try:
+                        # Get all the notes in the clip
+                        current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
 
-                    # if the current clip has different notes save the new notes.
-                    if current_raw_notes != self.last_raw_notes:
-                        self.last_raw_notes = current_raw_notes
+                        # if the current clip has different notes save the new notes.
+                        if current_raw_notes != self.last_raw_notes:
+                            self.last_raw_notes = current_raw_notes
 
-                        # Reset the current clip notes array
-                        self.current_clip_notes = []
-                        # add all the notes to the array
-                        for midi_note in current_raw_notes:
-                            pitch = midi_note.pitch
-                            duration = midi_note.duration
-                            start_time = midi_note.start_time
-                            # Process note properties as needed
-                            # self.log_message("Note: Pitch {}, Start Time {}, Duration {}".format(pitch, start_time, duration))
-                            end_time = start_time + duration
-                            self.current_clip_notes.append([pitch, start_time, end_time])
+                            # Reset the current clip notes array
+                            self.current_clip_notes = []
+                            # add all the notes to the array
+                            for midi_note in current_raw_notes:
+                                pitch = midi_note.pitch
+                                duration = midi_note.duration
+                                start_time = midi_note.start_time
+                                # Process note properties as needed
+                                # self.log_message("Note: Pitch {}, Start Time {}, Duration {}".format(pitch, start_time, duration))
+                                end_time = start_time + duration
+                                self.current_clip_notes.append([pitch, start_time, end_time])
 
-                    # check which notes are playing at position
-                    # if we detect changes send them out to app
-                    clip_position = clip_playing.playing_position
+                        # check which notes are playing at position
+                        # if we detect changes send them out to app
+                        clip_position = clip_playing.playing_position
 
-                    # making sure we have the right starting position
-                    if self.last_playing_position > clip_position:
-                        loop_start = clip_playing.loop_start
-                        if clip_position >= loop_start:
-                            self.last_playing_position = loop_start
-                        else:
-                            self.last_playing_position = clip_playing.start_marker
+                        # making sure we have the right starting position
+                        if self.last_playing_position > clip_position:
+                            loop_start = clip_playing.loop_start
+                            if clip_position >= loop_start:
+                                self.last_playing_position = loop_start
+                            else:
+                                self.last_playing_position = clip_playing.start_marker
 
-                    # check if currently playing notes are still playing in this playing position
-                    for (note_index, is_playing) in enumerate(self.currently_playing_notes):
-                        if is_playing:
-                            # Initialize a flag to indicate if a playing note was found
-                            found_playing_note = False
+                        # check if currently playing notes are still playing in this playing position
+                        for (note_index, is_playing) in enumerate(self.currently_playing_notes):
+                            if is_playing:
+                                # Initialize a flag to indicate if a playing note was found
+                                found_playing_note = False
 
-                            # Find the notes that stopped playing in since the last update
-                            for note in self.current_clip_notes:
-                                pitch, start_time, end_time = note
+                                # Find the notes that stopped playing in since the last update
+                                for note in self.current_clip_notes:
+                                    pitch, start_time, end_time = note
 
-                                if start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
-                                    # Note is still playing
-                                    found_playing_note = True
-                                    break
+                                    if start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
+                                        # Note is still playing
+                                        found_playing_note = True
+                                        break
 
-                            # If no playing note was found, update the state
-                            if not found_playing_note:
-                                self.currently_playing_notes[note_index] = False
-                                # send note off for note_index note.
-                                # self.log_message("Note off: {}".format(note_index))
-                                self.send_note_off(note_index, 0, 100)
+                                # If no playing note was found, update the state
+                                if not found_playing_note:
+                                    self.currently_playing_notes[note_index] = False
+                                    # send note off for note_index note.
+                                    # self.log_message("Note off: {}".format(note_index))
+                                    self.send_note_off(note_index, 0, 100)
 
-                    # check current clip notes array which notes are on for that playing position
-                    for note in self.current_clip_notes:
-                        pitch, start_time, end_time = note
-                        if self.last_playing_position <= start_time <= clip_position:
-                            # note starts playing
-                            self.currently_playing_notes[pitch] = True
-                            # send midi note on
-                            # self.log_message("Note on: {}".format(pitch))
-                            self.send_note_on(pitch, 0, 100)
-                    # update last playing position
-                    self.last_playing_position = clip_position
-
+                        # check current clip notes array which notes are on for that playing position
+                        for note in self.current_clip_notes:
+                            pitch, start_time, end_time = note
+                            if self.last_playing_position <= start_time <= clip_position:
+                                # note starts playing
+                                self.currently_playing_notes[pitch] = True
+                                # send midi note on
+                                # self.log_message("Note on: {}".format(pitch))
+                                self.send_note_on(pitch, 0, 100)
+                        # update last playing position
+                        self.last_playing_position = clip_position
+                    except:
+                        pass
                 # else:
                     # self.log_message("No valid clip in the slot.")
 
@@ -1216,19 +1219,19 @@ class Tap(ControlSurface):
             browser.load_item(selected_effect)
 
     def disconnect(self):
-        capture_button.remove_value_listener(self._capture_button_value)
-        quantize_button.remove_value_listener(self._quantize_button_value)
-        duplicate_button.remove_value_listener(self._duplicate_button_value)
-        duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
-        sesh_record_button.remove_value_listener(self._sesh_record_value)
-        redo_button.remove_value_listener(self._redo_button_value)
-        undo_button.remove_value_listener(self._undo_button_value)
+        self.capture_button.remove_value_listener(self._capture_button_value)
+        self.quantize_button.remove_value_listener(self._quantize_button_value)
+        self.duplicate_button.remove_value_listener(self._duplicate_button_value)
+        self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
+        self.sesh_record_button.remove_value_listener(self._sesh_record_value)
+        self.redo_button.remove_value_listener(self._redo_button_value)
+        self.undo_button.remove_value_listener(self._undo_button_value)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
-        self._unregister_clip_and_audio_listeners()
-        self.remove_midi_listener(self._midi_listener)
+        # self._unregister_clip_and_audio_listeners()
+        # self.remove_midi_listener(self._midi_listener)
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
