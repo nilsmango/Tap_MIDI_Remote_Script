@@ -1194,38 +1194,48 @@ class Tap(ControlSurface):
     def _add_random_effect(self, value):
         if value:
             browser = self.application().browser
-            random_index = random.randint(0, 1)
-            if random_index == 0:
-                max_effects = browser.max_for_live.children[0].children
-                max_number = len(max_effects)
+            # Tried loading max for live effects but gave up
+            # random_index = random.randint(0, 1)
+            # if random_index == 0:
+            #     max_effects = browser.max_for_live.children
+            #     max_number = len(max_effects)
+            #     random_max = random.randint(0, max_number - 1)
+            #     selected_folder = max_effects[random_max].children
+            #     max_number = len(selected_folder)
+            #     finished = False
+            #     number_of_tries = 0
+            #     if max_number == 0:
+            #         selected_effect = selected_folder
+            #         finished = True
+            #     while not finished and number_of_tries < 10:
+            #         random_max = random.randint(0, max_number - 1)
+            #         selected_effect = selected_folder[random_max]
+            #         number_of_tries += 1
+            #         self.log_message("Selected Device: {}".format(selected_effect.name))
+            #         if not any(selected_effect.name.lower().startswith(substring.lower()) for substring in ["IR", "Api", "Map8", "Max Audio Effect"]):
+            #             finished = True
+
+            # else:
+            effects = browser.audio_effects
+            effect_children = effects.children
+            number_of_effects = len(effect_children)
+            # check if effects are in folders or not
+            if number_of_effects >= 10:
+                random_effect_index = random.randint(0, number_of_effects - 1)
+                selected_effect = effect_children[random_effect_index]
+            else:
                 finished = False
                 while not finished:
-                    random_max = random.randint(0, max_number - 1)
-                    selected_effect = max_effects[random_max]
-                    if not any(substring.lower() in selected_effect.name.lower() for substring in ["IR", "Api", "Map8", "Max Audio Effect"]):
+                    random_folder_index = random.randint(0, number_of_effects - 1)
+                    selected_folder = effect_children[random_folder_index]
+                    self.log_message("Selected FOlder: {}".format(selected_folder.name))
+                    if selected_folder.name != "Utilities":
                         finished = True
 
-            else:
-                effects = browser.audio_effects
-                effect_children = effects.children
-                number_of_effects = len(effect_children)
-                # check if effects are in folders or not
-                if number_of_effects >= 10:
-                    random_effect_index = random.randint(0, number_of_effects - 1)
-                    selected_effect = effect_children[random_effect_index]
-                else:
-                    finished = False
-                    while not finished:
-                        random_folder_index = random.randint(0, number_of_effects - 1)
-                        selected_folder = effect_children[random_folder_index]
-                        if selected_folder.name != 'Utilities':
-                            if selected_folder.name != 'Modulators':
-                                finished = True
-
-                    folder_children = selected_folder.children
-                    number_folder_children = len(folder_children)
-                    random_folder_child_index = random.randint(0, number_folder_children - 1)
-                    selected_effect = folder_children[random_folder_child_index]
+                folder_children = selected_folder.children
+                number_folder_children = len(folder_children)
+                random_folder_child_index = random.randint(0, number_folder_children - 1)
+                selected_effect = folder_children[random_folder_child_index]
             browser.load_item(selected_effect)
 
     def disconnect(self):
