@@ -55,7 +55,8 @@ class Tap(ControlSurface):
             self._initialize_buttons()
             self._update_mixer_and_tracks()
             self._set_selected_track_implicit_arm()
-            self._send_selected_track_index(song.view.selected_track)
+            selected_track = song.view.selected_track
+            self._send_selected_track_index(selected_track)
             self._on_selected_track_changed.subject = song.view
             # updating scale
             self._on_scale_changed()
@@ -604,15 +605,24 @@ class Tap(ControlSurface):
 
     def _set_selected_track_implicit_arm(self):
         selected_track = self.song().view.selected_track
-        if selected_track:
-            selected_track.implicit_arm = True
-        else:
-            self.song().tracks[0].implicit_arm = True
+        if selected_track and selected_track.has_midi_input:
+            try:
+                selected_track.implicit_arm = True
+            except:
+                pass
+        # else:
+        #     try:
+        #         self.song().tracks[0].implicit_arm = True
+        #     except:
+        #         pass
 
     def _set_other_tracks_implicit_arm(self):
         for track in self.song().tracks:
             if track != self.song().view.selected_track:
-                track.implicit_arm = False
+                try:
+                    track.implicit_arm = False
+                except:
+                    pass
 
     def _on_tracks_changed(self):
         self._update_mixer_and_tracks()
@@ -1160,7 +1170,7 @@ class Tap(ControlSurface):
             while not found_drum:
                 random_index = random.randint(0, number_of_drums - 1)
                 random_drum = drums[random_index]
-                if random_drum.name is not "Drum Hits" or "Drum Rack":
+                if random_drum.name not in ["Drum Hits", "Drum Rack"]:
                     found_drum = True
             browser.load_item(random_drum)
             self._on_tracks_changed()
@@ -1192,7 +1202,7 @@ class Tap(ControlSurface):
                 while not finished:
                     random_max = random.randint(0, max_number - 1)
                     selected_effect = max_effects[random_max]
-                    if not any(substring.lower() in selected_effect.name.lower() for substring in ["IR", "Api", "Map8" "Max Audio Effect"]):
+                    if not any(substring.lower() in selected_effect.name.lower() for substring in ["IR", "Api", "Map8", "Max Audio Effect"]):
                         finished = True
 
             else:
