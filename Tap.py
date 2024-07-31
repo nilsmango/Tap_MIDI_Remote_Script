@@ -48,29 +48,12 @@ class Tap(ControlSurface):
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
-            song = self.song()
-
             self.old_clips_array = []
 
-            self._initialize_buttons()
-            self._update_mixer_and_tracks()
-            self._set_selected_track_implicit_arm()
-            selected_track = song.view.selected_track
-            self._send_selected_track_index(selected_track)
-            self._on_selected_track_changed.subject = song.view
-            # updating scale
-            self._on_scale_changed()
-
-            # track = self.song().view.selected_track
-            # track.view.add_selected_device_listener(self._on_selected_device_changed)
-            song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
-            # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
-            song.add_scale_name_listener(self._on_scale_changed)
-            song.add_root_note_listener(self._on_scale_changed)
-            self._setup_device_control()
-            self._register_clip_listeners()
-            self.periodic_timer = 1
-            self._periodic_execution()
+            self.was_initialized = False
+            # connection check button
+            connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
+            connection_check_button.add_value_listener(self._connection_established)
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -254,9 +237,6 @@ class Tap(ControlSurface):
         # scene delete
         scene_delete_button = ButtonElement(1, MIDI_CC_TYPE, 1, 16)
         scene_delete_button.add_value_listener(self._delete_scene)
-        # connection check button
-        connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
-        connection_check_button.add_value_listener(self._connection_established)
         # random device add button
         random_device_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 93)
         random_device_button.add_value_listener(self._add_random_sound)
@@ -323,6 +303,29 @@ class Tap(ControlSurface):
             # send midi note on channel 3, note number 1 to confirm handshake
             midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
             self._send_midi(midi_event_bytes)
+            # initializing everything else
+            if self.was_initialized is False:
+                self.was_initialized = True
+                song = self.song()
+                self._initialize_buttons()
+                self._update_mixer_and_tracks()
+                self._set_selected_track_implicit_arm()
+                selected_track = song.view.selected_track
+                self._send_selected_track_index(selected_track)
+                self._on_selected_track_changed.subject = song.view
+                # updating scale
+                self._on_scale_changed()
+
+                # track = self.song().view.selected_track
+                # track.view.add_selected_device_listener(self._on_selected_device_changed)
+                song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
+                # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
+                song.add_scale_name_listener(self._on_scale_changed)
+                song.add_root_note_listener(self._on_scale_changed)
+                self._setup_device_control()
+                self._register_clip_listeners()
+                self.periodic_timer = 1
+                self._periodic_execution()
 
     def _periodic_execution(self):
         self._periodic_check()
