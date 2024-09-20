@@ -38,7 +38,7 @@ class Tap(ControlSurface):
             self.device_status = True
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
-            max_clip_slots = 128  # Adjust this number based on your needs
+            max_clip_slots = 800  # Adjust this number based on your needs
             self.playing_position_listeners = [None] * max_clip_slots
             self.current_clip_notes = []
             self.current_clip = None
@@ -292,20 +292,17 @@ class Tap(ControlSurface):
         self._send_midi(midi_note_off_message)
 
     def _connection_established(self, value):
-        if value:
-            self.log_message("Connection App to Ableton works!")
-            # send all the channel names, colors, current device, undo redo, etc.
-            self.periodic_timer = 1
-            self.old_clips_array = []
-            self._on_tracks_changed()
-            # TODO: do I need to send this?
-            self._send_selected_track_index(self.song().view.selected_track)
+        if value:            
+            self.log_message("Connection App to Ableton (still) works!")
             # send midi note on channel 3, note number 1 to confirm handshake
             midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
             self._send_midi(midi_event_bytes)
-            # initializing everything else
+            
+            # initializing everything else if this is not just the handshake
             if self.was_initialized is False:
                 self.was_initialized = True
+                self.old_clips_array = []
+                self._on_tracks_changed()
                 song = self.song()
                 self._initialize_buttons()
                 self._update_mixer_and_tracks()
@@ -334,7 +331,9 @@ class Tap(ControlSurface):
 
     def _periodic_check(self):
         # update clip slots
-        self._update_clip_slots()
+        # we only need to update clip slots periodically when we are in clip slots view
+        if self.device_status is False and self.mixer_status is False:
+            self._update_clip_slots()
 
     def _redo_button_value(self, value):
         if value != 0:
@@ -960,11 +959,12 @@ class Tap(ControlSurface):
 
             # compare old track clips with new
             clips_difference = self.find_different_indexes(track_clips, self.old_clips_array)
-
+            
             # safe new values
             self.old_clips_array = track_clips
 
             # send different tracks out
+            # TODO: now this still does send out each track. not sure why. also it should only send out the clip that is changed and not the whole track I would say.
             if clips_difference != []:
                 for track_index in clips_difference:
                     if int(track_index) < len(track_clips):
