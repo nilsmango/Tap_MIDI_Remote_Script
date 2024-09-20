@@ -54,6 +54,9 @@ class Tap(ControlSurface):
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
+            # send project again button
+            send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
+            send_project_button.add_value_listener(self._send_project)
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -324,6 +327,12 @@ class Tap(ControlSurface):
                 self.periodic_timer = 1
                 self._periodic_execution()
 
+    def _send_project(self, value):
+        if value:
+            self.old_clips_array = []
+            self._update_mixer_and_tracks()
+            self._update_clip_slots()
+    
     def _periodic_execution(self):
         self._periodic_check()
         if self.periodic_timer == 1:
