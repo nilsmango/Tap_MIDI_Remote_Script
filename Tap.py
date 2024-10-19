@@ -57,6 +57,9 @@ class Tap(ControlSurface):
             # send project again button
             send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
             send_project_button.add_value_listener(self._send_project)
+            
+            # making a song instance
+            self.song_instance = self.song()
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -315,7 +318,6 @@ class Tap(ControlSurface):
                 self._on_selected_track_changed.subject = song.view
                 # updating scale
                 self._on_scale_changed()
-
                 # track = self.song().view.selected_track
                 # track.view.add_selected_device_listener(self._on_selected_device_changed)
                 song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
@@ -326,6 +328,12 @@ class Tap(ControlSurface):
                 self._register_clip_listeners()
                 self.periodic_timer = 1
                 self._periodic_execution()
+            
+            # hack to get new tracks if we have a new song.
+            current_song = self.song()
+            if current_song != self.song_instance:
+               self._on_tracks_changed()
+               self.song_instance = current_song
 
     def _send_project(self, value):
         if value:
