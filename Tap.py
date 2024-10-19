@@ -443,29 +443,30 @@ class Tap(ControlSurface):
 
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
-        selected_track = self.song().view.selected_track
-        track_has_midi_input = 0
-        if selected_track and selected_track.has_midi_input:
-            self._set_selected_track_implicit_arm()
-            track_has_midi_input = 1
-        self._set_up_notes_playing(selected_track)
-        # update device thing when we have no device on the selected track
-        # TODO: check if wee need this!
-        if selected_track.has_midi_output or not selected_track.has_midi_input:
-            self._on_device_changed()
-        self._set_other_tracks_implicit_arm()
-        # send new index of selected track
-        self._send_selected_track_index(selected_track)
-        self._on_selected_scene_changed()
-        # send sys ex of track midi input status.
-        self._send_sys_ex_message(str(track_has_midi_input), 0x0B)
-        # TODO: this part doesn't seem to work? how can I make this work with master and return?
-        device_to_select = selected_track.view.selected_device
-        if device_to_select is None and len(selected_track.devices) > 0:
-            device_to_select = selected_track.devices[0]
-        if device_to_select is not None:
-            self.song().view.select_device(device_to_select)
-        self._device_component.set_device(device_to_select)
+        if self.was_initialized:
+            selected_track = self.song().view.selected_track
+            track_has_midi_input = 0
+            if selected_track and selected_track.has_midi_input:
+                self._set_selected_track_implicit_arm()
+                track_has_midi_input = 1
+            self._set_up_notes_playing(selected_track)
+            # update device thing when we have no device on the selected track
+            # TODO: check if wee need this!
+            if selected_track.has_midi_output or not selected_track.has_midi_input:
+                self._on_device_changed()
+            self._set_other_tracks_implicit_arm()
+            # send new index of selected track
+            self._send_selected_track_index(selected_track)
+            self._on_selected_scene_changed()
+            # send sys ex of track midi input status.
+            self._send_sys_ex_message(str(track_has_midi_input), 0x0B)
+            # TODO: this part doesn't seem to work? how can I make this work with master and return?
+            device_to_select = selected_track.view.selected_device
+            if device_to_select is None and len(selected_track.devices) > 0:
+                device_to_select = selected_track.devices[0]
+            if device_to_select is not None:
+                self.song().view.select_device(device_to_select)
+            self._device_component.set_device(device_to_select)
 
     def _set_up_notes_playing(self, selected_track):
         if selected_track != "clip":
