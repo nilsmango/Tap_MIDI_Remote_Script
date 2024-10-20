@@ -17,6 +17,7 @@ import time
 import threading
 import random
 from itertools import zip_longest
+import traceback
 
 
 mixer, transport, session_component = None, None, None
@@ -959,9 +960,11 @@ class Tap(ControlSurface):
                         clip_value = "1"
 
                     color_string_value = "0"
-
+                    
+                    # this could also just be made to if value == "1", but does not hurt this way
                     if clip_value != "0":
-                        if clip_slot.clip.color is not None:
+                        # extra test if has clip because group channels don't have a clip but might be triggered etc
+                        if clip_slot.clip and clip_slot.clip.color is not None:
                             color_string_value = self._make_color_string(clip_slot.clip.color)
                     #     playing_position = clip_slot.clip.playing_position
                     #     length = clip_slot.clip.length
