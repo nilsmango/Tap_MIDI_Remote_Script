@@ -674,11 +674,13 @@ class Tap(ControlSurface):
         for index, track in enumerate(self.song().tracks):
             # track names
             track_names.append(track.name)
-            # is audio track
-            if track.has_audio_input:
-                track_is_audio.append("1")
+            # check if it's a group track or a grouped track member
+            if track.is_grouped:
+                track_is_audio.append("3")  # Group Member
+            elif track.has_audio_input:
+                track_is_audio.append("1")  # Regular Audio Track
             else:
-                track_is_audio.append("0")
+                track_is_audio.append("0")  # Non-Audio Track
             # track colors
             color_string = self._make_color_string(track.color)
             track_colors.append(color_string)
