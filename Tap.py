@@ -676,12 +676,18 @@ class Tap(ControlSurface):
             # track names
             track_names.append(track.name)
             # check if it's a group track or a grouped track member
-            if track.is_grouped:
-                track_is_audio.append("3")  # Group Member
+            # TODO: - we would actually also need a number string for grouped groups, where a track is a group slot but also grouped.
+            if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
+                track_is_audio.append("2")  # Group Track
+            elif track.is_grouped:
+                if track.has_audio_input:
+                    track_is_audio.append("4") # Grouped Audio Track
+                else:
+                    track_is_audio.append("3")  # Grouped MIDI Track
             elif track.has_audio_input:
                 track_is_audio.append("1")  # Regular Audio Track
             else:
-                track_is_audio.append("0")  # Non-Audio Track
+                track_is_audio.append("0")  # Regular MIDI Track
             # track colors
             color_string = self._make_color_string(track.color)
             track_colors.append(color_string)
