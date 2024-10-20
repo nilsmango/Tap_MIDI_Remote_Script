@@ -17,7 +17,6 @@ import time
 import threading
 import random
 from itertools import zip_longest
-import traceback
 
 
 mixer, transport, session_component = None, None, None
