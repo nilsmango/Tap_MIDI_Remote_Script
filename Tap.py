@@ -578,6 +578,7 @@ class Tap(ControlSurface):
                         # update last playing position
                         self.last_playing_position = clip_position
                     except:
+                        self.log_message("Exception for clip position changed")
                         pass
                 # else:
                     # self.log_message("No valid clip in the slot.")
@@ -999,6 +1000,8 @@ class Tap(ControlSurface):
         except:
             # need to stop threading or we get a fatal error.
             # self.periodic_timer = 0
+            self.log_message("Exception for Update Clip Slots")
+
             pass
 
     def _on_scale_changed(self):
