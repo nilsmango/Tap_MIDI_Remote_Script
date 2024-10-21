@@ -1,4 +1,4 @@
-# 7III Tap
+# 7III Tap 1.0.2
 
 from __future__ import with_statement
 import Live
