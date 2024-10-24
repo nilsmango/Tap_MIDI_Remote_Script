@@ -511,11 +511,14 @@ class Tap(ControlSurface):
                     
                     start_time = clip_playing.start_marker
                     time_span = clip_playing.length
+                    loop_start = clip_playing.loop_start
 
                     try:
                         # Get all the notes in the clip
-                        current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
-
+                        if start_time <= loop_start:
+                            current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
+                        else:
+                            current_raw_notes = clip_playing.get_notes_extended(0, 128, loop_start, time_span)
                         # if the current clip has different notes save the new notes.
                         if current_raw_notes != self.last_raw_notes:
                             self.last_raw_notes = current_raw_notes
@@ -526,19 +529,18 @@ class Tap(ControlSurface):
                             for midi_note in current_raw_notes:
                                 pitch = midi_note.pitch
                                 duration = midi_note.duration
-                                start_time = midi_note.start_time
+                                note_start_time = midi_note.start_time
                                 # Process note properties as needed
                                 # self.log_message("Note: Pitch {}, Start Time {}, Duration {}".format(pitch, start_time, duration))
-                                end_time = start_time + duration
-                                self.current_clip_notes.append([pitch, start_time, end_time])
+                                end_time = note_start_time + duration
+                                self.current_clip_notes.append([pitch, note_start_time, end_time])
 
                         # check which notes are playing at position
                         # if we detect changes send them out to app
                         clip_position = clip_playing.playing_position
 
-                        # making sure we have the right starting position
+                        # making sure we have the right starting position, when jumping back to the start of clip or loop
                         if self.last_playing_position > clip_position:
-                            loop_start = clip_playing.loop_start
                             if clip_position >= loop_start:
                                 self.last_playing_position = loop_start
                             else:
@@ -552,9 +554,9 @@ class Tap(ControlSurface):
 
                                 # Find the notes that stopped playing in since the last update
                                 for note in self.current_clip_notes:
-                                    pitch, start_time, end_time = note
+                                    pitch, note_start_time, end_time = note
 
-                                    if start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
+                                    if note_start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
                                         # Note is still playing
                                         found_playing_note = True
                                         break
@@ -568,8 +570,8 @@ class Tap(ControlSurface):
 
                         # check current clip notes array which notes are on for that playing position
                         for note in self.current_clip_notes:
-                            pitch, start_time, end_time = note
-                            if self.last_playing_position <= start_time <= clip_position:
+                            pitch, note_start_time, end_time = note
+                            if self.last_playing_position <= note_start_time <= clip_position:
                                 # note starts playing
                                 self.currently_playing_notes[pitch] = True
                                 # send midi note on
