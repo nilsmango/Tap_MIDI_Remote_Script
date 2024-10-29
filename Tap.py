@@ -36,12 +36,13 @@ class Tap(ControlSurface):
             self.mixer_status = False
             self.mixer_reset = True
             self.device_status = True
+            self.seq_status = False
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
             max_clip_slots = 800  # Adjust this number based on your needs
             self.playing_position_listeners = [None] * max_clip_slots
             self.current_clip_notes = []
-            self.current_clip = None
+            self.last_selected_clip_slot = None
             self.last_raw_notes = None
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
@@ -282,6 +283,9 @@ class Tap(ControlSurface):
         # device view status
         device_view_status = ButtonElement(1, MIDI_NOTE_TYPE, 15, 89)
         device_view_status.add_value_listener(self._update_device_status)
+        # step seq status
+        step_seq_status = ButtonElement(1, MIDI_NOTE_TYPE, 15, 87)
+        step_seq_status.add_value_listener(self._update_step_seq)
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -480,7 +484,7 @@ class Tap(ControlSurface):
         if selected_track != "clip":
             # remove old clip playing position listeners
             for track in self.song().tracks:
-                if track != selected_track:
+                if track is not selected_track:
                     for (clip_index, clip_slot) in enumerate(track.clip_slots):
                         if clip_slot is not None and clip_slot.has_clip:
                             if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
@@ -520,7 +524,7 @@ class Tap(ControlSurface):
                         else:
                             current_raw_notes = clip_playing.get_notes_extended(0, 128, loop_start, time_span)
                         # if the current clip has different notes save the new notes.
-                        if current_raw_notes != self.last_raw_notes:
+                        if current_raw_notes is not self.last_raw_notes:
                             self.last_raw_notes = current_raw_notes
 
                             # Reset the current clip notes array
@@ -1122,6 +1126,8 @@ class Tap(ControlSurface):
         scenes_list = self.song().scenes
         new_index = self._find_track_index(selected_scene, scenes_list)
         self._send_selected_clip_slot(new_index)
+        if self.seq_status:
+            self.start_step_seq()
 
     def _send_selected_clip_slot(self, clip_index):
         self._send_sys_ex_message(str(clip_index), 0x10)
@@ -1166,7 +1172,55 @@ class Tap(ControlSurface):
             self.device_status = True
         else:
             self.device_status = False
-
+    
+    def _update_step_seq(self, value):
+        if value:
+            self.seq_status = True
+            self.start_step_seq()
+        else:
+           self.seq_status = False
+           self.stop_step_seq()
+    
+    def start_step_seq(self):
+        # getting the highlighted clip
+        song = self.song()
+        selcted_clip_slot = song.view.highlighted_clip_slot
+        if self.last_selected_clip_slot is not selcted_clip_slot:
+            if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
+                self.last_selected_clip_slot.clip.remove_notes_listener(self.make_and_send_clip(self.last_selected_clip_slot))
+            # updating last selected clip
+            self.last_selected_clip_slot = selcted_clip_slot
+            if selcted_clip_slot is not None and selcted_clip_slot.has_clip:
+                # add notes listener
+                # TODO: - check if this will fire the first time or if we have to call make_and_send_clip
+                selcted_clip_slot.clip.add_notes_listener(self.make_and_send_clip(selcted_clip_slot))
+    
+    def stop_step_seq(self):
+        song = self.song()
+        selected_clip_slot = song.view.highlighted_clip_slot
+        if selected_clip_slot is not None and selected_clip_slot.has_clip:
+            # remove notes listener
+            selected_clip_slot.clip.remove_notes_listener(self.make_and_send_clip(selected_clip_slot))
+            # reseting last selected clip
+            self.last_selected_clip_slot = None
+    
+    def make_and_send_clip(self, value):
+       # TODO: simply log clip to understand how it works
+       self.log_message("make and send clip")
+       # getting the whole clip
+       selected_clip = value.clip
+       clip_length = selected_clip.length
+       start_time = selected_clip.start_time
+       notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
+       start_marker = selected_clip.start_marker
+       loop_start = selected_clip.loop_start
+       loop_end = selected_clip.loop_end
+       signature_denominator = selected_clip.signature_denominator
+       signature_numerator = selected_clip.signature_numerator
+       for note in notes:
+           self.log_message("ID: {}".format(note.note_id))
+           self.log_message("Pitch: {}".format(note.pitch))
+    
     def _delete_return_track(self, value):
         song = self.song()
         song.delete_return_track(value)
@@ -1275,8 +1329,7 @@ class Tap(ControlSurface):
             browser.load_item(selected_effect)
 
     def disconnect(self):
-        self.capture_button.remove_value_listener(self._capture_button_value)
-        self.quantize_button.remove_value_listener(self._quantize_button_value)
+#        self.quantize_button.remove_value_listener(self._quantize_button_value)
         self.duplicate_button.remove_value_listener(self._duplicate_button_value)
         self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
         self.sesh_record_button.remove_value_listener(self._sesh_record_value)
