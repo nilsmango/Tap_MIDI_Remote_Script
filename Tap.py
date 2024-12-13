@@ -1185,43 +1185,84 @@ class Tap(ControlSurface):
     def start_step_seq(self):
         # getting the highlighted clip
         song = self.song()
-        selcted_clip_slot = song.view.highlighted_clip_slot
-        if self.last_selected_clip_slot is not selcted_clip_slot:
+        selected_clip_slot = song.view.highlighted_clip_slot
+        self.send_selected_clip_metadata()
+        self.send_selected_clip_notes()
+        self.log_message("Starting step seq")
+        if self.last_selected_clip_slot is not selected_clip_slot:
             if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
-                self.last_selected_clip_slot.clip.remove_notes_listener(self.send_clip_notes(self.last_selected_clip_slot))
+                clip = self.last_selected_clip_slot.clip
+                if clip.notes_has_listener(self.send_selected_clip_notes):
+                    self.log_message("removing notes listener")
+                    clip.remove_notes_listener(self.send_selected_clip_notes)
+                else:
+                    self.log_message("no notes listener to remove")
             # updating last selected clip
-            self.last_selected_clip_slot = selcted_clip_slot
-            if selcted_clip_slot is not None and selcted_clip_slot.has_clip:
+            self.last_selected_clip_slot = selected_clip_slot
+            if selected_clip_slot is not None and selected_clip_slot.has_clip:
                 # add notes listener
+                self.log_message("adding notes listener")
                 # TODO: - check if this will fire the first time or if we have to call make_and_send_clip
-                selcted_clip_slot.clip.add_notes_listener(self.send_clip_notes(selcted_clip_slot))
+                selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
     
     def stop_step_seq(self):
         song = self.song()
         selected_clip_slot = song.view.highlighted_clip_slot
         if selected_clip_slot is not None and selected_clip_slot.has_clip:
             # remove notes listener
-            selected_clip_slot.clip.remove_notes_listener(self.send_clip_notes(selected_clip_slot))
+            selected_clip_slot.clip.remove_notes_listener(self.send_selected_clip_notes)
             # reseting last selected clip
             self.last_selected_clip_slot = None
     
-    def send_clip_metadata(self, value):
-        selected_clip = value.clip
-        # Extract clip metadata
-        clip_length = float(selected_clip.length)
-        start_time = float(selected_clip.start_time)
-        start_marker = float(selected_clip.start_marker)
-        loop_start = float(selected_clip.loop_start)
-        loop_end = float(selected_clip.loop_end)
-        signature_denominator = int(selected_clip.signature_denominator)
-        signature_numerator = int(selected_clip.signature_numerator)
-        # todo: send via sysex
+    # Use 7-bit encoding for multi-byte values
+    def _to_7bit_bytes(self, value):
+        return [
+            value & 0x7F,           # Low 7 bits
+            (value >> 7) & 0x7F     # High 7 bits
+        ]
     
-    def send_clip_notes(self, value):
+    def send_selected_clip_metadata(self):
+        """
+        Encode clip metadata into a compact SysEx message and send it out.
+        """
+        self.log_message("sending clip metadata")
+        status_byte = 0xF0
+        end_byte = 0xF7
+        manufacturer_id = 0x0E
+        device_id = 0x01
+        
+        song = self.song()
+        clip_slot = song.view.highlighted_clip_slot
+        if clip_slot is not None and clip_slot.has_clip:
+            selected_clip = clip_slot.clip
+            # Extract clip metadata, make ints
+            clip_length = int(selected_clip.length * 1000)
+            start_time = int(selected_clip.start_time * 1000)
+            start_marker = int(selected_clip.start_marker * 1000)
+            loop_start = int(selected_clip.loop_start * 1000)
+            loop_end = int(selected_clip.loop_end * 1000)
+            signature_denominator = int(selected_clip.signature_denominator)
+            signature_numerator = int(selected_clip.signature_numerator)
+            
+            note_data = [
+                *self._to_7bit_bytes(clip_length),
+                *self._to_7bit_bytes(start_time),
+                *self._to_7bit_bytes(start_marker),
+                *self._to_7bit_bytes(loop_start),
+                *self._to_7bit_bytes(loop_end),
+                signature_denominator,
+                signature_numerator
+            ]
+            
+            # Send the SysEx message
+            sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(note_data) + (end_byte,)
+            self._send_midi(sys_ex_message)
+    
+    def send_selected_clip_notes(self):
         """
         Encode a full clip with all notes into a compact SysEx message and send it out.
         """
-        self.log_message("Making notes to send")
+        
         status_byte = 0xF0
         end_byte = 0xF7
         manufacturer_id = 0x0D
@@ -1229,46 +1270,42 @@ class Tap(ControlSurface):
         max_chunk_length = 250
         data = bytearray()
             
-        selected_clip = value.clip
+        song = self.song()
+        clip_slot = song.view.highlighted_clip_slot
+        if clip_slot is not None and clip_slot.has_clip:
+            selected_clip = clip_slot.clip
         
-        # Extract clip metadata
-        clip_length = float(selected_clip.length)
-        start_time = float(selected_clip.start_time)
-        
-        # Get notes
-        notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
-        
-        for note in notes:
-            note_id = int(note.note_id)
-            pitch = int(note.pitch)
-            start_time = int(note.start_time * 1000)
-            duration = int(note.duration * 1000)
-            velocity = int(note.velocity)
-            mute = 1 if note.mute else 0
-            probability = int(note.probability * 127)
-        
-            # Use 7-bit encoding for multi-byte values
-            def to_7bit_bytes(value):
-                return [
-                    value & 0x7F,           # Low 7 bits
-                    (value >> 7) & 0x7F     # High 7 bits
+            # Extract clip metadata
+            clip_length = float(selected_clip.length)
+            start_time = float(selected_clip.start_time)
+            
+            # Get notes
+            notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
+            
+            for note in notes:
+                note_id = int(note.note_id)
+                pitch = int(note.pitch)
+                start_time = int(note.start_time * 1000)
+                duration = int(note.duration * 1000)
+                velocity = int(note.velocity)
+                mute = 1 if note.mute else 0
+                probability = int(note.probability * 127)
+            
+                note_data = [
+                    *self._to_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
+                    pitch,                      # 1 byte
+                    *self._to_7bit_bytes(start_time),# 2 bytes, 7-bit encoded
+                    *self._to_7bit_bytes(duration),  # 2 bytes, 7-bit encoded
+                    velocity,  
+                    (mute << 7) | probability
                 ]
-        
-            note_data = [
-                *to_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
-                pitch,                      # 1 byte
-                *to_7bit_bytes(start_time),# 2 bytes, 7-bit encoded
-                *to_7bit_bytes(duration),  # 2 bytes, 7-bit encoded
-                velocity,  
-                (mute << 7) | probability
-            ]
-        
-            data.extend(note_data)
+            
+                data.extend(note_data)
             
         # Split data if it's too large for a single SysEx message
-        num_of_chunks = (len(data) + max_chunk_length - 1) // max_chunk_length
+        num_of_chunks = max(1, (len(data) + max_chunk_length - 1) // max_chunk_length)
         
-        self.log_message("Sending SysEx")
+        self.log_message(f"Data length before splitting: {len(data)}")
         
         for chunk_index in range(num_of_chunks):
             start_index = chunk_index * max_chunk_length
@@ -1281,6 +1318,7 @@ class Tap(ControlSurface):
         
             # Send the SysEx message
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte,)
+            self.log_message("Sending SysEx chunk")
             self._send_midi(sys_ex_message)
     
     
