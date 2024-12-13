@@ -17,6 +17,7 @@ import time
 import threading
 import random
 from itertools import zip_longest
+import struct
 
 
 mixer, transport, session_component = None, None, None
@@ -1187,39 +1188,101 @@ class Tap(ControlSurface):
         selcted_clip_slot = song.view.highlighted_clip_slot
         if self.last_selected_clip_slot is not selcted_clip_slot:
             if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
-                self.last_selected_clip_slot.clip.remove_notes_listener(self.make_and_send_clip(self.last_selected_clip_slot))
+                self.last_selected_clip_slot.clip.remove_notes_listener(self.send_clip_notes(self.last_selected_clip_slot))
             # updating last selected clip
             self.last_selected_clip_slot = selcted_clip_slot
             if selcted_clip_slot is not None and selcted_clip_slot.has_clip:
                 # add notes listener
                 # TODO: - check if this will fire the first time or if we have to call make_and_send_clip
-                selcted_clip_slot.clip.add_notes_listener(self.make_and_send_clip(selcted_clip_slot))
+                selcted_clip_slot.clip.add_notes_listener(self.send_clip_notes(selcted_clip_slot))
     
     def stop_step_seq(self):
         song = self.song()
         selected_clip_slot = song.view.highlighted_clip_slot
         if selected_clip_slot is not None and selected_clip_slot.has_clip:
             # remove notes listener
-            selected_clip_slot.clip.remove_notes_listener(self.make_and_send_clip(selected_clip_slot))
+            selected_clip_slot.clip.remove_notes_listener(self.send_clip_notes(selected_clip_slot))
             # reseting last selected clip
             self.last_selected_clip_slot = None
     
-    def make_and_send_clip(self, value):
-       # TODO: simply log clip to understand how it works
-       self.log_message("make and send clip")
-       # getting the whole clip
-       selected_clip = value.clip
-       clip_length = selected_clip.length
-       start_time = selected_clip.start_time
-       notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
-       start_marker = selected_clip.start_marker
-       loop_start = selected_clip.loop_start
-       loop_end = selected_clip.loop_end
-       signature_denominator = selected_clip.signature_denominator
-       signature_numerator = selected_clip.signature_numerator
-       for note in notes:
-           self.log_message("ID: {}".format(note.note_id))
-           self.log_message("Pitch: {}".format(note.pitch))
+    def send_clip_metadata(self, value):
+        selected_clip = value.clip
+        # Extract clip metadata
+        clip_length = float(selected_clip.length)
+        start_time = float(selected_clip.start_time)
+        start_marker = float(selected_clip.start_marker)
+        loop_start = float(selected_clip.loop_start)
+        loop_end = float(selected_clip.loop_end)
+        signature_denominator = int(selected_clip.signature_denominator)
+        signature_numerator = int(selected_clip.signature_numerator)
+        # todo: send via sysex
+    
+    def send_clip_notes(self, value):
+        """
+        Encode a full clip with all notes into a compact SysEx message and send it out.
+        """
+        self.log_message("Making notes to send")
+        status_byte = 0xF0
+        end_byte = 0xF7
+        manufacturer_id = 0x0D
+        device_id = 0x01
+        max_chunk_length = 250
+        data = bytearray()
+            
+        selected_clip = value.clip
+        
+        # Extract clip metadata
+        clip_length = float(selected_clip.length)
+        start_time = float(selected_clip.start_time)
+        
+        # Get notes
+        notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
+        
+        for note in notes:
+            note_id = int(note.note_id)
+            pitch = int(note.pitch)
+            start_time = int(note.start_time * 1000)
+            duration = int(note.duration * 1000)
+            velocity = int(note.velocity)
+            mute = 1 if note.mute else 0
+            probability = int(note.probability * 127)
+        
+            # Use 7-bit encoding for multi-byte values
+            def to_7bit_bytes(value):
+                return [
+                    value & 0x7F,           # Low 7 bits
+                    (value >> 7) & 0x7F     # High 7 bits
+                ]
+        
+            note_data = [
+                *to_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
+                pitch,                      # 1 byte
+                *to_7bit_bytes(start_time),# 2 bytes, 7-bit encoded
+                *to_7bit_bytes(duration),  # 2 bytes, 7-bit encoded
+                velocity,  
+                (mute << 7) | probability
+            ]
+        
+            data.extend(note_data)
+            
+        # Split data if it's too large for a single SysEx message
+        num_of_chunks = (len(data) + max_chunk_length - 1) // max_chunk_length
+        
+        self.log_message("Sending SysEx")
+        
+        for chunk_index in range(num_of_chunks):
+            start_index = chunk_index * max_chunk_length
+            end_index = start_index + max_chunk_length
+            chunk_data = data[start_index:end_index]
+            
+            # Add prefix and suffix to chunks
+            prefix = "_" if chunk_index == num_of_chunks - 1 else "$"
+            chunk_data = prefix.encode('ascii') + chunk_data
+        
+            # Send the SysEx message
+            sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte,)
+            self._send_midi(sys_ex_message)
+    
     
     def _delete_return_track(self, value):
         song = self.song()
