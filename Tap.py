@@ -12,6 +12,7 @@ from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+from Live.Clip import MidiNoteSpecification
 
 import time
 import threading
@@ -1050,6 +1051,82 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 2:
                 self._duplicate_loop(values[0], values[1])
+        # add note
+        if len(message) >= 2 and message[1] == 14:
+            # Decode the note data
+            note_pitch = message[2]
+            start_time = message[3] | (message[4] << 7)
+            duration = message[5] | (message[6] << 7)
+            velocity = message[7]
+            mute_and_probability = message[8]
+            mute = (mute_and_probability & 0x80) != 0
+            probability = (mute_and_probability & 0x7F) / 127.0
+        
+            # Get the selected clip
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            if clip_slot is not None and clip_slot.has_clip:
+                clip = clip_slot.clip
+                
+                # Create a MidiNoteSpecification object
+                note_spec = MidiNoteSpecification(
+                    pitch=note_pitch,
+                    start_time=start_time / 1000.0,
+                    duration=duration / 1000.0,
+                    velocity=velocity,
+                    mute=mute,
+                    probability=probability
+                )
+                
+                # Add the note to the clip
+                clip.add_new_notes([note_spec])
+        # remove note
+        if len(message) >= 2 and message[1] == 15:
+            # Decode the note ID
+            note_id = message[2] | (message[3] << 7)
+        
+            # Get the selected clip
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            if clip_slot is not None and clip_slot.has_clip:
+                clip = clip_slot.clip
+        
+                # Remove the note by ID
+                clip.remove_notes_by_id([note_id])
+        # modify ONE note
+        if len(message) >= 2 and message[1] == 16:
+            # Decode the note ID and data
+            note_id = message[2] | (message[3] << 7)
+            pitch = message[4]
+            start_time = (message[5] | (message[6] << 7)) / 1000.0
+            duration = (message[7] | (message[8] << 7)) / 1000.0
+            velocity = message[9]
+            mute = bool(message[10] & 0x80)
+            probability = (message[10] & 0x7F) / 127.0
+        
+            # Get the selected clip
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            if clip_slot is not None and clip_slot.has_clip:
+                clip = clip_slot.clip
+        
+                # Fetch existing notes from the clip
+                clip_length = float(clip.length)
+                notes = clip.get_notes_extended(0, 128, 0, clip_length)
+        
+                # Modify the matching note
+                for note in notes:
+                    if note.note_id == note_id:
+                        note.pitch = pitch
+                        note.start_time = start_time
+                        note.duration = duration
+                        note.velocity = velocity
+                        note.mute = mute
+                        note.probability = probability
+                        break
+        
+                # Apply the modified notes back to the clip
+                clip.apply_note_modifications(notes)
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
