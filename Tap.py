@@ -544,7 +544,9 @@ class Tap(ControlSurface):
                         # check which notes are playing at position
                         # if we detect changes send them out to app
                         clip_position = clip_playing.playing_position
-
+                        
+                        self.send_out_playing_pos(clip_position)
+                        
                         # making sure we have the right starting position, when jumping back to the start of clip or loop
                         if self.last_playing_position > clip_position:
                             if clip_position >= loop_start:
@@ -1434,6 +1436,22 @@ class Tap(ControlSurface):
                 # self.log_message("Sending SysEx chunk")
                 self._send_midi(sys_ex_message)
     
+    def send_out_playing_pos(self, value):
+        if self.seq_status:
+            status_byte = 0xF0
+            end_byte = 0xF7
+            manufacturer_id = 0x0F
+            device_id = 0x01
+                
+            playing_pos_in_ms = int(value * 1000)
+            
+            pos_data = self._to_7bit_bytes(playing_pos_in_ms)
+            
+            # Send the SysEx message
+            sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
+            # self.log_message("Sending SysEx chunk")
+            self._send_midi(sys_ex_message)
+            
     
     def _delete_return_track(self, value):
         song = self.song()
