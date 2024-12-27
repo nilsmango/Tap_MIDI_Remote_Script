@@ -48,6 +48,7 @@ class Tap(ControlSurface):
             self.last_raw_notes = None
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
+            self.last_sent_out_playing_pos = 0.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -507,7 +508,8 @@ class Tap(ControlSurface):
     def _clip_pos_changed(self, clip_index):
         # Only check and send things if we are in device view
         if self.device_status:
-            selected_track = self.song().view.selected_track
+            song = self.song()
+            selected_track = song.view.selected_track
 
             if clip_index < len(selected_track.clip_slots):
                 clip_slot = selected_track.clip_slots[clip_index]
@@ -545,48 +547,58 @@ class Tap(ControlSurface):
                         # if we detect changes send them out to app
                         clip_position = clip_playing.playing_position
                         
-                        self.send_out_playing_pos(clip_position)
-                        
-                        # making sure we have the right starting position, when jumping back to the start of clip or loop
-                        if self.last_playing_position > clip_position:
-                            if clip_position >= loop_start:
-                                self.last_playing_position = loop_start
+                        if self.seq_status:
+                            if song.view.highlighted_clip_slot.is_playing:
+                                self.send_out_playing_pos(clip_position)
+                                self.last_sent_out_playing_pos = clip_position
                             else:
-                                self.last_playing_position = clip_playing.start_marker
-
-                        # check if currently playing notes are still playing in this playing position
-                        for (note_index, is_playing) in enumerate(self.currently_playing_notes):
-                            if is_playing:
-                                # Initialize a flag to indicate if a playing note was found
-                                found_playing_note = False
-
-                                # Find the notes that stopped playing in since the last update
-                                for note in self.current_clip_notes:
-                                    pitch, note_start_time, end_time = note
-
-                                    if note_start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
-                                        # Note is still playing
-                                        found_playing_note = True
-                                        break
-
-                                # If no playing note was found, update the state
-                                if not found_playing_note:
-                                    self.currently_playing_notes[note_index] = False
-                                    # send note off for note_index note.
-                                    # self.log_message("Note off: {}".format(note_index))
-                                    self.send_note_off(note_index, 0, 100)
-
-                        # check current clip notes array which notes are on for that playing position
-                        for note in self.current_clip_notes:
-                            pitch, note_start_time, end_time = note
-                            if self.last_playing_position <= note_start_time <= clip_position:
-                                # note starts playing
-                                self.currently_playing_notes[pitch] = True
-                                # send midi note on
-                                # self.log_message("Note on: {}".format(pitch))
-                                self.send_note_on(pitch, 0, 100)
-                        # update last playing position
-                        self.last_playing_position = clip_position
+                                # reseting the playing position
+                                if self.last_sent_out_playing_pos != 0.0:
+                                    self.last_sent_out_playing_pos = 0.0
+                                    self.send_out_playing_pos(self.last_sent_out_playing_pos)
+                                    
+                                
+                        else:
+                            # making sure we have the right starting position, when jumping back to the start of clip or loop
+                            if self.last_playing_position > clip_position:
+                                if clip_position >= loop_start:
+                                    self.last_playing_position = loop_start
+                                else:
+                                    self.last_playing_position = clip_playing.start_marker
+    
+                            # check if currently playing notes are still playing in this playing position
+                            for (note_index, is_playing) in enumerate(self.currently_playing_notes):
+                                if is_playing:
+                                    # Initialize a flag to indicate if a playing note was found
+                                    found_playing_note = False
+    
+                                    # Find the notes that stopped playing in since the last update
+                                    for note in self.current_clip_notes:
+                                        pitch, note_start_time, end_time = note
+    
+                                        if note_start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
+                                            # Note is still playing
+                                            found_playing_note = True
+                                            break
+    
+                                    # If no playing note was found, update the state
+                                    if not found_playing_note:
+                                        self.currently_playing_notes[note_index] = False
+                                        # send note off for note_index note.
+                                        # self.log_message("Note off: {}".format(note_index))
+                                        self.send_note_off(note_index, 0, 100)
+    
+                            # check current clip notes array which notes are on for that playing position
+                            for note in self.current_clip_notes:
+                                pitch, note_start_time, end_time = note
+                                if self.last_playing_position <= note_start_time <= clip_position:
+                                    # note starts playing
+                                    self.currently_playing_notes[pitch] = True
+                                    # send midi note on
+                                    # self.log_message("Note on: {}".format(pitch))
+                                    self.send_note_on(pitch, 0, 100)
+                            # update last playing position
+                            self.last_playing_position = clip_position
                     except:
                         self.log_message("Exception for clip position changed")
                         pass
@@ -1437,20 +1449,19 @@ class Tap(ControlSurface):
                 self._send_midi(sys_ex_message)
     
     def send_out_playing_pos(self, value):
-        if self.seq_status:
-            status_byte = 0xF0
-            end_byte = 0xF7
-            manufacturer_id = 0x0F
-            device_id = 0x01
-                
-            playing_pos_in_ms = int(value * 1000)
+        status_byte = 0xF0
+        end_byte = 0xF7
+        manufacturer_id = 0x0F
+        device_id = 0x01
             
-            pos_data = self._to_7bit_bytes(playing_pos_in_ms)
-            
-            # Send the SysEx message
-            sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
-            # self.log_message("Sending SysEx chunk")
-            self._send_midi(sys_ex_message)
+        playing_pos_in_ms = int(value * 1000)
+        
+        pos_data = self._to_7bit_bytes(playing_pos_in_ms)
+        
+        # Send the SysEx message
+        sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
+        # self.log_message("Sending SysEx chunk")
+        self._send_midi(sys_ex_message)
             
     
     def _delete_return_track(self, value):
