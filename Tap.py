@@ -1357,18 +1357,20 @@ class Tap(ControlSurface):
                 if clip_slot.has_clip:
                     selected_clip = clip_slot.clip
                     # Extract clip metadata, make ints
-                    clip_length = int(selected_clip.length * 1000)
+                    end_time = int(selected_clip.end_time * 1000)
                     start_time = int(selected_clip.start_time * 1000)
                     start_marker = int(selected_clip.start_marker * 1000)
+                    end_marker = int(selected_clip.end_marker * 1000)
                     loop_start = int(selected_clip.loop_start * 1000)
                     loop_end = int(selected_clip.loop_end * 1000)
                     signature_denominator = int(selected_clip.signature_denominator)
                     signature_numerator = int(selected_clip.signature_numerator)
                     
                     note_data = [
-                        *self._to_7bit_bytes(clip_length),
+                        *self._to_7bit_bytes(end_time),
                         *self._to_7bit_bytes(start_time),
                         *self._to_7bit_bytes(start_marker),
+                        *self._to_7bit_bytes(end_marker),
                         *self._to_7bit_bytes(loop_start),
                         *self._to_7bit_bytes(loop_end),
                         signature_denominator,
