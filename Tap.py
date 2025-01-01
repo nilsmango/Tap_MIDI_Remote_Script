@@ -49,6 +49,7 @@ class Tap(ControlSurface):
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
             self.last_sent_out_playing_pos = 0.0
+            self.clip_length_trick = 120.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -517,16 +518,13 @@ class Tap(ControlSurface):
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
                     
-                    start_time = clip_playing.start_marker
-                    time_span = clip_playing.length
+                    time_span = self.clip_length_trick
                     loop_start = clip_playing.loop_start
 
                     try:
                         # Get all the notes in the clip
-                        if start_time <= loop_start:
-                            current_raw_notes = clip_playing.get_notes_extended(0, 128, start_time, time_span)
-                        else:
-                            current_raw_notes = clip_playing.get_notes_extended(0, 128, loop_start, time_span)
+                        current_raw_notes = clip_playing.get_notes_extended(0, 128, 0, time_span)
+                        
                         # if the current clip has different notes save the new notes.
                         if current_raw_notes is not self.last_raw_notes:
                             self.last_raw_notes = current_raw_notes
@@ -1065,14 +1063,29 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 2:
                 self._duplicate_loop(values[0], values[1])
+        
         # add note
         if len(message) >= 2 and message[1] == 14:
             # Decode the note data
-            note_pitch = message[2]
-            start_time = message[3] | (message[4] << 7)
-            duration = message[5] | (message[6] << 7)
-            velocity = message[7]
-            mute_and_probability = message[8]
+            index = 2
+            # Decode the pitch of the note
+            note_pitch = message[index]
+            index += 1
+        
+            # Decode the start time (variable-length value)
+            start_time = self._from_3_7bit_bytes(message, index)
+            index += 3
+        
+            # Decode the duration (variable-length value)
+            duration = self._from_3_7bit_bytes(message, index)
+            index += 3
+        
+            # Decode the velocity (single byte)
+            velocity = message[index]
+            index += 1
+        
+            # Decode mute and probability
+            mute_and_probability = message[index]
             mute = (mute_and_probability & 0x80) != 0
             probability = (mute_and_probability & 0x7F) / 127.0
         
@@ -1094,6 +1107,7 @@ class Tap(ControlSurface):
                 
                 # Add the note to the clip
                 clip.add_new_notes([note_spec])
+        
         # remove note
         if len(message) >= 2 and message[1] == 15:
             # Decode the note ID
@@ -1107,26 +1121,40 @@ class Tap(ControlSurface):
         
                 # Remove the note by ID
                 clip.remove_notes_by_id([note_id])
+        
         # modify ONE note
         if len(message) >= 2 and message[1] == 16:
             # Decode the note ID and data
             note_id = message[2] | (message[3] << 7)
             pitch = message[4]
-            start_time = (message[5] | (message[6] << 7)) / 1000.0
-            duration = (message[7] | (message[8] << 7)) / 1000.0
-            velocity = message[9]
-            mute = bool(message[10] & 0x80)
-            probability = (message[10] & 0x7F) / 127.0
+
+            # Decode start time (variable-length value)
+            index = 5
+            start_time_raw = self._from_3_7bit_bytes(message, index)
+            start_time = start_time_raw / 1000.0
+            index += 3
+            
+            # Decode duration (variable-length value)
+            duration_raw = self._from_3_7bit_bytes(message, index)
+            duration = duration_raw / 1000.0
+            index += 3
+            
+            # Decode velocity (single byte)
+            velocity = message[index]
+            index += 1
+            
+            # Decode mute and probability
+            mute = bool(message[index] & 0x80)
+            probability = (message[index] & 0x7F) / 127.0
         
             # Get the selected clip
             song = self.song()
             clip_slot = song.view.highlighted_clip_slot
             if clip_slot is not None and clip_slot.has_clip:
                 clip = clip_slot.clip
-        
+                
                 # Fetch existing notes from the clip
-                clip_length = float(clip.length)
-                notes = clip.get_notes_extended(0, 128, 0, clip_length)
+                notes = clip.get_notes_extended(0, 128, 0, self.clip_length_trick)
         
                 # Modify the matching note
                 for note in notes:
@@ -1283,12 +1311,15 @@ class Tap(ControlSurface):
         if self.last_selected_clip_slot is not selected_clip_slot:
             if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
                 clip = self.last_selected_clip_slot.clip
+                
                 if clip.notes_has_listener(self.send_selected_clip_notes):
                     # self.log_message("removing notes listener")
                     clip.remove_notes_listener(self.send_selected_clip_notes)
 
                 if self.last_selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                     self.last_selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
+                
+                self.remove_clip_metadata_listeners(clip)
             
             # updating last selected clip
             self.last_selected_clip_slot = selected_clip_slot
@@ -1298,11 +1329,41 @@ class Tap(ControlSurface):
                     # self.log_message("adding notes listener")
                     if not selected_clip_slot.clip.notes_has_listener(self.send_selected_clip_notes):
                         selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
+                    
+                    self.add_clip_metadata_listeners(selected_clip_slot.clip)
                 else:
                     # TODO: create a clip slot listener that listens to clip changes
                     if not selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                         selected_clip_slot.add_has_clip_listener(self.on_highlighted_slot_changed)
                         # self.log_message("added a has clip listener")
+    
+    def add_clip_metadata_listeners(self, clip):
+        if not clip.end_marker_has_listener(self.send_selected_clip_metadata):
+            clip.add_end_marker_listener(self.send_selected_clip_metadata)
+        if not clip.start_marker_has_listener(self.send_selected_clip_metadata):
+            clip.add_start_marker_listener(self.send_selected_clip_metadata)
+        if not clip.loop_end_has_listener(self.send_selected_clip_metadata):
+            clip.add_loop_end_listener(self.send_selected_clip_metadata)
+        if not clip.loop_start_has_listener(self.send_selected_clip_metadata):
+            clip.add_loop_start_listener(self.send_selected_clip_metadata)
+        if not clip.signature_denominator_has_listener(self.send_selected_clip_metadata):
+            clip.add_signature_denominator_listener(self.send_selected_clip_metadata)
+        if not clip.signature_numerator_has_listener(self.send_selected_clip_metadata):
+            clip.add_signature_numerator_listener(self.send_selected_clip_metadata)
+        
+    def remove_clip_metadata_listeners(self, clip):
+        if clip.end_marker_has_listener(self.send_selected_clip_metadata):
+            clip.remove_end_marker_listener(self.send_selected_clip_metadata)
+        if clip.start_marker_has_listener(self.send_selected_clip_metadata):
+            clip.remove_start_marker_listener(self.send_selected_clip_metadata)
+        if clip.loop_end_has_listener(self.send_selected_clip_metadata):
+            clip.remove_loop_end_listener(self.send_selected_clip_metadata)
+        if clip.loop_start_has_listener(self.send_selected_clip_metadata):
+            clip.remove_loop_start_listener(self.send_selected_clip_metadata)
+        if clip.signature_denominator_has_listener(self.send_selected_clip_metadata):
+            clip.remove_signature_denominator_listener(self.send_selected_clip_metadata)
+        if clip.signature_numerator_has_listener(self.send_selected_clip_metadata):
+            clip.remove_signature_numerator_listener(self.send_selected_clip_metadata)
     
     def on_highlighted_slot_changed(self):
         """
@@ -1329,16 +1390,49 @@ class Tap(ControlSurface):
                 # remove notes listener
                 if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                     selected_clip_slot.clip.remove_notes_listener(self.send_selected_clip_notes)
+                # remove metadata listeners
+                self.remove_clip_metadata_listeners(selected_clip_slot.clip)
             
         # reseting last selected clip
         self.last_selected_clip_slot = None
     
-    # Use 7-bit encoding for multi-byte values
-    def _to_7bit_bytes(self, value):
+    # Use 7-bit encoding for multi-byte values below 1000
+    def _to_2_7bit_bytes(self, value):
         return [
             value & 0x7F,           # Low 7 bits
             (value >> 7) & 0x7F     # High 7 bits
         ]
+    
+    def _to_3_7bit_bytes(self, value):
+        """
+        Convert an integer value to exactly 3 7-bit bytes suitable for MIDI.
+        Each byte uses only 7 bits, with the MSB reserved for MIDI.
+        Can handle values up to 2,097,151 (2^21 - 1).
+        """
+        if value < 0:
+            value = 0
+        if value > 0x1FFFFF:  # 2,097,151
+            value = 0x1FFFFF
+            
+        return [
+            (value >> 14) & 0x7F,  # Highest 7 bits
+            (value >> 7) & 0x7F,   # Middle 7 bits
+            value & 0x7F           # Lowest 7 bits
+        ]
+    
+    def _from_3_7bit_bytes(self, bytes_list, start_index=0):
+        """
+        Convert 3 7-bit bytes back into an integer value.
+        Expects exactly 3 bytes.
+        """
+        if len(bytes_list) < start_index + 3:
+            return 0
+            
+        return (
+            (bytes_list[start_index] << 14) |
+            (bytes_list[start_index + 1] << 7) |
+            bytes_list[start_index + 2]
+        )
     
     def send_selected_clip_metadata(self):
         """
@@ -1357,8 +1451,6 @@ class Tap(ControlSurface):
                 if clip_slot.has_clip:
                     selected_clip = clip_slot.clip
                     # Extract clip metadata, make ints
-                    end_time = int(selected_clip.end_time * 1000)
-                    start_time = int(selected_clip.start_time * 1000)
                     start_marker = int(selected_clip.start_marker * 1000)
                     end_marker = int(selected_clip.end_marker * 1000)
                     loop_start = int(selected_clip.loop_start * 1000)
@@ -1367,12 +1459,10 @@ class Tap(ControlSurface):
                     signature_numerator = int(selected_clip.signature_numerator)
                     
                     note_data = [
-                        *self._to_7bit_bytes(end_time),
-                        *self._to_7bit_bytes(start_time),
-                        *self._to_7bit_bytes(start_marker),
-                        *self._to_7bit_bytes(end_marker),
-                        *self._to_7bit_bytes(loop_start),
-                        *self._to_7bit_bytes(loop_end),
+                        *self._to_3_7bit_bytes(start_marker),
+                        *self._to_3_7bit_bytes(end_marker),
+                        *self._to_3_7bit_bytes(loop_start),
+                        *self._to_3_7bit_bytes(loop_end),
                         signature_denominator,
                         signature_numerator
                     ]
@@ -1401,14 +1491,10 @@ class Tap(ControlSurface):
                     selected_clip = clip_slot.clip
                 
                     # Extract clip metadata
-                    clip_length = float(selected_clip.length)
-                    # sometimes new clips have a start time bigger than 0, so I just use this trick:
-                    start_time = float(selected_clip.start_time)
-                    if start_time > 0.0:
-                        start_time = 0.0
+                    clip_length = self.clip_length_trick
                     
                     # Get notes
-                    notes = selected_clip.get_notes_extended(0, 128, start_time, clip_length)
+                    notes = selected_clip.get_notes_extended(0, 128, 0, clip_length)
                     # self.log_message(f"Number of notes found: {len(notes)}")
                     for note in notes:
                         note_id = int(note.note_id)
@@ -1420,10 +1506,10 @@ class Tap(ControlSurface):
                         probability = int(note.probability * 127)
                     
                         note_data = [
-                            *self._to_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
+                            *self._to_2_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
                             pitch,                      # 1 byte
-                            *self._to_7bit_bytes(start_time),# 2 bytes, 7-bit encoded
-                            *self._to_7bit_bytes(duration),  # 2 bytes, 7-bit encoded
+                            *self._to_3_7bit_bytes(start_time),# 3 bytes, 7-bit encoded
+                            *self._to_3_7bit_bytes(duration),  # 3 bytes, 7-bit encoded
                             velocity,  
                             (mute << 7) | probability
                         ]
@@ -1458,7 +1544,7 @@ class Tap(ControlSurface):
             
         playing_pos_in_ms = int(value * 1000)
         
-        pos_data = self._to_7bit_bytes(playing_pos_in_ms)
+        pos_data = self._to_3_7bit_bytes(playing_pos_in_ms)
         
         # Send the SysEx message
         sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
