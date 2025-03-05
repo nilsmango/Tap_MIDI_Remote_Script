@@ -19,6 +19,7 @@ import threading
 import random
 from itertools import zip_longest
 import struct
+import re
 
 
 mixer, transport, session_component = None, None, None
@@ -54,7 +55,7 @@ class Tap(ControlSurface):
             transport = TransportComponent()
             session_component = SessionComponent()
             self.old_clips_array = []
-
+            self._drum_rack_device = None
             self.was_initialized = False
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -99,9 +100,61 @@ class Tap(ControlSurface):
                     if drum_rack is not None:
                         return drum_rack
         return None
+    
+    def _setup_drum_pad_listeners(self):
+        if self._drum_rack_device:
+            self._send_all_drum_pad_names()
+            for pad in self._drum_rack_device.drum_pads:
+                if not pad.name_has_listener(self._send_all_drum_pad_names):
+                    pad.add_name_listener(self._send_all_drum_pad_names)
 
+    def _remove_drum_pad_name_listeners(self):
+        if self._drum_rack_device:
+            for pad in self._drum_rack_device.drum_pads:
+                if pad.name_has_listener(self._send_all_drum_pad_names):
+                    pad.remove_name_listener(self._send_all_drum_pad_names)
+
+    def _send_all_drum_pad_names(self):
+        if not self._drum_rack_device:
+            return
+    
+        pads = self._drum_rack_device.drum_pads
+    
+        # Find the first and last pad with chains using the .note property
+        first_with_chain = None
+        last_with_chain = None
+    
+        for pad in pads:
+            if pad.chains:
+                first_with_chain = pad
+                break
+    
+        for pad in reversed(pads):
+            if pad.chains:
+                last_with_chain = pad
+                break
+                
+        if first_with_chain and last_with_chain:
+            first_index = first_with_chain.note
+            last_index = last_with_chain.note
+        
+            pad_names = []
+            
+            # Add index of first chain pad
+            pad_names.append(str(first_index))
+            for pad in pads[first_index:last_index + 1]:
+                if pad.chains:
+                    pad_names.append(pad.name)
+                else:
+                    pad_names.append(str(pad.note))
+            self._send_sys_ex_message(",".join(pad_names), 0x11)
+            
     @subject_slot('device')
     def _on_device_changed(self):
+        if self._drum_rack_device:
+            self._remove_drum_pad_name_listeners()
+            self._drum_rack_device = None
+            
         if liveobj_valid(self._device):
             # device = self._device.device()  # Retrieve the Device object
             # get and send name of bank and device
@@ -114,7 +167,10 @@ class Tap(ControlSurface):
             drum_rack_device = self._find_drum_rack_in_track(selected_track)
             if drum_rack_device is not None:
                 track_has_drums = 1
-
+                # set up drum pad names, with listener
+                self._drum_rack_device = drum_rack_device
+                self._setup_drum_pad_listeners()
+                
             # find index of device
             selected_device_index = self._find_device_index(selected_device, available_devices)
             # self.log_message("Selected Device Index: {}".format(selected_device_index))
@@ -176,7 +232,7 @@ class Tap(ControlSurface):
         status_byte = 0xF0  # SysEx message start
         end_byte = 0xF7  # SysEx message end
         device_id = 0x01
-        data = name_string.encode('ascii')
+        data = name_string.encode('ascii', errors='ignore')
         max_chunk_length = 250
         if len(data) <= max_chunk_length:
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
