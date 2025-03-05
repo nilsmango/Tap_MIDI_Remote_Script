@@ -1169,6 +1169,29 @@ class Tap(ControlSurface):
         
                 # Apply the modified notes back to the clip
                 clip.apply_note_modifications(notes)
+        # markers
+        if len(message) >= 2 and message[1] == 17:
+            # Decode the note ID and data
+            marker_id = message[2]
+            
+            # Decode start time (variable-length value)
+            index = 3
+            marker_time_raw = self._from_3_7bit_bytes(message, index)
+            marker_time = marker_time_raw / 1000.0
+            
+            # Get the selected clip
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            if clip_slot is not None and clip_slot.has_clip:
+                clip = clip_slot.clip
+                if marker_id == 0:
+                    clip.start_marker = marker_time
+                elif marker_id == 1:
+                    clip.end_marker = marker_time
+                elif marker_id == 2:
+                    clip.loop_start = marker_time
+                else:
+                    clip.loop_end = marker_time
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
