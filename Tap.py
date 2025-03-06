@@ -50,7 +50,7 @@ class Tap(ControlSurface):
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
             self.last_sent_out_playing_pos = 0.0
-            self.clip_length_trick = 120.0
+            self.clip_length_trick = 220.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -346,6 +346,9 @@ class Tap(ControlSurface):
         # step seq status
         step_seq_status = ButtonElement(1, MIDI_NOTE_TYPE, 15, 87)
         step_seq_status.add_value_listener(self._update_step_seq)
+        # adding empty clip
+        add_empty_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 86)
+        add_empty_clip_button.add_value_listener(self._add_empty_clip)
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -475,6 +478,29 @@ class Tap(ControlSurface):
             all_scenes = song.scenes
             current_index = list(all_scenes).index(selected_scene)
             song.duplicate_scene(current_index)
+
+    def _add_empty_clip(self, value):
+        """
+        Adds an empty clip at the currently highlighted track and scene.
+        The clip length matches the time signature numerator (one full bar).
+        """
+        song = self.song()
+        selected_track = song.view.selected_track
+
+        if selected_track is None:
+            return
+        
+        selected_scene = song.view.selected_scene
+        all_scenes = song.scenes
+        scene_index = list(all_scenes).index(selected_scene)
+    
+        clip_slot = selected_track.clip_slots[scene_index]
+        
+        if clip_slot.has_clip:
+            return  # Avoid overwriting an existing clip
+        
+        clip_length = song.signature_numerator  # Use the time signature numerator for one full bar
+        clip_slot.create_clip(clip_length)
 
     def _duplicate_clip(self):
         song = self.song()
@@ -1595,6 +1621,8 @@ class Tap(ControlSurface):
                     
                         data.extend(note_data)
                 else:
+                    # Indicate no clip selected by adding a recognizable marker
+                    data.extend([0x7F, 0x7F, 0x7F])
                     if not clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                         clip_slot.add_has_clip_listener(self.on_highlighted_slot_changed)
                 
