@@ -600,7 +600,7 @@ class Tap(ControlSurface):
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
                     
-                    time_span = self.clip_length_trick
+                    time_span = max(self.clip_length_trick, clip_playing.loop_end, clip_playing.end_marker, clip_playing.length)
                     loop_start = clip_playing.loop_start
 
                     try:
@@ -1236,7 +1236,8 @@ class Tap(ControlSurface):
                 clip = clip_slot.clip
                 
                 # Fetch existing notes from the clip
-                notes = clip.get_notes_extended(0, 128, 0, self.clip_length_trick)
+                clip_length = max(self.clip_length_trick, clip.loop_end, clip.end_marker, clip.length)
+                notes = clip.get_notes_extended(0, 128, 0, clip_length)
         
                 # Modify the matching note
                 for note in notes:
@@ -1596,7 +1597,7 @@ class Tap(ControlSurface):
                     selected_clip = clip_slot.clip
                 
                     # Extract clip metadata
-                    clip_length = self.clip_length_trick
+                    clip_length = max(self.clip_length_trick, selected_clip.loop_end, selected_clip.end_marker, selected_clip.length)
                     
                     # Get notes
                     notes = selected_clip.get_notes_extended(0, 128, 0, clip_length)
