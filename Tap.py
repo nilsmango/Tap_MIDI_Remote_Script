@@ -14,12 +14,9 @@ from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
 from Live.Clip import MidiNoteSpecification
 
-import time
 import threading
 import random
 from itertools import zip_longest
-import struct
-import re
 
 
 mixer, transport, session_component = None, None, None
