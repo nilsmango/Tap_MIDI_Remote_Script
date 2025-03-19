@@ -346,6 +346,9 @@ class Tap(ControlSurface):
         # adding empty clip
         add_empty_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 86)
         add_empty_clip_button.add_value_listener(self._add_empty_clip)
+        # creating new empty clip
+        create_empty_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 85)
+        create_empty_clip_button.add_value_listener(self._create_new_empty_clip)
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -481,24 +484,63 @@ class Tap(ControlSurface):
         Adds an empty clip at the currently highlighted track and scene.
         The clip length matches the time signature numerator (one full bar).
         """
-        song = self.song()
-        selected_track = song.view.selected_track
-
-        if selected_track is None:
-            return
-        
-        selected_scene = song.view.selected_scene
-        all_scenes = song.scenes
-        scene_index = list(all_scenes).index(selected_scene)
+        if value != 0:
+            song = self.song()
+            selected_track = song.view.selected_track
     
-        clip_slot = selected_track.clip_slots[scene_index]
+            if selected_track is None:
+                return
+            
+            selected_scene = song.view.selected_scene
+            all_scenes = song.scenes
+            scene_index = list(all_scenes).index(selected_scene)
         
-        if clip_slot.has_clip:
-            return  # Avoid overwriting an existing clip
+            clip_slot = selected_track.clip_slots[scene_index]
+            
+            if clip_slot.has_clip:
+                return  # Avoid overwriting an existing clip
+            
+            clip_length = song.signature_numerator  # Use the time signature numerator for one full bar
+            clip_slot.create_clip(clip_length)
+    
+    def _create_new_empty_clip(self, value):
+        """
+        Creates an empty clip at the next empty the slot in the currently highlighted track.
+        The clip length matches the time signature numerator (one full bar).
+        """
+        if value != 0:
+            song = self.song()
+            selected_track = song.view.selected_track
+    
+            if selected_track is None:
+                return
+            
+            selected_scene = song.view.selected_scene
+            all_scenes = song.scenes
+            scene_index = list(all_scenes).index(selected_scene)
+            destination_scene_index = len(all_scenes)
+    
+            # check if there is a free clip slot after the current clip
+            for index, clip_slot in enumerate(selected_track.clip_slots):
+                if index <= scene_index:
+                    continue
+                if clip_slot.has_clip:
+                    continue
+                destination_scene_index = index
+                break
+    
+            if destination_scene_index == len(all_scenes):
+                # create a new scene if there is no free slot after the current slot
+                song.create_scene(-1)
         
-        clip_length = song.signature_numerator  # Use the time signature numerator for one full bar
-        clip_slot.create_clip(clip_length)
-
+            # adding empty clip at next empty scene
+            clip_slot = selected_track.clip_slots[destination_scene_index]
+            clip_length = song.signature_numerator  # Use the time signature numerator for one full bar
+            clip_slot.create_clip(clip_length)
+            
+            # selecting the empty scene
+            song.view.selected_scene = song.scenes[destination_scene_index]
+    
     def _duplicate_clip(self):
         song = self.song()
         selected_track = song.view.selected_track
