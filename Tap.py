@@ -605,6 +605,10 @@ class Tap(ControlSurface):
             if device_to_select is not None:
                 self.song().view.select_device(device_to_select)
             self._device_component.set_device(device_to_select)
+            self._check_clip_playing_status()
+            if self.seq_status:
+                if self.device_status:
+                    self.start_step_seq()
 
     def _set_up_notes_playing(self, selected_track):
         if selected_track != "clip":
@@ -627,6 +631,26 @@ class Tap(ControlSurface):
                         listener = lambda index=clip_index: self._clip_pos_changed(index)
                         self.playing_position_listeners[clip_index] = listener
                         clip_slot.clip.add_playing_position_listener(listener)
+
+    def _check_clip_playing_status(self):
+        song = self.song()
+        selected_track = song.view.selected_track
+        highlighted_clip_slot_playing = song.view.highlighted_clip_slot.is_playing
+        
+        if highlighted_clip_slot_playing:
+            # Ensure status is 0 if the highlighted clip is playing
+            new_status = 0
+        else:
+            # Check if any other clip is playing
+            another_clip_playing = any(clip_slot.is_playing for clip_slot in selected_track.clip_slots if clip_slot.has_clip)
+            new_status = 1 if another_clip_playing else 2
+        
+        # Update status only if it has changed
+        if self.seq_clip_playing_status != new_status:
+            self.seq_clip_playing_status = new_status
+            velocity_map = {0: 100, 1: 200, 2: 300}
+            velocity = velocity_map[new_status] & 0x7F
+            self.send_note_on(2, 3, velocity)
 
     def _clip_pos_changed(self, clip_index):
         # Only check and send things if we are in device view
@@ -668,25 +692,10 @@ class Tap(ControlSurface):
                         clip_position = clip_playing.playing_position
                         
                         # clip status no mater the seq_status
-                        highlighted_clip_slot_playing = song.view.highlighted_clip_slot.is_playing
-                        
-                        if highlighted_clip_slot_playing:
-                            # Ensure status is 0 if the highlighted clip is playing
-                            new_status = 0
-                        else:
-                            # Check if any other clip is playing
-                            another_clip_playing = any(clip_slot.is_playing for clip_slot in selected_track.clip_slots if clip_slot.has_clip)
-                            new_status = 1 if another_clip_playing else 2
-                        
-                        # Update status only if it has changed
-                        if self.seq_clip_playing_status != new_status:
-                            self.seq_clip_playing_status = new_status
-                            velocity_map = {0: 100, 1: 200, 2: 300}
-                            velocity = velocity_map[new_status] & 0x7F
-                            self.send_note_on(2, 3, velocity)
+                        self._check_clip_playing_status()
                         
                         if self.seq_status:
-                            if highlighted_clip_slot_playing:
+                            if song.view.highlighted_clip_slot.is_playing:
                                 self.send_out_playing_pos(clip_position)
                                 self.last_sent_out_playing_pos = clip_position
                             else:
@@ -1453,6 +1462,7 @@ class Tap(ControlSurface):
     def _update_device_status(self, value):
         if value:
             self.device_status = True
+            self._check_clip_playing_status()
         else:
             self.device_status = False
     
