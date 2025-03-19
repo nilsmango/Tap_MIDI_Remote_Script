@@ -350,6 +350,9 @@ class Tap(ControlSurface):
         # creating new empty clip
         create_empty_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 85)
         create_empty_clip_button.add_value_listener(self._create_new_empty_clip)
+        # selecting playing clip
+        select_playing_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 84)
+        select_playing_clip_button.add_value_listener(self._select_playing_clip)
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -541,6 +544,20 @@ class Tap(ControlSurface):
             
             # selecting the empty scene
             song.view.selected_scene = song.scenes[destination_scene_index]
+    
+    def _select_playing_clip(self, value):
+        if value != 0:
+            song = self.song()
+            selected_track = song.view.selected_track
+    
+            if selected_track is None:
+                return
+            
+            for index, clip_slot in enumerate(selected_track.clip_slots):
+                if clip_slot.is_playing:
+                    song.view.selected_scene = song.scenes[index]
+                    break
+    
     
     def _duplicate_clip(self):
         song = self.song()
