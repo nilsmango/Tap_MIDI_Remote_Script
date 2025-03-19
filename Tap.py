@@ -37,6 +37,7 @@ class Tap(ControlSurface):
             self.mixer_reset = True
             self.device_status = True
             self.seq_status = False
+            self.seq_clip_playing_status = 2
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
             max_clip_slots = 800  # Adjust this number based on your needs
@@ -666,8 +667,26 @@ class Tap(ControlSurface):
                         # if we detect changes send them out to app
                         clip_position = clip_playing.playing_position
                         
+                        # clip status no mater the seq_status
+                        highlighted_clip_slot_playing = song.view.highlighted_clip_slot.is_playing
+                        
+                        if highlighted_clip_slot_playing:
+                            # Ensure status is 0 if the highlighted clip is playing
+                            new_status = 0
+                        else:
+                            # Check if any other clip is playing
+                            another_clip_playing = any(clip_slot.is_playing for clip_slot in selected_track.clip_slots if clip_slot.has_clip)
+                            new_status = 1 if another_clip_playing else 2
+                        
+                        # Update status only if it has changed
+                        if self.seq_clip_playing_status != new_status:
+                            self.seq_clip_playing_status = new_status
+                            velocity_map = {0: 100, 1: 200, 2: 300}
+                            velocity = velocity_map[new_status] & 0x7F
+                            self.send_note_on(2, 3, velocity)
+                        
                         if self.seq_status:
-                            if song.view.highlighted_clip_slot.is_playing:
+                            if highlighted_clip_slot_playing:
                                 self.send_out_playing_pos(clip_position)
                                 self.last_sent_out_playing_pos = clip_position
                             else:
@@ -675,7 +694,6 @@ class Tap(ControlSurface):
                                 if self.last_sent_out_playing_pos != 0.0:
                                     self.last_sent_out_playing_pos = 0.0
                                     self.send_out_playing_pos(self.last_sent_out_playing_pos)
-                                    
                                 
                         else:
                             # making sure we have the right starting position, when jumping back to the start of clip or loop
