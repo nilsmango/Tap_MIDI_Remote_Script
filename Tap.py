@@ -353,6 +353,10 @@ class Tap(ControlSurface):
         # selecting playing clip
         select_playing_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 84)
         select_playing_clip_button.add_value_listener(self._select_playing_clip)
+        # cropping selected clip
+        crop_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 83)
+        crop_clip_button.add_value_listener(self._crop_clip)
+        
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -558,6 +562,14 @@ class Tap(ControlSurface):
                     song.view.selected_scene = song.scenes[index]
                     break
     
+    def _crop_clip(self, value):
+        if value != 0:
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            
+            if clip_slot and clip_slot.has_clip:
+                clip = clip_slot.clip
+                clip.crop()
     
     def _duplicate_clip(self):
         song = self.song()
@@ -652,7 +664,7 @@ class Tap(ControlSurface):
     def _check_clip_playing_status(self):
         song = self.song()
         selected_track = song.view.selected_track
-        highlighted_clip_slot_playing = song.view.highlighted_clip_slot.is_playing
+        highlighted_clip_slot_playing = getattr(song.view.highlighted_clip_slot, 'is_playing', False)
         
         if highlighted_clip_slot_playing:
             # Ensure status is 0 if the highlighted clip is playing
