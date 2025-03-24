@@ -424,7 +424,8 @@ class Tap(ControlSurface):
     def _periodic_check(self):
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
-        if self.device_status is False and self.mixer_status is False:
+        # meaning not in the device view
+        if self.device_status is False:
             self._update_clip_slots()
 
     def _redo_button_value(self, value):
