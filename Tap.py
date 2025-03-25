@@ -49,6 +49,7 @@ class Tap(ControlSurface):
             self.last_playing_position = 0.0
             self.last_sent_out_playing_pos = 0.0
             self.clip_length_trick = 220.0
+            self.clip_start_trick = -100.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -696,10 +697,11 @@ class Tap(ControlSurface):
                     
                     time_span = max(self.clip_length_trick, clip_playing.loop_end, clip_playing.end_marker, clip_playing.length)
                     loop_start = clip_playing.loop_start
-
+                    clip_start = min(self.clip_start_trick, clip_playing.start_time, clip_playing.start_marker, loop_start)
+                    
                     try:
                         # Get all the notes in the clip
-                        current_raw_notes = clip_playing.get_notes_extended(0, 128, 0, time_span)
+                        current_raw_notes = clip_playing.get_notes_extended(0, 128, clip_start, time_span)
                         
                         # if the current clip has different notes save the new notes.
                         if current_raw_notes is not self.last_raw_notes:
@@ -775,8 +777,10 @@ class Tap(ControlSurface):
                                     self.send_note_on(pitch, 0, 100)
                             # update last playing position
                             self.last_playing_position = clip_position
-                    except:
-                        self.log_message("Exception for clip position changed")
+                    except Exception as e:
+                        self.log_message(f"Exception for clip position changed: {str(e)}")
+                        import traceback
+                        self.log_message(traceback.format_exc())
                         pass
                 # else:
                     # self.log_message("No valid clip in the slot.")
@@ -1333,7 +1337,8 @@ class Tap(ControlSurface):
                 
                 # Fetch existing notes from the clip
                 clip_length = max(self.clip_length_trick, clip.loop_end, clip.end_marker, clip.length)
-                notes = clip.get_notes_extended(0, 128, 0, clip_length)
+                clip_start = min(self.clip_start_trick, clip.start_time, clip.start_marker, clip.loop_start)
+                notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
         
                 # Modify the matching note
                 for note in notes:
@@ -1608,34 +1613,34 @@ class Tap(ControlSurface):
     
     def _to_3_7bit_bytes(self, value):
         """
-        Convert an integer value to exactly 3 7-bit bytes suitable for MIDI.
-        Each byte uses only 7 bits, with the MSB reserved for MIDI.
-        Can handle values up to 2,097,151 (2^21 - 1).
+        Convert an integer into 3 MIDI 7-bit bytes.
+        Uses the highest bit of the first byte as a sign indicator.
         """
-        if value < 0:
-            value = 0
-        if value > 0x1FFFFF:  # 2,097,151
+        is_negative = value < 0
+        value = abs(value)
+        
+        if value > 0x1FFFFF:  # Cap at 2,097,151
             value = 0x1FFFFF
-            
-        return [
-            (value >> 14) & 0x7F,  # Highest 7 bits
-            (value >> 7) & 0x7F,   # Middle 7 bits
-            value & 0x7F           # Lowest 7 bits
-        ]
+    
+        first_byte = (value >> 14) & 0x7F
+        if is_negative:
+            first_byte |= 0x40  # Set the sign bit for negative numbers
+    
+        return [first_byte, (value >> 7) & 0x7F, value & 0x7F]
     
     def _from_3_7bit_bytes(self, bytes_list, start_index=0):
         """
-        Convert 3 7-bit bytes back into an integer value.
-        Expects exactly 3 bytes.
+        Convert 3 MIDI 7-bit bytes back into an integer.
+        The highest bit of the first byte is used as a sign indicator.
         """
         if len(bytes_list) < start_index + 3:
             return 0
-            
-        return (
-            (bytes_list[start_index] << 14) |
-            (bytes_list[start_index + 1] << 7) |
-            bytes_list[start_index + 2]
-        )
+    
+        first_byte = bytes_list[start_index]
+        is_negative = (first_byte & 0x40) != 0  # Check if the sign bit is set
+        value = ((first_byte & 0x3F) << 14) | (bytes_list[start_index + 1] << 7) | bytes_list[start_index + 2]
+    
+        return -value if is_negative else value
     
     def send_selected_clip_metadata(self):
         """
@@ -1695,9 +1700,9 @@ class Tap(ControlSurface):
                 
                     # Extract clip metadata
                     clip_length = max(self.clip_length_trick, selected_clip.loop_end, selected_clip.end_marker, selected_clip.length)
-                    
+                    clip_start = min(self.clip_start_trick, selected_clip.start_time, selected_clip.start_marker, selected_clip.loop_start)
                     # Get notes
-                    notes = selected_clip.get_notes_extended(0, 128, 0, clip_length)
+                    notes = selected_clip.get_notes_extended(0, 128, clip_start, clip_length)
                     # self.log_message(f"Number of notes found: {len(notes)}")
                     for note in notes:
                         note_id = int(note.note_id)
