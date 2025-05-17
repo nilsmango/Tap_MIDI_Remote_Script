@@ -155,12 +155,17 @@ class Tap(ControlSurface):
             self._drum_rack_device = None
             
         if liveobj_valid(self._device):
-            # device = self._device.device()  # Retrieve the Device object
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
-            # device_name = selected_device.name
-            available_devices = selected_track.devices
+            
+            # Get all available devices of the selected track, including nested devices
+            # CHANGE 1: Create the nested devices list early
+            all_devices = self._get_all_nested_devices(selected_track.devices)
+            # Convert device objects to names for display
+            all_device_names = [device.name for device in all_devices]
+            available_devices_string = ','.join(all_device_names)
+            
             # find out if track has a drum rack.
             track_has_drums = 0
             drum_rack_device = self._find_drum_rack_in_track(selected_track)
@@ -170,30 +175,32 @@ class Tap(ControlSurface):
                 self._drum_rack_device = drum_rack_device
                 self._setup_drum_pad_listeners()
                 
-            # find index of device
-            selected_device_index = self._find_device_index(selected_device, available_devices)
-            # self.log_message("Selected Device Index: {}".format(selected_device_index))
+            # CHANGE 2: Find index of selected device in our comprehensive nested devices list
+            selected_device_index = "not found"
+            for index, device in enumerate(all_devices):
+                if device == selected_device:
+                    selected_device_index = str(index)
+                    break
+            
             # bank names, list and if has drum
             bank_name_drum = self._device._bank_name + ";" + str(track_has_drums)
             bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
+            
             # sending sysex of bank name, device name, bank names
             self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
-            # sending the index instead of name for device.
+            # CHANGE 3: Send the index from our comprehensive device list
             self._send_sys_ex_message(selected_device_index, 0x4D)
-            # Get all available devices of the selected track
-            available_devices = [device.name for device in selected_track.devices]
-            available_devices_string = ','.join(available_devices)
-            # self.log_message("devices: {}".format(available_devices))
+            
+            # Send the comprehensive list of available devices
             self._send_sys_ex_message(available_devices_string, 0x01)
-
+    
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
                 # TODO: make this prettier!
                 parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
                                 for control in self._device._parameter_controls]
                 parameter_names = [name for name in parameter_names if name]  # Remove empty names
                 if parameter_names:
-                    # self.log_message("Parameter Names: {}".format(parameter_names))
                     # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
@@ -213,12 +220,56 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(available_devices_string, 0x01)
             self._send_parameter_names(parameter_names)
-
-    def _find_device_index(self, device, device_list):
-        for index, d in enumerate(device_list):
-            if device == d:
-                return str(index)
-        return "not found"  # Device not found
+    
+    def _get_all_nested_devices(self, devices):
+        """
+        Recursively collect all devices, including those inside instruments and drum racks.
+        For drum racks, only include the selected drum pad chain (like Push behavior).
+        Returns a list of device objects (not just names).
+        """
+        all_devices = []
+        
+        for device in devices:
+            if liveobj_valid(device):
+                # Add the current device
+                all_devices.append(device)
+                
+                # Check if device is a drum rack
+                if hasattr(device, 'can_have_drum_pads') and device.can_have_drum_pads and hasattr(device, 'drum_pads') and device.drum_pads:
+                    # For drum racks, only process the selected drum pad chain
+                    selected_drum_pad = self._get_selected_drum_pad(device)
+                    if selected_drum_pad and hasattr(selected_drum_pad, 'chains') and selected_drum_pad.chains:
+                        for chain in selected_drum_pad.chains:
+                            if liveobj_valid(chain) and hasattr(chain, 'devices'):
+                                # Add devices from the selected drum pad chain
+                                nested_devices = self._get_all_nested_devices(chain.devices)
+                                all_devices.extend(nested_devices)
+                
+                # Check if device is an instrument rack or effect rack (has chains)
+                elif hasattr(device, 'chains') and device.chains:
+                    for chain in device.chains:
+                        if liveobj_valid(chain) and hasattr(chain, 'devices'):
+                            # Add devices from this chain
+                            nested_devices = self._get_all_nested_devices(chain.devices)
+                            all_devices.extend(nested_devices)
+                            
+        return all_devices
+    
+    def _get_selected_drum_pad(self, drum_rack):
+        """
+        Get the currently selected drum pad from a drum rack device.
+        Returns the selected drum pad or None if none is selected.
+        """
+        if hasattr(drum_rack, 'view') and hasattr(drum_rack.view, 'selected_drum_pad'):
+            return drum_rack.view.selected_drum_pad
+        
+        # Alternative: if the view approach doesn't work, we could try to find the 
+        # currently playing pad or default to the first pad with a chain
+        for pad in drum_rack.drum_pads:
+            if liveobj_valid(pad) and hasattr(pad, 'chains') and pad.chains:
+                return pad
+                
+        return None
 
     def _send_parameter_names(self, parameter_names):
         if parameter_names == "":
