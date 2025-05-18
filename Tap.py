@@ -103,15 +103,19 @@ class Tap(ControlSurface):
     def _setup_drum_pad_listeners(self):
         if self._drum_rack_device:
             self._send_all_drum_pad_names()
+            self._send_selected_drum_pad_number()
             for pad in self._drum_rack_device.drum_pads:
                 if not pad.name_has_listener(self._send_all_drum_pad_names):
                     pad.add_name_listener(self._send_all_drum_pad_names)
+            self._drum_rack_device.view.add_selected_drum_pad_listener(self._send_selected_drum_pad_number)
 
     def _remove_drum_pad_name_listeners(self):
         if self._drum_rack_device:
             for pad in self._drum_rack_device.drum_pads:
                 if pad.name_has_listener(self._send_all_drum_pad_names):
                     pad.remove_name_listener(self._send_all_drum_pad_names)
+            if self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
+                self._drum_rack_device.view.remove_selected_drum_pad_listener(self._send_selected_drum_pad_number)
 
     def _send_all_drum_pad_names(self):
         if not self._drum_rack_device:
@@ -270,7 +274,26 @@ class Tap(ControlSurface):
                 return pad
                 
         return None
-
+    
+    def _send_selected_drum_pad_number(self):
+        """
+        Gets the currently selected drum pad number and sends it as a MIDI note on message
+        on channel 3, note number 3, with the pad number encoded in the velocity.
+        """
+        try:
+            # Get the selected drum pad
+            if self._drum_rack_device:
+                pad_number = self._drum_rack_device.view.selected_drum_pad.note
+                channel = 3  # This is channel 3 in 0-indexed counting
+                midi_note_number = 3
+                # Sending pad number out as velocity. So 0 will have no signal, but doesn not matter as we don't even go so low in Tap
+                self.send_note_on(midi_note_number, channel, pad_number)
+            else:
+                self.log_message("No drum pad selected")
+            
+        except Exception as e:
+            self.log_message(f"Error sending drum pad number: {str(e)}")
+    
     def _send_parameter_names(self, parameter_names):
         if parameter_names == "":
             name_string = ""
