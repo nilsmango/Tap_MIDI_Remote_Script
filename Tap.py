@@ -856,8 +856,9 @@ class Tap(ControlSurface):
         return "not found" # Track not found
 
     def _select_device_by_index(self, value):
-        # self.log_message("Setting new device Index: {}".format(value))
-        device_to_select = self.song().view.selected_track.devices[value]
+        selected_track = self.song().view.selected_track
+        all_devices = self._get_all_nested_devices(selected_track.devices)
+        device_to_select = all_devices[value]
         self.song().view.select_device(device_to_select)
 
     def _select_track_by_index(self, track_index):
