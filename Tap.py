@@ -392,6 +392,9 @@ class Tap(ControlSurface):
         # delete device button
         delete_device_button = ButtonElement(1, MIDI_CC_TYPE, 1, 17)
         delete_device_button.add_value_listener(self._delete_device)
+        # select drum pad button
+        select_drum_pad_button = ButtonElement(1, MIDI_CC_TYPE, 1, 24)
+        select_drum_pad_button.add_value_listener(self._select_drum_pad)
         # move device left
         move_device_left_button = ButtonElement(1, MIDI_CC_TYPE, 1, 18)
         move_device_left_button.add_value_listener(self._move_device_left)
@@ -1538,6 +1541,11 @@ class Tap(ControlSurface):
         selected_track = self.song().view.selected_track
         selected_track.delete_device(value)
         self._on_device_changed()
+    
+    def _select_drum_pad(self, value):
+        if self._drum_rack_device:
+            drum_pad = self._drum_rack_device.drum_pads[value]
+            self._drum_rack_device.view.selected_drum_pad = drum_pad
 
     def _move_device_left(self, value):
         song = self.song()
