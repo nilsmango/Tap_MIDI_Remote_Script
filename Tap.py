@@ -1036,7 +1036,9 @@ class Tap(ControlSurface):
         track_colors_string = "-".join(return_track_colors)
         self._send_sys_ex_message(track_colors_string, 0x07)
 
-
+        self._set_up_mixer_controls()
+        
+    def _set_up_mixer_controls(self):
         # Channels
         for index, track in enumerate(self.song().tracks):
 
@@ -1044,65 +1046,56 @@ class Tap(ControlSurface):
 
             # Configure strip controls for each channel track
 
-            # VolumeSlider control
-            volume_slider = SliderElement(MIDI_CC_TYPE, 2, index)  # MIDI CC channel 2, index == CC number
-            strip.set_volume_control(volume_slider)
-
-            # Send1Knob control
-            send1_knob = EncoderElement(MIDI_CC_TYPE, 3, index, Live.MidiMap.MapMode.absolute)
-
-            # Send2Knob control
-            send2_knob = EncoderElement(MIDI_CC_TYPE, 4, index, Live.MidiMap.MapMode.absolute)
-            strip.set_send_controls((send1_knob, send2_knob,))
-
-            # Pan
-            pan_knob = EncoderElement(MIDI_CC_TYPE, 5, index, Live.MidiMap.MapMode.absolute)
-            strip.set_pan_control(pan_knob)
-
-            # TrackMuteButton control
-            mute_button = ButtonElement(1, MIDI_CC_TYPE, 6, index)
-            strip.set_mute_button(mute_button)
-
-            # Solo button control
-            solo_button = ButtonElement(1, MIDI_CC_TYPE, 7, index)
-            strip.set_solo_button(solo_button)
+            if self.mixer_status:
+                strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 2, index))
+                strip.set_send_controls((
+                    EncoderElement(MIDI_CC_TYPE, 3, index, Live.MidiMap.MapMode.absolute),
+                    EncoderElement(MIDI_CC_TYPE, 4, index, Live.MidiMap.MapMode.absolute)
+                ))
+                strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 5, index, Live.MidiMap.MapMode.absolute))
+                strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 6, index))
+                strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 7, index))
+            else:
+                strip.set_volume_control(None)
+                strip.set_send_controls(None)
+                strip.set_pan_control(None)
+                strip.set_mute_button(None)
+                strip.set_solo_button(None)
 
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
             # strip.set_shift_button(...)
 
         # Master / channel 7 cc 127
-        mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
-        mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
-        mixer.master_strip().set_pan_control(EncoderElement(MIDI_CC_TYPE, 0, 125, Live.MidiMap.MapMode.absolute))
+        if self.mixer_status:
+            mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
+            mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
+            mixer.master_strip().set_pan_control(EncoderElement(MIDI_CC_TYPE, 0, 125, Live.MidiMap.MapMode.absolute))
+        else:
+            mixer.master_strip().set_volume_control(None)
+            mixer.set_prehear_volume_control(None)
+            mixer.master_strip().set_pan_control(None)
 
         # Return Tracks
         for index, returnTrack in enumerate(self.song().return_tracks):
             strip = mixer.return_strip(index)
 
-            # VolumeSlider
-            return_volume_slider = SliderElement(MIDI_CC_TYPE, 8, index)
-            strip.set_volume_control(return_volume_slider)
-
-            # TrackMuteButton control
-            mute_button = ButtonElement(1, MIDI_CC_TYPE, 8, index + 12)
-            strip.set_mute_button(mute_button)
-
-            # Solo button control
-            solo_button = ButtonElement(1, MIDI_CC_TYPE, 8, index + 24)
-            strip.set_solo_button(solo_button)
-
-            # Send1Knob control (A)
-            send1_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 36, Live.MidiMap.MapMode.absolute)
-
-            # Send2Knob control (B)
-            send2_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 48, Live.MidiMap.MapMode.absolute)
-            strip.set_send_controls((send1_knob, send2_knob,))
-
-            # Pan
-            pan_knob = EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute)
-            strip.set_pan_control(pan_knob)
-
+            if self.mixer_status:
+                strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 8, index))
+                strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 12))
+                strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 24))
+                strip.set_send_controls((
+                    EncoderElement(MIDI_CC_TYPE, 8, index + 36, Live.MidiMap.MapMode.absolute),
+                    EncoderElement(MIDI_CC_TYPE, 8, index + 48, Live.MidiMap.MapMode.absolute)
+                ))
+                strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute))
+            else:
+                strip.set_volume_control(None)
+                strip.set_mute_button(None)
+                strip.set_solo_button(None)
+                strip.set_send_controls(None)
+                strip.set_pan_control(None)
+        
     def _on_output_level_changed(self, index):
         # self.log_message("output level sending: {}".format(index))
         if self.mixer_status:
@@ -1574,8 +1567,10 @@ class Tap(ControlSurface):
     def _update_mixer_status(self, value):
         if value:
             self.mixer_status = True
+            self._set_up_mixer_controls()
         else:
             self.mixer_status = False
+            self._set_up_mixer_controls()
 
     def _update_device_status(self, value):
         if value:
