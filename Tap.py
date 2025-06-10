@@ -57,6 +57,9 @@ class Tap(ControlSurface):
             self.old_clips_array = []
             self._drum_rack_device = None
             self.was_initialized = False
+            self._track_level_listeners = {}
+            self._return_level_listeners = {}
+            self._master_level_listeners = {}
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -941,19 +944,51 @@ class Tap(ControlSurface):
     def _on_color_name_changed(self):
         self._update_mixer_and_tracks()
         self._on_selected_track_changed()
-
+    
+    def _create_level_change_handler(self, index):
+        """
+        A factory that returns a handler function for a specific index.
+        This guarantees the index is correctly captured.
+        """
+        def handler():
+            self._on_output_level_changed(index)
+        return handler
+    
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
-        tracks = self.song().tracks
+        tracks = list(self.song().tracks)
+        return_tracks = list(self.song().return_tracks)
+        master_track = self.song().master_track
+
+        # 1. Remove all old listeners to prevent leaks
+        for track, (left_listener, right_listener) in self._track_level_listeners.items():
+            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+                track.remove_output_meter_left_listener(left_listener)
+            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+                track.remove_output_meter_right_listener(right_listener)
+        self._track_level_listeners.clear()
+
+        for track, (left_listener, right_listener) in self._return_level_listeners.items():
+            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+                track.remove_output_meter_left_listener(left_listener)
+            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+                track.remove_output_meter_right_listener(right_listener)
+        self._return_level_listeners.clear()
+        
+        if self._master_level_listeners:
+            left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
+            if left_listener and master_track.output_meter_left_has_listener(left_listener):
+                master_track.remove_output_meter_left_listener(left_listener)
+            if right_listener and master_track.output_meter_right_has_listener(right_listener):
+                master_track.remove_output_meter_right_listener(right_listener)
+            self._master_level_listeners.clear()
+                    
         tracks_length = len(tracks)
-        # # send track names
-        # track_names = ",".join([track.name for track in tracks])
-        # self._send_sys_ex_message(track_names, 0x02)
         track_names = []
         track_is_audio = []
         track_colors = []
-
-        for index, track in enumerate(self.song().tracks):
+        
+        for index, track in enumerate(tracks):
             # track names
             track_names.append(track.name)
             # check if it's a group track or a grouped track member
@@ -975,11 +1010,12 @@ class Tap(ControlSurface):
 
             # output meter listeners
             if track.has_audio_output:
-                # self.log_message("Adding listener at {}".format(index))
-                if not track.output_meter_left_has_listener(self._on_output_level_changed(index)):
-                    track.add_output_meter_left_listener(lambda index=index: self._on_output_level_changed(index))
-                if not track.output_meter_right_has_listener(self._on_output_level_changed(index)):
-                    track.add_output_meter_right_listener(lambda index=index: self._on_output_level_changed(index))
+                left_handler = self._create_level_change_handler(index)
+                right_handler = self._create_level_change_handler(index)
+                track.add_output_meter_left_listener(left_handler)
+                track.add_output_meter_right_listener(right_handler)
+                # Store the new listeners so we can remove them later
+                self._track_level_listeners[track] = (left_handler, right_handler)
 
             # other listeners
             if not track.color_has_listener(self._on_color_name_changed):
@@ -1003,27 +1039,24 @@ class Tap(ControlSurface):
         return_track_names = []
         return_track_colors = []
 
-        for index, return_track in enumerate(self.song().return_tracks):
+        for index, return_track in enumerate(return_tracks):
             return_track_names.append(return_track.name)
-
-            color_string = color_string = self._make_color_string(return_track.color)
-            return_track_colors.append(color_string)
-
-            # output meter listeners
-            return_index = index + tracks_length
-            if not return_track.output_meter_left_has_listener(self._on_output_level_changed(return_index)):
-                return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
-            if not return_track.output_meter_right_has_listener(self._on_output_level_changed(return_index)):
-                return_track.add_output_meter_left_listener(lambda index=return_index: self._on_output_level_changed(index))
+            return_track_colors.append(self._make_color_string(return_track.color))
+            
+            return_index = index + len(tracks)
+            left_handler = self._create_level_change_handler(return_index)
+            right_handler = self._create_level_change_handler(return_index)
+            return_track.add_output_meter_left_listener(left_handler)
+            return_track.add_output_meter_right_listener(right_handler) 
+            self._return_level_listeners[return_track] = (left_handler, right_handler)
 
         # output meter listeners master track
-        master_index = 127 # len(self.song().return_tracks) + tracks_length
-        # self.log_message("master index: {}".format(master_index))
-        master_track = self.song().master_track
-        if not master_track.output_meter_left_has_listener(self._on_output_level_changed(master_index)):
-                master_track.add_output_meter_left_listener(lambda index=master_index: self._on_output_level_changed(index))
-        if not master_track.output_meter_right_has_listener(self._on_output_level_changed):
-            master_track.add_output_meter_right_listener(lambda index=master_index: self._on_output_level_changed(index))
+        master_index = 127
+        left_handler = self._create_level_change_handler(master_index)
+        right_handler = self._create_level_change_handler(master_index)
+        master_track.add_output_meter_left_listener(left_handler)
+        master_track.add_output_meter_right_listener(right_handler)
+        self._master_level_listeners[master_track] = (left_handler, right_handler)
 
         # add master track color to the mix:
         color_string = self._make_color_string(master_track.color)
@@ -2000,5 +2033,26 @@ class Tap(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
+        # Clean up level listeners
+        for track, (left_listener, right_listener) in self._track_level_listeners.items():
+            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+                track.remove_output_meter_left_listener(left_listener)
+            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+                track.remove_output_meter_right_listener(right_listener)
+        
+        for track, (left_listener, right_listener) in self._return_level_listeners.items():
+            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+                track.remove_output_meter_left_listener(left_listener)
+            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+                track.remove_output_meter_right_listener(right_listener)
+
+        if self._master_level_listeners:
+            master_track = self.song().master_track
+            left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
+            if left_listener and liveobj_valid(master_track) and master_track.output_meter_left_has_listener(left_listener):
+                master_track.remove_output_meter_left_listener(left_listener)
+            if right_listener and liveobj_valid(master_track) and master_track.output_meter_right_has_listener(right_listener):
+                master_track.remove_output_meter_right_listener(right_listener)
+        
         self.periodic_timer = 0
         super(Tap, self).disconnect()
