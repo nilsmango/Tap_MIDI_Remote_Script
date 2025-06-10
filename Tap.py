@@ -35,6 +35,7 @@ class Tap(ControlSurface):
             global session_component
             self.mixer_status = False
             self.mixer_reset = True
+            self.visible_channels = (0, 3)
             self.device_status = True
             self.seq_status = False
             self.seq_clip_playing_status = 2
@@ -1039,14 +1040,33 @@ class Tap(ControlSurface):
         self._set_up_mixer_controls()
         
     def _set_up_mixer_controls(self):
+        song = self.song()
+        tracks = song.tracks
+        return_tracks = song.return_tracks
+        # - 1 because visible_channels is starting at 0
+        last_track_index = len(tracks) - 1
+        
+        number_of_return_tracks = len(return_tracks)
+        number_of_return_tracks_visible = self.visible_channels[1] - last_track_index
+        master_track_visible = number_of_return_tracks_visible > number_of_return_tracks
+        # self.log_message(f"visible_channels[0]: {self.visible_channels[0]}")
+        # self.log_message(f"visible_channels[1]: {self.visible_channels[1]}")
+        # self.log_message(f"master_track_visible: {master_track_visible}")
+        
+        # if last is 9, and last track is 7 -> last visible return is 1
+        last_visible_return_index = self.visible_channels[1] - len(tracks)
+        # if first is 8, and last track is 7 -> first visible return is 0
+        first_visible_return_index = self.visible_channels[0] - len(tracks)
+        # self.log_message(f"first_visible_return_index: {first_visible_return_index}")
+        # self.log_message(f"last_visible_return_index: {last_visible_return_index}")
+        
         # Channels
-        for index, track in enumerate(self.song().tracks):
+        for index, track in enumerate(tracks):
 
             strip = mixer.channel_strip(index)
 
             # Configure strip controls for each channel track
-
-            if self.mixer_status:
+            if self.mixer_status and index >= self.visible_channels[0] and index <= self.visible_channels[1]:
                 strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 2, index))
                 strip.set_send_controls((
                     EncoderElement(MIDI_CC_TYPE, 3, index, Live.MidiMap.MapMode.absolute),
@@ -1055,6 +1075,8 @@ class Tap(ControlSurface):
                 strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 5, index, Live.MidiMap.MapMode.absolute))
                 strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 6, index))
                 strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 7, index))
+                # reseting volume just in case
+                self._on_output_level_changed(index)
             else:
                 strip.set_volume_control(None)
                 strip.set_send_controls(None)
@@ -1067,20 +1089,22 @@ class Tap(ControlSurface):
             # strip.set_shift_button(...)
 
         # Master / channel 7 cc 127
-        if self.mixer_status:
+        if self.mixer_status and master_track_visible:
             mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
             mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
             mixer.master_strip().set_pan_control(EncoderElement(MIDI_CC_TYPE, 0, 125, Live.MidiMap.MapMode.absolute))
+            # reseting volume just in case
+            self._on_output_level_changed(127)
         else:
             mixer.master_strip().set_volume_control(None)
             mixer.set_prehear_volume_control(None)
             mixer.master_strip().set_pan_control(None)
 
         # Return Tracks
-        for index, returnTrack in enumerate(self.song().return_tracks):
+        for index, returnTrack in enumerate(return_tracks):
             strip = mixer.return_strip(index)
 
-            if self.mixer_status:
+            if self.mixer_status and index <= last_visible_return_index and index >= first_visible_return_index:
                 strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 8, index))
                 strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 12))
                 strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 24))
@@ -1089,6 +1113,8 @@ class Tap(ControlSurface):
                     EncoderElement(MIDI_CC_TYPE, 8, index + 48, Live.MidiMap.MapMode.absolute)
                 ))
                 strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute))
+                # reseting volume just in case
+                self._on_output_level_changed(index + len(tracks))
             else:
                 strip.set_volume_control(None)
                 strip.set_mute_button(None)
@@ -1097,39 +1123,42 @@ class Tap(ControlSurface):
                 strip.set_pan_control(None)
         
     def _on_output_level_changed(self, index):
-        # self.log_message("output level sending: {}".format(index))
         if self.mixer_status:
             if not self.mixer_reset:
                 self.mixer_reset = True
             song = self.song()
             tracks = song.tracks
             return_tracks = song.return_tracks
-            if index < len(tracks):
-                track = tracks[index]
-            elif index - len(tracks) < len(return_tracks):
-                track = return_tracks[index - len(tracks)]
-            else:
-                track = song.master_track
-
-            if track.has_audio_output:
-                left_channel = track.output_meter_left
-                right_channel = track.output_meter_right
-            else:
-                left_channel = 0.0
-                right_channel = 0.0
-
-            value_left = int(round(left_channel * 100))
-            value_right = int(round(right_channel * 100))
-
-            # send midi cc left on channel 9, right on channel 10, cc == index, 
-            # value == Int(left_channel * 100)
-
-            status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
-            midi_cc_message_left = (status_byte_left, index, value_left)
-            self._send_midi(midi_cc_message_left)
-            status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
-            midi_cc_message_right = (status_byte_right, index, value_right)
-            self._send_midi(midi_cc_message_right)
+            is_visible_track = index >= self.visible_channels[0] and index <= self.visible_channels[1]            
+            is_visible_master = index == 127 and (len(tracks) + len(return_tracks) - 1) < self.visible_channels[1]
+            
+            if is_visible_track or is_visible_master:
+                if index < len(tracks):
+                    track = tracks[index]
+                elif index - len(tracks) < len(return_tracks):
+                    track = return_tracks[index - len(tracks)]
+                else:
+                    track = song.master_track
+    
+                if track.has_audio_output:
+                    left_channel = track.output_meter_left
+                    right_channel = track.output_meter_right
+                else:
+                    left_channel = 0.0
+                    right_channel = 0.0
+    
+                value_left = int(round(left_channel * 100))
+                value_right = int(round(right_channel * 100))
+    
+                # send midi cc left on channel 9, right on channel 10, cc == index, 
+                # value == Int(left_channel * 100)
+    
+                status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
+                midi_cc_message_left = (status_byte_left, index, value_left)
+                self._send_midi(midi_cc_message_left)
+                status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
+                midi_cc_message_right = (status_byte_right, index, value_right)
+                self._send_midi(midi_cc_message_right)
 
         elif self.mixer_reset:
             self.mixer_reset = False
@@ -1424,6 +1453,7 @@ class Tap(ControlSurface):
         
                 # Apply the modified notes back to the clip
                 clip.apply_note_modifications(notes)
+        
         # markers
         if len(message) >= 2 and message[1] == 17:
             # Decode the note ID and data
@@ -1447,6 +1477,14 @@ class Tap(ControlSurface):
                     clip.loop_start = marker_time
                 else:
                     clip.loop_end = marker_time
+        
+        # visible channel and mixer status true
+        if len(message) >= 2 and message[1] == 18:
+            start = message[2]
+            end = message[3]
+            self.visible_channels = (start, end)
+            self.mixer_status = True
+            self._set_up_mixer_controls()
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
@@ -1563,11 +1601,10 @@ class Tap(ControlSurface):
     def _add_return_track(self, value):
         if value:
             self.song().create_return_track()
-
+    
     def _update_mixer_status(self, value):
         if value:
-            self.mixer_status = True
-            self._set_up_mixer_controls()
+            pass
         else:
             self.mixer_status = False
             self._set_up_mixer_controls()
