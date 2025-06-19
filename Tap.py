@@ -70,23 +70,39 @@ class Tap(ControlSurface):
             # making a song instance
             self.song_instance = self.song()
 
-    def _setup_device_control(self):
-        self._device = DeviceComponent()
-        self._device.name = 'Device_Component'
-        device_controls = []
-        for index in range(8):
-            control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
-            control.name = 'Ctrl_' + str(index)
-            device_controls.append(control)
-        self._device.set_parameter_controls(device_controls)
-        nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
-        nav_right_button = ButtonElement(1, MIDI_CC_TYPE, 0, 32)
-        self._device.set_bank_nav_buttons(nav_left_button, nav_right_button)
-        self._on_device_changed.subject = self._device
-        self.set_device_component(self._device)
-        # Register button listeners for navigation buttons
-        nav_left_button.add_value_listener(self._on_nav_button_pressed)
-        nav_right_button.add_value_listener(self._on_nav_button_pressed)
+    def _setup_device_control(self, mixer_status):
+        if mixer_status:
+            self._device = DeviceComponent()
+            self._device.name = 'Device_Component'
+            device_controls = []
+            for index in range(8):
+                control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
+                control.name = 'Ctrl_' + str(index)
+                device_controls.append(control)
+            self._device.set_parameter_controls(device_controls)
+            nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
+            nav_right_button = ButtonElement(1, MIDI_CC_TYPE, 0, 32)
+            self._device.set_bank_nav_buttons(nav_left_button, nav_right_button)
+            self._on_device_changed.subject = self._device
+            self.set_device_component(self._device)
+            # Register button listeners for navigation buttons
+            if not nav_left_button.value_has_listener(self._on_nav_button_pressed):
+                nav_left_button.add_value_listener(self._on_nav_button_pressed)
+            
+            if not nav_right_button.value_has_listener(self._on_nav_button_pressed):
+                nav_right_button.add_value_listener(self._on_nav_button_pressed)
+        
+        else:
+            if self._device:
+                self._device.set_parameter_controls([])
+                self._on_device_changed.subject = None
+                self.set_device_component(None)
+                self._device = None
+        
+        
+        
+        
+
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -481,7 +497,7 @@ class Tap(ControlSurface):
                 # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
                 song.add_scale_name_listener(self._on_scale_changed)
                 song.add_root_note_listener(self._on_scale_changed)
-                self._setup_device_control()
+                self._setup_device_control(True)
                 self._register_clip_listeners()
                 self.periodic_timer = 1
                 self._periodic_execution()
@@ -716,7 +732,8 @@ class Tap(ControlSurface):
                 device_to_select = selected_track.devices[0]
             if device_to_select is not None:
                 self.song().view.select_device(device_to_select)
-            self._device_component.set_device(device_to_select)
+            if self._device_component:
+                self._device_component.set_device(device_to_select)
             self._check_clip_playing_status()
             if self.seq_status:
                 if self.device_status:
@@ -1637,10 +1654,14 @@ class Tap(ControlSurface):
     
     def _update_mixer_status(self, value):
         if value:
-            pass
+            # we are setting the mixer_status to true with the sysex we get
+            self._setup_device_control(True)
         else:
             self.mixer_status = False
+            self._setup_device_control(False)
             self._set_up_mixer_controls()
+            
+        
 
     def _update_device_status(self, value):
         if value:
