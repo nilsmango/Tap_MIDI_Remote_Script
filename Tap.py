@@ -26,7 +26,6 @@ swing_amount_value = 0.0
 
 
 class Tap(ControlSurface):
-
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
         with self.component_guard():
@@ -73,20 +72,37 @@ class Tap(ControlSurface):
     def _setup_device_control(self):
         self._device = DeviceComponent()
         self._device.name = 'Device_Component'
-        device_controls = []
+        
+        self._device_controls = []
         for index in range(8):
             control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
             control.name = 'Ctrl_' + str(index)
-            device_controls.append(control)
-        self._device.set_parameter_controls(device_controls)
+            self._device_controls.append(control)
+        
         nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
         nav_right_button = ButtonElement(1, MIDI_CC_TYPE, 0, 32)
         self._device.set_bank_nav_buttons(nav_left_button, nav_right_button)
+        
+        # Set up device change listener
         self._on_device_changed.subject = self._device
         self.set_device_component(self._device)
+        
         # Register button listeners for navigation buttons
         nav_left_button.add_value_listener(self._on_nav_button_pressed)
         nav_right_button.add_value_listener(self._on_nav_button_pressed)
+        
+        # Initially connect the controls (assuming we start in device mode)
+        self._connect_device_controls()
+
+    def _connect_device_controls(self):
+        """Connect device controls to parameters"""
+        if hasattr(self, '_device_controls'):
+            self._device.set_parameter_controls(self._device_controls)
+    
+    def _disconnect_device_controls(self):
+        """Disconnect device controls from parameters"""
+        if hasattr(self, '_device'):
+            self._device.set_parameter_controls([])
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -202,9 +218,12 @@ class Tap(ControlSurface):
             
             # Send the comprehensive list of available devices
             self._send_sys_ex_message(available_devices_string, 0x01)
-    
+            
+            if self.mixer_status:
+                # temporarily reconnect
+                self._connect_device_controls()
+            
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
-                # TODO: make this prettier!
                 parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
                                 for control in self._device._parameter_controls]
                 parameter_names = [name for name in parameter_names if name]  # Remove empty names
@@ -217,6 +236,11 @@ class Tap(ControlSurface):
             else:
                 parameter_names = ""
                 self._send_parameter_names(parameter_names)
+            
+            if self.mixer_status:
+                # disconnect again
+                self._disconnect_device_controls()
+        
         else:
             # no device
             # sending sysex of bank name, device name, bank names
@@ -1637,10 +1661,11 @@ class Tap(ControlSurface):
     
     def _update_mixer_status(self, value):
         if value:
-            pass
+            self._disconnect_device_controls()
         else:
             self.mixer_status = False
             self._set_up_mixer_controls()
+            self._connect_device_controls()
 
     def _update_device_status(self, value):
         if value:
