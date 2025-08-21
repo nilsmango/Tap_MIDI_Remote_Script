@@ -184,10 +184,27 @@ class Tap(ControlSurface):
             selected_device = selected_track.view.selected_device
             
             # Get all available devices of the selected track, including nested devices
-            # CHANGE 1: Create the nested devices list early
-            all_devices = self._get_all_nested_devices(selected_track.devices)
-            # Convert device objects to names for display
-            all_device_names = [device.name for device in all_devices]
+            all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+            
+            # Convert device objects to names for display, adding chain markers
+            all_device_names = []
+            for i, device in enumerate(all_devices):
+                name = device.name
+                
+                # Check if this device is the start of any chain
+                for info in chain_info:
+                    if info['start_index'] == i:
+                        name = "||" + name
+                        break
+                
+                # Check if this device is the end of any chain  
+                for info in chain_info:
+                    if info['end_index'] == i:
+                        name = name + "||"
+                        break
+                
+                all_device_names.append(name)
+            
             available_devices_string = ','.join(all_device_names)
             
             # find out if track has a drum rack.
@@ -288,9 +305,12 @@ class Tap(ControlSurface):
         """
         Recursively collect all devices, including those inside instruments and drum racks.
         For drum racks, only include the selected drum pad chain (like Push behavior).
-        Returns a list of device objects (not just names).
+        Returns a tuple: (list of device objects, list of chain_info dicts)
+        
+        chain_info format: {'start_index': int, 'end_index': int, 'type': 'drum_rack'/'rack'}
         """
         all_devices = []
+        chain_info = []
         
         for device in devices:
             if liveobj_valid(device):
@@ -304,19 +324,59 @@ class Tap(ControlSurface):
                     if selected_drum_pad and hasattr(selected_drum_pad, 'chains') and selected_drum_pad.chains:
                         for chain in selected_drum_pad.chains:
                             if liveobj_valid(chain) and hasattr(chain, 'devices'):
+                                # Mark start of nested chain
+                                start_index = len(all_devices)
+                                
                                 # Add devices from the selected drum pad chain
-                                nested_devices = self._get_all_nested_devices(chain.devices)
+                                nested_devices, nested_chain_info = self._get_all_nested_devices(chain.devices)
                                 all_devices.extend(nested_devices)
+                                
+                                # Mark end of nested chain (if any devices were added)
+                                if nested_devices:
+                                    end_index = len(all_devices) - 1
+                                    chain_info.append({
+                                        'start_index': start_index,
+                                        'end_index': end_index,
+                                        'type': 'drum_rack'
+                                    })
+                                
+                                # Add any nested chain info with adjusted indices
+                                for info in nested_chain_info:
+                                    chain_info.append({
+                                        'start_index': info['start_index'] + start_index,
+                                        'end_index': info['end_index'] + start_index,
+                                        'type': info['type']
+                                    })
                 
                 # Check if device is an instrument rack or effect rack (has chains)
                 elif hasattr(device, 'chains') and device.chains:
                     for chain in device.chains:
                         if liveobj_valid(chain) and hasattr(chain, 'devices'):
+                            # Mark start of nested chain
+                            start_index = len(all_devices)
+                            
                             # Add devices from this chain
-                            nested_devices = self._get_all_nested_devices(chain.devices)
+                            nested_devices, nested_chain_info = self._get_all_nested_devices(chain.devices)
                             all_devices.extend(nested_devices)
                             
-        return all_devices
+                            # Mark end of nested chain (if any devices were added)
+                            if nested_devices:
+                                end_index = len(all_devices) - 1
+                                chain_info.append({
+                                    'start_index': start_index,
+                                    'end_index': end_index,
+                                    'type': 'rack'
+                                })
+                            
+                            # Add any nested chain info with adjusted indices
+                            for info in nested_chain_info:
+                                chain_info.append({
+                                    'start_index': info['start_index'] + start_index,
+                                    'end_index': info['end_index'] + start_index,
+                                    'type': info['type']
+                                })
+                            
+        return all_devices, chain_info
     
     def _get_selected_drum_pad(self, drum_rack):
         """
@@ -942,7 +1002,7 @@ class Tap(ControlSurface):
 
     def _select_device_by_index(self, value):
         selected_track = self.song().view.selected_track
-        all_devices = self._get_all_nested_devices(selected_track.devices)
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
         device_to_select = all_devices[value]
         self.song().view.select_device(device_to_select)
 
