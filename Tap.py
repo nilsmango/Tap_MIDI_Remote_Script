@@ -224,11 +224,42 @@ class Tap(ControlSurface):
                 self._connect_device_controls()
             
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
-                parameter_names = [control.mapped_parameter().name if control.mapped_parameter() else ""
-                                for control in self._device._parameter_controls]
-                parameter_names = [name for name in parameter_names if name]  # Remove empty names
+                parameter_names = []
+                
+                # Get the actual device parameters directly
+                device_parameters = list(selected_device.parameters)
+                
+                for control in self._device._parameter_controls:
+                    if control.mapped_parameter():
+                        mapped_param = control.mapped_parameter()
+                        
+                        # Try to find the corresponding DeviceParameter by name
+                        device_param = None
+                        for dp in device_parameters:
+                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                device_param = dp
+                                break
+                        
+                        if device_param and hasattr(device_param, 'is_enabled'):
+                            if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
+                                if device_param.automation_state == 1:
+                                    parameter_names.append(f"**{device_param.name}")
+                                elif device_param.automation_state == 2:
+                                    parameter_names.append(f"*/{device_param.name}")
+                            elif device_param.is_enabled:
+                                parameter_names.append(device_param.name)
+                            else:
+                                parameter_names.append(f"*-{device_param.name}")
+                        else:
+                            # Fallback to mapped parameter name if DeviceParameter not found
+                            parameter_names.append(mapped_param.name)
+                    else:
+                        parameter_names.append("")
+                
+                # Filter out empty names but keep "-" for disabled parameters
+                parameter_names = [name for name in parameter_names if name != ""]
+                
                 if parameter_names:
-                    # send a MIDI SysEx message with the names
                     self._send_parameter_names(parameter_names)
                 else:
                     parameter_names = ""
