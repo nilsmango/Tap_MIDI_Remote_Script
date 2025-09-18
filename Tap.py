@@ -191,19 +191,26 @@ class Tap(ControlSurface):
             for i, device in enumerate(all_devices):
                 name = device.name
                 
-                # Check if this device is the start of any chain
-                for info in chain_info:
-                    if info['start_index'] == i:
-                        name = "||" + name
-                        break
+                # collect all starts/ends for this index
+                starts = [info for info in chain_info if info['start_index'] == i]
+                ends   = [info for info in chain_info if info['end_index'] == i]
                 
-                # Check if this device is the end of any chain  
-                for info in chain_info:
-                    if info['end_index'] == i:
-                        name = name + "||"
-                        break
-                
-                all_device_names.append(name)
+                # there should never be more than one rack or chain at the same index
+                prefix = ""
+                for s in starts:
+                    if s['type'] == 'rack':
+                        prefix += "||"
+                    elif s['type'] == 'chain':
+                        prefix += "|*"
+            
+                # make sure chains come first, racks after
+                suffix = ""
+                for e in [e for e in ends if e['type'] == 'chain']:
+                    suffix += "*|"
+                for e in [e for e in ends if e['type'] == 'rack']:
+                    suffix += "||"
+            
+                all_device_names.append(prefix + name + suffix)
             
             available_devices_string = ','.join(all_device_names)
             
@@ -337,7 +344,7 @@ class Tap(ControlSurface):
                                     chain_info.append({
                                         'start_index': start_index,
                                         'end_index': end_index,
-                                        'type': 'drum_rack'
+                                        'type': 'rack'
                                     })
                                 
                                 # Add any nested chain info with adjusted indices
@@ -350,6 +357,8 @@ class Tap(ControlSurface):
                 
                 # Check if device is an instrument rack or effect rack (has chains)
                 elif hasattr(device, 'chains') and device.chains:
+                    num_chains = len([c for c in device.chains if liveobj_valid(c) and hasattr(c, 'devices')])
+                    
                     for chain in device.chains:
                         if liveobj_valid(chain) and hasattr(chain, 'devices'):
                             # Mark start of nested chain
@@ -360,12 +369,13 @@ class Tap(ControlSurface):
                             all_devices.extend(nested_devices)
                             
                             # Mark end of nested chain (if any devices were added)
+                            # adding chain instead of rack if we have more than one chain
                             if nested_devices:
                                 end_index = len(all_devices) - 1
                                 chain_info.append({
                                     'start_index': start_index,
                                     'end_index': end_index,
-                                    'type': 'rack'
+                                    'type': 'chain' if num_chains > 1 else 'rack'
                                 })
                             
                             # Add any nested chain info with adjusted indices
