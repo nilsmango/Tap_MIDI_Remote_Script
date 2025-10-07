@@ -435,7 +435,7 @@ class Tap(ControlSurface):
         end_byte = 0xF7  # SysEx message end
         device_id = 0x01
         data = name_string.encode('ascii', errors='ignore')
-        max_chunk_length = 250
+        max_chunk_length = 240
         if len(data) <= max_chunk_length:
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
             self._send_midi(sys_ex_message)
@@ -1962,7 +1962,7 @@ class Tap(ControlSurface):
             end_byte = 0xF7
             manufacturer_id = 0x0D
             device_id = 0x01
-            max_chunk_length = 250
+            max_chunk_length = 240
             data = bytearray()
                 
             song = self.song()
