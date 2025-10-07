@@ -1478,6 +1478,48 @@ class Tap(ControlSurface):
         self._send_sys_ex_message(scale_string, 0x0A)
 
     def handle_sysex(self, message):
+        """
+        Handles incoming SysEx messages, including multi-part (chunked) ones.
+        Chunks start with '$' (more coming) or '_' (final chunk).
+        """
+        # Ensure we have a buffer for assembling chunks
+        if not hasattr(self, "_sysex_buffer"):
+            self._sysex_buffer = []
+    
+        # Basic validity check
+        if len(message) < 2:
+            return
+        
+        manufacturer_id = message[1]
+        prefix = message[2]
+    
+        # Check if this message is chunked (when manufacturer_id == 16)
+        if manufacturer_id == 16:
+            if prefix == 36:
+                # Intermediate chunk
+                self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
+                return
+        
+            elif prefix == 95:
+                # Final chunk — assemble full message
+                self._sysex_buffer.extend(message[3:-1])
+                full_message = [0xF0, manufacturer_id] + self._sysex_buffer + [0xF7]
+                self._sysex_buffer = []  # reset buffer
+        
+                # Now call the original handler
+                self._handle_full_sysex(full_message)
+                return
+            
+            else:
+                # Cancel chunking, something went wrong
+                self._sysex_buffer = []
+                return
+        
+        else:
+            # Non-chunked message → handle directly
+            self._handle_full_sysex(message)
+
+    def _handle_full_sysex(self, message):
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
             values = self.extract_values_from_sysex_message(message)
@@ -1562,30 +1604,10 @@ class Tap(ControlSurface):
                 # Remove the note by ID
                 clip.remove_notes_by_id([note_id])
         
-        # modify ONE note
-        if len(message) >= 2 and message[1] == 16:
-            # Decode the note ID and data
-            note_id = message[2] | (message[3] << 7)
-            pitch = message[4]
-
-            # Decode start time (variable-length value)
-            index = 5
-            start_time_raw = self._from_3_7bit_bytes(message, index)
-            start_time = start_time_raw / 1000.0
-            index += 3
-            
-            # Decode duration (variable-length value)
-            duration_raw = self._from_3_7bit_bytes(message, index)
-            duration = duration_raw / 1000.0
-            index += 3
-            
-            # Decode velocity (single byte)
-            velocity = message[index]
-            index += 1
-            
-            # Decode mute and probability
-            mute = bool(message[index] & 0x80)
-            probability = (message[index] & 0x7F) / 127.0
+        # modify MULTIPLE notes
+        if len(message) >= 3 and message[1] == 16:
+            note_count = message[2]
+            index = 3
         
             # Get the selected clip
             song = self.song()
@@ -1598,16 +1620,36 @@ class Tap(ControlSurface):
                 clip_start = min(self.clip_start_trick, clip.start_time, clip.start_marker, clip.loop_start)
                 notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
         
-                # Modify the matching note
-                for note in notes:
-                    if note.note_id == note_id:
-                        note.pitch = pitch
-                        note.start_time = start_time
-                        note.duration = duration
-                        note.velocity = velocity
-                        note.mute = mute
-                        note.probability = probability
-                        break
+                # Modify the matching notes
+                for _ in range(note_count):
+                    note_id = message[index] | (message[index + 1] << 7)
+                    pitch = message[index + 2]
+                    index += 3
+        
+                    start_time_raw = self._from_3_7bit_bytes(message, index)
+                    start_time = start_time_raw / 1000.0
+                    index += 3
+        
+                    duration_raw = self._from_3_7bit_bytes(message, index)
+                    duration = duration_raw / 1000.0
+                    index += 3
+        
+                    velocity = message[index]
+                    index += 1
+        
+                    mute = bool(message[index] & 0x80)
+                    probability = (message[index] & 0x7F) / 127.0
+                    index += 1
+        
+                    for note in notes:
+                        if note.note_id == note_id:
+                            note.pitch = pitch
+                            note.start_time = start_time
+                            note.duration = duration
+                            note.velocity = velocity
+                            note.mute = mute
+                            note.probability = probability
+                            break
         
                 # Apply the modified notes back to the clip
                 clip.apply_note_modifications(notes)
