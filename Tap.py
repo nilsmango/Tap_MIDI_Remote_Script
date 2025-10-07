@@ -1496,7 +1496,7 @@ class Tap(ControlSurface):
         prefix = message[2]
     
         # Check if this message is chunked (when manufacturer_id == 16)
-        if manufacturer_id == 16:
+        if manufacturer_id == 16 or manufacturer_id == 15:
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -1598,10 +1598,14 @@ class Tap(ControlSurface):
                 # Add the note to the clip
                 clip.add_new_notes([note_spec])
         
-        # remove note
+        # remove note (also multiple)
         if len(message) >= 2 and message[1] == 15:
-            # Decode the note ID
-            note_id = message[2] | (message[3] << 7)
+            note_ids = []
+            index = 2
+            while index < (len(message) - 1):
+                note_id = message[index] | (message[index + 1] << 7)
+                note_ids.append(note_id)
+                index += 2
         
             # Get the selected clip
             song = self.song()
@@ -1610,12 +1614,11 @@ class Tap(ControlSurface):
                 clip = clip_slot.clip
         
                 # Remove the note by ID
-                clip.remove_notes_by_id([note_id])
+                clip.remove_notes_by_id(note_ids)
         
         # modify MULTIPLE notes
         if len(message) >= 3 and message[1] == 16:
-            note_count = message[2]
-            index = 3
+            index = 2
         
             # Get the selected clip
             song = self.song()
@@ -1629,7 +1632,7 @@ class Tap(ControlSurface):
                 notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
         
                 # Modify the matching notes
-                for _ in range(note_count):
+                while index < (len(message) - 1):
                     note_id = message[index] | (message[index + 1] << 7)
                     pitch = message[index + 2]
                     index += 3
