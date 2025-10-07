@@ -1481,6 +1481,7 @@ class Tap(ControlSurface):
         """
         Handles incoming SysEx messages, including multi-part (chunked) ones.
         Chunks start with '$' (more coming) or '_' (final chunk).
+        Only for manufacturer ID 16 (Modify Notes).
         """
         # Ensure we have a buffer for assembling chunks
         if not hasattr(self, "_sysex_buffer"):
@@ -1488,6 +1489,7 @@ class Tap(ControlSurface):
     
         # Basic validity check
         if len(message) < 2:
+            self._sysex_buffer = []
             return
         
         manufacturer_id = message[1]
@@ -1516,8 +1518,14 @@ class Tap(ControlSurface):
                 return
         
         else:
-            # Non-chunked message → handle directly
-            self._handle_full_sysex(message)
+            if self._sysex_buffer != []:
+                # Cancel chunking, something went wrong
+                self._sysex_buffer = []
+                return
+                
+            else:
+                # Non-chunked message → handle directly
+                self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
         # start stop clip
