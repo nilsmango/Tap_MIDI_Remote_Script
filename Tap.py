@@ -1481,7 +1481,7 @@ class Tap(ControlSurface):
         """
         Handles incoming SysEx messages, including multi-part (chunked) ones.
         Chunks start with '$' (more coming) or '_' (final chunk).
-        Only for manufacturer ID 16 (Modify Notes).
+        Only for manufacturer ID 16, 15, 14 (Modify Notes).
         """
         # Ensure we have a buffer for assembling chunks
         if not hasattr(self, "_sysex_buffer"):
@@ -1496,7 +1496,7 @@ class Tap(ControlSurface):
         prefix = message[2]
     
         # Check if this message is chunked (when manufacturer_id == 16)
-        if manufacturer_id == 16 or manufacturer_id == 15:
+        if manufacturer_id == 16 or manufacturer_id == 15 or manufacturer_id == 14:
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -1554,37 +1554,43 @@ class Tap(ControlSurface):
             if len(values) == 2:
                 self._duplicate_loop(values[0], values[1])
         
-        # add note
+        # add MULTIPLE notes
         if len(message) >= 2 and message[1] == 14:
-            # Decode the note data
             index = 2
-            # Decode the pitch of the note
-            note_pitch = message[index]
-            index += 1
-        
-            # Decode the start time (variable-length value)
-            start_time = self._from_3_7bit_bytes(message, index)
-            index += 3
-        
-            # Decode the duration (variable-length value)
-            duration = self._from_3_7bit_bytes(message, index)
-            index += 3
-        
-            # Decode the velocity (single byte)
-            velocity = message[index]
-            index += 1
-        
-            # Decode mute and probability
-            mute_and_probability = message[index]
-            mute = (mute_and_probability & 0x80) != 0
-            probability = (mute_and_probability & 0x7F) / 127.0
-        
-            # Get the selected clip
-            song = self.song()
-            clip_slot = song.view.highlighted_clip_slot
-            if clip_slot is not None and clip_slot.has_clip:
-                clip = clip_slot.clip
-                
+            new_notes = []
+
+            # Decode all notes in the message
+            while index < (len(message) - 1):
+                # Decode the pitch of the note
+                note_pitch = message[index]
+                index += 1
+
+                # Decode the start time (3 bytes, 7-bit packed)
+                if index + 3 > len(message):
+                    break
+                start_time = self._from_3_7bit_bytes(message, index)
+                index += 3
+
+                # Decode the duration (3 bytes, 7-bit packed)
+                if index + 3 > len(message):
+                    break
+                duration = self._from_3_7bit_bytes(message, index)
+                index += 3
+
+                # Decode velocity
+                if index >= len(message):
+                    break
+                velocity = message[index]
+                index += 1
+
+                # Decode mute and probability
+                if index >= len(message):
+                    break
+                mute_and_probability = message[index]
+                mute = (mute_and_probability & 0x80) != 0
+                probability = (mute_and_probability & 0x7F) / 127.0
+                index += 1
+
                 # Create a MidiNoteSpecification object
                 note_spec = MidiNoteSpecification(
                     pitch=note_pitch,
@@ -1594,9 +1600,15 @@ class Tap(ControlSurface):
                     mute=mute,
                     probability=probability
                 )
-                
-                # Add the note to the clip
-                clip.add_new_notes([note_spec])
+
+                new_notes.append(note_spec)
+
+            # Add all decoded notes to the current clip
+            song = self.song()
+            clip_slot = song.view.highlighted_clip_slot
+            if clip_slot is not None and clip_slot.has_clip and len(new_notes) > 0:
+                clip = clip_slot.clip
+                clip.add_new_notes(new_notes)
         
         # remove note (also multiple)
         if len(message) >= 2 and message[1] == 15:
