@@ -718,6 +718,11 @@ class Tap(ControlSurface):
             
             clip_length = song.signature_numerator  # Use the time signature numerator for one full bar
             clip_slot.create_clip(clip_length)
+            
+            # lil trick to get the clip metadata to fire
+            if self.seq_status:
+                if self.device_status:
+                    self.start_step_seq()
     
     def _create_new_empty_clip(self, value):
         """
@@ -1879,7 +1884,7 @@ class Tap(ControlSurface):
                     
                     self.add_clip_metadata_listeners(selected_clip_slot.clip)
                 else:
-                    # TODO: create a clip slot listener that listens to clip changes
+                    # create a clip slot listener that listens to clip changes
                     if not selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                         selected_clip_slot.add_has_clip_listener(self.on_highlighted_slot_changed)
                         # self.log_message("added a has clip listener")
