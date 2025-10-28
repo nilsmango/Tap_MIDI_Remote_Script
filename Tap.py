@@ -1767,6 +1767,11 @@ class Tap(ControlSurface):
         song.scale_name = scale
         song.root_note = root
 
+        if scale.lower() == 'chromatic':
+            song.scale_mode = False
+        else:
+            song.scale_mode = True
+
     def _fire_scene(self, value):
         scenes = self.song().scenes
         if value < len(scenes):
