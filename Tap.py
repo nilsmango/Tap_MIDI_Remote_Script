@@ -1713,6 +1713,12 @@ class Tap(ControlSurface):
             self.visible_channels = (start, end)
             self.mixer_status = True
             self._set_up_mixer_controls()
+            
+        # combine clips
+        if len(message) >= 2 and message[1] == 19:
+            values = self.extract_values_from_sysex_message(message)
+            if len(values) == 4:
+                self._append_and_remove_clip(values[0], values[1], values[2], values[3])
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
@@ -1761,6 +1767,75 @@ class Tap(ControlSurface):
         paste_clip_slot = paste_track.clip_slots[to_clip]
 
         copy_clip_slot.duplicate_clip_to(paste_clip_slot)
+
+    def _append_and_remove_clip(self, from_track, from_clip, to_track, to_clip):
+        """
+        Appends notes from one MIDI clip to the end of another, then removes the source clip.
+        
+        Args:
+            from_track: Index of the track containing the clip to append
+            from_clip: Index of the clip slot to append from
+            to_track: Index of the track containing the destination clip
+            to_clip: Index of the clip slot to append to
+        """
+        tracks = self.song().tracks
+        source_track = tracks[from_track]
+        source_clip_slot = source_track.clip_slots[from_clip]
+        dest_track = tracks[to_track]
+        dest_clip_slot = dest_track.clip_slots[to_clip]
+        
+        # Check if both clips exist and are MIDI clips
+        if not source_clip_slot.has_clip or not dest_clip_slot.has_clip:
+            return
+        
+        source_clip = source_clip_slot.clip
+        dest_clip = dest_clip_slot.clip
+        
+        if not source_clip.is_midi_clip or not dest_clip.is_midi_clip:
+            return
+        
+        # Get source clip notes
+        source_clip_length = max(source_clip.loop_end, source_clip.end_marker, source_clip.length)
+        source_clip_start = min(source_clip.start_time, source_clip.start_marker, source_clip.loop_start)
+        source_notes = source_clip.get_notes_extended(0, 128, source_clip_start, source_clip_length)
+        
+        # Get destination clip end position (max of loop_end and end_marker)
+        dest_clip_end = max(dest_clip.loop_end, dest_clip.end_marker)
+        
+        # Calculate offset for appending notes
+        time_offset = dest_clip_end - source_clip_start
+        
+        # Offset the source notes to append at the end of destination
+        if source_notes:
+            new_notes = []
+            for note in source_notes:
+                pitch = int(note.pitch)
+                start_time = note.start_time + time_offset
+                duration = note.duration
+                velocity = int(note.velocity)
+                mute = note.mute
+                probability = note.probability
+                
+                note_spec = MidiNoteSpecification(
+                    pitch=pitch,
+                    start_time=start_time,
+                    duration=duration,
+                    velocity=velocity,
+                    mute=mute,
+                    probability=probability
+                )
+                new_notes.append(note_spec)
+            
+            # Add the offset notes to destination clip
+            dest_clip.add_new_notes(tuple(new_notes))
+            
+            # Update destination clip loop_end and end_marker to include new notes
+            new_end = dest_clip_end + source_clip_length
+            dest_clip.loop_end = new_end
+            dest_clip.end_marker = new_end
+        
+        # Remove the source clip
+        source_clip_slot.delete_clip()
 
     def _set_scale_root_note(self, scale, root):
         song = self.song()
