@@ -1878,8 +1878,35 @@ class Tap(ControlSurface):
 
     def _delete_device(self, value):
         selected_track = self.song().view.selected_track
-        selected_track.delete_device(value)
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        device_to_delete = all_devices[value]
+
+        # Try to find it in top-level devices first
+        if device_to_delete in selected_track.devices:
+            original_index = list(selected_track.devices).index(device_to_delete)
+            selected_track.delete_device(original_index)
+        else:
+            # Device is nested, find its parent chain
+            parent_chain, device_idx = self._find_parent_chain(selected_track.devices, device_to_delete)
+            if parent_chain:
+                parent_chain.delete_device(device_idx)
         self._on_device_changed()
+        
+        
+    def _find_parent_chain(self, devices, target_device):
+        """Find the parent chain and device index for a nested device"""
+        for rack in devices:
+            if hasattr(rack, 'chains'):
+                for chain in rack.chains:
+                    if target_device in chain.devices:
+                        device_idx = list(chain.devices).index(target_device)
+                        return chain, device_idx
+                    # Recursively check nested racks
+                    result = self._find_parent_chain(chain.devices, target_device)
+                    if result[0]:
+                        return result
+        return None, None
+        
     
     def _select_drum_pad(self, value):
         if self._drum_rack_device:
@@ -1889,14 +1916,36 @@ class Tap(ControlSurface):
     def _move_device_left(self, value):
         song = self.song()
         selected_track = song.view.selected_track
-        selected_device = selected_track.devices[value]
-        song.move_device(selected_device, selected_track, value - 1)
-
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        device_to_move = all_devices[value]
+        
+        # Check if it's a top-level device
+        if device_to_move in selected_track.devices:
+            real_index = list(selected_track.devices).index(device_to_move)
+            if real_index > 0:
+                song.move_device(device_to_move, selected_track, real_index - 1)
+        else:
+            # Device is inside a rack, move within its chain
+            parent_chain, device_idx = self._find_parent_chain(selected_track.devices, device_to_move)
+            if parent_chain and device_idx > 0:
+                song.move_device(device_to_move, parent_chain, device_idx - 1)
+    
     def _move_device_right(self, value):
         song = self.song()
         selected_track = song.view.selected_track
-        selected_device = selected_track.devices[value]
-        song.move_device(selected_device, selected_track, value + 2)
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        device_to_move = all_devices[value]
+        
+        # Check if it's a top-level device
+        if device_to_move in selected_track.devices:
+            real_index = list(selected_track.devices).index(device_to_move)
+            if real_index < len(selected_track.devices) - 1:
+                song.move_device(device_to_move, selected_track, real_index + 2)
+        else:
+            # Device is inside a rack, move within its chain
+            parent_chain, device_idx = self._find_parent_chain(selected_track.devices, device_to_move)
+            if parent_chain and device_idx < len(parent_chain.devices) - 1:
+                song.move_device(device_to_move, parent_chain, device_idx + 2)
 
     def _add_midi_track(self, value):
         song = self.song()
