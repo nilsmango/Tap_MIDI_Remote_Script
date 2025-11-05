@@ -1722,6 +1722,13 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 4:
                 self._append_and_remove_clip(values[0], values[1], values[2], values[3])
+        
+        # toggle arm for audio tracks
+        if len(message) >= 2 and message[1] == 20:
+            track_index = message[2]
+            track = self.song().tracks[track_index]
+            track.arm = not track.arm
+
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
