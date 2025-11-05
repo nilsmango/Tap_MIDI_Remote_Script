@@ -1417,8 +1417,9 @@ class Tap(ControlSurface):
     def _update_clip_slots(self):
         try:
             track_clips = []
-
             for track in self.song().tracks:
+                is_armed = track.arm
+                has_audio = track.has_audio_input
                 # track clip slots
                 clip_slots = []
                 for clip_slot in track.clip_slots:
@@ -1431,6 +1432,8 @@ class Tap(ControlSurface):
                         clip_value = "2"
                     elif clip_slot.has_clip:
                         clip_value = "1"
+                    elif is_armed and has_audio:
+                        clip_value = "5"
 
                     color_string_value = "0"
                     
