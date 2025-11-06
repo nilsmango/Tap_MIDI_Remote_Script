@@ -1728,6 +1728,30 @@ class Tap(ControlSurface):
             track_index = message[2]
             track = self.song().tracks[track_index]
             track.arm = not track.arm
+        
+        # select next clip
+        if len(message) >= 2 and message[1] == 21:
+            upValue = message[2]
+            track = self.song().view.selected_track
+            current_clip_slot = self.song().view.highlighted_clip_slot
+            # Find current index
+            current_index = list(track.clip_slots).index(current_clip_slot)
+            
+            if upValue == 0:  # Move down to next clip
+                # Search for next clip slot with a clip
+                for i in range(current_index + 1, len(track.clip_slots)):
+                    if track.clip_slots[i].has_clip:
+                        self.song().view.highlighted_clip_slot = track.clip_slots[i]
+                        break
+                        
+            elif upValue == 1:  # Move up to previous clip
+                # Search for previous clip slot with a clip (in reverse)
+                for i in range(current_index - 1, -1, -1):
+                    if track.clip_slots[i].has_clip:
+                        self.song().view.highlighted_clip_slot = track.clip_slots[i]
+                        break
+
+            
 
 
     def decode_sys_ex_scale_root(self, message):
