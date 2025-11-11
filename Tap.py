@@ -48,8 +48,7 @@ class Tap(ControlSurface):
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
             self.last_sent_out_playing_pos = 0.0
-            self.clip_length_trick = 220.0
-            self.clip_start_trick = -100.0
+            self.clip_length_trick = 110.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
             session_component = SessionComponent()
@@ -906,9 +905,9 @@ class Tap(ControlSurface):
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
                     
-                    time_span = max(self.clip_length_trick, clip_playing.loop_end, clip_playing.end_marker, clip_playing.length)
+                    time_span = max(clip_playing.loop_end, clip_playing.end_marker, clip_playing.length) + self.clip_length_trick
                     loop_start = clip_playing.loop_start
-                    clip_start = min(self.clip_start_trick, clip_playing.start_time, clip_playing.start_marker, loop_start)
+                    clip_start = min(clip_playing.start_time, clip_playing.start_marker, loop_start) - self.clip_length_trick
                     
                     try:
                         # Get all the notes in the clip
@@ -1647,8 +1646,8 @@ class Tap(ControlSurface):
                 clip = clip_slot.clip
                 
                 # Fetch existing notes from the clip
-                clip_length = max(self.clip_length_trick, clip.loop_end, clip.end_marker, clip.length)
-                clip_start = min(self.clip_start_trick, clip.start_time, clip.start_marker, clip.loop_start)
+                clip_length = max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick
+                clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
                 notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
         
                 # Modify the matching notes
@@ -2206,8 +2205,8 @@ class Tap(ControlSurface):
                     selected_clip = clip_slot.clip
                 
                     # Extract clip metadata
-                    clip_length = max(self.clip_length_trick, selected_clip.loop_end, selected_clip.end_marker, selected_clip.length)
-                    clip_start = min(self.clip_start_trick, selected_clip.start_time, selected_clip.start_marker, selected_clip.loop_start)
+                    clip_length = max(selected_clip.loop_end, selected_clip.end_marker, selected_clip.length) + self.clip_length_trick
+                    clip_start = min(selected_clip.start_time, selected_clip.start_marker, selected_clip.loop_start) - self.clip_length_trick
                     # Get notes
                     notes = selected_clip.get_notes_extended(0, 128, clip_start, clip_length)
                     # self.log_message(f"Number of notes found: {len(notes)}")
