@@ -819,6 +819,9 @@ class Tap(ControlSurface):
         # fire the new clip if the old clip was playing
         if was_playing:
             song.view.highlighted_clip_slot.fire(force_legato=True)
+        
+        # set up everything new
+        self._on_selected_track_changed()
 
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
@@ -1800,6 +1803,9 @@ class Tap(ControlSurface):
         paste_clip_slot = paste_track.clip_slots[to_clip]
 
         copy_clip_slot.duplicate_clip_to(paste_clip_slot)
+        
+        # set up new clip listeners
+        self._register_clip_listeners()
 
     def _append_and_remove_clip(self, from_track, from_clip, to_track, to_clip):
         """
