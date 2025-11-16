@@ -170,7 +170,11 @@ class Tap(ControlSurface):
                 else:
                     pad_names.append(str(pad.note))
             self._send_sys_ex_message(",".join(pad_names), 0x11)
-            
+    
+    def _update_tempo(self):
+        new_tempo = round(self.song().tempo, 2)
+        self._send_sys_ex_message(str(new_tempo), 0x12)
+    
     @subject_slot('device')
     def _on_device_changed(self):
         if self._drum_rack_device:
@@ -605,6 +609,11 @@ class Tap(ControlSurface):
                 # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
                 song.add_scale_name_listener(self._on_scale_changed)
                 song.add_root_note_listener(self._on_scale_changed)
+                # add song tempo listener
+                song.add_tempo_listener(self._update_tempo)
+                # updating tempo
+                self._update_tempo()
+                # rest
                 self._setup_device_control()
                 self._register_clip_listeners()
                 self.periodic_timer = 1
@@ -615,6 +624,8 @@ class Tap(ControlSurface):
             if current_song != self.song_instance:
                self._on_tracks_changed()
                self.song_instance = current_song
+               current_song.add_tempo_listener(self._update_tempo)
+               self._update_tempo()
 
     def _send_project(self, value):
         if value:
@@ -1752,6 +1763,19 @@ class Tap(ControlSurface):
                     if track.clip_slots[i].has_clip:
                         self.song().view.highlighted_clip_slot = track.clip_slots[i]
                         break
+        if len(message) >= 2 and message[1] == 22:
+            tempo_bytes = message[2:-1]
+            try:
+                tempo_string = bytes(tempo_bytes).decode('ascii')
+                new_tempo = float(tempo_string)
+                self.song().tempo = new_tempo
+                # Optional: print for debugging
+                # self.canonical_parent.log_message("Tempo set to " + tempo_string)
+            except Exception as e:
+                # Optional: log error
+                # self.canonical_parent.log_message("Tempo decode error: " + str(e))
+                pass
+            
 
             
 
