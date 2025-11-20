@@ -919,9 +919,9 @@ class Tap(ControlSurface):
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
                     
-                    time_span = max(clip_playing.loop_end, clip_playing.end_marker, clip_playing.length) + self.clip_length_trick
+                    clip_start = min(clip_playing.start_time, clip_playing.start_marker, clip_playing.loop_start) - self.clip_length_trick
+                    time_span = (max(clip_playing.loop_end, clip_playing.end_marker, clip_playing.length) + self.clip_length_trick) - clip_start
                     loop_start = clip_playing.loop_start
-                    clip_start = min(clip_playing.start_time, clip_playing.start_marker, loop_start) - self.clip_length_trick
                     
                     try:
                         # Get all the notes in the clip
@@ -1660,8 +1660,8 @@ class Tap(ControlSurface):
                 clip = clip_slot.clip
                 
                 # Fetch existing notes from the clip
-                clip_length = max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick
                 clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+                clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
                 notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
         
                 # Modify the matching notes
@@ -2235,8 +2235,9 @@ class Tap(ControlSurface):
                     selected_clip = clip_slot.clip
                 
                     # Extract clip metadata
-                    clip_length = max(selected_clip.loop_end, selected_clip.end_marker, selected_clip.length) + self.clip_length_trick
                     clip_start = min(selected_clip.start_time, selected_clip.start_marker, selected_clip.loop_start) - self.clip_length_trick
+                    clip_length = (max(selected_clip.loop_end, selected_clip.end_marker, selected_clip.length) + self.clip_length_trick) - clip_start
+                    
                     # Get notes
                     notes = selected_clip.get_notes_extended(0, 128, clip_start, clip_length)
                     # self.log_message(f"Number of notes found: {len(notes)}")
