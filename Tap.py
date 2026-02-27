@@ -17,6 +17,7 @@ from Live.Clip import MidiNoteSpecification
 import threading
 import random
 from itertools import zip_longest
+from .browser_manager import BrowserManager
 
 
 mixer, transport, session_component = None, None, None
@@ -64,34 +65,80 @@ class Tap(ControlSurface):
             # send project again button
             send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
             send_project_button.add_value_listener(self._send_project)
-            
+
             # making a song instance
             self.song_instance = self.song()
+
+            # Browser initialization
+            self.browser_manager = None
+            self.browser_active = False
+            self._setup_browser()
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
         self._device.name = 'Device_Component'
-        
+
         self._device_controls = []
         for index in range(8):
             control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
             control.name = 'Ctrl_' + str(index)
             self._device_controls.append(control)
-        
+
         nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
         nav_right_button = ButtonElement(1, MIDI_CC_TYPE, 0, 32)
         self._device.set_bank_nav_buttons(nav_left_button, nav_right_button)
-        
+
         # Set up device change listener
         self._on_device_changed.subject = self._device
         self.set_device_component(self._device)
-        
+
         # Register button listeners for navigation buttons
         nav_left_button.add_value_listener(self._on_nav_button_pressed)
         nav_right_button.add_value_listener(self._on_nav_button_pressed)
-        
+
         # Initially connect the controls (assuming we start in device mode)
         self._connect_device_controls()
+
+    def _setup_browser(self):
+        """Initialize browser manager and setup browser controls."""
+        browser = self.application().browser
+        self.browser_manager = BrowserManager(browser, self.log_message)
+        self._setup_browser_controls()
+
+    def _setup_browser_controls(self):
+        """Setup MIDI CC controls for browser navigation."""
+        self.browser_mode_button = ButtonElement(1, MIDI_CC_TYPE, 1, 30)
+        self.browser_mode_button.add_value_listener(self._browser_mode_toggle)
+
+        self.nav_up_button = ButtonElement(1, MIDI_CC_TYPE, 1, 31)
+        self.nav_up_button.add_value_listener(self._browser_nav_up)
+
+        self.nav_down_button = ButtonElement(1, MIDI_CC_TYPE, 1, 32)
+        self.nav_down_button.add_value_listener(self._browser_nav_down)
+
+        self.nav_prev_button = ButtonElement(1, MIDI_CC_TYPE, 1, 33)
+        self.nav_prev_button.add_value_listener(self._browser_nav_prev)
+
+        self.nav_next_button = ButtonElement(1, MIDI_CC_TYPE, 1, 34)
+        self.nav_next_button.add_value_listener(self._browser_nav_next)
+
+        self.select_load_button = ButtonElement(1, MIDI_CC_TYPE, 1, 35)
+        self.select_load_button.add_value_listener(self._browser_select_load)
+
+        self.preview_button = ButtonElement(1, MIDI_CC_TYPE, 1, 36)
+        self.preview_button.add_value_listener(self._browser_preview)
+
+        self.stop_preview_button = ButtonElement(1, MIDI_CC_TYPE, 1, 37)
+        self.stop_preview_button.add_value_listener(self._browser_stop_preview)
+
+        self.category_select_button = ButtonElement(1, MIDI_CC_TYPE, 1, 38)
+        self.category_select_button.add_value_listener(self._browser_select_category)
+
+        self.refresh_button = ButtonElement(1, MIDI_CC_TYPE, 1, 39)
+        self.refresh_button.add_value_listener(self._browser_refresh)
+
+        self.search_trigger_button = ButtonElement(1, MIDI_CC_TYPE, 1, 40)
+        self.search_trigger_button.add_value_listener(self._browser_search_trigger)
 
     def _connect_device_controls(self):
         """Connect device controls to parameters"""
@@ -102,6 +149,156 @@ class Tap(ControlSurface):
         """Disconnect device controls from parameters"""
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
+
+    # ===== Browser Control Handlers =====
+
+    def _browser_mode_toggle(self, value):
+        if value:
+            if not self.browser_active:
+                self.browser_active = True
+                if self.browser_manager.current_item or self.browser_manager.current_category:
+                    self._send_browser_view()
+                else:
+                    self.browser_manager.select_category('audio_effects')
+                    self._send_browser_view()
+            else:
+                if self.browser_active:
+                    self.browser_active = False
+                    self.browser_manager.stop_preview()
+
+    def _browser_nav_up(self, value):
+        if value and self.browser_active:
+            if self.browser_manager.navigate_up():
+                self._send_browser_view()
+
+    def _browser_nav_down(self, value):
+        if value and self.browser_active:
+            if self.browser_manager.navigate_down(self.browser_manager.selected_index):
+                self._send_browser_view()
+
+    def _browser_nav_prev(self, value):
+        if value and self.browser_active:
+            new_index = self.browser_manager.navigate_prev()
+            self._send_selected_index(new_index)
+
+    def _browser_nav_next(self, value):
+        if value and self.browser_active:
+            new_index = self.browser_manager.navigate_next()
+            self._send_selected_index(new_index)
+
+    def _browser_select_load(self, value):
+        if value and self.browser_active:
+            selected = self.browser_manager.get_selected_item()
+            if not selected:
+                return
+            if getattr(selected, 'is_folder', False):
+                if self.browser_manager.navigate_down(self.browser_manager.selected_index):
+                    self._send_browser_view()
+            elif getattr(selected, 'is_device', False) or getattr(selected, 'is_loadable', False):
+                self.browser_manager.load_selected_item()
+
+    def _browser_preview(self, value):
+        if value and self.browser_active:
+            self.browser_manager.preview_selected_item()
+
+    def _browser_stop_preview(self, value):
+        if value:
+            self.browser_manager.stop_preview()
+
+    def _browser_select_category(self, value):
+        if self.browser_active:
+            category_map = self.browser_manager.get_category_index_map()
+            if value in category_map:
+                category_name = category_map[value]
+                if self.browser_manager.select_category(category_name):
+                    self._send_browser_view()
+
+    def _browser_refresh(self, value):
+        if value and self.browser_active:
+            self._send_browser_view()
+
+    def _browser_search_trigger(self, value):
+        if value and self.browser_active:
+            self._send_sys_ex_message("filter_mode", 0x1A)
+
+    # ===== Browser Data Transmission =====
+
+    def _send_browser_view(self):
+        """Send unified folder contents to iOS app."""
+        children = self.browser_manager.get_children()
+
+        if not children:
+            self._send_chunked_sysex("1/1:", 0x18)
+            self._send_selected_index(0)
+            self._send_current_path()
+            return
+
+        items = []
+        for child in children:
+            if liveobj_valid(child):
+                is_fldr = getattr(child, 'is_folder', False)
+                is_dev = getattr(child, 'is_device', False)
+                t = 'F' if is_fldr else ('D' if is_dev else 'O')
+
+                safe_name = child.name.replace('\t', ' ').replace('|', '-')
+                items.append(f"{t}|{safe_name}")
+
+        full_string = '\t'.join(items)
+        self._send_chunked_sysex(full_string, 0x18)
+
+        self._send_selected_index(self.browser_manager.selected_index)
+        self._send_current_path()
+
+    def _send_chunked_sysex(self, data_string, manufacturer_id):
+        """Splits large payloads into chunks: [idx]/[total]:[data]"""
+        chunk_size = 180
+        data_bytes = data_string.encode('utf-8')
+        chunks = [data_bytes[i:i+chunk_size] for i in range(0, len(data_bytes), chunk_size)]
+        total = len(chunks)
+
+        if total == 0:
+            self._send_sys_ex_message(b"1/1:".decode('ascii'), manufacturer_id)
+            return
+
+        for idx, chunk_bytes in enumerate(chunks, 1):
+            header = f"{idx}/{total}:".encode('ascii')
+            payload = header + chunk_bytes
+            self._send_sys_ex_message(payload.decode('latin-1'), manufacturer_id)
+
+    def _send_selected_index(self, index):
+        self._send_sys_ex_message(str(index), 0x1A)
+
+    def _send_current_path(self):
+        path_names = self.browser_manager.get_current_path_names()
+        path_string = '\t'.join([p.replace('\t', ' ') for p in path_names])
+        self._send_sys_ex_message(f"PATH:{path_string}", 0x19)
+
+    def handle_sysex(self, midi_bytes):
+        """Intercept incoming SysEx for shortcut traversal"""
+        if len(midi_bytes) > 4 and midi_bytes[1] == 0x01 and midi_bytes[2] == 0x10:
+            try:
+                data_str = bytes(midi_bytes[3:-1]).decode('utf-8')
+                if data_str.startswith("SHORTCUT:"):
+                    payload = data_str.replace("SHORTCUT:", "").split('\t')
+                    category = payload[0]
+                    path = payload[1:] if len(payload) > 1 else []
+                    self.browser_manager.navigate_to_path(category, path)
+                    self._send_browser_view()
+            except Exception as e:
+                self.log_message(f"Shortcut decode error: {e}")
+        else:
+            super().handle_sysex(midi_bytes)
+
+    def _send_sys_ex_message(self, message, manufacturer_id):
+        """Send a SysEx message to the iOS app."""
+        try:
+            msg_bytes = message.encode('utf-8') if isinstance(message, str) else message
+            sysex = bytearray([0xF0, manufacturer_id])
+            sysex.extend(msg_bytes)
+            sysex.append(0xF7)
+            self._send_midi(sysex)
+        except Exception as e:
+            self.log_message(f"Error sending SysEx: {e}")
 
     def _on_nav_button_pressed(self, value):
         if value:
