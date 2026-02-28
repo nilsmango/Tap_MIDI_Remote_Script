@@ -592,8 +592,11 @@ class Tap(ControlSurface):
         self.browser_navigate_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 82)
         self.browser_navigate_button.add_value_listener(self._browser_navigate)
         # browser select item button (MIDI note channel 15, note 81)
-        self.browser_select_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 81)
-        self.browser_select_button.add_value_listener(self._browser_select_item)
+        self.browser_open_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 81)
+        self.browser_open_button.add_value_listener(self._browser_open_item)
+        # browser load item button (MIDI note channel 15, note 80) - always loads, never opens children
+        self.browser_load_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 80)
+        self.browser_load_button.add_value_listener(self._browser_load_item)
 
 
     def send_note_on(self, note_number, channel, velocity):
@@ -2491,12 +2494,18 @@ class Tap(ControlSurface):
             item: A BrowserItem object from Live's browser
 
         Returns:
-            String suffix: '//' for folders, '||' for devices, empty string otherwise
+            String suffix: '//' for folders, '||<' for devices with children, '||' for devices without children,
+            '<' for items with children that are neither folders nor devices, empty string otherwise
         """
         if hasattr(item, 'is_folder') and item.is_folder:
             return '//'
         elif hasattr(item, 'is_device') and item.is_device:
-            return '||'
+            if hasattr(item, 'children') and item.children:
+                return '||<'
+            else:
+                return '||'
+        elif hasattr(item, 'children') and item.children:
+            return '<'
         else:
             return ''
 
@@ -2505,10 +2514,11 @@ class Tap(ControlSurface):
         Send a paginated list of browser items via SysEx.
 
         Sends up to 10 items (browser_items_per_page) from the current browser folder.
-        Items are formatted with type suffixes: '//' for folders, '||' for devices.
+        Items are formatted with type suffixes: '//' for folders, '||<' for devices with children,
+        '||' for devices without children, '<' for non-folder non-device items with children.
 
         SysEx message format (manufacturer ID 0x13):
-            current_page^total_pages^item1//,item2||,item3||,...
+            current_page^total_pages^item1//,item2||<,item3||,item4<,...
 
         Args:
             page_number: The page number to send (0-indexed)
@@ -2562,9 +2572,9 @@ class Tap(ControlSurface):
             if self.browser_current_page > 0:
                 self._send_browser_page(self.browser_current_page - 1)
 
-    def _browser_select_item(self, value):
+    def _browser_open_item(self, value):
         """
-        Select and action on a browser item based on MIDI note velocity.
+        Open and action on a browser item based on MIDI note velocity.
 
         Triggered by MIDI note on channel 15, note 81. The velocity is sent as
         (index + 1) to avoid velocity 0 issues.
@@ -2618,6 +2628,34 @@ class Tap(ControlSurface):
             self._on_tracks_changed()
             self._on_device_changed()
 
+    def _browser_load_item(self, value):
+        """
+        Load a browser item based on MIDI note velocity, never opening children.
+
+        Triggered by MIDI note on channel 15, note 80. The velocity is sent as
+        (index + 1) to avoid velocity 0 issues.
+
+        The actual item index is calculated as: (current_page * items_per_page) + (value - 1)
+
+        Always attempts to load the item, regardless of whether it's a folder, device with children, etc.
+        After loading, updates track and device views to reflect changes.
+
+        Args:
+            value: MIDI note velocity (1-10), sent as index + 1
+        """
+        if not self.browser_current_items:
+            return
+
+        index = (self.browser_current_page * self.browser_items_per_page) + (value - 1)
+        if index >= len(self.browser_current_items):
+            return
+
+        item = self.browser_current_items[index]
+        browser = self.application().browser
+        browser.load_item(item)
+        self._on_tracks_changed()
+        self._on_device_changed()
+
     def disconnect(self):
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         self.duplicate_button.remove_value_listener(self._duplicate_button_value)
@@ -2630,8 +2668,10 @@ class Tap(ControlSurface):
             self.browser_start_button.remove_value_listener(self._start_browser)
         if hasattr(self, 'browser_navigate_button'):
             self.browser_navigate_button.remove_value_listener(self._browser_navigate)
-        if hasattr(self, 'browser_select_button'):
-            self.browser_select_button.remove_value_listener(self._browser_select_item)
+        if hasattr(self, 'browser_open_button'):
+            self.browser_open_button.remove_value_listener(self._browser_open_item)
+        if hasattr(self, 'browser_load_button'):
+            self.browser_load_button.remove_value_listener(self._browser_load_item)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
