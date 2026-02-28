@@ -2430,6 +2430,8 @@ class Tap(ControlSurface):
                 random_folder_child_index = random.randint(0, number_folder_children - 1)
                 selected_effect = folder_children[random_folder_child_index]
             browser.load_item(selected_effect)
+            self._on_tracks_changed()
+            self._on_device_changed()
 
     def _start_browser(self, folder_index):
         """
