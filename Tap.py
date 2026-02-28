@@ -58,13 +58,32 @@ class Tap(ControlSurface):
             self._track_level_listeners = {}
             self._return_level_listeners = {}
             self._master_level_listeners = {}
+            # browser pagination state
+            self.browser_current_items = []
+            self.browser_current_page = 0
+            self.browser_pages_count = 0
+            self.browser_items_per_page = 10
+            self.browser_folder_mapping = {
+                0: 'audio_effects',
+                1: 'colors',
+                2: 'current_project',
+                3: 'drums',
+                4: 'instruments',
+                5: 'max_for_live',
+                6: 'midi_effects',
+                7: 'packs',
+                8: 'plugins',
+                9: 'sounds',
+                10: 'user_folders',
+                11: 'user_library'
+            }
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
             # send project again button
             send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
             send_project_button.add_value_listener(self._send_project)
-            
+
             # making a song instance
             self.song_instance = self.song()
 
@@ -566,7 +585,13 @@ class Tap(ControlSurface):
         # cropping selected clip
         crop_clip_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 83)
         crop_clip_button.add_value_listener(self._crop_clip)
-        
+        # browser start button (CC channel 1, CC 25)
+        self.browser_start_button = ButtonElement(1, MIDI_CC_TYPE, 1, 25)
+        self.browser_start_button.add_value_listener(self._start_browser)
+        # browser pagination button (MIDI note channel 15, note 82)
+        self.browser_navigate_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 82)
+        self.browser_navigate_button.add_value_listener(self._browser_navigate)
+
 
     def send_note_on(self, note_number, channel, velocity):
         channel_byte = channel & 0x7F
@@ -2406,6 +2431,132 @@ class Tap(ControlSurface):
                 selected_effect = folder_children[random_folder_child_index]
             browser.load_item(selected_effect)
 
+    def _start_browser(self, folder_index):
+        """
+        Start browsing a specific browser folder.
+
+        Triggered by MIDI CC on channel 1, CC 25. The value corresponds to a folder mapping:
+        0 = audio_effects, 1 = colors, 2 = current_project, 3 = drums,
+        4 = instruments, 5 = max_for_live, 6 = midi_effects, 7 = packs,
+        8 = plugins, 9 = sounds, 10 = user_folders, 11 = user_library
+
+        Collects all items from the requested folder, resets pagination, and sends the first page
+        via SysEx with manufacturer ID 0x13.
+
+        Args:
+            folder_index: Integer (0-11) corresponding to the folder to browse
+        """
+        browser = self.application().browser
+
+        if folder_index not in self.browser_folder_mapping:
+            return
+
+        folder_name = self.browser_folder_mapping[folder_index]
+
+        try:
+            # Get the browser item for the requested folder
+            if folder_name in ['colors', 'user_folders']:
+                # These return lists instead of BrowserItem
+                folder_items = getattr(browser, folder_name)
+                self.browser_current_items = list(folder_items)
+            else:
+                # These return a BrowserItem with children
+                folder_item = getattr(browser, folder_name)
+                if hasattr(folder_item, 'children'):
+                    self.browser_current_items = list(folder_item.children)
+                else:
+                    self.browser_current_items = [folder_item]
+
+            # Reset pagination and send first page
+            self.browser_current_page = 0
+            self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
+            self._send_browser_page(self.browser_current_page)
+
+        except Exception as e:
+            self.log_message(f"Error starting browser: {str(e)}")
+
+    def _get_browser_item_type(self, item):
+        """
+        Determine the type suffix for a browser item.
+
+        Checks the browser item's properties and returns the appropriate suffix for display
+        in the app. The type can be inferred from which folder was requested.
+
+        Args:
+            item: A BrowserItem object from Live's browser
+
+        Returns:
+            String suffix: '//' for folders, '||' for devices, empty string otherwise
+        """
+        if hasattr(item, 'is_folder') and item.is_folder:
+            return '//'
+        elif hasattr(item, 'is_device') and item.is_device:
+            return '||'
+        else:
+            return ''
+
+    def _send_browser_page(self, page_number):
+        """
+        Send a paginated list of browser items via SysEx.
+
+        Sends up to 10 items (browser_items_per_page) from the current browser folder.
+        Items are formatted with type suffixes: '//' for folders, '||' for devices.
+
+        SysEx message format (manufacturer ID 0x13):
+            current_page^total_pages^item1//,item2||,item3||,...
+
+        Args:
+            page_number: The page number to send (0-indexed)
+        """
+        if page_number < 0 or page_number >= self.browser_pages_count:
+            return
+
+        self.browser_current_page = page_number
+
+        start_index = page_number * self.browser_items_per_page
+        end_index = min(start_index + self.browser_items_per_page, len(self.browser_current_items))
+        page_items = self.browser_current_items[start_index:end_index]
+
+        # Build item strings with type suffixes
+        item_strings = []
+        for item in page_items:
+            if hasattr(item, 'name'):
+                item_name = item.name
+                item_type = self._get_browser_item_type(item)
+                item_strings.append(f"{item_name}{item_type}")
+
+        # Format: current_page^total_pages^item1//,item2||,item3||,...
+        items_string = ','.join(item_strings)
+        message = f"{self.browser_current_page}^{self.browser_pages_count}^{items_string}"
+
+        # Send using manufacturer ID 0x13
+        self._send_sys_ex_message(message, 0x13)
+
+    def _browser_navigate(self, value):
+        """
+        Navigate between browser pages using a MIDI note button.
+
+        Triggered by MIDI note on channel 15, note 82.
+        - Note on (value != 0): Go to next page
+        - Note off (value == 0): Go to previous page
+
+        Validates boundaries and only sends pages that exist.
+
+        Args:
+            value: MIDI note velocity (0-127). Non-zero = note on, zero = note off
+        """
+        if not self.browser_current_items:
+            return
+
+        if value != 0:
+            # Note on: go to next page
+            if self.browser_current_page < self.browser_pages_count - 1:
+                self._send_browser_page(self.browser_current_page + 1)
+        else:
+            # Note off: go to previous page
+            if self.browser_current_page > 0:
+                self._send_browser_page(self.browser_current_page - 1)
+
     def disconnect(self):
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         self.duplicate_button.remove_value_listener(self._duplicate_button_value)
@@ -2413,6 +2564,11 @@ class Tap(ControlSurface):
         self.sesh_record_button.remove_value_listener(self._sesh_record_value)
         self.redo_button.remove_value_listener(self._redo_button_value)
         self.undo_button.remove_value_listener(self._undo_button_value)
+        # browser buttons cleanup
+        if hasattr(self, 'browser_start_button'):
+            self.browser_start_button.remove_value_listener(self._start_browser)
+        if hasattr(self, 'browser_navigate_button'):
+            self.browser_navigate_button.remove_value_listener(self._browser_navigate)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
