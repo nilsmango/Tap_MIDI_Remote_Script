@@ -62,7 +62,7 @@ class Tap(ControlSurface):
             self.browser_current_items = []
             self.browser_current_page = 0
             self.browser_pages_count = 0
-            self.browser_items_per_page = 10
+            self.browser_items_per_page = 12
             # browser navigation history for back button
             self.browser_history = []
             self.browser_folder_mapping = {
@@ -2521,7 +2521,7 @@ class Tap(ControlSurface):
         """
         Send a paginated list of browser items via SysEx.
 
-        Sends up to 10 items (browser_items_per_page) from the current browser folder.
+        Sends up to 12 items (browser_items_per_page) from the current browser folder.
         Items are formatted with type suffixes: '//' for folders, '||<' for devices with children,
         '||' for devices without children, '<' for non-folder non-device items with children.
 
@@ -2597,7 +2597,7 @@ class Tap(ControlSurface):
         After loading a device, updates track and device views to reflect changes.
 
         Args:
-            value: MIDI note velocity (1-10), sent as index + 1
+            value: MIDI note velocity (1-12), sent as index + 1
         """
         if not self.browser_current_items:
             return
@@ -2661,7 +2661,7 @@ class Tap(ControlSurface):
         After loading, updates track and device views to reflect changes.
 
         Args:
-            value: MIDI note velocity (1-10), sent as index + 1
+            value: MIDI note velocity (1-12), sent as index + 1
         """
         if not self.browser_current_items:
             return
@@ -2678,20 +2678,31 @@ class Tap(ControlSurface):
 
     def _browser_go_back(self, value):
         """
-        Go back one level in the browser history, restoring the page state.
+        Go back one or more levels in the browser history, restoring the page state.
 
         Triggered by MIDI note on channel 15, note 79.
+
+        The velocity determines how many steps to go back:
+        - Velocity 1 = go back 1 step
+        - Velocity 2 = go back 2 steps
+        - etc.
 
         Restores the previous level's items and page number from the history stack.
         Only works if there's history available.
 
         Args:
-            value: MIDI note velocity (0-127). Non-zero = trigger go back
+            value: MIDI note velocity (1-127). Determines number of steps to go back.
         """
         if value == 0 or not self.browser_history:
             return
 
-        # Pop the last state from history
+        # Determine number of steps to go back
+        steps = min(value, len(self.browser_history))
+
+        # Pop the last state(s) from history
+        for _ in range(steps - 1):
+            self.browser_history.pop()
+
         previous_state = self.browser_history.pop()
 
         # Restore the previous state
