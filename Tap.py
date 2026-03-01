@@ -63,6 +63,8 @@ class Tap(ControlSurface):
             self.browser_current_page = 0
             self.browser_pages_count = 0
             self.browser_items_per_page = 10
+            # browser navigation history for back button
+            self.browser_history = []
             self.browser_folder_mapping = {
                 0: 'audio_effects',
                 1: 'colors',
@@ -597,6 +599,9 @@ class Tap(ControlSurface):
         # browser load item button (MIDI note channel 15, note 80) - always loads, never opens children
         self.browser_load_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 80)
         self.browser_load_button.add_value_listener(self._browser_load_item)
+        # browser go back button (MIDI note channel 15, note 79) - go one level back, remembers page
+        self.browser_back_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 79)
+        self.browser_back_button.add_value_listener(self._browser_go_back)
 
 
     def send_note_on(self, note_number, channel, velocity):
@@ -2462,6 +2467,9 @@ class Tap(ControlSurface):
         folder_name = self.browser_folder_mapping[folder_index]
 
         try:
+            # Clear history when starting fresh
+            self.browser_history = []
+
             # Get the browser item for the requested folder
             if folder_name in ['colors', 'user_folders']:
                 # These return lists instead of BrowserItem
@@ -2603,6 +2611,12 @@ class Tap(ControlSurface):
 
         if hasattr(item, 'is_folder') and item.is_folder:
             if hasattr(item, 'children'):
+                # Save current state to history before navigating
+                self.browser_history.append({
+                    'items': self.browser_current_items,
+                    'page': self.browser_current_page,
+                    'pages_count': self.browser_pages_count
+                })
                 self.browser_current_items = list(item.children)
                 self.browser_current_page = 0
                 self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
@@ -2611,6 +2625,12 @@ class Tap(ControlSurface):
             try:
                 children = list(item.children)
                 if children:
+                    # Save current state to history before navigating
+                    self.browser_history.append({
+                        'items': self.browser_current_items,
+                        'page': self.browser_current_page,
+                        'pages_count': self.browser_pages_count
+                    })
                     self.browser_current_items = children
                     self.browser_current_page = 0
                     self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
@@ -2656,6 +2676,32 @@ class Tap(ControlSurface):
         self._on_tracks_changed()
         self._on_device_changed()
 
+    def _browser_go_back(self, value):
+        """
+        Go back one level in the browser history, restoring the page state.
+
+        Triggered by MIDI note on channel 15, note 79.
+
+        Restores the previous level's items and page number from the history stack.
+        Only works if there's history available.
+
+        Args:
+            value: MIDI note velocity (0-127). Non-zero = trigger go back
+        """
+        if value == 0 or not self.browser_history:
+            return
+
+        # Pop the last state from history
+        previous_state = self.browser_history.pop()
+
+        # Restore the previous state
+        self.browser_current_items = previous_state['items']
+        self.browser_current_page = previous_state['page']
+        self.browser_pages_count = previous_state['pages_count']
+
+        # Send the page we were at
+        self._send_browser_page(self.browser_current_page)
+
     def disconnect(self):
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         self.duplicate_button.remove_value_listener(self._duplicate_button_value)
@@ -2672,6 +2718,8 @@ class Tap(ControlSurface):
             self.browser_open_button.remove_value_listener(self._browser_open_item)
         if hasattr(self, 'browser_load_button'):
             self.browser_load_button.remove_value_listener(self._browser_load_item)
+        if hasattr(self, 'browser_back_button'):
+            self.browser_back_button.remove_value_listener(self._browser_go_back)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
