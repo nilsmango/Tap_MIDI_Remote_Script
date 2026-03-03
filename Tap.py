@@ -1,4 +1,4 @@
-# 7III Tap 1.4
+# 7III Tap 1.9
 
 from __future__ import with_statement
 import Live
@@ -308,18 +308,18 @@ class Tap(ControlSurface):
                 parameter_names = [name for name in parameter_names if name != ""]
                 
                 if parameter_names:
-                    self._send_parameter_names(parameter_names)
+                    self._send_parameter_info(parameter_names)
                 else:
                     parameter_names = ""
-                    self._send_parameter_names(parameter_names)
+                    self._send_parameter_info(parameter_names)
             else:
                 parameter_names = ""
-                self._send_parameter_names(parameter_names)
-            
+                self._send_parameter_info(parameter_names)
+
             if self.mixer_status:
                 # disconnect again
                 self._disconnect_device_controls()
-        
+
         else:
             # no device
             # sending sysex of bank name, device name, bank names
@@ -330,7 +330,7 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(available_devices_string, 0x01)
-            self._send_parameter_names(parameter_names)
+            self._send_parameter_info(parameter_names)
     
     def _get_all_nested_devices(self, devices):
         """
@@ -446,13 +446,105 @@ class Tap(ControlSurface):
             
         except Exception as e:
             self.log_message(f"Error sending drum pad number: {str(e)}")
-    
-    def _send_parameter_names(self, parameter_names):
+
+    def _send_parameter_info(self, parameter_names):
         if parameter_names == "":
-            name_string = ""
+            self._send_sys_ex_message("", 0x7D)
         else:
-            name_string = ','.join(parameter_names)
-        self._send_sys_ex_message(name_string, 0x7D)
+            # Send all parameter metadata in one compact message
+            # Format: name|min|max|default|value_items|value_string,name2|min2|max2|default2|value_items2|value_string2,...
+            # Parameters separated by comma, fields separated by pipe, value items separated by semicolon
+            # value_string contains formatted value at current position (e.g., "1000.0 Hz") - may be empty if device doesn't provide unit
+            selected_track = self.song().view.selected_track
+            selected_device = selected_track.view.selected_device
+
+            param_data = []
+
+            if hasattr(selected_device, 'parameters'):
+                device_parameters = list(selected_device.parameters)
+
+                for control in self._device._parameter_controls:
+                    if control.mapped_parameter():
+                        mapped_param = control.mapped_parameter()
+
+                        # Find the corresponding DeviceParameter
+                        device_param = None
+                        for dp in device_parameters:
+                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                device_param = dp
+                                break
+
+                        if device_param:
+                            # Extract metadata with automation/enabled prefixes on name
+                            if hasattr(device_param, 'is_enabled'):
+                                if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
+                                    if device_param.automation_state == 1:
+                                        name = f"**{device_param.name}"
+                                    elif device_param.automation_state == 2:
+                                        name = f"*/{device_param.name}"
+                                elif device_param.is_enabled:
+                                    name = device_param.name
+                                else:
+                                    name = f"*-{device_param.name}"
+                            else:
+                                name = device_param.name
+
+                            # Try to get display min/max as full strings (with units)
+                            # This way the unit is embedded in the value string
+                            min_val_str = None
+                            max_val_str = None
+                            default_val_str = None
+
+                            # Method 1: Try display_min/display_max properties
+                            if hasattr(device_param, 'display_min') and hasattr(device_param, 'display_max'):
+                                min_val_str = str(device_param.display_min)
+                                max_val_str = str(device_param.display_max)
+                            elif hasattr(device_param, 'min_display_value') and hasattr(device_param, 'max_display_value'):
+                                min_val_str = str(device_param.min_display_value)
+                                max_val_str = str(device_param.max_display_value)
+
+                            # Method 2: Use str_for_value at boundaries to get full display strings
+                            if min_val_str is None or max_val_str is None:
+                                try:
+                                    if hasattr(device_param, 'str_for_value'):
+                                        min_val_str = device_param.str_for_value(0.0)
+                                        max_val_str = device_param.str_for_value(1.0)
+                                except:
+                                    pass
+
+                            # Fall back to normalized min/max as strings
+                            if min_val_str is None:
+                                min_val_str = str(device_param.min) if hasattr(device_param, 'min') else "0.0"
+                            if max_val_str is None:
+                                max_val_str = str(device_param.max) if hasattr(device_param, 'max') else "1.0"
+
+                            # Get default as full display string
+                            if (not device_param.is_quantized and hasattr(device_param, 'default_value')):
+                                try:
+                                    if hasattr(device_param, 'str_for_value'):
+                                        default_val_str = device_param.str_for_value(device_param.default_value)
+                                    else:
+                                        default_val_str = str(device_param.default_value)
+                                except:
+                                    default_val_str = min_val_str
+                            else:
+                                default_val_str = min_val_str
+
+                            # Value items for quantized parameters (booleans, enums)
+                            if device_param.is_quantized and hasattr(device_param, 'value_items'):
+                                value_items = ';'.join(str(item) for item in device_param.value_items)
+                            else:
+                                value_items = ''
+
+                            # Build compact data for this parameter
+                            # min/max/default are strings with units embedded
+                            # value_string removed - calculate from CC value + unit from min/max/default
+                            param_str = f"{name}|{min_val_str}|{max_val_str}|{default_val_str}|{value_items}"
+                            param_data.append(param_str)
+
+            # Send all parameter data in one message
+            all_params = ','.join(param_data)
+            self._send_sys_ex_message(all_params, 0x7D)
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
