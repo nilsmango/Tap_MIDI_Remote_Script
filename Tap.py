@@ -507,8 +507,12 @@ class Tap(ControlSurface):
                             if min_val_str is None or max_val_str is None:
                                 try:
                                     if hasattr(device_param, 'str_for_value'):
-                                        min_val_str = device_param.str_for_value(0.0)
-                                        max_val_str = device_param.str_for_value(1.0)
+                                        if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
+                                            min_val_str = device_param.str_for_value(device_param.min)
+                                            max_val_str = device_param.str_for_value(device_param.max)
+                                        else:
+                                            min_val_str = device_param.str_for_value(0.0)
+                                            max_val_str = device_param.str_for_value(1.0)
                                 except:
                                     pass
 
