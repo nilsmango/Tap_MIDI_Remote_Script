@@ -496,12 +496,12 @@ class Tap(ControlSurface):
                             default_val_str = None
 
                             # Method 1: Try display_min/display_max properties
-                            if hasattr(device_param, 'display_min') and hasattr(device_param, 'display_max'):
-                                min_val_str = str(device_param.display_min)
-                                max_val_str = str(device_param.display_max)
-                            elif hasattr(device_param, 'min_display_value') and hasattr(device_param, 'max_display_value'):
-                                min_val_str = str(device_param.min_display_value)
-                                max_val_str = str(device_param.max_display_value)
+                            # if hasattr(device_param, 'display_min') and hasattr(device_param, 'display_max'):
+                            #     min_val_str = str(device_param.display_min)
+                            #     max_val_str = str(device_param.display_max)
+                            # elif hasattr(device_param, 'min_display_value') and hasattr(device_param, 'max_display_value'):
+                            #     min_val_str = str(device_param.min_display_value)
+                            #     max_val_str = str(device_param.max_display_value)
 
                             # Method 2: Use str_for_value at boundaries to get full display strings
                             if min_val_str is None or max_val_str is None:
@@ -522,17 +522,24 @@ class Tap(ControlSurface):
                             if max_val_str is None:
                                 max_val_str = str(device_param.max) if hasattr(device_param, 'max') else "1.0"
 
-                            # Get default as full display string
+                            # Get default as full display string and raw value
+                            raw_default_value = None
+                            quarter_str = "0.0"
                             if (not device_param.is_quantized and hasattr(device_param, 'default_value')):
                                 try:
+                                    raw_default_value = device_param.default_value
                                     if hasattr(device_param, 'str_for_value'):
                                         default_val_str = device_param.str_for_value(device_param.default_value)
+                                        # Calculate quarter value (0-127 normalized) and get its display string
+                                        quarter_str = device_param.str_for_value(32/127)
                                     else:
                                         default_val_str = str(device_param.default_value)
                                 except:
                                     default_val_str = min_val_str
+                                    raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
                             else:
                                 default_val_str = min_val_str
+                                raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
 
                             # Value items for quantized parameters (booleans, enums)
                             if device_param.is_quantized and hasattr(device_param, 'value_items'):
@@ -543,7 +550,8 @@ class Tap(ControlSurface):
                             # Build compact data for this parameter
                             # min/max/default are strings with units embedded
                             # value_string removed - calculate from CC value + unit from min/max/default
-                            param_str = f"{name}|{min_val_str}|{max_val_str}|{default_val_str}|{value_items}"
+                            default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
+                            param_str = f"{name}|{min_val_str}|{max_val_str}|{default_val_str}|{default_raw_str}|{quarter_str}|{value_items}"
                             param_data.append(param_str)
 
             # Send all parameter data in one message
