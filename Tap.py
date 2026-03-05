@@ -530,10 +530,21 @@ class Tap(ControlSurface):
                                     raw_default_value = device_param.default_value
                                     if hasattr(device_param, 'str_for_value'):
                                         default_val_str = device_param.str_for_value(device_param.default_value)
-                                        # Calculate quarter value (0-127 normalized) and get its display string
-                                        quarter_str = device_param.str_for_value(32/127)
+                                        # Round to 2 decimal places if it's a numeric string
+                                        try:
+                                            num_val = float(default_val_str)
+                                            default_val_str = str(round(num_val, 2))
+                                        except:
+                                            pass
+                                        # Calculate quarter value (25% of min-max range) and get its display string
+                                        if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
+                                            quarter_value = device_param.min + (device_param.max - device_param.min) * 32/127
+                                            quarter_str = device_param.str_for_value(quarter_value)
                                     else:
-                                        default_val_str = str(device_param.default_value)
+                                        default_val_str = str(round(device_param.default_value, 2))
+                                    # Normalize raw_default_value to 0-1 range
+                                    if hasattr(device_param, 'min') and hasattr(device_param, 'max') and device_param.max != device_param.min:
+                                        raw_default_value = round((raw_default_value - device_param.min) / (device_param.max - device_param.min), 3)
                                 except:
                                     default_val_str = min_val_str
                                     raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
