@@ -562,7 +562,7 @@ class Tap(ControlSurface):
                             # min/max/default are strings with units embedded
                             # value_string removed - calculate from CC value + unit from min/max/default
                             default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
-                            param_str = f"{name}|{min_val_str}|{max_val_str}|{default_val_str}|{default_raw_str}|{quarter_str}|{value_items}"
+                            param_str = f"{name.strip()}|{min_val_str.strip()}|{max_val_str.strip()}|{default_val_str.strip()}|{default_raw_str.strip()}|{quarter_str.strip()}|{value_items.strip()}"
                             param_data.append(param_str)
 
             # Send all parameter data in one message
