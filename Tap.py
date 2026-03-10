@@ -735,7 +735,7 @@ class Tap(ControlSurface):
 
     def _connection_established(self, value):
         if value:            
-            self.log_message("Connection App to Ableton (still) works!")
+            # self.log_message("Connection App to Ableton (still) works!")
             # send midi note on channel 3, note number 1 to confirm handshake
             midi_event_bytes = (0x90 | 0x03, 0x01, 0x64)
             self._send_midi(midi_event_bytes)
