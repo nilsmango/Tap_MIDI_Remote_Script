@@ -1,4 +1,4 @@
-# 7III Tap 1.9
+# 7III Tap 1.9.1
 
 from __future__ import with_statement
 import Live
@@ -496,11 +496,16 @@ class Tap(ControlSurface):
 
             if hasattr(selected_device, 'parameters'):
                 device_parameters = list(selected_device.parameters)
+                # Track unmapped encoder indices to send CC 0 after SysEx
+                unmapped_encoder_indices = []
 
-                for control in self._device._parameter_controls:
-                    if control.mapped_parameter():
-                        mapped_param = control.mapped_parameter()
+                # Iterate through all 8 encoder positions to ensure consistent parameter count
+                for control_index in range(8):
+                    # Check if this encoder position has a mapped parameter
+                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
 
+                    if mapped_param:
                         # Find the corresponding DeviceParameter
                         device_param = None
                         for dp in device_parameters:
@@ -598,10 +603,29 @@ class Tap(ControlSurface):
                             default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
                             param_str = f"{name.strip()}|{min_val_str.strip()}|{max_val_str.strip()}|{default_val_str.strip()}|{default_raw_str.strip()}|{quarter_str.strip()}|{value_items.strip()}"
                             param_data.append(param_str)
+                        else:
+                            # Device parameter not found in list - send placeholder
+                            param_str = "*--&&-|0|127|0.0|0.0|32|"
+                            param_data.append(param_str)
+                            unmapped_encoder_indices.append(control_index)
+                    else:
+                        # No parameter mapped to this control - send placeholder
+                        # Format: *--&&-|0|127|0.0|0.0|32|
+                        # Name: *--&&- (unmapped marker to distinguish from *- disabled params)
+                        # Min/Max/Default/Quarter: Normalized values for consistency
+                        # This ensures always exactly 8 parameters in SysEx message
+                        param_str = "*--&&-|0|127|0.0|0.0|32|"
+                        param_data.append(param_str)
+                        unmapped_encoder_indices.append(control_index)
 
             # Send all parameter data in one message
             all_params = ','.join(param_data)
             self._send_sys_ex_message(all_params, 0x7D)
+
+            # Send CC 0 for all unmapped encoders to update app display
+            for control_index in unmapped_encoder_indices:
+                cc_number = 72 + control_index
+                self.send_cc(cc_number, 8, 0)
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start

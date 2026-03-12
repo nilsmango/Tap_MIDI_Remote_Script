@@ -63,7 +63,7 @@ Value items within a parameter separated by semicolon (;)
 
 ### Parameter Name Prefixes
 
-The `name` field includes prefixes to indicate automation and enabled status:
+The `name` field includes prefixes to indicate automation, enabled, and mapping status:
 
 | Prefix | Meaning |
 |---------|---------|
@@ -71,6 +71,7 @@ The `name` field includes prefixes to indicate automation and enabled status:
 | `*/name` | Automation overridden |
 | `name` | Normal, enabled |
 | `*-name` | Disabled |
+| `*--&&-` | No parameter mapped to this encoder (unmapped) |
 
 ### Parameter Types
 
@@ -211,6 +212,16 @@ Value Items: "Saw;Square;Triangle;Sine", CC: 42
 Calculation: round((42/127) * (4-1)) = 1
 Index 1 = "Square"
 Display: "Square" (from value_items)
+```
+
+#### Unmapped Parameter
+```
+Parameter: (no parameter mapped)
+Name: "*--&&-"
+|0|127|0.0|0.0|32|
+Display: Show encoder as disabled/unavailable
+Behavior: CC values sent to unmapped encoders are ignored by Live
+Note: Script sends CC 0 (channel 8) to unmapped encoders after SysEx to reset app display
 ```
 
 ### Implementation for iOS App
@@ -611,6 +622,11 @@ Test with various device types:
 ✅ **Drum Rack** (drum pad parameters)
    - Decay, Tune, Pitch, Pan
 
+✅ **Drum Synth with gaps** (unmapped parameters)
+   - Test with devices that have fewer than 8 mapped parameters
+   - Verify `*--&&-` placeholders appear in correct positions
+   - Confirm encoder count always equals 8
+
 ### Troubleshooting
 
 #### No metadata received
@@ -644,16 +660,128 @@ Your app should handle both by extracting numeric value when needed for calculat
 - Example: "0.10 ms" → unit = "ms"
 - Example: "0.0" (no space) → unit = nil
 
+#### Unexpected `*--&&-` parameters
+- This is expected behavior for unmapped encoders
+- Devices with fewer than 8 parameters will have `*--&&-` placeholders
+- Your app should detect `*--&&-` and disable the corresponding encoder UI
+- Verify your parser handles exactly 8 comma-separated parameters
+
+
 #### Default value seems wrong
 Some parameters may have default values that differ from min:
 - Check if default string matches min string (common for some parameters)
 - If they differ, use default string for reset functionality
 - Extract numeric value for CC calculation: `extractValue(from: default_string)`
+
+### Unmapped Parameters
+
+When an encoder has no parameter mapped to it, the script sends a placeholder with name `*--&&-`:
+
+**Unmapped Parameter Format**:
 ```
+*--&&-|0|127|0.0|0.0|32|
+```
+
+**Characteristics**:
+- Name prefix: `*--&&-` (unmapped marker to distinguish from *- disabled params)
+- Min/Max: "0" and "127" (CC range values)
+- Raw default: "0.0"
+- Quarter value: "32" (CC value for 32/127)
+- Value items: Empty string
+
+**Important**: After sending the SysEx message, the script sends CC 0 (channel 8) to all unmapped encoders to update your app's display to show 0 value.
+
+**Handling in iOS App**:
+
+```swift
+func displayValue(for encoder: Int, ccValue: Int) {
+    guard let metadata = encoders[encoder].metadata else { return }
+
+    // Check if this is an unmapped encoder
+    if metadata.name == "*--&&-" {
+        // Disable the encoder display
+        encoders[encoder].centerLabel.text = ""
+        encoders[encoder].isEnabled = false
+        return
+    }
+
+    // Normal parameter handling...
+    if let valueItems = metadata.valueItems {
+        // Enum/Boolean handling
+    } else {
+        // Continuous parameter handling
+    }
+}
+
+func parseParameterMetadata(_ message: String) -> [ParameterMetadata] {
+    let parameters = message.components(separatedBy: ",")
+
+    for (index, param) in parameters.enumerated() {
+        let fields = param.components(separatedBy: "|")
+        guard fields.count >= 1 else { continue }
+
+        let name = fields[0]
+
+        // Handle unmapped encoders - check for special name prefix
+        if name == "*--&&-" {
+            encoders[index].isEnabled = false
+            encoders[index].centerLabel.text = ""
+            // No need to parse further values - all are empty
+            continue
+        }
+
+        // Normal parameter parsing...
+        guard fields.count >= 6 else { continue }
+        let min = fields[1]
+        let max = fields[2]
+        let defaultVal = fields[3]
+        let rawDefault = fields[4]
+        let quarter = fields[5]
+        let valueItems = fields.count > 6 ? fields[6] : ""
+
+        let metadata = ParameterMetadata(
+            name: name,
+            min: min,
+            max: max,
+            default: defaultVal,
+            rawDefault: rawDefault,
+            quarter: quarter,
+            valueItems: valueItems.isEmpty ? nil : valueItems.components(separatedBy: ";")
+        )
+        encoders[index].metadata = metadata
+        encoders[index].isEnabled = true
+    }
+}
+```
+
+**Important Notes**:
+- **Always 8 parameters**: The message now always contains exactly 8 parameter entries
+- **Encoder position preserved**: Unmapped parameters occupy their encoder position, preventing gaps
+- **Bandwidth optimized**: All values are empty for unmapped parameters, only name is sent
+- **No CC mapping needed**: Sending CC values to unmapped encoders is safe - Live will simply ignore them
+- **Visual feedback**: Disable the encoder UI (grayed out, no label) to indicate no parameter is available
+
 
 ---
 
-**Last Updated**: 2026-03-03
-**Version**: 1.9
+**Last Updated**: 2026-03-12
+**Version**: 1.9.1
 **Script**: Tap.py
 **Manufacturer ID**: 0x7D
+
+### Version History
+
+**1.9.1** (2026-03-12)
+- Added `*--&&-` placeholder for unmapped encoder positions
+- Ensures consistent 8-parameter count in all SysEx messages
+- Fixes gaps in parameter sequences for devices with fewer than 8 mapped parameters
+- Script now sends CC 0 (channel 8) to unmapped encoders after SysEx to update app display
+
+**1.9.1** (2026-03-12)
+- Added placeholder for unmapped encoder positions
+- Ensures consistent 8-parameter count in all SysEx messages
+- Fixes gaps in parameter sequences for devices with fewer than 8 mapped parameters
+- Script now sends CC 0 (channel 8) to unmapped encoders after SysEx to update app display
+
+**1.9** (2026-03-03)
+- Initial parameter metadata enhancement
