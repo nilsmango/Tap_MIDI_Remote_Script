@@ -17,6 +17,7 @@ from Live.Clip import MidiNoteSpecification
 import threading
 import random
 from itertools import zip_longest
+import time
 
 
 mixer, transport, session_component = None, None, None
@@ -88,6 +89,8 @@ class Tap(ControlSurface):
 
             # making a song instance
             self.song_instance = self.song()
+            
+            self._last_playing_pos_sent = 0.0
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -2435,6 +2438,11 @@ class Tap(ControlSurface):
                 self._send_midi(sys_ex_message)
     
     def send_out_playing_pos(self, value):
+        now = time.time()
+        if now - self._last_playing_pos_sent < 1.0 / 60.0:
+            return
+        self._last_playing_pos_sent = now
+    
         status_byte = 0xF0
         end_byte = 0xF7
         manufacturer_id = 0x0F
@@ -2444,9 +2452,7 @@ class Tap(ControlSurface):
         
         pos_data = self._to_3_7bit_bytes(playing_pos_in_ms)
         
-        # Send the SysEx message
         sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
-        # self.log_message("Sending SysEx chunk")
         self._send_midi(sys_ex_message)
             
     
