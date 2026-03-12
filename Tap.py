@@ -1689,39 +1689,52 @@ class Tap(ControlSurface):
         try:
             track_clips = []
             for track in self.song().tracks:
-                is_armed = track.arm
-                has_audio = track.has_audio_input
+                try:
+                    is_armed = track.arm
+                    has_audio = track.has_audio_input
+                except:
+                    is_armed = False
+                    has_audio = False
                 # track clip slots
                 clip_slots = []
-                for clip_slot in track.clip_slots:
-                    clip_value = "0"
-                    if clip_slot.is_triggered:
-                        clip_value = "4"
-                    elif clip_slot.is_recording:
-                        clip_value = "3"
-                    elif clip_slot.is_playing:
-                        clip_value = "2"
-                    elif clip_slot.has_clip:
-                        clip_value = "1"
-                    elif is_armed and has_audio:
-                        clip_value = "5"
+                try:
+                    for clip_slot in track.clip_slots:
+                        clip_value = "0"
+                        try:
+                            if clip_slot.is_triggered:
+                                clip_value = "4"
+                            elif clip_slot.is_recording:
+                                clip_value = "3"
+                            elif clip_slot.is_playing:
+                                clip_value = "2"
+                            elif clip_slot.has_clip:
+                                clip_value = "1"
+                            elif is_armed and has_audio:
+                                clip_value = "5"
+                        except:
+                            clip_value = "0"
 
-                    color_string_value = "0"
-                    
-                    # this could also just be made to if value == "1", but does not hurt this way
-                    if clip_value != "0":
-                        # extra test if has clip because group channels don't have a clip but might be triggered etc
-                        if clip_slot.clip and clip_slot.clip.color is not None:
-                            color_string_value = self._make_color_string(clip_slot.clip.color)
-                    #     playing_position = clip_slot.clip.playing_position
-                    #     length = clip_slot.clip.length
-                    #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
-                    # else:
-                    #     playing_position = 0.0
-                    #     length = 0.0
+                        color_string_value = "0"
+                        
+                        # this could also just be made to if value == "1", but does not hurt this way
+                        if clip_value != "0" and clip_slot.has_clip:
+                            # extra test if has clip because group channels don't have a clip but might be triggered etc
+                            try:
+                                if clip_slot.clip.color is not None:
+                                    color_string_value = self._make_color_string(clip_slot.clip.color)
+                            except:
+                                color_string_value = "0"
+                        #     playing_position = clip_slot.clip.playing_position
+                        #     length = clip_slot.clip.length
+                        #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
+                        # else:
+                        #     playing_position = 0.0
+                        #     length = 0.0
 
-                    clip_string = "{}:{}".format(clip_value, color_string_value)
-                    clip_slots.append(clip_string)
+                        clip_string = "{}:{}".format(clip_value, color_string_value)
+                        clip_slots.append(clip_string)
+                except Exception as e:
+                    pass
                 clip_slots_string = "-".join(clip_slots)
                 track_clips.append(clip_slots_string)
 
@@ -1742,11 +1755,9 @@ class Tap(ControlSurface):
                     else:
                         delete_clips = "DEL" + str(track_index)
                         self._send_sys_ex_message(delete_clips, 0x05)
-        except:
+        except Exception as e:
             # need to stop threading or we get a fatal error.
             # self.periodic_timer = 0
-            self.log_message("Exception for Update Clip Slots")
-
             pass
 
     def _on_scale_changed(self):
