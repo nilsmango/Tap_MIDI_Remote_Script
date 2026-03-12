@@ -59,6 +59,9 @@ class Tap(ControlSurface):
             self._track_level_listeners = {}
             self._return_level_listeners = {}
             self._master_level_listeners = {}
+            self._disabled_parameter_listeners = {}
+            self._disabled_parameters = []
+            self._current_disabled_controls = []
             # browser pagination state
             self.browser_current_items = []
             self.browser_current_page = 0
@@ -118,14 +121,14 @@ class Tap(ControlSurface):
         self._connect_device_controls()
 
     def _connect_device_controls(self):
-        """Connect device controls to parameters"""
         if hasattr(self, '_device_controls'):
             self._device.set_parameter_controls(self._device_controls)
+        self._readd_disabled_parameter_listeners()
     
     def _disconnect_device_controls(self):
-        """Disconnect device controls from parameters"""
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
+        self._remove_disabled_parameter_listeners()
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -315,6 +318,34 @@ class Tap(ControlSurface):
                 else:
                     parameter_names = ""
                     self._send_parameter_info(parameter_names)
+            
+            self._remove_disabled_parameter_listeners()
+            
+            if hasattr(selected_device, 'parameters') and selected_device.parameters:
+                device_parameters = list(selected_device.parameters)
+                
+                for control_index, control in enumerate(self._device._parameter_controls):
+                    if control.mapped_parameter():
+                        mapped_param = control.mapped_parameter()
+                        
+                        device_param = None
+                        for dp in device_parameters:
+                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                device_param = dp
+                                break
+                        
+                        if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
+                            listener = self._create_disabled_param_listener(device_param, control_index)
+                            if not device_param.value_has_listener(listener):
+                                device_param.add_value_listener(listener)
+                            
+                            self._disabled_parameter_listeners[(device_param, control_index)] = listener
+                            self._disabled_parameters.append(device_param)
+                            self._current_disabled_controls.append(control_index)
+                            
+                            cc_value = self._parameter_value_to_cc(device_param)
+                            cc_number = 72 + control_index
+                            self.send_cc(cc_number, 8, cc_value)
             else:
                 parameter_names = ""
                 self._send_parameter_info(parameter_names)
@@ -735,6 +766,79 @@ class Tap(ControlSurface):
         velocity_byte = velocity & 0x7F
         midi_note_off_message = (0x80 | channel_byte, note_byte, velocity_byte)
         self._send_midi(midi_note_off_message)
+
+    def send_cc(self, cc_number, channel, value):
+        channel_byte = channel & 0x7F
+        cc_byte = cc_number & 0x7F
+        value_byte = int(round(value)) & 0x7F
+        midi_cc_message = (0xB0 | channel_byte, cc_byte, value_byte)
+        self._send_midi(midi_cc_message)
+
+    def _parameter_value_to_cc(self, device_param):
+        if not hasattr(device_param, 'value') or not hasattr(device_param, 'min') or not hasattr(device_param, 'max'):
+            return 0
+        
+        value = device_param.value
+        min_val = device_param.min
+        max_val = device_param.max
+        
+        if max_val == min_val:
+            return 0
+        
+        normalized = (value - min_val) / (max_val - min_val)
+        cc_value = int(round(normalized * 127))
+        return max(0, min(127, cc_value))
+
+    def _create_disabled_param_listener(self, device_param, control_index):
+        def listener():
+            cc_value = self._parameter_value_to_cc(device_param)
+            cc_number = 72 + control_index
+            channel = 8
+            self.send_cc(cc_number, channel, cc_value)
+        return listener
+
+    def _remove_disabled_parameter_listeners(self):
+        for (param, control_index), listener in self._disabled_parameter_listeners.items():
+            if liveobj_valid(param) and hasattr(param, 'remove_value_listener'):
+                if param.value_has_listener(listener):
+                    param.remove_value_listener(listener)
+        self._disabled_parameter_listeners.clear()
+        self._disabled_parameters.clear()
+        self._current_disabled_controls.clear()
+
+    def _readd_disabled_parameter_listeners(self):
+        if not hasattr(self, '_device') or not liveobj_valid(self._device):
+            return
+        
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device
+        
+        if hasattr(selected_device, 'parameters') and selected_device.parameters:
+            device_parameters = list(selected_device.parameters)
+            
+            for control_index, control in enumerate(self._device._parameter_controls):
+                if control.mapped_parameter():
+                    mapped_param = control.mapped_parameter()
+                    
+                    device_param = None
+                    for dp in device_parameters:
+                        if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                            device_param = dp
+                            break
+                    
+                    if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
+                        if (device_param, control_index) not in self._disabled_parameter_listeners:
+                            listener = self._create_disabled_param_listener(device_param, control_index)
+                            if not device_param.value_has_listener(listener):
+                                device_param.add_value_listener(listener)
+                            
+                            self._disabled_parameter_listeners[(device_param, control_index)] = listener
+                            self._disabled_parameters.append(device_param)
+                            self._current_disabled_controls.append(control_index)
+                            
+                            cc_value = self._parameter_value_to_cc(device_param)
+                            cc_number = 72 + control_index
+                            self.send_cc(cc_number, 8, cc_value)
 
     def _connection_established(self, value):
         if value:            
@@ -2835,6 +2939,7 @@ class Tap(ControlSurface):
         self._send_browser_page(self.browser_current_page)
 
     def disconnect(self):
+        self._remove_disabled_parameter_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         self.duplicate_button.remove_value_listener(self._duplicate_button_value)
         self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
