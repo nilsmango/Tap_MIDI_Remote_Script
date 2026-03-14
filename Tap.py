@@ -84,6 +84,8 @@ class Tap(ControlSurface):
                 10: 'user_folders',
                 11: 'user_library'
             }
+            self._metadata_recheck_timer = None
+            self._last_sent_metadata = None
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -223,6 +225,142 @@ class Tap(ControlSurface):
         
         start_idx, end_idx = macro_ranges[bank_name]
         return any(device.macros_mapped[start_idx:end_idx])
+    
+    def _build_parameter_metadata(self, selected_device):
+        if not hasattr(selected_device, 'parameters'):
+            return ""
+        
+        param_data = []
+        device_parameters = list(selected_device.parameters)
+        unmapped_encoder_indices = []
+        
+        for control_index in range(8):
+            control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+            mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+            
+            if mapped_param:
+                device_param = None
+                for dp in device_parameters:
+                    if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                        device_param = dp
+                        break
+                
+                if device_param:
+                    if hasattr(device_param, 'is_enabled'):
+                        if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
+                            if device_param.automation_state == 1:
+                                name = f"**{device_param.name}"
+                            elif device_param.automation_state == 2:
+                                name = f"*/{device_param.name}"
+                        elif device_param.is_enabled:
+                            name = device_param.name
+                        else:
+                            name = f"*-{device_param.name}"
+                    else:
+                        name = device_param.name
+                    
+                    min_val_str = None
+                    max_val_str = None
+                    default_val_str = None
+                    
+                    if min_val_str is None or max_val_str is None:
+                        try:
+                            if hasattr(device_param, 'str_for_value'):
+                                if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
+                                    min_val_str = device_param.str_for_value(device_param.min)
+                                    max_val_str = device_param.str_for_value(device_param.max)
+                                else:
+                                    min_val_str = device_param.str_for_value(0.0)
+                                    max_val_str = device_param.str_for_value(1.0)
+                        except:
+                            pass
+                    
+                    if min_val_str is None:
+                        min_val_str = str(device_param.min) if hasattr(device_param, 'min') else "0.0"
+                    if max_val_str is None:
+                        max_val_str = str(device_param.max) if hasattr(device_param, 'max') else "1.0"
+                    
+                    raw_default_value = None
+                    quarter_str = "0.0"
+                    if (not device_param.is_quantized and hasattr(device_param, 'default_value')):
+                        try:
+                            raw_default_value = device_param.default_value
+                            if hasattr(device_param, 'str_for_value'):
+                                default_val_str = device_param.str_for_value(device_param.default_value)
+                                try:
+                                    num_val = float(default_val_str)
+                                    default_val_str = str(round(num_val, 2))
+                                except:
+                                    pass
+                                if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
+                                    quarter_value = device_param.min + (device_param.max - device_param.min) * 32/127
+                                    quarter_str = device_param.str_for_value(quarter_value)
+                            else:
+                                default_val_str = str(round(device_param.default_value, 2))
+                            if hasattr(device_param, 'min') and hasattr(device_param, 'max') and device_param.max != device_param.min:
+                                raw_default_value = round((raw_default_value - device_param.min) / (device_param.max - device_param.min), 3)
+                        except:
+                            default_val_str = min_val_str
+                            raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
+                    else:
+                        default_val_str = min_val_str
+                        raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
+                    
+                    if device_param.is_quantized and hasattr(device_param, 'value_items'):
+                        value_items = ';'.join(str(item) for item in device_param.value_items)
+                    else:
+                        value_items = ''
+                    
+                    default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
+                    param_str = f"{name.strip()}|{min_val_str.strip()}|{max_val_str.strip()}|{default_val_str.strip()}|{default_raw_str.strip()}|{quarter_str.strip()}|{value_items.strip()}"
+                    param_data.append(param_str)
+                else:
+                    param_str = "*--&&-|0|127|0.0|0.0|32|"
+                    param_data.append(param_str)
+                    unmapped_encoder_indices.append(control_index)
+            else:
+                param_str = "*--&&-|0|127|0.0|0.0|32|"
+                param_data.append(param_str)
+                unmapped_encoder_indices.append(control_index)
+        
+        return ','.join(param_data)
+    
+    def _metadata_has_only_numbers(self, metadata):
+        if not metadata:
+            return False
+        
+        params = metadata.split(',')
+        
+        for param in params:
+            fields = param.split('|')
+            for field_index in [1, 2, 3, 5]:
+                if field_index < len(fields):
+                    field_value = fields[field_index].strip()
+                    if field_value:
+                        try:
+                            float(field_value)
+                        except ValueError:
+                            return False
+        
+        return True
+    
+    def _recheck_parameter_metadata(self):
+        self._metadata_recheck_timer = None
+        
+        if not liveobj_valid(self._device):
+            return
+        
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device
+        
+        if not isinstance(selected_device, Live.RackDevice.RackDevice):
+            return
+        
+        current_metadata = self._build_parameter_metadata(selected_device)
+        
+        if current_metadata and current_metadata != self._last_sent_metadata:
+            self._send_sys_ex_message(current_metadata, 0x7D)
+            self._last_sent_metadata = current_metadata
     
     @subject_slot('device')
     def _on_device_changed(self):
@@ -521,147 +659,35 @@ class Tap(ControlSurface):
         if parameter_names == "":
             self._send_sys_ex_message("", 0x7D)
         else:
-            # Send all parameter metadata in one compact message
-            # Format: name|min|max|default|value_items|value_string,name2|min2|max2|default2|value_items2|value_string2,...
-            # Parameters separated by comma, fields separated by pipe, value items separated by semicolon
-            # value_string contains formatted value at current position (e.g., "1000.0 Hz") - may be empty if device doesn't provide unit
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
-
-            param_data = []
-
-            if hasattr(selected_device, 'parameters'):
-                device_parameters = list(selected_device.parameters)
-                # Track unmapped encoder indices to send CC 0 after SysEx
+            
+            current_metadata = self._build_parameter_metadata(selected_device)
+            
+            if current_metadata:
+                self._send_sys_ex_message(current_metadata, 0x7D)
+                
                 unmapped_encoder_indices = []
-
-                # Iterate through all 8 encoder positions to ensure consistent parameter count
                 for control_index in range(8):
-                    # Check if this encoder position has a mapped parameter
                     control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
                     mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
-
-                    if mapped_param:
-                        # Find the corresponding DeviceParameter
-                        device_param = None
-                        for dp in device_parameters:
-                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                device_param = dp
-                                break
-
-                        if device_param:
-                            # Extract metadata with automation/enabled prefixes on name
-                            if hasattr(device_param, 'is_enabled'):
-                                if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
-                                    if device_param.automation_state == 1:
-                                        name = f"**{device_param.name}"
-                                    elif device_param.automation_state == 2:
-                                        name = f"*/{device_param.name}"
-                                elif device_param.is_enabled:
-                                    name = device_param.name
-                                else:
-                                    name = f"*-{device_param.name}"
-                            else:
-                                name = device_param.name
-
-                            # Try to get display min/max as full strings (with units)
-                            # This way the unit is embedded in the value string
-                            min_val_str = None
-                            max_val_str = None
-                            default_val_str = None
-
-                            # Method 1: Try display_min/display_max properties
-                            # if hasattr(device_param, 'display_min') and hasattr(device_param, 'display_max'):
-                            #     min_val_str = str(device_param.display_min)
-                            #     max_val_str = str(device_param.display_max)
-                            # elif hasattr(device_param, 'min_display_value') and hasattr(device_param, 'max_display_value'):
-                            #     min_val_str = str(device_param.min_display_value)
-                            #     max_val_str = str(device_param.max_display_value)
-
-                            # Method 2: Use str_for_value at boundaries to get full display strings
-                            if min_val_str is None or max_val_str is None:
-                                try:
-                                    if hasattr(device_param, 'str_for_value'):
-                                        if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
-                                            min_val_str = device_param.str_for_value(device_param.min)
-                                            max_val_str = device_param.str_for_value(device_param.max)
-                                        else:
-                                            min_val_str = device_param.str_for_value(0.0)
-                                            max_val_str = device_param.str_for_value(1.0)
-                                except:
-                                    pass
-
-                            # Fall back to normalized min/max as strings
-                            if min_val_str is None:
-                                min_val_str = str(device_param.min) if hasattr(device_param, 'min') else "0.0"
-                            if max_val_str is None:
-                                max_val_str = str(device_param.max) if hasattr(device_param, 'max') else "1.0"
-
-                            # Get default as full display string and raw value
-                            raw_default_value = None
-                            quarter_str = "0.0"
-                            if (not device_param.is_quantized and hasattr(device_param, 'default_value')):
-                                try:
-                                    raw_default_value = device_param.default_value
-                                    if hasattr(device_param, 'str_for_value'):
-                                        default_val_str = device_param.str_for_value(device_param.default_value)
-                                        # Round to 2 decimal places if it's a numeric string
-                                        try:
-                                            num_val = float(default_val_str)
-                                            default_val_str = str(round(num_val, 2))
-                                        except:
-                                            pass
-                                        # Calculate quarter value (25% of min-max range) and get its display string
-                                        if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
-                                            quarter_value = device_param.min + (device_param.max - device_param.min) * 32/127
-                                            quarter_str = device_param.str_for_value(quarter_value)
-                                    else:
-                                        default_val_str = str(round(device_param.default_value, 2))
-                                    # Normalize raw_default_value to 0-1 range
-                                    if hasattr(device_param, 'min') and hasattr(device_param, 'max') and device_param.max != device_param.min:
-                                        raw_default_value = round((raw_default_value - device_param.min) / (device_param.max - device_param.min), 3)
-                                except:
-                                    default_val_str = min_val_str
-                                    raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
-                            else:
-                                default_val_str = min_val_str
-                                raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
-
-                            # Value items for quantized parameters (booleans, enums)
-                            if device_param.is_quantized and hasattr(device_param, 'value_items'):
-                                value_items = ';'.join(str(item) for item in device_param.value_items)
-                            else:
-                                value_items = ''
-
-                            # Build compact data for this parameter
-                            # min/max/default are strings with units embedded
-                            # value_string removed - calculate from CC value + unit from min/max/default
-                            default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
-                            param_str = f"{name.strip()}|{min_val_str.strip()}|{max_val_str.strip()}|{default_val_str.strip()}|{default_raw_str.strip()}|{quarter_str.strip()}|{value_items.strip()}"
-                            param_data.append(param_str)
-                        else:
-                            # Device parameter not found in list - send placeholder
-                            param_str = "*--&&-|0|127|0.0|0.0|32|"
-                            param_data.append(param_str)
-                            unmapped_encoder_indices.append(control_index)
-                    else:
-                        # No parameter mapped to this control - send placeholder
-                        # Format: *--&&-|0|127|0.0|0.0|32|
-                        # Name: *--&&- (unmapped marker to distinguish from *- disabled params)
-                        # Min/Max/Default/Quarter: Normalized values for consistency
-                        # This ensures always exactly 8 parameters in SysEx message
-                        param_str = "*--&&-|0|127|0.0|0.0|32|"
-                        param_data.append(param_str)
+                    if not mapped_param:
                         unmapped_encoder_indices.append(control_index)
-
-            # Send all parameter data in one message
-            all_params = ','.join(param_data)
-            self._send_sys_ex_message(all_params, 0x7D)
-
-            # Send CC 0 for all unmapped encoders to update app display
-            for control_index in unmapped_encoder_indices:
-                cc_number = 72 + control_index
-                self.send_cc(cc_number, 8, 0)
+                
+                for control_index in unmapped_encoder_indices:
+                    cc_number = 72 + control_index
+                    self.send_cc(cc_number, 8, 0)
+                
+                if isinstance(selected_device, Live.RackDevice.RackDevice) and self._metadata_has_only_numbers(current_metadata):
+                    self._last_sent_metadata = current_metadata
+                    
+                    if self._metadata_recheck_timer:
+                        self._metadata_recheck_timer.cancel()
+                    
+                    self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
+                    self._metadata_recheck_timer.start()
+                else:
+                    self._last_sent_metadata = None
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
@@ -3028,6 +3054,9 @@ class Tap(ControlSurface):
         self._send_browser_page(self.browser_current_page)
 
     def disconnect(self):
+        if self._metadata_recheck_timer:
+            self._metadata_recheck_timer.cancel()
+            self._metadata_recheck_timer = None
         self._remove_disabled_parameter_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         if hasattr(self, 'duplicate_button'):
