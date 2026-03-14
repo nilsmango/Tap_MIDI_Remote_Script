@@ -1387,24 +1387,24 @@ class Tap(ControlSurface):
 
         # 1. Remove all old listeners to prevent leaks
         for track, (left_listener, right_listener) in self._track_level_listeners.items():
-            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
                 track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
                 track.remove_output_meter_right_listener(right_listener)
         self._track_level_listeners.clear()
 
         for track, (left_listener, right_listener) in self._return_level_listeners.items():
-            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
                 track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
                 track.remove_output_meter_right_listener(right_listener)
         self._return_level_listeners.clear()
         
         if self._master_level_listeners:
             left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
-            if left_listener and master_track.output_meter_left_has_listener(left_listener):
+            if left_listener and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
                 master_track.remove_output_meter_left_listener(left_listener)
-            if right_listener and master_track.output_meter_right_has_listener(right_listener):
+            if right_listener and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
                 master_track.remove_output_meter_right_listener(right_listener)
             self._master_level_listeners.clear()
                     
@@ -1467,21 +1467,23 @@ class Tap(ControlSurface):
         for index, return_track in enumerate(return_tracks):
             return_track_names.append(return_track.name)
             return_track_colors.append(self._make_color_string(return_track.color))
-            
-            return_index = index + len(tracks)
-            left_handler = self._create_level_change_handler(return_index)
-            right_handler = self._create_level_change_handler(return_index)
-            return_track.add_output_meter_left_listener(left_handler)
-            return_track.add_output_meter_right_listener(right_handler) 
-            self._return_level_listeners[return_track] = (left_handler, right_handler)
+
+            if hasattr(return_track, 'add_output_meter_left_listener'):
+                return_index = index + len(tracks)
+                left_handler = self._create_level_change_handler(return_index)
+                right_handler = self._create_level_change_handler(return_index)
+                return_track.add_output_meter_left_listener(left_handler)
+                return_track.add_output_meter_right_listener(right_handler)
+                self._return_level_listeners[return_track] = (left_handler, right_handler)
 
         # output meter listeners master track
-        master_index = 127
-        left_handler = self._create_level_change_handler(master_index)
-        right_handler = self._create_level_change_handler(master_index)
-        master_track.add_output_meter_left_listener(left_handler)
-        master_track.add_output_meter_right_listener(right_handler)
-        self._master_level_listeners[master_track] = (left_handler, right_handler)
+        if hasattr(master_track, 'add_output_meter_left_listener'):
+            master_index = 127
+            left_handler = self._create_level_change_handler(master_index)
+            right_handler = self._create_level_change_handler(master_index)
+            master_track.add_output_meter_left_listener(left_handler)
+            master_track.add_output_meter_right_listener(right_handler)
+            self._master_level_listeners[master_track] = (left_handler, right_handler)
 
         # add master track color to the mix:
         color_string = self._make_color_string(master_track.color)
@@ -1676,15 +1678,15 @@ class Tap(ControlSurface):
                 #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
             # output meter listeners
             if track.has_audio_output:
-                if track.output_meter_left_has_listener(self._on_output_level_changed):
+                if hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(self._on_output_level_changed):
                     track.remove_output_meter_left_listener(self._on_output_level_changed)
-                if track.output_meter_right_has_listener(self._on_output_level_changed):
+                if hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(self._on_output_level_changed):
                     track.remove_output_meter_right_listener(self._on_output_level_changed)
 
         for return_track in self.song().return_tracks:
-            if return_track.output_meter_left_has_listener(self._on_output_level_changed):
+            if hasattr(return_track, 'output_meter_left_has_listener') and return_track.output_meter_left_has_listener(self._on_output_level_changed):
                 return_track.remove_output_meter_left_listener(self._on_output_level_changed)
-            if return_track.output_meter_right_has_listener(self._on_output_level_changed):
+            if hasattr(return_track, 'output_meter_right_has_listener') and return_track.output_meter_right_has_listener(self._on_output_level_changed):
                 return_track.remove_output_meter_right_listener(self._on_output_level_changed)
 
     # def _on_playing_position_changed(self):
@@ -3003,23 +3005,23 @@ class Tap(ControlSurface):
         song.remove_root_note_listener(self._on_scale_changed)
         # Clean up level listeners
         for track, (left_listener, right_listener) in self._track_level_listeners.items():
-            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
                 track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
                 track.remove_output_meter_right_listener(right_listener)
-        
+
         for track, (left_listener, right_listener) in self._return_level_listeners.items():
-            if liveobj_valid(track) and track.output_meter_left_has_listener(left_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
                 track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and track.output_meter_right_has_listener(right_listener):
+            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
                 track.remove_output_meter_right_listener(right_listener)
 
         if self._master_level_listeners:
             master_track = self.song().master_track
             left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
-            if left_listener and liveobj_valid(master_track) and master_track.output_meter_left_has_listener(left_listener):
+            if left_listener and liveobj_valid(master_track) and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
                 master_track.remove_output_meter_left_listener(left_listener)
-            if right_listener and liveobj_valid(master_track) and master_track.output_meter_right_has_listener(right_listener):
+            if right_listener and liveobj_valid(master_track) and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
                 master_track.remove_output_meter_right_listener(right_listener)
         
         self.periodic_timer = 0
