@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Build script for Tap MIDI Remote Script distribution
+# Copies files to ZIP/Tap folder and creates a Tap.zip file for distribution
+
 import os
 import shutil
 import zipfile
@@ -9,9 +12,11 @@ zip_path = "/Users/simxn/Documents/Geschäft/project7III/Apps/7III Tap/MIDI Remo
 
 files_to_copy = ["__init__.py", "Tap.py", "README.md"]
 
+# Create target directory if it doesn't exist
 print(f"Creating target directory: {target_dir}")
 os.makedirs(target_dir, exist_ok=True)
 
+# Clear all files in the target directory
 print(f"Clearing {target_dir}...")
 for item in os.listdir(target_dir):
     item_path = os.path.join(target_dir, item)
@@ -19,6 +24,7 @@ for item in os.listdir(target_dir):
         os.remove(item_path)
         print(f"  Removed: {item}")
 
+# Copy source files to the target directory
 print(f"\nCopying files to {target_dir}...")
 for filename in files_to_copy:
     source_path = os.path.join(source_dir, filename)
@@ -28,6 +34,7 @@ for filename in files_to_copy:
     else:
         print(f"  Warning: {filename} not found")
 
+# Create zip file
 print(f"\nCreating zip: {zip_path}")
 if os.path.exists(zip_path):
     os.remove(zip_path)
