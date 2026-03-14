@@ -2978,11 +2978,16 @@ class Tap(ControlSurface):
     def disconnect(self):
         self._remove_disabled_parameter_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
-        self.duplicate_button.remove_value_listener(self._duplicate_button_value)
-        self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
-        self.sesh_record_button.remove_value_listener(self._sesh_record_value)
-        self.redo_button.remove_value_listener(self._redo_button_value)
-        self.undo_button.remove_value_listener(self._undo_button_value)
+        if hasattr(self, 'duplicate_button'):
+            self.duplicate_button.remove_value_listener(self._duplicate_button_value)
+        if hasattr(self, 'duplicate_scene_button'):
+            self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
+        if hasattr(self, 'sesh_record_button'):
+            self.sesh_record_button.remove_value_listener(self._sesh_record_value)
+        if hasattr(self, 'redo_button'):
+            self.redo_button.remove_value_listener(self._redo_button_value)
+        if hasattr(self, 'undo_button'):
+            self.undo_button.remove_value_listener(self._undo_button_value)
         # browser buttons cleanup
         if hasattr(self, 'browser_start_button'):
             self.browser_start_button.remove_value_listener(self._start_browser)
