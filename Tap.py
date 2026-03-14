@@ -1804,7 +1804,7 @@ class Tap(ControlSurface):
             self._sysex_buffer = []
     
         # Basic validity check
-        if len(message) < 2:
+        if len(message) < 3:
             self._sysex_buffer = []
             return
         
