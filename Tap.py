@@ -203,6 +203,27 @@ class Tap(ControlSurface):
         new_tempo = round(self.song().tempo, 2)
         self._send_sys_ex_message(str(new_tempo), 0x12)
     
+    def _is_bank_connected(self, device, bank_name):
+        if not isinstance(device, Live.RackDevice.RackDevice):
+            return True
+        
+        if bank_name not in ("Macros", "Macros 2"):
+            return True
+        
+        if not hasattr(device, 'macros_mapped'):
+            return True
+        
+        macro_ranges = {
+            "Macros": (0, 8),
+            "Macros 2": (8, 16)
+        }
+        
+        if bank_name not in macro_ranges:
+            return True
+        
+        start_idx, end_idx = macro_ranges[bank_name]
+        return any(device.macros_mapped[start_idx:end_idx])
+    
     @subject_slot('device')
     def _on_device_changed(self):
         if self._drum_rack_device:
@@ -262,8 +283,22 @@ class Tap(ControlSurface):
                     break
             
             # bank names, list and if has drum
-            bank_name_drum = self._device._bank_name + ";" + str(track_has_drums)
-            bank_names_list = ','.join(str(name) for name in self._device._parameter_bank_names())
+            current_bank_name = self._device._bank_name
+            all_bank_names = self._device._parameter_bank_names()
+            connected_bank_names = [name for name in all_bank_names if self._is_bank_connected(selected_device, name)]
+            
+            # Handle case where current bank was filtered out
+            if current_bank_name and isinstance(selected_device, Live.RackDevice.RackDevice):
+                if current_bank_name in all_bank_names and current_bank_name not in connected_bank_names:
+                    # Current bank was filtered, navigate to first connected bank
+                    if connected_bank_names:
+                        # Simulate bank navigation to trigger device change with valid bank
+                        self._device.set_bank_index(all_bank_names.index(connected_bank_names[0]))
+                    else:
+                        current_bank_name = ""
+            
+            bank_name_drum = current_bank_name + ";" + str(track_has_drums)
+            bank_names_list = ','.join(str(name) for name in connected_bank_names)
             
             # sending sysex of bank name, device name, bank names
             self._send_sys_ex_message(bank_name_drum, 0x6D)
@@ -2153,18 +2188,29 @@ class Tap(ControlSurface):
         if not source_clip.is_midi_clip or not dest_clip.is_midi_clip:
             return
         
-        # Get source clip notes
-        source_clip_length = max(source_clip.loop_end, source_clip.end_marker, source_clip.length)
-        source_clip_start = min(source_clip.start_time, source_clip.start_marker, source_clip.loop_start)
-        source_notes = source_clip.get_notes_extended(0, 128, source_clip_start, source_clip_length)
+        # Get source clip looped region only
+        source_loop_start = source_clip.loop_start
+        source_loop_end = source_clip.loop_end
+        source_looped_length = source_loop_end - source_loop_start
+        source_notes = source_clip.get_notes_extended(0, 128, source_loop_start, source_looped_length)
         
-        # Get destination clip end position (max of loop_end and end_marker)
-        dest_clip_end = max(dest_clip.loop_end, dest_clip.end_marker)
+        # Get destination clip loop end position
+        dest_clip_loop_end = dest_clip.loop_end
         
-        # Calculate offset for appending notes
-        time_offset = dest_clip_end - source_clip_start
+        # Remove any notes in destination clip that are after loop_end
+        dest_clip_notes = dest_clip.get_notes_extended(0, 128, 0, dest_clip_loop_end)
+        notes_to_delete = []
+        for note in dest_clip_notes:
+            if note.start_time >= dest_clip_loop_end:
+                notes_to_delete.append(note)
         
-        # Offset the source notes to append at the end of destination
+        if notes_to_delete:
+            dest_clip.remove_notes(tuple(notes_to_delete))
+        
+        # Calculate offset for appending notes (append after destination's loop_end)
+        time_offset = dest_clip_loop_end - source_loop_start
+        
+        # Offset source notes to append at the end of destination
         if source_notes:
             new_notes = []
             for note in source_notes:
@@ -2185,11 +2231,11 @@ class Tap(ControlSurface):
                 )
                 new_notes.append(note_spec)
             
-            # Add the offset notes to destination clip
+            # Add offset notes to destination clip
             dest_clip.add_new_notes(tuple(new_notes))
             
             # Update destination clip loop_end and end_marker to include new notes
-            new_end = dest_clip_end + source_clip_length
+            new_end = dest_clip_loop_end + source_looped_length
             dest_clip.loop_end = new_end
             dest_clip.end_marker = new_end
         
