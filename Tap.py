@@ -361,6 +361,25 @@ class Tap(ControlSurface):
         if current_metadata and current_metadata != self._last_sent_metadata:
             self._send_sys_ex_message(current_metadata, 0x7D)
             self._last_sent_metadata = current_metadata
+            
+            if hasattr(selected_device, 'parameters') and selected_device.parameters:
+                device_parameters = list(selected_device.parameters)
+                
+                for control_index in range(8):
+                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+                    
+                    if mapped_param:
+                        device_param = None
+                        for dp in device_parameters:
+                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                device_param = dp
+                                break
+                        
+                        if device_param:
+                            cc_value = self._parameter_value_to_cc(device_param)
+                            cc_number = 72 + control_index
+                            self.send_cc(cc_number, 8, cc_value)
     
     @subject_slot('device')
     def _on_device_changed(self):
