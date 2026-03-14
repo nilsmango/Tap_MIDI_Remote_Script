@@ -2198,14 +2198,19 @@ class Tap(ControlSurface):
         dest_clip_loop_end = dest_clip.loop_end
         
         # Remove any notes in destination clip that are after loop_end
-        dest_clip_notes = dest_clip.get_notes_extended(0, 128, 0, dest_clip_loop_end)
-        notes_to_delete = []
+        # Get ALL notes in the clip (use clip length to ensure we capture everything)
+        dest_clip_full_length = max(dest_clip.loop_end, dest_clip.end_marker, dest_clip.length, 110)
+        dest_clip_notes = dest_clip.get_notes_extended(0, 128, 0, dest_clip_full_length)
+        
+        # Collect note IDs to delete (notes at or after loop_end)
+        note_ids_to_delete = []
         for note in dest_clip_notes:
             if note.start_time >= dest_clip_loop_end:
-                notes_to_delete.append(note)
+                note_ids_to_delete.append(note.note_id)
         
-        if notes_to_delete:
-            dest_clip.remove_notes(tuple(notes_to_delete))
+        # Delete all notes in one call using note IDs
+        if note_ids_to_delete:
+            dest_clip.remove_notes_by_id(tuple(note_ids_to_delete))
         
         # Calculate offset for appending notes (append after destination's loop_end)
         time_offset = dest_clip_loop_end - source_loop_start
