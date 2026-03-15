@@ -1,5 +1,5 @@
 # Tap
-Version: 1.4
+Version: 1.5
 
 An Ableton Live MIDI remote script for the iOS app 7III Tap by project7III.
 
