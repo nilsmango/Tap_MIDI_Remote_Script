@@ -509,8 +509,13 @@ class Tap(ControlSurface):
                 if parameter_names:
                     self._send_parameter_info(parameter_names)
                 else:
-                    parameter_names = ""
-                    self._send_parameter_info(parameter_names)
+                    # Send not mapped for all controls when no parameters are mapped (e.g., inactive bank)
+                    self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
+                    
+                    # Send CC 0 for all encoders
+                    for control_index in range(8):
+                        cc_number = 72 + control_index
+                        self.send_cc(cc_number, 8, 0)
             
             self._remove_disabled_parameter_listeners()
             
@@ -540,8 +545,13 @@ class Tap(ControlSurface):
                             cc_number = 72 + control_index
                             self.send_cc(cc_number, 8, cc_value)
             else:
-                parameter_names = ""
-                self._send_parameter_info(parameter_names)
+                # Device has no parameters - send not mapped for all controls
+                self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
+                
+                # Send CC 0 for all encoders
+                for control_index in range(8):
+                    cc_number = 72 + control_index
+                    self.send_cc(cc_number, 8, 0)
 
             if self.mixer_status:
                 # disconnect again
@@ -553,11 +563,16 @@ class Tap(ControlSurface):
             bank_name_drum = ";0"
             bank_names_list = ""
             available_devices_string = ""
-            parameter_names = ""
             self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(available_devices_string, 0x01)
-            self._send_parameter_info(parameter_names)
+            # Send not mapped for all controls when no device is selected
+            self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
+            
+            # Send CC 0 for all encoders
+            for control_index in range(8):
+                cc_number = 72 + control_index
+                self.send_cc(cc_number, 8, 0)
     
     def _get_all_nested_devices(self, devices):
         """
