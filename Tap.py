@@ -350,11 +350,32 @@ class Tap(ControlSurface):
         
         return True
 
+    def _metadata_has_raw_0_127(self, metadata):
+        if not metadata:
+            return False
+        
+        params = metadata.split(',')
+        for param in params:
+            fields = param.split('|')
+            for field_index in [1, 2, 3, 5]:
+                if field_index < len(fields):
+                    field_value = fields[field_index].strip()
+                    if field_value in ("0", "127"):
+                        return True
+        return False
+
     def _metadata_has_unmapped(self, metadata):
         if not metadata:
             return False
         
         return "*--&&-" in metadata
+
+    def _metadata_needs_rack_recheck(self, metadata):
+        return (
+            self._metadata_has_unmapped(metadata)
+            or self._metadata_has_only_numbers(metadata)
+            or self._metadata_has_raw_0_127(metadata)
+        )
     
     def _recheck_parameter_metadata(self):
         self._metadata_recheck_timer = None
@@ -408,7 +429,7 @@ class Tap(ControlSurface):
         elif is_drum_pad_device:
             last_metadata = self._last_drum_pad_metadata
         
-        if current_metadata and (has_unmapped or (last_metadata is not None and current_metadata != last_metadata)):
+        if current_metadata and last_metadata is not None and current_metadata != last_metadata:
             should_resend = True
         
         if should_resend:
@@ -886,6 +907,13 @@ class Tap(ControlSurface):
                         return True
         
         return False
+
+    def _is_device_in_rack_chain(self, device, track_devices):
+        if not device or not track_devices:
+            return False
+        
+        parent_chain, _ = self._find_parent_chain(track_devices, device)
+        return parent_chain is not None
     
     def _is_device_in_drum_pad(self, device):
         """
@@ -942,12 +970,13 @@ class Tap(ControlSurface):
                 is_rack_device = isinstance(selected_device, Live.RackDevice.RackDevice)
                 is_drum_rack = self._drum_rack_device and selected_device == self._drum_rack_device
                 is_drum_pad_device = self._drum_rack_device and self._is_device_in_drum_pad(selected_device)
+                is_rack_related = is_rack_device or self._is_device_in_rack_chain(selected_device, selected_track.devices)
                 
                 should_iterate = False
                 if is_drum_rack or is_drum_pad_device:
                     should_iterate = self._metadata_has_unmapped(current_metadata)
-                elif is_rack_device:
-                    should_iterate = self._metadata_has_only_numbers(current_metadata)
+                elif is_rack_related:
+                    should_iterate = self._metadata_needs_rack_recheck(current_metadata)
                 
                 if should_iterate:
                     if is_drum_pad_device:
@@ -955,8 +984,12 @@ class Tap(ControlSurface):
                     else:
                         self._last_sent_metadata = current_metadata
                     
-                    self._drum_pad_change_recheck_count = 0
-                    self._drum_pad_recheck_start = time.time()
+                    if is_drum_rack or is_drum_pad_device:
+                        self._drum_pad_change_recheck_count = 0
+                        self._drum_pad_recheck_start = time.time()
+                    else:
+                        self._device_recheck_count = 0
+                        self._device_recheck_start = time.time()
                     
                     if self._metadata_recheck_timer:
                         self._metadata_recheck_timer.cancel()
