@@ -91,6 +91,9 @@ class Tap(ControlSurface):
             self._drum_pad_recheck_start = None
             self._last_drum_pad_note = None
             self._last_drum_pad_change_at = 0.0
+            self._device_recheck_start = None
+            self._device_recheck_count = 0
+            self._debug_mode = False
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -376,6 +379,10 @@ class Tap(ControlSurface):
             or self._metadata_has_only_numbers(metadata)
             or self._metadata_has_raw_0_127(metadata)
         )
+
+    def _debug_log(self, message):
+        if self._debug_mode:
+            self.log_message(message)
     
     def _recheck_parameter_metadata(self):
         self._metadata_recheck_timer = None
@@ -407,7 +414,7 @@ class Tap(ControlSurface):
             self._drum_pad_recheck_start = time.time()
         
         elapsed = time.time() - self._drum_pad_recheck_start
-        self.log_message(
+        self._debug_log(
             "Recheck metadata: "
             f"iter={self._drum_pad_change_recheck_count} "
             f"elapsed={round(elapsed, 3)}s "
@@ -417,7 +424,7 @@ class Tap(ControlSurface):
         )
         
         if elapsed >= 0.8:
-            self.log_message("Recheck metadata: reached max duration 0.8s, stopping")
+            self._debug_log("Recheck metadata: reached max duration 0.8s, stopping")
             self._drum_pad_change_recheck_count = 0
             self._drum_pad_recheck_start = None
             return
@@ -433,7 +440,7 @@ class Tap(ControlSurface):
             should_resend = True
         
         if should_resend:
-            self.log_message(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
+            self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
             self._send_sys_ex_message(current_metadata, 0x7D)
             
             if is_drum_pad_device:
@@ -474,13 +481,13 @@ class Tap(ControlSurface):
                 self._metadata_recheck_timer.start()
             else:
                 if is_drum_pad_device:
-                    self.log_message(f"Drum pad recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                    self._debug_log(f"Drum pad recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
                     self._last_drum_pad_metadata = None
                 else:
                     if is_drum_rack:
-                        self.log_message(f"Drum rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                        self._debug_log(f"Drum rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
                     else:
-                        self.log_message(f"Rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                        self._debug_log(f"Rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
                 self._drum_pad_change_recheck_count = 0
                 self._drum_pad_recheck_start = None
                 return
@@ -809,14 +816,14 @@ class Tap(ControlSurface):
                     self._select_device_in_selected_drum_pad()
                     
                     # Kick off a metadata recheck loop to wait for full pad loading
-                    self.log_message("Drum pad change: starting metadata recheck loop")
+                    self._debug_log("Drum pad change: starting metadata recheck loop")
                     self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
                     self._metadata_recheck_timer.start()
             else:
-                self.log_message("No drum pad selected")
+                self._debug_log("No drum pad selected")
             
         except Exception as e:
-            self.log_message(f"Error sending drum pad number: {str(e)}")
+            self._debug_log(f"Error sending drum pad number: {str(e)}")
     
     def _find_mapped_device(self):
         """
@@ -882,7 +889,7 @@ class Tap(ControlSurface):
                 else:
                     selected_track.view.selected_device = target_device
             except Exception as e:
-                self.log_message(f"Error selecting drum pad device: {str(e)}")
+                self._debug_log(f"Error selecting drum pad device: {str(e)}")
 
     def _is_device_in_any_drum_pad(self, device):
         if not self._drum_rack_device or not device:
@@ -1658,9 +1665,9 @@ class Tap(ControlSurface):
                             # update last playing position
                             self.last_playing_position = clip_position
                     except Exception as e:
-                        self.log_message(f"Exception for clip position changed: {str(e)}")
+                        self._debug_log(f"Exception for clip position changed: {str(e)}")
                         import traceback
-                        self.log_message(traceback.format_exc())
+                        self._debug_log(traceback.format_exc())
                         pass
                 # else:
                     # self.log_message("No valid clip in the slot.")
@@ -1696,7 +1703,7 @@ class Tap(ControlSurface):
         if track_index >= 0 and track_index < len(song.tracks):
             song.view.selected_track = song.tracks[track_index]
         else:
-            self.log_message("Invalid track index: {}".format(track_index))
+            self._debug_log("Invalid track index: {}".format(track_index))
 
     def _select_return_track_by_index(self, track_index):
         song = self.song()
@@ -3084,7 +3091,7 @@ class Tap(ControlSurface):
                 while not finished:
                     random_folder_index = random.randint(0, number_of_effects - 1)
                     selected_folder = effect_children[random_folder_index]
-                    self.log_message("Selected FOlder: {}".format(selected_folder.name))
+                    self._debug_log("Selected FOlder: {}".format(selected_folder.name))
                     if selected_folder.name != "Utilities":
                         finished = True
 
@@ -3141,7 +3148,7 @@ class Tap(ControlSurface):
             self._send_browser_page(self.browser_current_page)
 
         except Exception as e:
-            self.log_message(f"Error starting browser: {str(e)}")
+            self._debug_log(f"Error starting browser: {str(e)}")
 
     def _get_browser_item_type(self, item):
         """
