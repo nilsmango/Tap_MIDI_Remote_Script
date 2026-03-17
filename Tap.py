@@ -86,6 +86,11 @@ class Tap(ControlSurface):
             }
             self._metadata_recheck_timer = None
             self._last_sent_metadata = None
+            self._last_drum_pad_metadata = None
+            self._drum_pad_change_recheck_count = 0
+            self._drum_pad_recheck_start = None
+            self._last_drum_pad_note = None
+            self._last_drum_pad_change_at = 0.0
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -156,7 +161,8 @@ class Tap(ControlSurface):
             for pad in self._drum_rack_device.drum_pads:
                 if not pad.name_has_listener(self._send_all_drum_pad_names):
                     pad.add_name_listener(self._send_all_drum_pad_names)
-            self._drum_rack_device.view.add_selected_drum_pad_listener(self._send_selected_drum_pad_number)
+            if not self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
+                self._drum_rack_device.view.add_selected_drum_pad_listener(self._send_selected_drum_pad_number)
 
     def _remove_drum_pad_name_listeners(self):
         if self._drum_rack_device:
@@ -343,6 +349,12 @@ class Tap(ControlSurface):
                             return False
         
         return True
+
+    def _metadata_has_unmapped(self, metadata):
+        if not metadata:
+            return False
+        
+        return "*--&&-" in metadata
     
     def _recheck_parameter_metadata(self):
         self._metadata_recheck_timer = None
@@ -352,18 +364,64 @@ class Tap(ControlSurface):
         
         selected_track = self.song().view.selected_track
         selected_device = selected_track.view.selected_device
+        metadata_device = selected_device
         
-        if not isinstance(selected_device, Live.RackDevice.RackDevice):
+        if self._drum_rack_device and selected_device == self._drum_rack_device:
+            mapped_device = self._find_mapped_device()
+            if mapped_device and self._is_device_in_drum_pad(mapped_device):
+                metadata_device = mapped_device
+        
+        is_rack_device = isinstance(metadata_device, Live.RackDevice.RackDevice)
+        is_drum_rack = self._drum_rack_device and metadata_device == self._drum_rack_device
+        is_drum_pad_device = self._drum_rack_device and self._is_device_in_drum_pad(metadata_device)
+        
+        if not is_rack_device and not is_drum_pad_device:
             return
         
-        current_metadata = self._build_parameter_metadata(selected_device)
+        current_metadata = self._build_parameter_metadata(metadata_device)
+        has_unmapped = self._metadata_has_unmapped(current_metadata)
+        has_only_numbers = self._metadata_has_only_numbers(current_metadata)
         
-        if current_metadata and current_metadata != self._last_sent_metadata:
+        if self._drum_pad_recheck_start is None:
+            self._drum_pad_recheck_start = time.time()
+        
+        elapsed = time.time() - self._drum_pad_recheck_start
+        self.log_message(
+            "Recheck metadata: "
+            f"iter={self._drum_pad_change_recheck_count} "
+            f"elapsed={round(elapsed, 3)}s "
+            f"device='{metadata_device.name if metadata_device else 'None'}' "
+            f"rack={is_rack_device} drum_rack={bool(is_drum_rack)} drum_pad_device={bool(is_drum_pad_device)} "
+            f"unmapped={has_unmapped} only_numbers={has_only_numbers}"
+        )
+        
+        if elapsed >= 0.8:
+            self.log_message("Recheck metadata: reached max duration 0.8s, stopping")
+            self._drum_pad_change_recheck_count = 0
+            self._drum_pad_recheck_start = None
+            return
+        
+        should_resend = False
+        last_metadata = None
+        if is_rack_device:
+            last_metadata = self._last_sent_metadata
+        elif is_drum_pad_device:
+            last_metadata = self._last_drum_pad_metadata
+        
+        if current_metadata and (has_unmapped or (last_metadata is not None and current_metadata != last_metadata)):
+            should_resend = True
+        
+        if should_resend:
+            self.log_message(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
             self._send_sys_ex_message(current_metadata, 0x7D)
-            self._last_sent_metadata = current_metadata
             
-            if hasattr(selected_device, 'parameters') and selected_device.parameters:
-                device_parameters = list(selected_device.parameters)
+            if is_drum_pad_device:
+                self._last_drum_pad_metadata = current_metadata
+            else:
+                self._last_sent_metadata = current_metadata
+            
+            if hasattr(metadata_device, 'parameters') and metadata_device.parameters:
+                device_parameters = list(metadata_device.parameters)
                 
                 for control_index in range(8):
                     control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
@@ -380,6 +438,34 @@ class Tap(ControlSurface):
                             cc_value = self._parameter_value_to_cc(device_param)
                             cc_number = 72 + control_index
                             self.send_cc(cc_number, 8, cc_value)
+        
+        max_iterations = 8
+        should_continue = False
+        if is_drum_pad_device or is_drum_rack:
+            should_continue = has_unmapped
+        elif is_rack_device:
+            should_continue = has_only_numbers
+        
+        if should_continue:
+            self._drum_pad_change_recheck_count += 1
+            if self._drum_pad_change_recheck_count <= max_iterations:
+                self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
+                self._metadata_recheck_timer.start()
+            else:
+                if is_drum_pad_device:
+                    self.log_message(f"Drum pad recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                    self._last_drum_pad_metadata = None
+                else:
+                    if is_drum_rack:
+                        self.log_message(f"Drum rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                    else:
+                        self.log_message(f"Rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                self._drum_pad_change_recheck_count = 0
+                self._drum_pad_recheck_start = None
+                return
+        else:
+            self._drum_pad_change_recheck_count = 0
+            self._drum_pad_recheck_start = None
     
     @subject_slot('device')
     def _on_device_changed(self):
@@ -450,7 +536,7 @@ class Tap(ControlSurface):
                     # Current bank was filtered, navigate to first connected bank
                     if connected_bank_names:
                         # Simulate bank navigation to trigger device change with valid bank
-                        self._device.set_bank_index(all_bank_names.index(connected_bank_names[0]))
+                        self._device._bank_index = all_bank_names.index(connected_bank_names[0])
                     else:
                         current_bank_name = ""
             
@@ -676,18 +762,159 @@ class Tap(ControlSurface):
         on channel 3, note number 3, with the pad number encoded in the velocity.
         """
         try:
-            # Get the selected drum pad
             if self._drum_rack_device:
-                pad_number = self._drum_rack_device.view.selected_drum_pad.note
-                channel = 3  # This is channel 3 in 0-indexed counting
-                midi_note_number = 3
-                # Sending pad number out as velocity. So 0 will have no signal, but doesn not matter as we don't even go so low in Tap
-                self.send_note_on(midi_note_number, channel, pad_number)
+                selected_pad = self._drum_rack_device.view.selected_drum_pad
+                if selected_pad:
+                    pad_number = selected_pad.note
+                    now = time.time()
+                    if self._last_drum_pad_note == pad_number and (now - self._last_drum_pad_change_at) < 0.05:
+                        return
+                    self._last_drum_pad_note = pad_number
+                    self._last_drum_pad_change_at = now
+                    
+                    channel = 3
+                    midi_note_number = 3
+                    self.send_note_on(midi_note_number, channel, pad_number)
+                    
+                    if hasattr(self, '_metadata_recheck_timer') and self._metadata_recheck_timer:
+                        self._metadata_recheck_timer.cancel()
+                    
+                    self._drum_pad_change_recheck_count = 0
+                    self._last_drum_pad_metadata = None
+                    self._last_sent_metadata = None
+                    self._drum_pad_recheck_start = time.time()
+                    
+                    # Only auto-follow pad if we're already on a pad device
+                    self._select_device_in_selected_drum_pad()
+                    
+                    # Kick off a metadata recheck loop to wait for full pad loading
+                    self.log_message("Drum pad change: starting metadata recheck loop")
+                    self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
+                    self._metadata_recheck_timer.start()
             else:
                 self.log_message("No drum pad selected")
             
         except Exception as e:
             self.log_message(f"Error sending drum pad number: {str(e)}")
+    
+    def _find_mapped_device(self):
+        """
+        Finds the device that controls are currently mapped to by checking
+        the device that owns the mapped parameters.
+        """
+        if not hasattr(self, '_device_controls'):
+            return None
+        
+        for control in self._device_controls:
+            if control and control.mapped_parameter():
+                mapped_param = control.mapped_parameter()
+                if hasattr(mapped_param, 'canonical_parent'):
+                    device = mapped_param.canonical_parent
+                    if hasattr(device, 'canonical_parent') and hasattr(device.canonical_parent, 'canonical_parent'):
+                        return device
+        return None
+
+    def _select_device_in_selected_drum_pad(self):
+        if not self._drum_rack_device:
+            return
+        
+        selected_track = self.song().view.selected_track
+        current_device = selected_track.view.selected_device
+        if not current_device or not self._is_device_in_any_drum_pad(current_device):
+            return
+        
+        selected_drum_pad = self._get_selected_drum_pad(self._drum_rack_device)
+        if not selected_drum_pad or not selected_drum_pad.chains:
+            return
+        
+        target_device = None
+        mapped_device = self._find_mapped_device()
+        if mapped_device and self._is_device_in_drum_pad(mapped_device):
+            target_device = mapped_device
+        else:
+            def _first_device_in_chain(chain):
+                if not liveobj_valid(chain) or not hasattr(chain, 'devices'):
+                    return None
+                for chain_device in chain.devices:
+                    if liveobj_valid(chain_device):
+                        if hasattr(chain_device, 'parameters') and chain_device.parameters:
+                            return chain_device
+                        if hasattr(chain_device, 'chains') and chain_device.chains:
+                            for inner_chain in chain_device.chains:
+                                nested = _first_device_in_chain(inner_chain)
+                                if nested:
+                                    return nested
+                        return chain_device
+                return None
+            
+            for chain in selected_drum_pad.chains:
+                target_device = _first_device_in_chain(chain)
+                if target_device:
+                    break
+        
+        if target_device and liveobj_valid(target_device):
+            try:
+                if hasattr(self.song().view, 'select_device'):
+                    self.song().view.select_device(target_device)
+                elif hasattr(self._device, 'set_device'):
+                    self._device.set_device(target_device)
+                else:
+                    selected_track.view.selected_device = target_device
+            except Exception as e:
+                self.log_message(f"Error selecting drum pad device: {str(e)}")
+
+    def _is_device_in_any_drum_pad(self, device):
+        if not self._drum_rack_device or not device:
+            return False
+        
+        def _device_in_chain(chain):
+            if not liveobj_valid(chain) or not hasattr(chain, 'devices'):
+                return False
+            for chain_device in chain.devices:
+                if chain_device == device:
+                    return True
+                if hasattr(chain_device, 'chains') and chain_device.chains:
+                    for inner_chain in chain_device.chains:
+                        if _device_in_chain(inner_chain):
+                            return True
+            return False
+        
+        for pad in self._drum_rack_device.drum_pads:
+            if liveobj_valid(pad) and hasattr(pad, 'chains') and pad.chains:
+                for chain in pad.chains:
+                    if _device_in_chain(chain):
+                        return True
+        
+        return False
+    
+    def _is_device_in_drum_pad(self, device):
+        """
+        Checks if a device is inside a drum pad of the current drum rack.
+        """
+        if not self._drum_rack_device or not device:
+            return False
+        
+        selected_drum_pad = self._get_selected_drum_pad(self._drum_rack_device)
+        if not selected_drum_pad or not selected_drum_pad.chains:
+            return False
+        
+        def _device_in_chain(chain):
+            if not liveobj_valid(chain) or not hasattr(chain, 'devices'):
+                return False
+            for chain_device in chain.devices:
+                if chain_device == device:
+                    return True
+                if hasattr(chain_device, 'chains') and chain_device.chains:
+                    for inner_chain in chain_device.chains:
+                        if _device_in_chain(inner_chain):
+                            return True
+            return False
+        
+        for chain in selected_drum_pad.chains:
+            if _device_in_chain(chain):
+                return True
+        
+        return False
 
     def _send_parameter_info(self, parameter_names):
         if parameter_names == "":
@@ -712,8 +939,24 @@ class Tap(ControlSurface):
                     cc_number = 72 + control_index
                     self.send_cc(cc_number, 8, 0)
                 
-                if isinstance(selected_device, Live.RackDevice.RackDevice) and self._metadata_has_only_numbers(current_metadata):
-                    self._last_sent_metadata = current_metadata
+                is_rack_device = isinstance(selected_device, Live.RackDevice.RackDevice)
+                is_drum_rack = self._drum_rack_device and selected_device == self._drum_rack_device
+                is_drum_pad_device = self._drum_rack_device and self._is_device_in_drum_pad(selected_device)
+                
+                should_iterate = False
+                if is_drum_rack or is_drum_pad_device:
+                    should_iterate = self._metadata_has_unmapped(current_metadata)
+                elif is_rack_device:
+                    should_iterate = self._metadata_has_only_numbers(current_metadata)
+                
+                if should_iterate:
+                    if is_drum_pad_device:
+                        self._last_drum_pad_metadata = current_metadata
+                    else:
+                        self._last_sent_metadata = current_metadata
+                    
+                    self._drum_pad_change_recheck_count = 0
+                    self._drum_pad_recheck_start = time.time()
                     
                     if self._metadata_recheck_timer:
                         self._metadata_recheck_timer.cancel()
@@ -722,6 +965,8 @@ class Tap(ControlSurface):
                     self._metadata_recheck_timer.start()
                 else:
                     self._last_sent_metadata = None
+                    self._last_drum_pad_metadata = None
+                    self._drum_pad_change_recheck_count = 0
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
