@@ -63,6 +63,8 @@ class Tap(ControlSurface):
             self._disabled_parameter_listeners = {}
             self._disabled_parameters = []
             self._current_disabled_controls = []
+            self._automation_state_listeners = {}
+            self._automation_metadata_update_timer = None
             # browser pagination state
             self.browser_current_items = []
             self.browser_current_page = 0
@@ -140,6 +142,7 @@ class Tap(ControlSurface):
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
         self._remove_disabled_parameter_listeners()
+        self._remove_automation_state_listeners()
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -622,6 +625,23 @@ class Tap(ControlSurface):
                 
                 if parameter_names:
                     self._send_parameter_info(parameter_names)
+                    
+                    for control in self._device._parameter_controls:
+                        if control.mapped_parameter():
+                            mapped_param = control.mapped_parameter()
+                            
+                            device_param = None
+                            for dp in device_parameters:
+                                if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                    device_param = dp
+                                    break
+                            
+                            if device_param:
+                                listener = self._create_automation_state_listener(device_param)
+                                if device_param not in self._automation_state_listeners:
+                                    self._automation_state_listeners[device_param] = listener
+                                    if hasattr(device_param, 'add_automation_state_listener'):
+                                        device_param.add_automation_state_listener(listener)
                 else:
                     # Send not mapped for all controls when no parameters are mapped (e.g., inactive bank)
                     self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
@@ -1202,6 +1222,52 @@ class Tap(ControlSurface):
             self.send_cc(cc_number, channel, cc_value)
         return listener
 
+    def _create_automation_state_listener(self, device_param):
+        def listener():
+            self._refresh_parameter_metadata_on_automation_change()
+        return listener
+
+    def _refresh_parameter_metadata_on_automation_change(self):
+        if not liveobj_valid(self._device):
+            return
+        
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device
+        
+        if not selected_device or not hasattr(selected_device, 'parameters'):
+            return
+        
+        if self._automation_metadata_update_timer:
+            self._automation_metadata_update_timer.cancel()
+        
+        self._automation_metadata_update_timer = threading.Timer(0.05, self._send_refreshed_parameter_metadata, args=[selected_device])
+        self._automation_metadata_update_timer.start()
+
+    def _send_refreshed_parameter_metadata(self, selected_device):
+        self._automation_metadata_update_timer = None
+        current_metadata = self._build_parameter_metadata(selected_device)
+        if current_metadata:
+            self._send_sys_ex_message(current_metadata, 0x7D)
+            
+            if hasattr(selected_device, 'parameters') and selected_device.parameters:
+                device_parameters = list(selected_device.parameters)
+                
+                for control_index in range(8):
+                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+                    
+                    if mapped_param:
+                        device_param = None
+                        for dp in device_parameters:
+                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
+                                device_param = dp
+                                break
+                        
+                        if device_param:
+                            cc_value = self._parameter_value_to_cc(device_param)
+                            cc_number = 72 + control_index
+                            self.send_cc(cc_number, 8, cc_value)
+
     def _remove_disabled_parameter_listeners(self):
         for (param, control_index), listener in self._disabled_parameter_listeners.items():
             if liveobj_valid(param) and hasattr(param, 'remove_value_listener'):
@@ -1210,6 +1276,17 @@ class Tap(ControlSurface):
         self._disabled_parameter_listeners.clear()
         self._disabled_parameters.clear()
         self._current_disabled_controls.clear()
+
+    def _remove_automation_state_listeners(self):
+        for param, listener in self._automation_state_listeners.items():
+            if liveobj_valid(param) and hasattr(param, 'remove_automation_state_listener'):
+                if hasattr(param, 'automation_state_has_listener') and param.automation_state_has_listener(listener):
+                    param.remove_automation_state_listener(listener)
+        self._automation_state_listeners.clear()
+        
+        if self._automation_metadata_update_timer:
+            self._automation_metadata_update_timer.cancel()
+            self._automation_metadata_update_timer = None
 
     def _readd_disabled_parameter_listeners(self):
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
