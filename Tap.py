@@ -65,6 +65,9 @@ class Tap(ControlSurface):
             self._current_disabled_controls = []
             self._automation_state_listeners = {}
             self._automation_metadata_update_timer = None
+            self._automation_metadata_retry_count = 0
+            self._automation_metadata_retry_start = None
+            self._last_automation_signature = None
             # browser pagination state
             self.browser_current_items = []
             self.browser_current_page = 0
@@ -96,6 +99,20 @@ class Tap(ControlSurface):
             self._device_recheck_start = None
             self._device_recheck_count = 0
             self._debug_mode = False
+            self._metadata_cache = {}
+            self._drum_pad_names_cache = {}
+            self._automation_metadata_device_id = None
+            self._clip_slot_listeners = {}
+            self._clip_color_listeners = {}
+            self._clip_listener_track_slots = {}
+            self._track_list_signature = None
+            self._track_names_cache = None
+            self._track_is_audio_cache = None
+            self._track_colors_cache = None
+            self._return_track_names_cache = None
+            self._return_track_colors_cache = None
+            self._drum_rack_cache = {}
+            self._sysex_cache = {}
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -149,15 +166,23 @@ class Tap(ControlSurface):
             self._on_device_changed()
 
     def _find_drum_rack_in_track(self, track):
+        cache_key = id(track)
+        if cache_key in self._drum_rack_cache:
+            cached = self._drum_rack_cache.get(cache_key)
+            if cached is None or liveobj_valid(cached):
+                return cached
         for device in track.devices:
             if device.can_have_drum_pads:
+                self._drum_rack_cache[cache_key] = device
                 return device
             elif isinstance(device, Live.RackDevice.RackDevice):
                 # If the device is a RackDevice (e.g., Instrument Rack), recursively search inside its chains
                 for chain in device.chains:
                     drum_rack = self._find_drum_rack_in_track(chain)
                     if drum_rack is not None:
+                        self._drum_rack_cache[cache_key] = drum_rack
                         return drum_rack
+        self._drum_rack_cache[cache_key] = None
         return None
     
     def _setup_drum_pad_listeners(self):
@@ -211,7 +236,12 @@ class Tap(ControlSurface):
                     pad_names.append(pad.name)
                 else:
                     pad_names.append(str(pad.note))
-            self._send_sys_ex_message(",".join(pad_names), 0x11)
+            payload = ",".join(pad_names)
+            cache_key = id(self._drum_rack_device)
+            cached_payload = self._drum_pad_names_cache.get(cache_key)
+            if payload != cached_payload:
+                self._send_sys_ex_message(payload, 0x11)
+                self._drum_pad_names_cache[cache_key] = payload
     
     def _update_tempo(self):
         new_tempo = round(self.song().tempo, 2)
@@ -244,6 +274,10 @@ class Tap(ControlSurface):
         
         param_data = []
         device_parameters = list(selected_device.parameters)
+        device_param_map = {}
+        for dp in device_parameters:
+            if hasattr(dp, 'name'):
+                device_param_map[dp.name] = dp
         unmapped_encoder_indices = []
         
         for control_index in range(8):
@@ -251,11 +285,9 @@ class Tap(ControlSurface):
             mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
             
             if mapped_param:
-                device_param = None
-                for dp in device_parameters:
-                    if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                        device_param = dp
-                        break
+                device_param = mapped_param
+                if device_param is None or not hasattr(device_param, 'name'):
+                    device_param = device_param_map.get(mapped_param.name)
                 
                 if device_param:
                     if hasattr(device_param, 'is_enabled'):
@@ -318,7 +350,7 @@ class Tap(ControlSurface):
                         default_val_str = min_val_str
                         raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
                     
-                    if device_param.is_quantized and hasattr(device_param, 'value_items'):
+                    if hasattr(device_param, 'is_quantized') and device_param.is_quantized and hasattr(device_param, 'value_items'):
                         value_items = ';'.join(str(item) for item in device_param.value_items)
                     else:
                         value_items = ''
@@ -386,6 +418,30 @@ class Tap(ControlSurface):
     def _debug_log(self, message):
         if self._debug_mode:
             self.log_message(message)
+
+    def _get_device_cache_key(self, device):
+        if not device:
+            return None
+        return id(device)
+
+    def _get_cached_metadata(self, device):
+        key = self._get_device_cache_key(device)
+        if key is None:
+            return None
+        return self._metadata_cache.get(key)
+
+    def _set_cached_metadata(self, device, metadata):
+        key = self._get_device_cache_key(device)
+        if key is None:
+            return
+        self._metadata_cache[key] = metadata
+
+    def _clear_cached_metadata(self, device):
+        key = self._get_device_cache_key(device)
+        if key is None:
+            return
+        if key in self._metadata_cache:
+            del self._metadata_cache[key]
     
     def _recheck_parameter_metadata(self):
         self._metadata_recheck_timer = None
@@ -433,18 +489,14 @@ class Tap(ControlSurface):
             return
         
         should_resend = False
-        last_metadata = None
-        if is_rack_device:
-            last_metadata = self._last_sent_metadata
-        elif is_drum_pad_device:
-            last_metadata = self._last_drum_pad_metadata
-        
-        if current_metadata and last_metadata is not None and current_metadata != last_metadata:
+        cached_metadata = self._get_cached_metadata(metadata_device)
+        if current_metadata and cached_metadata != current_metadata:
             should_resend = True
         
         if should_resend:
             self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
             self._send_sys_ex_message(current_metadata, 0x7D)
+            self._set_cached_metadata(metadata_device, current_metadata)
             
             if is_drum_pad_device:
                 self._last_drum_pad_metadata = current_metadata
@@ -503,6 +555,8 @@ class Tap(ControlSurface):
         if self._drum_rack_device:
             self._remove_drum_pad_name_listeners()
             self._drum_rack_device = None
+        self._remove_automation_state_listeners()
+        self._automation_metadata_device_id = None
             
         if liveobj_valid(self._device):
             # get and send name of bank and device
@@ -590,19 +644,11 @@ class Tap(ControlSurface):
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
                 parameter_names = []
                 
-                # Get the actual device parameters directly
-                device_parameters = list(selected_device.parameters)
-                
                 for control in self._device._parameter_controls:
                     if control.mapped_parameter():
                         mapped_param = control.mapped_parameter()
                         
-                        # Try to find the corresponding DeviceParameter by name
-                        device_param = None
-                        for dp in device_parameters:
-                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                device_param = dp
-                                break
+                        device_param = mapped_param
                         
                         if device_param and hasattr(device_param, 'is_enabled'):
                             if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
@@ -625,23 +671,6 @@ class Tap(ControlSurface):
                 
                 if parameter_names:
                     self._send_parameter_info(parameter_names)
-                    
-                    for control in self._device._parameter_controls:
-                        if control.mapped_parameter():
-                            mapped_param = control.mapped_parameter()
-                            
-                            device_param = None
-                            for dp in device_parameters:
-                                if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                    device_param = dp
-                                    break
-                            
-                            if device_param:
-                                listener = self._create_automation_state_listener(device_param)
-                                if device_param not in self._automation_state_listeners:
-                                    self._automation_state_listeners[device_param] = listener
-                                    if hasattr(device_param, 'add_automation_state_listener'):
-                                        device_param.add_automation_state_listener(listener)
                 else:
                     # Send not mapped for all controls when no parameters are mapped (e.g., inactive bank)
                     self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
@@ -650,21 +679,17 @@ class Tap(ControlSurface):
                     for control_index in range(8):
                         cc_number = 72 + control_index
                         self.send_cc(cc_number, 8, 0)
+                self._refresh_automation_state_listeners_current_bank()
+                self._last_automation_signature = self._get_automation_signature()
             
             self._remove_disabled_parameter_listeners()
             
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
-                device_parameters = list(selected_device.parameters)
-                
                 for control_index, control in enumerate(self._device._parameter_controls):
                     if control.mapped_parameter():
                         mapped_param = control.mapped_parameter()
                         
-                        device_param = None
-                        for dp in device_parameters:
-                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                device_param = dp
-                                break
+                        device_param = mapped_param
                         
                         if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
                             listener = self._create_disabled_param_listener(device_param, control_index)
@@ -981,18 +1006,23 @@ class Tap(ControlSurface):
             current_metadata = self._build_parameter_metadata(selected_device)
             
             if current_metadata:
-                self._send_sys_ex_message(current_metadata, 0x7D)
+                cached_metadata = self._get_cached_metadata(selected_device)
+                metadata_changed = cached_metadata != current_metadata
+                if metadata_changed:
+                    self._send_sys_ex_message(current_metadata, 0x7D)
+                    self._set_cached_metadata(selected_device, current_metadata)
                 
-                unmapped_encoder_indices = []
-                for control_index in range(8):
-                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
-                    if not mapped_param:
-                        unmapped_encoder_indices.append(control_index)
-                
-                for control_index in unmapped_encoder_indices:
-                    cc_number = 72 + control_index
-                    self.send_cc(cc_number, 8, 0)
+                if metadata_changed:
+                    unmapped_encoder_indices = []
+                    for control_index in range(8):
+                        control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+                        mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+                        if not mapped_param:
+                            unmapped_encoder_indices.append(control_index)
+                    
+                    for control_index in unmapped_encoder_indices:
+                        cc_number = 72 + control_index
+                        self.send_cc(cc_number, 8, 0)
                 
                 is_rack_device = isinstance(selected_device, Live.RackDevice.RackDevice)
                 is_drum_rack = self._drum_rack_device and selected_device == self._drum_rack_device
@@ -1032,7 +1062,12 @@ class Tap(ControlSurface):
         status_byte = 0xF0  # SysEx message start
         end_byte = 0xF7  # SysEx message end
         device_id = 0x01
-        data = name_string.encode('ascii', errors='ignore')
+        data = self._sysex_cache.get(name_string)
+        if data is None:
+            data = name_string.encode('ascii', errors='ignore')
+            if len(self._sysex_cache) > 128:
+                self._sysex_cache.clear()
+            self._sysex_cache[name_string] = data
         max_chunk_length = 240
         if len(data) <= max_chunk_length:
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
@@ -1227,6 +1262,32 @@ class Tap(ControlSurface):
             self._refresh_parameter_metadata_on_automation_change()
         return listener
 
+    def _refresh_automation_state_listeners_current_bank(self):
+        self._remove_automation_state_listeners()
+        if not hasattr(self, '_device') or not liveobj_valid(self._device):
+            return
+        for control in self._device._parameter_controls:
+            if control.mapped_parameter():
+                device_param = control.mapped_parameter()
+                if device_param:
+                    listener = self._create_automation_state_listener(device_param)
+                    if device_param not in self._automation_state_listeners:
+                        self._automation_state_listeners[device_param] = listener
+                        if hasattr(device_param, 'add_automation_state_listener'):
+                            device_param.add_automation_state_listener(listener)
+
+    def _get_automation_signature(self):
+        if not hasattr(self, '_device') or not liveobj_valid(self._device):
+            return None
+        signature = []
+        for control in self._device._parameter_controls:
+            mapped_param = control.mapped_parameter() if control else None
+            if mapped_param and hasattr(mapped_param, 'automation_state'):
+                signature.append(mapped_param.automation_state)
+            else:
+                signature.append(None)
+        return tuple(signature)
+
     def _refresh_parameter_metadata_on_automation_change(self):
         if not liveobj_valid(self._device):
             return
@@ -1236,37 +1297,69 @@ class Tap(ControlSurface):
         
         if not selected_device or not hasattr(selected_device, 'parameters'):
             return
+
+        current_signature = self._get_automation_signature()
+        if current_signature is not None and current_signature == self._last_automation_signature:
+            return
         
         if self._automation_metadata_update_timer:
             self._automation_metadata_update_timer.cancel()
         
+        self._automation_metadata_device_id = id(selected_device)
+        self._automation_metadata_retry_count = 0
+        self._automation_metadata_retry_start = time.time()
         self._automation_metadata_update_timer = threading.Timer(0.05, self._send_refreshed_parameter_metadata, args=[selected_device])
         self._automation_metadata_update_timer.start()
 
     def _send_refreshed_parameter_metadata(self, selected_device):
         self._automation_metadata_update_timer = None
+        if not selected_device or not liveobj_valid(selected_device):
+            return
+        current_selected = self.song().view.selected_track.view.selected_device
+        if current_selected != selected_device or id(selected_device) != self._automation_metadata_device_id:
+            return
         current_metadata = self._build_parameter_metadata(selected_device)
         if current_metadata:
-            self._send_sys_ex_message(current_metadata, 0x7D)
+            cached_metadata = self._get_cached_metadata(selected_device)
+            current_signature = self._get_automation_signature()
+            automation_changed = (
+                current_signature is not None
+                and current_signature != self._last_automation_signature
+            )
+            metadata_changed = cached_metadata != current_metadata
+            if metadata_changed or automation_changed:
+                self._send_sys_ex_message(current_metadata, 0x7D)
+                self._set_cached_metadata(selected_device, current_metadata)
+                if current_signature is not None:
+                    self._last_automation_signature = current_signature
             
-            if hasattr(selected_device, 'parameters') and selected_device.parameters:
-                device_parameters = list(selected_device.parameters)
-                
+            if (metadata_changed or automation_changed) and hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index in range(8):
                     control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
                     mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
                     
                     if mapped_param:
-                        device_param = None
-                        for dp in device_parameters:
-                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                device_param = dp
-                                break
+                        device_param = mapped_param
                         
                         if device_param:
                             cc_value = self._parameter_value_to_cc(device_param)
                             cc_number = 72 + control_index
                             self.send_cc(cc_number, 8, cc_value)
+            
+            if not metadata_changed and not automation_changed:
+                elapsed = 0.0
+                if self._automation_metadata_retry_start is not None:
+                    elapsed = time.time() - self._automation_metadata_retry_start
+                if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
+                    self._automation_metadata_retry_count += 1
+                    self._automation_metadata_update_timer = threading.Timer(0.05, self._send_refreshed_parameter_metadata, args=[selected_device])
+                    self._automation_metadata_update_timer.start()
+                else:
+                    self._automation_metadata_retry_count = 0
+                    self._automation_metadata_retry_start = None
+            else:
+                self._automation_metadata_retry_count = 0
+                self._automation_metadata_retry_start = None
 
     def _remove_disabled_parameter_listeners(self):
         for (param, control_index), listener in self._disabled_parameter_listeners.items():
@@ -1283,6 +1376,10 @@ class Tap(ControlSurface):
                 if hasattr(param, 'automation_state_has_listener') and param.automation_state_has_listener(listener):
                     param.remove_automation_state_listener(listener)
         self._automation_state_listeners.clear()
+        self._automation_metadata_device_id = None
+        self._automation_metadata_retry_count = 0
+        self._automation_metadata_retry_start = None
+        self._last_automation_signature = None
         
         if self._automation_metadata_update_timer:
             self._automation_metadata_update_timer.cancel()
@@ -1813,6 +1910,9 @@ class Tap(ControlSurface):
                     pass
 
     def _on_tracks_changed(self):
+        self._metadata_cache.clear()
+        self._drum_pad_names_cache.clear()
+        self._drum_rack_cache.clear()
         self._update_mixer_and_tracks()
         self._register_clip_listeners()
         self._update_clip_slots()
@@ -1843,28 +1943,31 @@ class Tap(ControlSurface):
         return_tracks = list(self.song().return_tracks)
         master_track = self.song().master_track
 
-        # 1. Remove all old listeners to prevent leaks
-        for track, (left_listener, right_listener) in self._track_level_listeners.items():
-            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                track.remove_output_meter_right_listener(right_listener)
-        self._track_level_listeners.clear()
+        track_signature = (tuple(id(t) for t in tracks), tuple(id(t) for t in return_tracks))
+        if track_signature != self._track_list_signature:
+            # 1. Remove all old listeners to prevent leaks
+            for track, (left_listener, right_listener) in self._track_level_listeners.items():
+                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
+                    track.remove_output_meter_left_listener(left_listener)
+                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
+                    track.remove_output_meter_right_listener(right_listener)
+            self._track_level_listeners.clear()
 
-        for track, (left_listener, right_listener) in self._return_level_listeners.items():
-            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                track.remove_output_meter_right_listener(right_listener)
-        self._return_level_listeners.clear()
-        
-        if self._master_level_listeners:
-            left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
-            if left_listener and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
-                master_track.remove_output_meter_left_listener(left_listener)
-            if right_listener and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
-                master_track.remove_output_meter_right_listener(right_listener)
-            self._master_level_listeners.clear()
+            for track, (left_listener, right_listener) in self._return_level_listeners.items():
+                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
+                    track.remove_output_meter_left_listener(left_listener)
+                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
+                    track.remove_output_meter_right_listener(right_listener)
+            self._return_level_listeners.clear()
+            
+            if self._master_level_listeners:
+                left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
+                if left_listener and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
+                    master_track.remove_output_meter_left_listener(left_listener)
+                if right_listener and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
+                    master_track.remove_output_meter_right_listener(right_listener)
+                self._master_level_listeners.clear()
+            self._track_list_signature = track_signature
                     
         tracks_length = len(tracks)
         track_names = []
@@ -1893,12 +1996,13 @@ class Tap(ControlSurface):
 
             # output meter listeners
             if track.has_audio_output:
-                left_handler = self._create_level_change_handler(index)
-                right_handler = self._create_level_change_handler(index)
-                track.add_output_meter_left_listener(left_handler)
-                track.add_output_meter_right_listener(right_handler)
-                # Store the new listeners so we can remove them later
-                self._track_level_listeners[track] = (left_handler, right_handler)
+                if track not in self._track_level_listeners:
+                    left_handler = self._create_level_change_handler(index)
+                    right_handler = self._create_level_change_handler(index)
+                    track.add_output_meter_left_listener(left_handler)
+                    track.add_output_meter_right_listener(right_handler)
+                    # Store the new listeners so we can remove them later
+                    self._track_level_listeners[track] = (left_handler, right_handler)
 
             # other listeners
             if not track.color_has_listener(self._on_color_name_changed):
@@ -1909,15 +2013,21 @@ class Tap(ControlSurface):
 
         # send track names
         track_names_string = ",".join(track_names)
-        self._send_sys_ex_message(track_names_string, 0x02)
+        if track_names_string != self._track_names_cache:
+            self._send_sys_ex_message(track_names_string, 0x02)
+            self._track_names_cache = track_names_string
 
         # send is audio tracks
         has_audio_string = ",".join(track_is_audio)
-        self._send_sys_ex_message(has_audio_string, 0x0C)
+        if has_audio_string != self._track_is_audio_cache:
+            self._send_sys_ex_message(has_audio_string, 0x0C)
+            self._track_is_audio_cache = has_audio_string
 
         # send track colors
         track_colors_string = "-".join(track_colors)
-        self._send_sys_ex_message(track_colors_string, 0x04)
+        if track_colors_string != self._track_colors_cache:
+            self._send_sys_ex_message(track_colors_string, 0x04)
+            self._track_colors_cache = track_colors_string
 
         return_track_names = []
         return_track_colors = []
@@ -1928,20 +2038,22 @@ class Tap(ControlSurface):
 
             if hasattr(return_track, 'add_output_meter_left_listener'):
                 return_index = index + len(tracks)
-                left_handler = self._create_level_change_handler(return_index)
-                right_handler = self._create_level_change_handler(return_index)
-                return_track.add_output_meter_left_listener(left_handler)
-                return_track.add_output_meter_right_listener(right_handler)
-                self._return_level_listeners[return_track] = (left_handler, right_handler)
+                if return_track not in self._return_level_listeners:
+                    left_handler = self._create_level_change_handler(return_index)
+                    right_handler = self._create_level_change_handler(return_index)
+                    return_track.add_output_meter_left_listener(left_handler)
+                    return_track.add_output_meter_right_listener(right_handler)
+                    self._return_level_listeners[return_track] = (left_handler, right_handler)
 
         # output meter listeners master track
         if hasattr(master_track, 'add_output_meter_left_listener'):
             master_index = 127
-            left_handler = self._create_level_change_handler(master_index)
-            right_handler = self._create_level_change_handler(master_index)
-            master_track.add_output_meter_left_listener(left_handler)
-            master_track.add_output_meter_right_listener(right_handler)
-            self._master_level_listeners[master_track] = (left_handler, right_handler)
+            if master_track not in self._master_level_listeners:
+                left_handler = self._create_level_change_handler(master_index)
+                right_handler = self._create_level_change_handler(master_index)
+                master_track.add_output_meter_left_listener(left_handler)
+                master_track.add_output_meter_right_listener(right_handler)
+                self._master_level_listeners[master_track] = (left_handler, right_handler)
 
         # add master track color to the mix:
         color_string = self._make_color_string(master_track.color)
@@ -1949,11 +2061,15 @@ class Tap(ControlSurface):
 
         # send return track names
         return_track_names_string = ",".join(return_track_names)
-        self._send_sys_ex_message(return_track_names_string, 0x06)
+        if return_track_names_string != self._return_track_names_cache:
+            self._send_sys_ex_message(return_track_names_string, 0x06)
+            self._return_track_names_cache = return_track_names_string
 
         # send return track colors + master track
         track_colors_string = "-".join(return_track_colors)
-        self._send_sys_ex_message(track_colors_string, 0x07)
+        if track_colors_string != self._return_track_colors_cache:
+            self._send_sys_ex_message(track_colors_string, 0x07)
+            self._return_track_colors_cache = track_colors_string
 
         self._set_up_mixer_controls()
         
@@ -2095,9 +2211,36 @@ class Tap(ControlSurface):
                 midi_cc_message_right = (status_byte_right, index, value)
                 self._send_midi(midi_cc_message_right)
 
+    def _get_track_index(self, track):
+        if not track:
+            return None
+        try:
+            return list(self.song().tracks).index(track)
+        except ValueError:
+            return None
+
+    def _make_clip_has_clip_listener(self, track):
+        def listener():
+            self._on_clip_has_clip_changed(track)
+        return listener
+
+    def _make_clip_triggered_listener(self, track):
+        def listener():
+            self._on_clip_playing_status_changed(track)
+        return listener
+
+    def _make_clip_color_listener(self, track):
+        def listener():
+            self._on_clip_has_clip_changed(track)
+        return listener
+
     # clipSlots
     def _register_clip_listeners(self):
         for track in self.song().tracks:
+            track_id = id(track)
+            clip_slot_count = len(track.clip_slots)
+            if self._clip_listener_track_slots.get(track_id) == clip_slot_count:
+                continue
             for clip_slot in track.clip_slots:
 
                 if clip_slot == None:
@@ -2106,14 +2249,24 @@ class Tap(ControlSurface):
                 # if not clip_slot.has_stop_button:
                 #     continue
 
-                if not clip_slot.has_clip_has_listener(self._on_clip_has_clip_changed):
-                    clip_slot.add_has_clip_listener(self._on_clip_has_clip_changed)
+                listener_key = (clip_slot, 'has_clip')
+                if listener_key not in self._clip_slot_listeners:
+                    listener = self._make_clip_has_clip_listener(track)
+                    self._clip_slot_listeners[listener_key] = listener
+                    clip_slot.add_has_clip_listener(listener)
 
-                if not clip_slot.is_triggered_has_listener(self._on_clip_playing_status_changed):
-                    clip_slot.add_is_triggered_listener(self._on_clip_playing_status_changed)
+                listener_key = (clip_slot, 'is_triggered')
+                if listener_key not in self._clip_slot_listeners:
+                    listener = self._make_clip_triggered_listener(track)
+                    self._clip_slot_listeners[listener_key] = listener
+                    clip_slot.add_is_triggered_listener(listener)
 
-                if clip_slot.has_clip and not clip_slot.clip.color_has_listener(self._on_clip_has_clip_changed):
-                    clip_slot.clip.add_color_listener(self._on_clip_has_clip_changed)
+                if clip_slot.has_clip:
+                    color_key = (clip_slot.clip, 'color')
+                    if color_key not in self._clip_color_listeners:
+                        listener = self._make_clip_color_listener(track)
+                        self._clip_color_listeners[color_key] = listener
+                        clip_slot.clip.add_color_listener(listener)
 
                 # if clip_slot.has_clip:
                 #     if not clip_slot.clip.playing_position_has_listener(self._on_playing_position_changed):
@@ -2123,14 +2276,32 @@ class Tap(ControlSurface):
                                 #     # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
                 #     #     # self.log_message("adding a playing status listener")
                 #     #     clip_slot.clip.add_playing_status_listener(self._on_clip_playing_status_changed)
+            self._clip_listener_track_slots[track_id] = clip_slot_count
 
     def _unregister_clip_and_audio_listeners(self):
         for track in self.song().tracks:
             for clip_slot in track.clip_slots:
-                clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
-                clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
+                listener_key = (clip_slot, 'is_triggered')
+                listener = self._clip_slot_listeners.pop(listener_key, None)
+                if listener:
+                    clip_slot.remove_is_triggered_listener(listener)
+                else:
+                    clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
+                
+                listener_key = (clip_slot, 'has_clip')
+                listener = self._clip_slot_listeners.pop(listener_key, None)
+                if listener:
+                    clip_slot.remove_has_clip_listener(listener)
+                else:
+                    clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
+                
                 if clip_slot.has_clip:
-                    clip_slot.clip.remove_color_listener(self._on_clip_has_clip_changed)
+                    color_key = (clip_slot.clip, 'color')
+                    listener = self._clip_color_listeners.pop(color_key, None)
+                    if listener:
+                        clip_slot.clip.remove_color_listener(listener)
+                    else:
+                        clip_slot.clip.remove_color_listener(self._on_clip_has_clip_changed)
                 # if clip_slot.has_clip:
                 #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
                 #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
@@ -2146,6 +2317,9 @@ class Tap(ControlSurface):
                 return_track.remove_output_meter_left_listener(self._on_output_level_changed)
             if hasattr(return_track, 'output_meter_right_has_listener') and return_track.output_meter_right_has_listener(self._on_output_level_changed):
                 return_track.remove_output_meter_right_listener(self._on_output_level_changed)
+        self._clip_listener_track_slots.clear()
+        self._clip_slot_listeners.clear()
+        self._clip_color_listeners.clear()
 
     # def _on_playing_position_changed(self):
     #     # self.log_message("trying to log the playing position")
@@ -2160,19 +2334,45 @@ class Tap(ControlSurface):
 
         return different_indexes
 
-    def _on_clip_playing_status_changed(self):
+    def _on_clip_playing_status_changed(self, track=None):
         # self.log_message("clip playing status changed")
+        self._refresh_parameter_metadata_on_automation_change()
+        if track:
+            track_index = self._get_track_index(track)
+            if track_index is not None:
+                self._update_clip_slots(track_index)
+                return
         self._update_clip_slots()
 
-    def _on_clip_has_clip_changed(self):
+    def _on_clip_has_clip_changed(self, track=None):
         # self.log_message("has clip status changed")
+        self._refresh_parameter_metadata_on_automation_change()
+        if track:
+            track_index = self._get_track_index(track)
+            if track_index is not None:
+                self._update_clip_slots(track_index)
+                for clip_slot in track.clip_slots:
+                    if clip_slot and clip_slot.has_clip:
+                        color_key = (clip_slot.clip, 'color')
+                        if color_key not in self._clip_color_listeners:
+                            listener = self._make_clip_color_listener(track)
+                            self._clip_color_listeners[color_key] = listener
+                            clip_slot.clip.add_color_listener(listener)
+                self._set_up_notes_playing("clip")
+                return
         self._update_clip_slots()
         self._set_up_notes_playing("clip")
 
-    def _update_clip_slots(self):
+    def _update_clip_slots(self, only_track_index=None):
         try:
             track_clips = []
-            for track in self.song().tracks:
+            tracks = self.song().tracks
+            if only_track_index is not None and len(self.old_clips_array) != len(tracks):
+                only_track_index = None
+            for track_index, track in enumerate(tracks):
+                if only_track_index is not None and track_index != only_track_index:
+                    track_clips.append(self.old_clips_array[track_index] if track_index < len(self.old_clips_array) else "")
+                    continue
                 try:
                     is_armed = track.arm
                     has_audio = track.has_audio_input
