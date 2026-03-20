@@ -103,6 +103,8 @@ class Tap(ControlSurface):
             self._metadata_send_seq = 0
             self._metadata_send_seq_by_device = {}
             self._automation_metadata_device_id = None
+            self._automation_timer_lock = threading.Lock()
+            self._mixer_disconnect_timer = None
             self._clip_slot_listeners = {}
             self._clip_color_listeners = {}
             self._clip_listener_track_slots = {}
@@ -627,8 +629,10 @@ class Tap(ControlSurface):
             # Send the comprehensive list of available devices
             self._send_sys_ex_message(available_devices_string, 0x01)
             
+            # In mixer mode, temporarily reconnect device controls so we can
+            # build parameter metadata. Do this early so the framework has more
+            # time to remap parameters to the new device before we read them.
             if self.mixer_status:
-                # temporarily reconnect
                 self._connect_device_controls()
             
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
@@ -684,13 +688,22 @@ class Tap(ControlSurface):
                 if parameter_names:
                     self._send_parameter_info(parameter_names)
                 else:
-                    # Send not mapped for all controls when no parameters are mapped (e.g., inactive bank)
-                    self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
-                    
-                    # Send CC 0 for all encoders
-                    for control_index in range(8):
-                        cc_number = 72 + control_index
-                        self.send_cc(cc_number, 8, 0)
+                    # parameter_names empty — try building metadata directly from
+                    # _build_parameter_metadata, which may succeed even when the
+                    # device component's own remapping is still in progress
+                    current_metadata = self._build_parameter_metadata(selected_device)
+                    if current_metadata and not self._metadata_has_unmapped(current_metadata):
+                        self._send_sys_ex_message(current_metadata, 0x7D)
+                        self._set_cached_metadata(selected_device, current_metadata)
+                        self._mark_metadata_sent(selected_device)
+                    else:
+                        # Truly unmapped — send placeholder
+                        self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
+                        
+                        # Send CC 0 for all encoders
+                        for control_index in range(8):
+                            cc_number = 72 + control_index
+                            self.send_cc(cc_number, 8, 0)
                 self._refresh_automation_state_listeners_current_bank()
                 self._last_automation_signature = self._get_automation_signature()
             
@@ -724,9 +737,14 @@ class Tap(ControlSurface):
                     cc_number = 72 + control_index
                     self.send_cc(cc_number, 8, 0)
 
+            # In mixer mode, disconnect device controls after a short delay
+            # instead of immediately, so the framework has time to finish
+            # remapping parameters to the new device.
             if self.mixer_status:
-                # disconnect again
-                self._disconnect_device_controls()
+                if hasattr(self, '_mixer_disconnect_timer') and self._mixer_disconnect_timer:
+                    self._mixer_disconnect_timer.cancel()
+                self._mixer_disconnect_timer = threading.Timer(0.2, self._disconnect_device_controls)
+                self._mixer_disconnect_timer.start()
 
         else:
             # no device
@@ -1310,22 +1328,26 @@ class Tap(ControlSurface):
         if current_signature is not None and current_signature == self._last_automation_signature:
             return
         
-        if self._automation_metadata_update_timer:
-            self._automation_metadata_update_timer.cancel()
+        with self._automation_timer_lock:
+            if self._automation_metadata_update_timer:
+                self._automation_metadata_update_timer.cancel()
         
         self._automation_metadata_device_id = id(selected_device)
         self._automation_metadata_retry_count = 0
         self._automation_metadata_retry_start = time.time()
         seq_at_schedule = self._metadata_send_seq_by_device.get(id(selected_device), 0)
-        self._automation_metadata_update_timer = threading.Timer(
+        new_timer = threading.Timer(
             0.05,
             self._send_refreshed_parameter_metadata,
             args=[selected_device, seq_at_schedule]
         )
-        self._automation_metadata_update_timer.start()
+        with self._automation_timer_lock:
+            self._automation_metadata_update_timer = new_timer
+        new_timer.start()
 
     def _send_refreshed_parameter_metadata(self, selected_device, seq_at_schedule=0):
-        self._automation_metadata_update_timer = None
+        with self._automation_timer_lock:
+            self._automation_metadata_update_timer = None
         if not selected_device or not liveobj_valid(selected_device):
             return
         if self._metadata_send_seq_by_device.get(id(selected_device), 0) != seq_at_schedule:
@@ -1341,6 +1363,7 @@ class Tap(ControlSurface):
                 self._send_sys_ex_message(current_metadata, 0x7D)
                 self._set_cached_metadata(selected_device, current_metadata)
                 self._mark_metadata_sent(selected_device)
+                self._last_automation_signature = self._get_automation_signature()
             
             if metadata_changed and hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index in range(8):
@@ -1361,15 +1384,18 @@ class Tap(ControlSurface):
                     elapsed = time.time() - self._automation_metadata_retry_start
                 if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
                     self._automation_metadata_retry_count += 1
-                    self._automation_metadata_update_timer = threading.Timer(
+                    new_timer = threading.Timer(
                         0.05,
                         self._send_refreshed_parameter_metadata,
                         args=[selected_device, seq_at_schedule]
                     )
-                    self._automation_metadata_update_timer.start()
+                    with self._automation_timer_lock:
+                        self._automation_metadata_update_timer = new_timer
+                    new_timer.start()
                 else:
                     self._automation_metadata_retry_count = 0
                     self._automation_metadata_retry_start = None
+                    self._last_automation_signature = self._get_automation_signature()
             else:
                 self._automation_metadata_retry_count = 0
                 self._automation_metadata_retry_start = None
@@ -3003,6 +3029,9 @@ class Tap(ControlSurface):
         if value:
             self._disconnect_device_controls()
         else:
+            if hasattr(self, '_mixer_disconnect_timer') and self._mixer_disconnect_timer:
+                self._mixer_disconnect_timer.cancel()
+                self._mixer_disconnect_timer = None
             self.mixer_status = False
             self._set_up_mixer_controls()
             self._connect_device_controls()
