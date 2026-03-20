@@ -106,10 +106,13 @@ class Tap(ControlSurface):
             self._automation_timer_lock = threading.Lock()
             self._mixer_disconnect_timer = None
             self._clip_slot_listeners = {}
+            self._registered_track_ids = set()
             self._clip_color_listeners = {}
             self._clip_listener_track_slots = {}
             self._clip_slot_color_map = {}
             self._track_list_signature = None
+            self._previous_selected_track = None
+            self._periodic_timer_ref = None
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -301,7 +304,7 @@ class Tap(ControlSurface):
                                 else:
                                     min_val_str = device_param.str_for_value(0.0)
                                     max_val_str = device_param.str_for_value(1.0)
-                        except:
+                        except Exception:
                             pass
                     
                     if min_val_str is None:
@@ -319,7 +322,7 @@ class Tap(ControlSurface):
                                 try:
                                     num_val = float(default_val_str)
                                     default_val_str = str(round(num_val, 2))
-                                except:
+                                except Exception:
                                     pass
                                 if hasattr(device_param, 'min') and hasattr(device_param, 'max'):
                                     quarter_value = device_param.min + (device_param.max - device_param.min) * 32/127
@@ -328,7 +331,7 @@ class Tap(ControlSurface):
                                 default_val_str = str(round(device_param.default_value, 2))
                             if hasattr(device_param, 'min') and hasattr(device_param, 'max') and device_param.max != device_param.min:
                                 raw_default_value = round((raw_default_value - device_param.min) / (device_param.max - device_param.min), 3)
-                        except:
+                        except Exception:
                             default_val_str = min_val_str
                             raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
                     else:
@@ -666,7 +669,7 @@ class Tap(ControlSurface):
                     if hasattr(self._device, 'set_device'):
                         try:
                             self._device.set_device(selected_device)
-                        except:
+                        except Exception:
                             pass
                     if connected_bank_names:
                         try:
@@ -674,12 +677,12 @@ class Tap(ControlSurface):
                                 self._device._bank_index = all_bank_names.index(current_bank_name)
                             else:
                                 self._device._bank_index = all_bank_names.index(connected_bank_names[0])
-                        except:
+                        except Exception:
                             pass
                     if hasattr(self._device, 'update'):
                         try:
                             self._device.update()
-                        except:
+                        except Exception:
                             pass
                     parameter_names = _build_parameter_names()
                 
@@ -1328,6 +1331,10 @@ class Tap(ControlSurface):
         if current_signature is not None and current_signature == self._last_automation_signature:
             return
         
+        # Update signature immediately so the same change doesn't re-trigger
+        # while the timer is pending
+        self._last_automation_signature = current_signature
+        
         with self._automation_timer_lock:
             if self._automation_metadata_update_timer:
                 self._automation_metadata_update_timer.cancel()
@@ -1512,7 +1519,8 @@ class Tap(ControlSurface):
     def _periodic_execution(self):
         self._periodic_check()
         if self.periodic_timer == 1:
-            threading.Timer(0.3, self._periodic_execution).start()
+            self._periodic_timer_ref = threading.Timer(0.3, self._periodic_execution)
+            self._periodic_timer_ref.start()
 
     def _periodic_check(self):
         # update clip slots
@@ -1730,11 +1738,14 @@ class Tap(ControlSurface):
             if device_to_select is None and len(selected_track.devices) > 0:
                 device_to_select = selected_track.devices[0]
             if device_to_select is not None:
+                self._track_change_in_progress = True
                 self.song().view.select_device(device_to_select)
+                self._track_change_in_progress = False
             self._device_component.set_device(device_to_select)
-            # update device thing when we have no device on the selected track
-            # TODO: check if wee need this!
-            if selected_track.has_midi_output or not selected_track.has_midi_input:
+            # _on_device_changed is already called by select_device above via
+            # the @subject_slot('device') listener. Only call it explicitly
+            # when no device was selected (listener won't fire).
+            if device_to_select is None:
                 self._on_device_changed()
             self._check_clip_playing_status()
             if self.seq_status:
@@ -1743,14 +1754,16 @@ class Tap(ControlSurface):
 
     def _set_up_notes_playing(self, selected_track):
         if selected_track != "clip":
-            # remove old clip playing position listeners
-            for track in self.song().tracks:
-                if track is not selected_track:
-                    for (clip_index, clip_slot) in enumerate(track.clip_slots):
+            # Only remove playing position listeners from the PREVIOUSLY selected track,
+            # not from all tracks. This changes O(tracks * clips) to O(clips).
+            if hasattr(self, '_previous_selected_track') and self._previous_selected_track is not None:
+                old_track = self._previous_selected_track
+                if liveobj_valid(old_track):
+                    for (clip_index, clip_slot) in enumerate(old_track.clip_slots):
                         if clip_slot is not None and clip_slot.has_clip:
                             if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
-                                # self.log_message("removing pos listener: {}".format(clip_index))
                                 clip_slot.clip.remove_playing_position_listener(self.playing_position_listeners[clip_index])
+            self._previous_selected_track = selected_track
         else:
             selected_track = self.song().view.selected_track
 
@@ -1932,12 +1945,12 @@ class Tap(ControlSurface):
         if selected_track and selected_track.has_midi_input:
             try:
                 selected_track.implicit_arm = True
-            except:
+            except Exception:
                 pass
         # else:
         #     try:
         #         self.song().tracks[0].implicit_arm = True
-        #     except:
+        #     except Exception:
         #         pass
 
     def _set_other_tracks_implicit_arm(self):
@@ -1945,10 +1958,13 @@ class Tap(ControlSurface):
             if track != self.song().view.selected_track:
                 try:
                     track.implicit_arm = False
-                except:
+                except Exception:
                     pass
 
     def _on_tracks_changed(self):
+        if self._metadata_recheck_timer:
+            self._metadata_recheck_timer.cancel()
+            self._metadata_recheck_timer = None
         self._metadata_cache.clear()
         self._metadata_send_seq_by_device.clear()
         self._update_mixer_and_tracks()
@@ -1982,7 +1998,9 @@ class Tap(ControlSurface):
         master_track = self.song().master_track
 
         track_signature = (tuple(id(t) for t in tracks), tuple(id(t) for t in return_tracks))
-        if track_signature != self._track_list_signature:
+        tracks_changed = track_signature != self._track_list_signature
+        
+        if tracks_changed:
             # 1. Remove all old listeners to prevent leaks
             for track, (left_listener, right_listener) in self._track_level_listeners.items():
                 if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
@@ -2006,68 +2024,59 @@ class Tap(ControlSurface):
                     master_track.remove_output_meter_right_listener(right_listener)
                 self._master_level_listeners.clear()
             self._track_list_signature = track_signature
-                    
-        tracks_length = len(tracks)
-        track_names = []
-        track_is_audio = []
-        track_colors = []
-        
-        for index, track in enumerate(tracks):
-            # track names
-            track_names.append(track.name)
-            # check if it's a group track or a grouped track member
-            # TODO: - we would actually also need a number string for grouped groups, where a track is a group slot but also grouped.
-            if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
-                track_is_audio.append("2")  # Group Track
-            elif track.is_grouped:
-                if track.has_audio_input:
-                    track_is_audio.append("4") # Grouped Audio Track
-                else:
-                    track_is_audio.append("3")  # Grouped MIDI Track
-            elif track.has_audio_input:
-                track_is_audio.append("1")  # Regular Audio Track
-            else:
-                track_is_audio.append("0")  # Regular MIDI Track
-            # track colors
-            color_string = self._make_color_string(track.color)
-            track_colors.append(color_string)
 
-            # output meter listeners
+            # 2. Build track names, types, colors and send via SysEx
+            track_names = []
+            track_is_audio = []
+            track_colors = []
+            
+            for index, track in enumerate(tracks):
+                track_names.append(track.name)
+                if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
+                    track_is_audio.append("2")
+                elif track.is_grouped:
+                    if track.has_audio_input:
+                        track_is_audio.append("4")
+                    else:
+                        track_is_audio.append("3")
+                elif track.has_audio_input:
+                    track_is_audio.append("1")
+                else:
+                    track_is_audio.append("0")
+                color_string = self._make_color_string(track.color)
+                track_colors.append(color_string)
+
+            self._send_sys_ex_message(",".join(track_names), 0x02)
+            self._send_sys_ex_message(",".join(track_is_audio), 0x0C)
+            self._send_sys_ex_message("-".join(track_colors), 0x04)
+
+            return_track_names = []
+            return_track_colors = []
+            for index, return_track in enumerate(return_tracks):
+                return_track_names.append(return_track.name)
+                return_track_colors.append(self._make_color_string(return_track.color))
+
+            color_string = self._make_color_string(master_track.color)
+            return_track_colors.append(color_string)
+            self._send_sys_ex_message(",".join(return_track_names), 0x06)
+            self._send_sys_ex_message("-".join(return_track_colors), 0x07)
+        
+        # 3. Set up level meter listeners (idempotent, safe to call every time)
+        for index, track in enumerate(tracks):
             if track.has_audio_output:
                 if track not in self._track_level_listeners:
                     left_handler = self._create_level_change_handler(index)
                     right_handler = self._create_level_change_handler(index)
                     track.add_output_meter_left_listener(left_handler)
                     track.add_output_meter_right_listener(right_handler)
-                    # Store the new listeners so we can remove them later
                     self._track_level_listeners[track] = (left_handler, right_handler)
 
-            # other listeners
             if not track.color_has_listener(self._on_color_name_changed):
                 track.add_color_listener(self._on_color_name_changed)
-
             if not track.name_has_listener(self._on_color_name_changed):
                 track.add_name_listener(self._on_color_name_changed)
 
-        # send track names
-        track_names_string = ",".join(track_names)
-        self._send_sys_ex_message(track_names_string, 0x02)
-
-        # send is audio tracks
-        has_audio_string = ",".join(track_is_audio)
-        self._send_sys_ex_message(has_audio_string, 0x0C)
-
-        # send track colors
-        track_colors_string = "-".join(track_colors)
-        self._send_sys_ex_message(track_colors_string, 0x04)
-
-        return_track_names = []
-        return_track_colors = []
-
         for index, return_track in enumerate(return_tracks):
-            return_track_names.append(return_track.name)
-            return_track_colors.append(self._make_color_string(return_track.color))
-
             if hasattr(return_track, 'add_output_meter_left_listener'):
                 return_index = index + len(tracks)
                 if return_track not in self._return_level_listeners:
@@ -2077,7 +2086,6 @@ class Tap(ControlSurface):
                     return_track.add_output_meter_right_listener(right_handler)
                     self._return_level_listeners[return_track] = (left_handler, right_handler)
 
-        # output meter listeners master track
         if hasattr(master_track, 'add_output_meter_left_listener'):
             master_index = 127
             if master_track not in self._master_level_listeners:
@@ -2086,18 +2094,6 @@ class Tap(ControlSurface):
                 master_track.add_output_meter_left_listener(left_handler)
                 master_track.add_output_meter_right_listener(right_handler)
                 self._master_level_listeners[master_track] = (left_handler, right_handler)
-
-        # add master track color to the mix:
-        color_string = self._make_color_string(master_track.color)
-        return_track_colors.append(color_string)
-
-        # send return track names
-        return_track_names_string = ",".join(return_track_names)
-        self._send_sys_ex_message(return_track_names_string, 0x06)
-
-        # send return track colors + master track
-        track_colors_string = "-".join(return_track_colors)
-        self._send_sys_ex_message(track_colors_string, 0x07)
 
         self._set_up_mixer_controls()
         
@@ -2287,14 +2283,19 @@ class Tap(ControlSurface):
 
     # clipSlots
     def _register_clip_listeners(self):
+        current_track_ids = set()
         for track in self.song().tracks:
+            track_id = id(track)
+            current_track_ids.add(track_id)
+            
+            # Skip tracks that already have all their listeners registered
+            if track_id in self._registered_track_ids:
+                continue
+            
             for clip_slot in track.clip_slots:
 
                 if clip_slot == None:
                     continue
-                # do this to ignore return-tracks
-                # if not clip_slot.has_stop_button:
-                #     continue
 
                 listener_key = (clip_slot, 'has_clip')
                 if listener_key not in self._clip_slot_listeners:
@@ -2307,15 +2308,14 @@ class Tap(ControlSurface):
                     listener = self._make_clip_triggered_listener(track)
                     self._clip_slot_listeners[listener_key] = listener
                     clip_slot.add_is_triggered_listener(listener)
-
-                # if clip_slot.has_clip:
-                #     if not clip_slot.clip.playing_position_has_listener(self._on_playing_position_changed):
-                #         clip_slot.clip.add_playing_position_listener(self._on_playing_position_changed)
-
-
-                                #     # if not clip_slot.playing_status_has_listener(self._on_clip_playing_status_changed):
-                #     #     # self.log_message("adding a playing status listener")
-                #     #     clip_slot.clip.add_playing_status_listener(self._on_clip_playing_status_changed)
+            
+            self._registered_track_ids.add(track_id)
+        
+        # Clean up stale entries for tracks that no longer exist
+        self._registered_track_ids &= current_track_ids
+        
+        # Sync color listeners for all tracks
+        for track in self.song().tracks:
             self._sync_clip_color_listeners_for_track(track)
 
     def _unregister_clip_and_audio_listeners(self):
@@ -2344,18 +2344,22 @@ class Tap(ControlSurface):
                 # if clip_slot.has_clip:
                 #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
                 #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
-            # output meter listeners
-            if track.has_audio_output:
-                if hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(self._on_output_level_changed):
-                    track.remove_output_meter_left_listener(self._on_output_level_changed)
-                if hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(self._on_output_level_changed):
-                    track.remove_output_meter_right_listener(self._on_output_level_changed)
+            # output meter listeners - use stored handler references
+            if track in self._track_level_listeners:
+                left_listener, right_listener = self._track_level_listeners[track]
+                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
+                    track.remove_output_meter_left_listener(left_listener)
+                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
+                    track.remove_output_meter_right_listener(right_listener)
 
-        for return_track in self.song().return_tracks:
-            if hasattr(return_track, 'output_meter_left_has_listener') and return_track.output_meter_left_has_listener(self._on_output_level_changed):
-                return_track.remove_output_meter_left_listener(self._on_output_level_changed)
-            if hasattr(return_track, 'output_meter_right_has_listener') and return_track.output_meter_right_has_listener(self._on_output_level_changed):
-                return_track.remove_output_meter_right_listener(self._on_output_level_changed)
+        for return_track, (left_listener, right_listener) in self._return_level_listeners.items():
+            if liveobj_valid(return_track) and hasattr(return_track, 'output_meter_left_has_listener') and return_track.output_meter_left_has_listener(left_listener):
+                return_track.remove_output_meter_left_listener(left_listener)
+            if liveobj_valid(return_track) and hasattr(return_track, 'output_meter_right_has_listener') and return_track.output_meter_right_has_listener(right_listener):
+                return_track.remove_output_meter_right_listener(right_listener)
+        
+        self._track_level_listeners.clear()
+        self._return_level_listeners.clear()
         self._clip_listener_track_slots.clear()
         self._clip_slot_listeners.clear()
         self._clip_color_listeners.clear()
@@ -2410,7 +2414,7 @@ class Tap(ControlSurface):
                 try:
                     is_armed = track.arm
                     has_audio = track.has_audio_input
-                except:
+                except Exception:
                     is_armed = False
                     has_audio = False
                 # track clip slots
@@ -2429,7 +2433,7 @@ class Tap(ControlSurface):
                                 clip_value = "1"
                             elif is_armed and has_audio:
                                 clip_value = "5"
-                        except:
+                        except Exception:
                             clip_value = "0"
 
                         color_string_value = "0"
@@ -2440,7 +2444,7 @@ class Tap(ControlSurface):
                             try:
                                 if clip_slot.clip.color is not None:
                                     color_string_value = self._make_color_string(clip_slot.clip.color)
-                            except:
+                            except Exception:
                                 color_string_value = "0"
                         #     playing_position = clip_slot.clip.playing_position
                         #     length = clip_slot.clip.length
@@ -3612,7 +3616,7 @@ class Tap(ControlSurface):
                     browser.load_item(item)
                     self._on_tracks_changed()
                     self._on_device_changed()
-            except:
+            except Exception:
                 browser.load_item(item)
                 self._on_tracks_changed()
                 self._on_device_changed()
@@ -3687,10 +3691,29 @@ class Tap(ControlSurface):
         self._send_browser_page(self.browser_current_page)
 
     def disconnect(self):
+        # Cancel all pending timers
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
             self._metadata_recheck_timer = None
+        if self._automation_metadata_update_timer:
+            self._automation_metadata_update_timer.cancel()
+            self._automation_metadata_update_timer = None
+        if hasattr(self, '_mixer_disconnect_timer') and self._mixer_disconnect_timer:
+            self._mixer_disconnect_timer.cancel()
+            self._mixer_disconnect_timer = None
+        if hasattr(self, '_periodic_timer_ref') and self._periodic_timer_ref:
+            self._periodic_timer_ref.cancel()
+            self._periodic_timer_ref = None
+        
+        # Stop periodic execution
+        self.periodic_timer = 0
+        
+        # Clear caches
+        self._metadata_cache.clear()
+        self._metadata_send_seq_by_device.clear()
+        
         self._remove_disabled_parameter_listeners()
+        self._remove_automation_state_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         if hasattr(self, 'duplicate_button'):
             self.duplicate_button.remove_value_listener(self._duplicate_button_value)
@@ -3743,5 +3766,4 @@ class Tap(ControlSurface):
             if right_listener and liveobj_valid(master_track) and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
                 master_track.remove_output_meter_right_listener(right_listener)
         
-        self.periodic_timer = 0
         super(Tap, self).disconnect()
