@@ -1817,7 +1817,7 @@ class Tap(ControlSurface):
                         current_raw_notes = clip_playing.get_notes_extended(0, 128, clip_start, time_span)
                         
                         # if the current clip has different notes save the new notes.
-                        if current_raw_notes is not self.last_raw_notes:
+                        if current_raw_notes != self.last_raw_notes:
                             self.last_raw_notes = current_raw_notes
 
                             # Reset the current clip notes array
