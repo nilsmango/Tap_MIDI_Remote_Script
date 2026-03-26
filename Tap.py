@@ -165,6 +165,26 @@ class Tap(ControlSurface):
         if value:
             self._on_device_changed()
 
+    def _bank_select(self, value):
+        if not liveobj_valid(self._device):
+            return
+        
+        offset = value - 64
+        if offset == 0:
+            return
+        
+        all_bank_names = self._device._parameter_bank_names()
+        if not all_bank_names:
+            return
+        
+        current_index = self._device._bank_index
+        new_index = max(0, min(len(all_bank_names) - 1, current_index + offset))
+        
+        if new_index != current_index:
+            self._device._bank_index = new_index
+            self._device.update()
+            self._on_device_changed()
+
     def _find_drum_rack_in_track(self, track):
         for device in track.devices:
             if device.can_have_drum_pads:
@@ -1240,6 +1260,9 @@ class Tap(ControlSurface):
         # browser go back button (MIDI note channel 15, note 79) - go one level back, remembers page
         self.browser_back_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 79)
         self.browser_back_button.add_value_listener(self._browser_go_back)
+        # direct bank selection (CC channel 11, CC 64) - value = 64 + offset
+        bank_select_button = ButtonElement(1, MIDI_CC_TYPE, 11, 64)
+        bank_select_button.add_value_listener(self._bank_select)
 
 
     def send_note_on(self, note_number, channel, velocity):
