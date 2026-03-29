@@ -12,6 +12,17 @@ More info: https://project7iii.com/tap
    - **Mac:** `Macintosh HD/Users/[username]/Music/Ableton/User Library`
    
 2. Place the remote script folder called `Tap` (the folder you found this README.md in) into the `Remote Scripts` folder you just created.
+3. Your directory should now look like this:
+
+```
+Ableton/
+└── User Library/
+    └── Remote Scripts/
+        └── Tap/
+            ├── __init__.py
+            ├── Tap.py
+            └── README.md (optional, can be removed)
+```
 
 ## 2. Connect your Device
 Note: If you have a Mac, MIDI over USB is the best way to connect your iPhone or iPad to Live. If you are never using MIDI over WiFi, you can disable `MIDI over WiFi enabled` in options.
