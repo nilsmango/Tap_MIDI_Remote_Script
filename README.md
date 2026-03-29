@@ -24,8 +24,10 @@ Ableton/
             └── README.md (optional, can be removed)
 ```
 
+>Important: Make sure the User Library is stored locally on your computer and matches the exact path described above. If it is cloud-based or even slightly misnamed, Ableton Live may fail to recognize the script.
+
 ## 2. Connect your Device
-Note: If you have a Mac, MIDI over USB is the best way to connect your iPhone or iPad to Live. If you are never using MIDI over WiFi, you can disable `MIDI over WiFi enabled` in options.
+Note: If you have a Mac, **MIDI over USB is the best way to connect your iPhone or iPad to Live**. If you are never using MIDI over WiFi, you can disable `MIDI over WiFi enabled` in options.
 
 ### Over USB (Mac Only)
 1. Connect your device to your Mac using a USB cable.
