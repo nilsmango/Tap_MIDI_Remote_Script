@@ -2054,7 +2054,10 @@ class Tap(ControlSurface):
             track_colors = []
             
             for index, track in enumerate(tracks):
-                track_names.append(track.name)
+                name = track.name
+                if len(name) >= 2 and name[0].isalnum() and name[1] == '-':
+                    name = name[0] + ' ' + name[2:]
+                track_names.append(name)
                 if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
                     track_is_audio.append("2")
                 elif track.is_grouped:
@@ -2076,7 +2079,10 @@ class Tap(ControlSurface):
             return_track_names = []
             return_track_colors = []
             for index, return_track in enumerate(return_tracks):
-                return_track_names.append(return_track.name)
+                name = return_track.name
+                if len(name) >= 2 and name[0].isalnum() and name[1] == '-':
+                    name = name[0] + ' ' + name[2:]
+                return_track_names.append(name)
                 return_track_colors.append(self._make_color_string(return_track.color))
 
             color_string = self._make_color_string(master_track.color)
