@@ -19,7 +19,7 @@ import random
 from itertools import zip_longest
 import time
 
-secret_version_number = 2
+secret_version_number = 3
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
