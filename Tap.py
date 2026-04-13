@@ -19,7 +19,7 @@ import random
 from itertools import zip_longest
 import time
 
-secret_version_number = 3
+secret_version_number = 4
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1573,10 +1573,12 @@ class Tap(ControlSurface):
                 self.song().session_record = True
             else:
                 self.song().session_record = False
+            self._set_up_notes_playing("clip")
 
     def _capture_button_value(self, value):
         if value != 0:
             self.song().capture_midi()
+            self._set_up_notes_playing("clip")
 
     def _quantize_grid_value(self, value):
         global quantize_grid_value
