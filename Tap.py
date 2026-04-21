@@ -1,4 +1,4 @@
-# 7III Tap 1.5.1
+# 7III Tap 1.5.2
 
 from __future__ import with_statement
 import Live
@@ -19,7 +19,7 @@ import random
 from itertools import zip_longest
 import time
 
-secret_version_number = 4
+secret_version_number = 5
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
