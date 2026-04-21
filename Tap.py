@@ -28,6 +28,9 @@ swing_amount_value = 0.0
 
 
 class Tap(ControlSurface):
+    SYSEX_STRING_ESCAPE_CHAR = "\\"
+    SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
+
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
         with self.component_guard():
@@ -245,7 +248,7 @@ class Tap(ControlSurface):
             pad_names.append(str(first_index))
             for pad in pads[first_index:last_index + 1]:
                 if pad.chains:
-                    pad_names.append(pad.name)
+                    pad_names.append(self._escape_sysex_string(pad.name))
                 else:
                     pad_names.append(str(pad.note))
             payload = ",".join(pad_names)
@@ -275,6 +278,68 @@ class Tap(ControlSurface):
         
         start_idx, end_idx = macro_ranges[bank_name]
         return any(device.macros_mapped[start_idx:end_idx])
+
+    def _escape_sysex_string(self, value):
+        escaped_value = str(value)
+        escaped_value = escaped_value.replace(
+            self.SYSEX_STRING_ESCAPE_CHAR,
+            self.SYSEX_STRING_ESCAPE_CHAR + self.SYSEX_STRING_ESCAPE_CHAR
+        )
+        for symbol in self.SYSEX_STRING_RESERVED_SYMBOLS:
+            if symbol == self.SYSEX_STRING_ESCAPE_CHAR:
+                continue
+            escaped_value = escaped_value.replace(symbol, self.SYSEX_STRING_ESCAPE_CHAR + symbol)
+        return escaped_value
+
+    def _unescape_sysex_string(self, value):
+        result = []
+        escaping = False
+        for char in str(value):
+            if escaping:
+                result.append(char)
+                escaping = False
+            elif char == self.SYSEX_STRING_ESCAPE_CHAR:
+                escaping = True
+            else:
+                result.append(char)
+        if escaping:
+            result.append(self.SYSEX_STRING_ESCAPE_CHAR)
+        return ''.join(result)
+
+    def _split_escaped_sysex_fields(self, value, separator):
+        fields = []
+        field_chars = []
+        escaping = False
+        for char in str(value):
+            if escaping:
+                field_chars.append(self.SYSEX_STRING_ESCAPE_CHAR)
+                field_chars.append(char)
+                escaping = False
+            elif char == self.SYSEX_STRING_ESCAPE_CHAR:
+                escaping = True
+            elif char == separator:
+                fields.append(''.join(field_chars))
+                field_chars = []
+            else:
+                field_chars.append(char)
+        if escaping:
+            field_chars.append(self.SYSEX_STRING_ESCAPE_CHAR)
+        fields.append(''.join(field_chars))
+        return fields
+
+    def _get_parameter_display_name(self, device_param):
+        raw_name = self._escape_sysex_string(device_param.name)
+        if hasattr(device_param, 'is_enabled'):
+            if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
+                if device_param.automation_state == 1:
+                    return f"**{raw_name}"
+                elif device_param.automation_state == 2:
+                    return f"*/{raw_name}"
+            elif device_param.is_enabled:
+                return raw_name
+            else:
+                return f"*-{raw_name}"
+        return raw_name
     
     def _build_parameter_metadata(self, selected_device):
         if not hasattr(selected_device, 'parameters'):
@@ -298,18 +363,7 @@ class Tap(ControlSurface):
                     device_param = device_param_map.get(mapped_param.name)
                 
                 if device_param:
-                    if hasattr(device_param, 'is_enabled'):
-                        if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
-                            if device_param.automation_state == 1:
-                                name = f"**{device_param.name}"
-                            elif device_param.automation_state == 2:
-                                name = f"*/{device_param.name}"
-                        elif device_param.is_enabled:
-                            name = device_param.name
-                        else:
-                            name = f"*-{device_param.name}"
-                    else:
-                        name = device_param.name
+                    name = self._get_parameter_display_name(device_param)
                     
                     min_val_str = None
                     max_val_str = None
@@ -359,12 +413,16 @@ class Tap(ControlSurface):
                         raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
                     
                     if hasattr(device_param, 'is_quantized') and device_param.is_quantized and hasattr(device_param, 'value_items'):
-                        value_items = ';'.join(str(item) for item in device_param.value_items)
+                        value_items = ';'.join(self._escape_sysex_string(item) for item in device_param.value_items)
                     else:
                         value_items = ''
                     
                     default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
-                    param_str = f"{name.strip()}|{min_val_str.strip()}|{max_val_str.strip()}|{default_val_str.strip()}|{default_raw_str.strip()}|{quarter_str.strip()}|{value_items.strip()}"
+                    min_val_str = self._escape_sysex_string(min_val_str.strip())
+                    max_val_str = self._escape_sysex_string(max_val_str.strip())
+                    default_val_str = self._escape_sysex_string(default_val_str.strip())
+                    quarter_str = self._escape_sysex_string(quarter_str.strip())
+                    param_str = f"{name.strip()}|{min_val_str}|{max_val_str}|{default_val_str}|{default_raw_str.strip()}|{quarter_str}|{value_items.strip()}"
                     param_data.append(param_str)
                 else:
                     param_str = "*--&&-|0|127|0.0|0.0|32|"
@@ -381,13 +439,13 @@ class Tap(ControlSurface):
         if not metadata:
             return False
         
-        params = metadata.split(',')
+        params = self._split_escaped_sysex_fields(metadata, ',')
         
         for param in params:
-            fields = param.split('|')
+            fields = self._split_escaped_sysex_fields(param, '|')
             for field_index in [1, 2, 3, 5]:
                 if field_index < len(fields):
-                    field_value = fields[field_index].strip()
+                    field_value = self._unescape_sysex_string(fields[field_index].strip())
                     if field_value:
                         try:
                             float(field_value)
@@ -400,12 +458,12 @@ class Tap(ControlSurface):
         if not metadata:
             return False
         
-        params = metadata.split(',')
+        params = self._split_escaped_sysex_fields(metadata, ',')
         for param in params:
-            fields = param.split('|')
+            fields = self._split_escaped_sysex_fields(param, '|')
             for field_index in [1, 2, 3, 5]:
                 if field_index < len(fields):
-                    field_value = fields[field_index].strip()
+                    field_value = self._unescape_sysex_string(fields[field_index].strip())
                     if field_value in ("0", "127"):
                         return True
         return False
@@ -605,7 +663,7 @@ class Tap(ControlSurface):
                 for e in [e for e in ends if e['type'] == 'rack']:
                     suffix += "||"
             
-                all_device_names.append(prefix + name + suffix)
+                all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
             
             available_devices_string = ','.join(all_device_names)
             
@@ -640,8 +698,8 @@ class Tap(ControlSurface):
                     else:
                         current_bank_name = ""
             
-            bank_name_drum = current_bank_name + ";" + str(track_has_drums)
-            bank_names_list = ','.join(str(name) for name in connected_bank_names)
+            bank_name_drum = self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums)
+            bank_names_list = ','.join(self._escape_sysex_string(name) for name in connected_bank_names)
             
             # sending sysex of bank name, device name, bank names
             self._send_sys_ex_message(bank_name_drum, 0x6D)
@@ -670,16 +728,16 @@ class Tap(ControlSurface):
                             if device_param and hasattr(device_param, 'is_enabled'):
                                 if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
                                     if device_param.automation_state == 1:
-                                        names.append(f"**{device_param.name}")
+                                        names.append(f"**{self._escape_sysex_string(device_param.name)}")
                                     elif device_param.automation_state == 2:
-                                        names.append(f"*/{device_param.name}")
+                                        names.append(f"*/{self._escape_sysex_string(device_param.name)}")
                                 elif device_param.is_enabled:
-                                    names.append(device_param.name)
+                                    names.append(self._escape_sysex_string(device_param.name))
                                 else:
-                                    names.append(f"*-{device_param.name}")
+                                    names.append(f"*-{self._escape_sysex_string(device_param.name)}")
                             else:
                                 # Fallback to mapped parameter name if DeviceParameter not found
-                                names.append(mapped_param.name)
+                                names.append(self._escape_sysex_string(mapped_param.name))
                         else:
                             names.append("")
                     return [name for name in names if name != ""]
@@ -2074,7 +2132,7 @@ class Tap(ControlSurface):
                 color_string = self._make_color_string(track.color)
                 track_colors.append(color_string)
 
-            self._send_sys_ex_message(",".join(track_names), 0x02)
+            self._send_sys_ex_message(",".join(self._escape_sysex_string(name) for name in track_names), 0x02)
             self._send_sys_ex_message(",".join(track_is_audio), 0x0C)
             self._send_sys_ex_message("-".join(track_colors), 0x04)
 
@@ -2089,7 +2147,7 @@ class Tap(ControlSurface):
 
             color_string = self._make_color_string(master_track.color)
             return_track_colors.append(color_string)
-            self._send_sys_ex_message(",".join(return_track_names), 0x06)
+            self._send_sys_ex_message(",".join(self._escape_sysex_string(name) for name in return_track_names), 0x06)
             self._send_sys_ex_message("-".join(return_track_colors), 0x07)
         
         # 3. Set up level meter listeners (idempotent, safe to call every time)
@@ -2517,7 +2575,7 @@ class Tap(ControlSurface):
         song = self.song()
         scale = song.scale_name
         root = song.root_note
-        scale_string = "{};{}".format(scale, root)
+        scale_string = "{};{}".format(self._escape_sysex_string(scale), root)
         self._send_sys_ex_message(scale_string, 0x0A)
 
     def handle_sysex(self, message):
@@ -2805,7 +2863,7 @@ class Tap(ControlSurface):
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
         scale_name_bytes = bytes(message[2:-2])
-        scale_name = scale_name_bytes.decode('utf-8')
+        scale_name = self._unescape_sysex_string(scale_name_bytes.decode('utf-8'))
         root_note_index = message[-2]
         return scale_name, root_note_index
 
@@ -3554,7 +3612,7 @@ class Tap(ControlSurface):
             if hasattr(item, 'name'):
                 item_name = item.name
                 item_type = self._get_browser_item_type(item)
-                item_strings.append(f"{item_name}{item_type}")
+                item_strings.append(f"{self._escape_sysex_string(item_name)}{item_type}")
 
         # Format: current_page^total_pages^item1//,item2||,item3||,...
         items_string = ','.join(item_strings)
