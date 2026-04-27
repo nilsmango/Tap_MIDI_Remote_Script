@@ -114,7 +114,6 @@ class Tap(ControlSurface):
             self._follow_action_track_signature = None
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
-            self._follow_action_debug = False
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -1625,14 +1624,6 @@ class Tap(ControlSurface):
             return ("clip", int(track_index), int(scene_index))
         return ("scene", int(scene_index))
 
-    def _log_follow_action(self, message):
-        if not getattr(self, "_follow_action_debug", False):
-            return
-        try:
-            self.log_message("[Tap Follow Actions] {}".format(message))
-        except Exception:
-            pass
-
     def _live_object_identity(self, live_object):
         try:
             live_ptr = live_object._live_ptr
@@ -1903,7 +1894,6 @@ class Tap(ControlSurface):
             return
 
         if not set(previous_signature).intersection(set(current_signature)):
-            self._log_follow_action("track topology replaced; clearing saved rules")
             self._reset_follow_action_state()
             return
 
@@ -1991,12 +1981,10 @@ class Tap(ControlSurface):
         try:
             raw_payload = bytes(self._follow_action_payload_bytes(message)).decode("ascii")
         except Exception:
-            self._log_follow_action("decode failed: non-ascii message")
             return None
 
         fields = self._split_escaped_sysex_fields(raw_payload, "|")
         if len(fields) < 9:
-            self._log_follow_action("decode failed: expected 9 fields, got {} payload={}".format(len(fields), raw_payload))
             return None
 
         try:
@@ -2010,11 +1998,9 @@ class Tap(ControlSurface):
             action_b = self._normalize_follow_action(fields[7])
             jump_b = int(fields[8]) if fields[8] != "" else None
         except Exception as error:
-            self._log_follow_action("decode failed: {} payload={}".format(error, raw_payload))
             return None
 
         if target_kind not in ("clip", "scene"):
-            self._log_follow_action("decode failed: invalid target kind {}".format(target_kind))
             return None
 
         return {
@@ -2035,7 +2021,6 @@ class Tap(ControlSurface):
             return
         key = self._follow_action_key(rule["target_kind"], rule.get("track_index"), rule["scene_index"])
         self._follow_action_rules[key] = rule
-        self._log_follow_action("set {} plays={} chance={} actions={}".format(key, rule.get("play_count"), rule.get("chance_a"), rule.get("actions")))
         self._send_follow_action_state()
 
     def _delete_follow_action_rule(self, message):
@@ -2052,9 +2037,7 @@ class Tap(ControlSurface):
                 del self._active_follow_actions[key]
             self._handled_follow_action_launches.discard(key)
             self._follow_action_missing_clip_counts.pop(key, None)
-            self._log_follow_action("delete {}".format(key))
         except Exception:
-            self._log_follow_action("delete failed")
             pass
         self._send_follow_action_state()
 
@@ -2066,10 +2049,8 @@ class Tap(ControlSurface):
             return
         rule = self._follow_action_rules.get(key)
         if not rule:
-            self._log_follow_action("clip activate ignored: no rule for {}".format(key))
             return
 
-        self._log_follow_action("clip active {}".format(key))
         self._active_follow_actions[key] = {
             "key": key,
             "rule": rule,
@@ -2088,11 +2069,9 @@ class Tap(ControlSurface):
             return
         rule = self._follow_action_rules.get(key)
         if not rule:
-            self._log_follow_action("scene activate ignored: no rule for {}".format(key))
             self._send_follow_action_state()
             return
 
-        self._log_follow_action("scene active {}".format(key))
         self._active_follow_actions[key] = {
             "key": key,
             "rule": rule,
@@ -2156,7 +2135,6 @@ class Tap(ControlSurface):
                 active["executed"] = True
                 del self._active_follow_actions[key]
                 self._handled_follow_action_launches.add(key)
-                self._log_follow_action("execute {}".format(key))
                 self._execute_follow_action(active)
                 changed = True
 
@@ -2274,7 +2252,6 @@ class Tap(ControlSurface):
         payload = ";".join(rules)
         if force or payload != self._last_follow_action_state:
             self._last_follow_action_state = payload
-            self._log_follow_action("send state rules={} active={} bytes={}".format(len(self._follow_action_rules), len(self._active_follow_actions), len(payload)))
             self._send_sys_ex_message(payload, 0x18)
 
     def _reconcile_follow_action_rules(self, force=False, remove_missing_clips=True):
@@ -3264,8 +3241,8 @@ class Tap(ControlSurface):
                         continue
                     if key in self._follow_action_rules:
                         self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
-        except Exception as error:
-            self._log_follow_action("playing scan failed: {}".format(error))
+        except Exception:
+            pass
 
     def _clear_finished_follow_action_launches(self):
         for key in list(self._handled_follow_action_launches):
@@ -3400,8 +3377,6 @@ class Tap(ControlSurface):
         
         manufacturer_id = message[1]
         prefix = message[2]
-        if manufacturer_id in (35, 36, 37):
-            self._log_follow_action("incoming sysex manufacturer={} length={}".format(manufacturer_id, len(message)))
     
         # Check if this message is chunked. Existing Tap app -> script chunks
         # always use the prefix directly after the manufacturer id.
@@ -3668,7 +3643,6 @@ class Tap(ControlSurface):
         if len(message) >= 2 and message[1] == 36:
             self._delete_follow_action_rule(message)
         if len(message) >= 2 and message[1] == 37:
-            self._log_follow_action("state requested")
             self._send_follow_action_state(force=True)
             
 
