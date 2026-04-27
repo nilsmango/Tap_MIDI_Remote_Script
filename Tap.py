@@ -108,6 +108,13 @@ class Tap(ControlSurface):
             self._automation_metadata_device_id = None
             self._automation_timer_lock = threading.Lock()
             self._mixer_disconnect_timer = None
+            self._follow_action_rules = {}
+            self._active_follow_actions = {}
+            self._handled_follow_action_launches = set()
+            self._follow_action_track_signature = None
+            self._follow_action_missing_clip_counts = {}
+            self._last_follow_action_state = None
+            self._follow_action_debug = False
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -1557,6 +1564,7 @@ class Tap(ControlSurface):
             if self.was_initialized is False:
                 self.was_initialized = True
                 self.old_clips_array = []
+                self._follow_action_track_signature = self._track_signature(self.song().tracks)
                 self._on_tracks_changed()
                 song = self.song()
                 self._initialize_buttons()
@@ -1604,11 +1612,733 @@ class Tap(ControlSurface):
             self._periodic_timer_ref.start()
 
     def _periodic_check(self):
+        self._reconcile_follow_action_rules()
+        self._evaluate_follow_actions()
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
         if self.device_status is False:
             self._update_clip_slots()
+
+    def _follow_action_key(self, target_kind, track_index, scene_index):
+        if target_kind == "clip":
+            return ("clip", int(track_index), int(scene_index))
+        return ("scene", int(scene_index))
+
+    def _log_follow_action(self, message):
+        if not getattr(self, "_follow_action_debug", False):
+            return
+        try:
+            self.log_message("[Tap Follow Actions] {}".format(message))
+        except Exception:
+            pass
+
+    def _live_object_identity(self, live_object):
+        try:
+            live_ptr = live_object._live_ptr
+            if callable(live_ptr):
+                return int(live_ptr())
+            return int(live_ptr)
+        except Exception:
+            return id(live_object)
+
+    def _track_signature(self, tracks):
+        return tuple(self._live_object_identity(track) for track in tracks)
+
+    def _find_clip_follow_action_rule(self, track_index, scene_index):
+        try:
+            clip_slot = self.song().tracks[track_index].clip_slots[scene_index]
+            if not clip_slot.has_clip:
+                return None, None
+            key = self._follow_action_key("clip", track_index, scene_index)
+            return key, self._follow_action_rules.get(key)
+        except Exception:
+            return None, None
+
+    def _copy_clip_follow_action_rule(self, from_track, from_clip, to_track, to_clip, remove_source=False):
+        source_key, source_rule = self._find_clip_follow_action_rule(from_track, from_clip)
+        if not source_rule:
+            return
+
+        try:
+            dest_slot = self.song().tracks[to_track].clip_slots[to_clip]
+            if not dest_slot.has_clip:
+                return
+        except Exception:
+            return
+
+        if remove_source and source_key in self._follow_action_rules:
+            del self._follow_action_rules[source_key]
+            self._handled_follow_action_launches.discard(source_key)
+            self._follow_action_missing_clip_counts.pop(source_key, None)
+
+        new_rule = dict(source_rule)
+        new_rule["track_index"] = to_track
+        new_rule["scene_index"] = to_clip
+
+        dest_key = self._follow_action_key("clip", to_track, to_clip)
+        self._follow_action_rules[dest_key] = new_rule
+
+    def _remove_clip_follow_action_rule(self, track_index, scene_index):
+        key, _ = self._find_clip_follow_action_rule(track_index, scene_index)
+        if key and key in self._follow_action_rules:
+            del self._follow_action_rules[key]
+        if key in self._active_follow_actions:
+            del self._active_follow_actions[key]
+        self._handled_follow_action_launches.discard(key)
+        self._follow_action_missing_clip_counts.pop(key, None)
+
+    def _shift_follow_actions_after_scene_insert(self, insert_index):
+        shifted_rules = {}
+        for key, rule in self._follow_action_rules.items():
+            target_kind = rule.get("target_kind")
+            scene_index = int(rule.get("scene_index", 0))
+            if scene_index >= insert_index:
+                rule = dict(rule)
+                rule["scene_index"] = scene_index + 1
+                if target_kind == "clip":
+                    key = self._follow_action_key("clip", rule.get("track_index"), rule["scene_index"])
+                else:
+                    key = self._follow_action_key("scene", None, rule["scene_index"])
+            shifted_rules[key] = rule
+        self._follow_action_rules = shifted_rules
+        self._follow_action_missing_clip_counts = {}
+
+        shifted_active = {}
+        for active_key, active in self._active_follow_actions.items():
+            if active.get("scene_index") >= insert_index:
+                active = dict(active)
+                active["scene_index"] += 1
+                if active.get("target_kind") == "clip":
+                    active_key = self._follow_action_key("clip", active.get("track_index"), active.get("scene_index"))
+                else:
+                    active_key = self._follow_action_key("scene", None, active.get("scene_index"))
+            shifted_active[active_key] = active
+        self._active_follow_actions = shifted_active
+
+    def _shift_follow_actions_after_scene_delete(self, deleted_index):
+        shifted_rules = {}
+        for key, rule in self._follow_action_rules.items():
+            scene_index = int(rule.get("scene_index", 0))
+            if scene_index == deleted_index:
+                continue
+            if scene_index > deleted_index:
+                rule = dict(rule)
+                rule["scene_index"] = scene_index - 1
+                if rule.get("target_kind") == "clip":
+                    key = self._follow_action_key("clip", rule.get("track_index"), rule["scene_index"])
+                else:
+                    key = self._follow_action_key("scene", None, rule["scene_index"])
+            shifted_rules[key] = rule
+        self._follow_action_rules = shifted_rules
+        self._follow_action_missing_clip_counts = {}
+
+        shifted_active = {}
+        for active_key, active in self._active_follow_actions.items():
+            active_scene = active.get("scene_index")
+            if active_scene == deleted_index:
+                continue
+            elif active_scene > deleted_index:
+                active = dict(active)
+                active["scene_index"] = active_scene - 1
+                if active.get("target_kind") == "clip":
+                    active_key = self._follow_action_key("clip", active.get("track_index"), active.get("scene_index"))
+                else:
+                    active_key = self._follow_action_key("scene", None, active.get("scene_index"))
+            shifted_active[active_key] = active
+        self._active_follow_actions = shifted_active
+
+    def _duplicate_follow_actions_for_scene(self, source_scene_index, dest_scene_index):
+        scene_key = self._follow_action_key("scene", None, source_scene_index)
+        scene_rule = self._follow_action_rules.get(scene_key)
+        if scene_rule:
+            new_rule = dict(scene_rule)
+            new_rule["scene_index"] = dest_scene_index
+            self._follow_action_rules[self._follow_action_key("scene", None, dest_scene_index)] = new_rule
+
+        try:
+            for track_index, track in enumerate(self.song().tracks):
+                self._copy_clip_follow_action_rule(track_index, source_scene_index, track_index, dest_scene_index)
+        except Exception:
+            pass
+
+    def _reset_follow_action_state(self):
+        self._follow_action_rules = {}
+        self._active_follow_actions = {}
+        self._handled_follow_action_launches = set()
+        self._follow_action_missing_clip_counts = {}
+        self._last_follow_action_state = None
+        self._send_follow_action_state(force=True)
+
+    def _shift_follow_actions_after_track_insert(self, insert_index):
+        shifted_rules = {}
+        for key, rule in self._follow_action_rules.items():
+            if rule.get("target_kind") == "clip":
+                track_index = int(rule.get("track_index", 0))
+                if track_index >= insert_index:
+                    rule = dict(rule)
+                    rule["track_index"] = track_index + 1
+                key = self._follow_action_key("clip", rule.get("track_index"), rule.get("scene_index"))
+            shifted_rules[key] = rule
+        self._follow_action_rules = shifted_rules
+
+        shifted_active = {}
+        for active_key, active in self._active_follow_actions.items():
+            if active.get("target_kind") == "clip":
+                track_index = int(active.get("track_index", 0))
+                if track_index >= insert_index:
+                    active = dict(active)
+                    active["track_index"] = track_index + 1
+                active_key = self._follow_action_key("clip", active.get("track_index"), active.get("scene_index"))
+            shifted_active[active_key] = active
+        self._active_follow_actions = shifted_active
+
+        shifted_handled = set()
+        for key in self._handled_follow_action_launches:
+            if key[0] == "clip":
+                _, track_index, scene_index = key
+                if track_index >= insert_index:
+                    track_index += 1
+                shifted_handled.add(self._follow_action_key("clip", track_index, scene_index))
+            else:
+                shifted_handled.add(key)
+        self._handled_follow_action_launches = shifted_handled
+        self._follow_action_missing_clip_counts = {}
+
+    def _shift_follow_actions_after_track_delete(self, deleted_index):
+        shifted_rules = {}
+        for key, rule in self._follow_action_rules.items():
+            if rule.get("target_kind") == "clip":
+                track_index = int(rule.get("track_index", 0))
+                if track_index == deleted_index:
+                    continue
+                if track_index > deleted_index:
+                    rule = dict(rule)
+                    rule["track_index"] = track_index - 1
+                key = self._follow_action_key("clip", rule.get("track_index"), rule.get("scene_index"))
+            shifted_rules[key] = rule
+        self._follow_action_rules = shifted_rules
+
+        shifted_active = {}
+        for active_key, active in self._active_follow_actions.items():
+            if active.get("target_kind") == "clip":
+                track_index = int(active.get("track_index", 0))
+                if track_index == deleted_index:
+                    continue
+                if track_index > deleted_index:
+                    active = dict(active)
+                    active["track_index"] = track_index - 1
+                active_key = self._follow_action_key("clip", active.get("track_index"), active.get("scene_index"))
+            shifted_active[active_key] = active
+        self._active_follow_actions = shifted_active
+
+        shifted_handled = set()
+        for key in self._handled_follow_action_launches:
+            if key[0] == "clip":
+                _, track_index, scene_index = key
+                if track_index == deleted_index:
+                    continue
+                if track_index > deleted_index:
+                    track_index -= 1
+                shifted_handled.add(self._follow_action_key("clip", track_index, scene_index))
+            else:
+                shifted_handled.add(key)
+        self._handled_follow_action_launches = shifted_handled
+        self._follow_action_missing_clip_counts = {}
+
+    def _remap_follow_actions_to_track_signature(self, previous_signature, current_signature):
+        current_index_by_track = dict((track_id, index) for index, track_id in enumerate(current_signature))
+
+        remapped_rules = {}
+        for key, rule in self._follow_action_rules.items():
+            if rule.get("target_kind") == "clip":
+                old_track_index = int(rule.get("track_index", 0))
+                if old_track_index >= len(previous_signature):
+                    continue
+                track_id = previous_signature[old_track_index]
+                if track_id not in current_index_by_track:
+                    continue
+                rule = dict(rule)
+                rule["track_index"] = current_index_by_track[track_id]
+                key = self._follow_action_key("clip", rule.get("track_index"), rule.get("scene_index"))
+            remapped_rules[key] = rule
+        self._follow_action_rules = remapped_rules
+
+        remapped_active = {}
+        for active_key, active in self._active_follow_actions.items():
+            if active.get("target_kind") == "clip":
+                old_track_index = int(active.get("track_index", 0))
+                if old_track_index >= len(previous_signature):
+                    continue
+                track_id = previous_signature[old_track_index]
+                if track_id not in current_index_by_track:
+                    continue
+                active = dict(active)
+                active["track_index"] = current_index_by_track[track_id]
+                active_key = self._follow_action_key("clip", active.get("track_index"), active.get("scene_index"))
+            remapped_active[active_key] = active
+        self._active_follow_actions = remapped_active
+
+        remapped_handled = set()
+        for key in self._handled_follow_action_launches:
+            if key[0] == "clip":
+                _, old_track_index, scene_index = key
+                if old_track_index >= len(previous_signature):
+                    continue
+                track_id = previous_signature[old_track_index]
+                if track_id not in current_index_by_track:
+                    continue
+                remapped_handled.add(self._follow_action_key("clip", current_index_by_track[track_id], scene_index))
+            else:
+                remapped_handled.add(key)
+        self._handled_follow_action_launches = remapped_handled
+        self._follow_action_missing_clip_counts = {}
+
+    def _sync_follow_actions_to_track_topology(self):
+        current_signature = self._track_signature(self.song().tracks)
+        previous_signature = self._follow_action_track_signature
+        self._follow_action_track_signature = current_signature
+
+        if previous_signature is None or previous_signature == current_signature:
+            return
+
+        if not set(previous_signature).intersection(set(current_signature)):
+            self._log_follow_action("track topology replaced; clearing saved rules")
+            self._reset_follow_action_state()
+            return
+
+        self._remap_follow_actions_to_track_signature(previous_signature, current_signature)
+        self._send_follow_action_state(force=True)
+
+    def _get_global_launch_quantization_beats(self):
+        try:
+            quantization = self.song().clip_trigger_quantization
+        except Exception:
+            return 0.0
+
+        quantization_beats = [
+            ("q_no_q", 0.0),
+            ("q_8_bars", 32.0),
+            ("q_4_bars", 16.0),
+            ("q_2_bars", 8.0),
+            ("q_bar", 4.0),
+            ("q_half", 2.0),
+            ("q_half_triplet", 4.0 / 3.0),
+            ("q_quarter", 1.0),
+            ("q_quarter_triplet", 2.0 / 3.0),
+            ("q_eight", 0.5),
+            ("q_eight_triplet", 1.0 / 3.0),
+            ("q_sixteenth", 0.25),
+            ("q_sixtenth", 0.25),
+            ("q_sixteenth_triplet", 1.0 / 6.0),
+            ("q_sixtenth_triplet", 1.0 / 6.0),
+            ("q_thirtytwoth", 0.125),
+        ]
+
+        for name, beats in quantization_beats:
+            try:
+                if quantization == getattr(Live.Song.Quantization, name):
+                    return beats
+            except Exception:
+                pass
+        return 0.0
+
+    def _clip_slot_length_beats(self, clip_slot):
+        try:
+            if clip_slot and clip_slot.has_clip:
+                clip = clip_slot.clip
+                return max(0.0, float(clip.loop_end) - float(clip.loop_start))
+        except Exception:
+            pass
+        return 0.0
+
+    def _scene_length_beats(self, scene_index):
+        longest = 0.0
+        try:
+            for track in self.song().tracks:
+                if scene_index < len(track.clip_slots):
+                    longest = max(longest, self._clip_slot_length_beats(track.clip_slots[scene_index]))
+        except Exception:
+            pass
+        return longest
+
+    def _scene_is_playing(self, scene_index):
+        try:
+            for track in self.song().tracks:
+                if scene_index < len(track.clip_slots) and track.clip_slots[scene_index].is_playing:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _normalize_follow_action(self, action_name):
+        action = str(action_name or "").strip().lower().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "playagain": "play_again",
+            "play_again": "play_again",
+            "noaction": "play_again",
+            "no_action": "play_again",
+            "none": "play_again",
+        }
+        return aliases.get(action, action)
+
+    def _follow_action_payload_bytes(self, message):
+        if len(message) > 3 and message[2] == 1:
+            return message[3:-1]
+        return message[2:-1]
+
+    def _decode_follow_action_rule(self, message):
+        try:
+            raw_payload = bytes(self._follow_action_payload_bytes(message)).decode("ascii")
+        except Exception:
+            self._log_follow_action("decode failed: non-ascii message")
+            return None
+
+        fields = self._split_escaped_sysex_fields(raw_payload, "|")
+        if len(fields) < 9:
+            self._log_follow_action("decode failed: expected 9 fields, got {} payload={}".format(len(fields), raw_payload))
+            return None
+
+        try:
+            target_kind = self._unescape_sysex_string(fields[0])
+            track_index = int(fields[1]) if fields[1] != "" else None
+            scene_index = int(fields[2])
+            play_count = max(1, int(fields[3]))
+            chance_a = max(0, min(100, int(fields[4])))
+            action_a = self._normalize_follow_action(fields[5])
+            jump_a = int(fields[6]) if fields[6] != "" else None
+            action_b = self._normalize_follow_action(fields[7])
+            jump_b = int(fields[8]) if fields[8] != "" else None
+        except Exception as error:
+            self._log_follow_action("decode failed: {} payload={}".format(error, raw_payload))
+            return None
+
+        if target_kind not in ("clip", "scene"):
+            self._log_follow_action("decode failed: invalid target kind {}".format(target_kind))
+            return None
+
+        return {
+            "target_kind": target_kind,
+            "track_index": track_index,
+            "scene_index": scene_index,
+            "play_count": play_count,
+            "chance_a": chance_a,
+            "actions": (
+                {"type": action_a, "jump_index": jump_a},
+                {"type": action_b, "jump_index": jump_b},
+            ),
+        }
+
+    def _set_follow_action_rule(self, message):
+        rule = self._decode_follow_action_rule(message)
+        if not rule:
+            return
+        key = self._follow_action_key(rule["target_kind"], rule.get("track_index"), rule["scene_index"])
+        self._follow_action_rules[key] = rule
+        self._log_follow_action("set {} plays={} chance={} actions={}".format(key, rule.get("play_count"), rule.get("chance_a"), rule.get("actions")))
+        self._send_follow_action_state()
+
+    def _delete_follow_action_rule(self, message):
+        try:
+            raw_payload = bytes(self._follow_action_payload_bytes(message)).decode("ascii")
+            fields = self._split_escaped_sysex_fields(raw_payload, "|")
+            target_kind = self._unescape_sysex_string(fields[0])
+            track_index = int(fields[1]) if fields[1] != "" else None
+            scene_index = int(fields[2])
+            key = self._follow_action_key(target_kind, track_index, scene_index)
+            if key in self._follow_action_rules:
+                del self._follow_action_rules[key]
+            if key in self._active_follow_actions:
+                del self._active_follow_actions[key]
+            self._handled_follow_action_launches.discard(key)
+            self._follow_action_missing_clip_counts.pop(key, None)
+            self._log_follow_action("delete {}".format(key))
+        except Exception:
+            self._log_follow_action("delete failed")
+            pass
+        self._send_follow_action_state()
+
+    def _activate_follow_action_for_clip(self, track_index, scene_index, clip_slot):
+        if not clip_slot or not clip_slot.has_clip:
+            return
+        key = self._follow_action_key("clip", track_index, scene_index)
+        if key in self._handled_follow_action_launches:
+            return
+        rule = self._follow_action_rules.get(key)
+        if not rule:
+            self._log_follow_action("clip activate ignored: no rule for {}".format(key))
+            return
+
+        self._log_follow_action("clip active {}".format(key))
+        self._active_follow_actions[key] = {
+            "key": key,
+            "rule": rule,
+            "target_kind": "clip",
+            "track_index": track_index,
+            "scene_index": scene_index,
+            "clip_slot": clip_slot,
+            "started_at": None,
+            "executed": False,
+        }
+        self._send_follow_action_state()
+
+    def _activate_follow_action_for_scene(self, scene_index):
+        key = self._follow_action_key("scene", None, scene_index)
+        if key in self._handled_follow_action_launches:
+            return
+        rule = self._follow_action_rules.get(key)
+        if not rule:
+            self._log_follow_action("scene activate ignored: no rule for {}".format(key))
+            self._send_follow_action_state()
+            return
+
+        self._log_follow_action("scene active {}".format(key))
+        self._active_follow_actions[key] = {
+            "key": key,
+            "rule": rule,
+            "target_kind": "scene",
+            "track_index": None,
+            "scene_index": scene_index,
+            "started_at": None,
+            "executed": False,
+        }
+        self._send_follow_action_state()
+
+    def _evaluate_follow_actions(self):
+        self._clear_finished_follow_action_launches()
+        if not self._active_follow_actions:
+            return
+
+        try:
+            song_time = float(self.song().current_song_time)
+        except Exception:
+            return
+
+        changed = False
+        active_items = sorted(
+            list(self._active_follow_actions.items()),
+            key=lambda item: 0 if item[1].get("target_kind") == "scene" else 1
+        )
+
+        for key, active in active_items:
+            if key not in self._active_follow_actions or active.get("executed"):
+                continue
+
+            target_kind = active.get("target_kind")
+            scene_index = active.get("scene_index")
+            clip_slot = active.get("clip_slot")
+
+            if target_kind == "clip":
+                if not clip_slot or not clip_slot.has_clip or not clip_slot.is_playing:
+                    del self._active_follow_actions[key]
+                    changed = True
+                    continue
+                base_length = self._clip_slot_length_beats(clip_slot)
+            else:
+                if not self._scene_is_playing(scene_index):
+                    del self._active_follow_actions[key]
+                    changed = True
+                    continue
+                base_length = self._scene_length_beats(scene_index)
+
+            if base_length <= 0.0:
+                continue
+
+            if active.get("started_at") is None:
+                active["started_at"] = song_time
+
+            rule = active.get("rule", {})
+            total_beats = base_length * max(1, int(rule.get("play_count", 1)))
+            launch_quantization_beats = self._get_global_launch_quantization_beats()
+            trigger_after = max(0.0, total_beats - launch_quantization_beats)
+
+            if song_time - active["started_at"] >= trigger_after:
+                active["executed"] = True
+                del self._active_follow_actions[key]
+                self._handled_follow_action_launches.add(key)
+                self._log_follow_action("execute {}".format(key))
+                self._execute_follow_action(active)
+                changed = True
+
+        if changed:
+            self._send_follow_action_state()
+
+    def _choose_follow_action(self, rule):
+        chance_a = max(0, min(100, int(rule.get("chance_a", 100))))
+        return rule.get("actions", ({}, {}))[0 if random.randint(1, 100) <= chance_a else 1]
+
+    def _execute_follow_action(self, active):
+        rule = active.get("rule", {})
+        action = self._choose_follow_action(rule)
+        action_type = action.get("type")
+        if action_type in (None, "", "none"):
+            return
+
+        if active.get("target_kind") == "scene":
+            self._execute_scene_follow_action(active.get("scene_index"), action)
+        else:
+            self._execute_clip_follow_action(active.get("track_index"), active.get("scene_index"), action)
+
+    def _valid_scene_indexes(self):
+        return list(range(len(self.song().scenes)))
+
+    def _valid_clip_indexes(self, track_index):
+        try:
+            return [index for index, clip_slot in enumerate(self.song().tracks[track_index].clip_slots) if clip_slot.has_clip]
+        except Exception:
+            return []
+
+    def _pick_index_for_action(self, indexes, current_index, action):
+        action_type = action.get("type")
+        if not indexes:
+            return None
+        if action_type == "first":
+            return indexes[0]
+        if action_type == "last":
+            return indexes[-1]
+        if action_type == "previous":
+            previous = [index for index in indexes if index < current_index]
+            return previous[-1] if previous else indexes[-1]
+        if action_type == "next":
+            next_indexes = [index for index in indexes if index > current_index]
+            return next_indexes[0] if next_indexes else indexes[0]
+        if action_type == "any":
+            return random.choice(indexes)
+        if action_type == "other":
+            other_indexes = [index for index in indexes if index != current_index]
+            return random.choice(other_indexes or indexes)
+        if action_type == "jump":
+            jump_index = action.get("jump_index")
+            return jump_index if jump_index in indexes else None
+        if action_type == "play_again":
+            return current_index
+        return None
+
+    def _execute_scene_follow_action(self, scene_index, action):
+        action_type = action.get("type")
+        if action_type == "stop":
+            self.song().stop_all_clips()
+            return
+        target_index = self._pick_index_for_action(self._valid_scene_indexes(), scene_index, action)
+        if target_index is not None and target_index < len(self.song().scenes):
+            self.song().scenes[target_index].fire()
+            self._activate_follow_action_for_scene(target_index)
+
+    def _execute_clip_follow_action(self, track_index, scene_index, action):
+        try:
+            track = self.song().tracks[track_index]
+            clip_slot = track.clip_slots[scene_index]
+        except Exception:
+            return
+
+        action_type = action.get("type")
+        if action_type == "stop":
+            clip_slot.stop()
+            return
+
+        if action_type == "jump":
+            target_index = action.get("jump_index")
+        else:
+            target_index = self._pick_index_for_action(self._valid_clip_indexes(track_index), scene_index, action)
+        if target_index is not None and 0 <= target_index < len(track.clip_slots):
+            target_slot = track.clip_slots[target_index]
+            target_slot.fire()
+            self._activate_follow_action_for_clip(track_index, target_index, target_slot)
+
+    def _encode_follow_action_rule(self, rule):
+        action_a, action_b = rule.get("actions", ({}, {}))
+        return "|".join([
+            "rule",
+            rule.get("target_kind", ""),
+            "" if rule.get("track_index") is None else str(rule.get("track_index")),
+            str(rule.get("scene_index", 0)),
+            str(rule.get("play_count", 1)),
+            str(rule.get("chance_a", 100)),
+            action_a.get("type", ""),
+            "" if action_a.get("jump_index") is None else str(action_a.get("jump_index")),
+            action_b.get("type", ""),
+            "" if action_b.get("jump_index") is None else str(action_b.get("jump_index")),
+        ])
+
+    def _send_follow_action_state(self, force=False):
+        rules = [self._encode_follow_action_rule(rule) for rule in self._follow_action_rules.values()]
+        for active in self._active_follow_actions.values():
+            rule = active.get("rule", {})
+            rules.append("|".join([
+                "active",
+                active.get("target_kind", ""),
+                "" if active.get("track_index") is None else str(active.get("track_index")),
+                str(active.get("scene_index", 0)),
+                "1",
+            ]))
+        payload = ";".join(rules)
+        if force or payload != self._last_follow_action_state:
+            self._last_follow_action_state = payload
+            self._log_follow_action("send state rules={} active={} bytes={}".format(len(self._follow_action_rules), len(self._active_follow_actions), len(payload)))
+            self._send_sys_ex_message(payload, 0x18)
+
+    def _reconcile_follow_action_rules(self, force=False, remove_missing_clips=True):
+        changed = False
+        reconciled_rules = {}
+        seen_keys = set()
+
+        for key, rule in self._follow_action_rules.items():
+            target_kind = rule.get("target_kind")
+            scene_index = rule.get("scene_index")
+
+            if target_kind == "clip":
+                track_index = rule.get("track_index")
+                try:
+                    clip_slot = self.song().tracks[track_index].clip_slots[scene_index]
+                    if not clip_slot.has_clip:
+                        if remove_missing_clips:
+                            missing_count = self._follow_action_missing_clip_counts.get(key, 0) + 1
+                            self._follow_action_missing_clip_counts[key] = missing_count
+                            if missing_count >= 4:
+                                changed = True
+                                self._follow_action_missing_clip_counts.pop(key, None)
+                                continue
+                        else:
+                            self._follow_action_missing_clip_counts.pop(key, None)
+                    else:
+                        self._follow_action_missing_clip_counts.pop(key, None)
+                except Exception:
+                    changed = True
+                    self._follow_action_missing_clip_counts.pop(key, None)
+                    continue
+
+                key = self._follow_action_key("clip", track_index, scene_index)
+                seen_keys.add(key)
+                reconciled_rules[key] = rule
+
+            elif target_kind == "scene":
+                try:
+                    if scene_index is None or scene_index >= len(self.song().scenes):
+                        changed = True
+                        continue
+                except Exception:
+                    changed = True
+                    continue
+
+                key = self._follow_action_key("scene", None, scene_index)
+                seen_keys.add(key)
+                reconciled_rules[key] = rule
+
+        for missing_key in list(self._follow_action_missing_clip_counts.keys()):
+            if missing_key not in seen_keys:
+                self._follow_action_missing_clip_counts.pop(missing_key, None)
+
+        if force or changed:
+            self._follow_action_rules = reconciled_rules
+            self._active_follow_actions = {
+                key: active for key, active in self._active_follow_actions.items()
+                if key in self._follow_action_rules
+            }
+            self._handled_follow_action_launches = {
+                key for key in self._handled_follow_action_launches
+                if key in self._follow_action_rules
+            }
+            self._send_follow_action_state()
 
     def _redo_button_value(self, value):
         if value != 0:
@@ -1671,6 +2401,10 @@ class Tap(ControlSurface):
             all_scenes = song.scenes
             current_index = list(all_scenes).index(selected_scene)
             song.duplicate_scene(current_index)
+            destination_index = current_index + 1
+            self._shift_follow_actions_after_scene_insert(destination_index)
+            self._duplicate_follow_actions_for_scene(current_index, destination_index)
+            self._send_follow_action_state()
 
     def _add_empty_clip(self, value):
         """
@@ -2050,6 +2784,7 @@ class Tap(ControlSurface):
             self._metadata_recheck_timer = None
         self._metadata_cache.clear()
         self._metadata_send_seq_by_device.clear()
+        self._sync_follow_actions_to_track_topology()
         self._update_mixer_and_tracks()
         self._register_clip_listeners()
         self._update_clip_slots()
@@ -2080,7 +2815,21 @@ class Tap(ControlSurface):
         return_tracks = list(self.song().return_tracks)
         master_track = self.song().master_track
 
-        track_signature = (tuple(id(t) for t in tracks), tuple(id(t) for t in return_tracks))
+        track_signature = (
+            tuple(
+                (
+                    id(track),
+                    str(track.name),
+                    int(track.color),
+                    bool(track.is_grouped),
+                    bool(track.has_audio_input),
+                    any(clip_slot.is_group_slot for clip_slot in track.clip_slots),
+                )
+                for track in tracks
+            ),
+            tuple((id(track), str(track.name), int(track.color)) for track in return_tracks),
+            int(master_track.color),
+        )
         tracks_changed = track_signature != self._track_list_signature
         
         if tracks_changed:
@@ -2342,6 +3091,11 @@ class Tap(ControlSurface):
             self._on_clip_playing_status_changed(track)
         return listener
 
+    def _make_clip_playing_listener(self, track):
+        def listener():
+            self._on_clip_playing_status_changed(track)
+        return listener
+
     def _make_clip_color_listener(self, track):
         def listener():
             self._on_clip_has_clip_changed(track)
@@ -2397,6 +3151,15 @@ class Tap(ControlSurface):
                     listener = self._make_clip_triggered_listener(track)
                     self._clip_slot_listeners[listener_key] = listener
                     clip_slot.add_is_triggered_listener(listener)
+
+                listener_key = (clip_slot, 'is_playing')
+                if listener_key not in self._clip_slot_listeners:
+                    try:
+                        listener = self._make_clip_playing_listener(track)
+                        self._clip_slot_listeners[listener_key] = listener
+                        clip_slot.add_is_playing_listener(listener)
+                    except Exception:
+                        pass
             
             self._registered_track_ids.add(track_id)
         
@@ -2416,6 +3179,14 @@ class Tap(ControlSurface):
                     clip_slot.remove_is_triggered_listener(listener)
                 else:
                     clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
+
+                listener_key = (clip_slot, 'is_playing')
+                listener = self._clip_slot_listeners.pop(listener_key, None)
+                if listener:
+                    try:
+                        clip_slot.remove_is_playing_listener(listener)
+                    except Exception:
+                        pass
                 
                 listener_key = (clip_slot, 'has_clip')
                 listener = self._clip_slot_listeners.pop(listener_key, None)
@@ -2474,8 +3245,42 @@ class Tap(ControlSurface):
             track_index = self._get_track_index(track)
             if track_index is not None:
                 self._update_clip_slots(track_index)
+                self._activate_follow_actions_for_playing_clips(track_index)
                 return
         self._update_clip_slots()
+        self._activate_follow_actions_for_playing_clips()
+
+    def _activate_follow_actions_for_playing_clips(self, only_track_index=None):
+        self._clear_finished_follow_action_launches()
+        try:
+            for track_index, track in enumerate(self.song().tracks):
+                if only_track_index is not None and track_index != only_track_index:
+                    continue
+                for scene_index, clip_slot in enumerate(track.clip_slots):
+                    if not clip_slot.has_clip or not clip_slot.is_playing:
+                        continue
+                    key = self._follow_action_key("clip", track_index, scene_index)
+                    if key in self._active_follow_actions:
+                        continue
+                    if key in self._follow_action_rules:
+                        self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
+        except Exception as error:
+            self._log_follow_action("playing scan failed: {}".format(error))
+
+    def _clear_finished_follow_action_launches(self):
+        for key in list(self._handled_follow_action_launches):
+            try:
+                if key[0] == "clip":
+                    _, track_index, scene_index = key
+                    clip_slot = self.song().tracks[track_index].clip_slots[scene_index]
+                    if not clip_slot.has_clip or not clip_slot.is_playing:
+                        self._handled_follow_action_launches.discard(key)
+                elif key[0] == "scene":
+                    _, scene_index = key
+                    if not self._scene_is_playing(scene_index):
+                        self._handled_follow_action_launches.discard(key)
+            except Exception:
+                self._handled_follow_action_launches.discard(key)
 
     def _on_clip_has_clip_changed(self, track=None):
         # self.log_message("has clip status changed")
@@ -2595,9 +3400,12 @@ class Tap(ControlSurface):
         
         manufacturer_id = message[1]
         prefix = message[2]
+        if manufacturer_id in (35, 36, 37):
+            self._log_follow_action("incoming sysex manufacturer={} length={}".format(manufacturer_id, len(message)))
     
-        # Check if this message is chunked (when manufacturer_id == 16)
-        if manufacturer_id == 16 or manufacturer_id == 15 or manufacturer_id == 14:
+        # Check if this message is chunked. Existing Tap app -> script chunks
+        # always use the prefix directly after the manufacturer id.
+        if manufacturer_id in (14, 15, 16):
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -2855,6 +3663,13 @@ class Tap(ControlSurface):
                 # Optional: log error
                 # self.canonical_parent.log_message("Tempo decode error: " + str(e))
                 pass
+        if len(message) >= 2 and message[1] == 35:
+            self._set_follow_action_rule(message)
+        if len(message) >= 2 and message[1] == 36:
+            self._delete_follow_action_rule(message)
+        if len(message) >= 2 and message[1] == 37:
+            self._log_follow_action("state requested")
+            self._send_follow_action_state(force=True)
             
 
             
@@ -2881,15 +3696,29 @@ class Tap(ControlSurface):
         if fire == 1:
             if clip_slot.is_playing:
                 clip_slot.stop()
+                keys_to_clear = [
+                    key for key, active in self._active_follow_actions.items()
+                    if active.get("target_kind") == "clip"
+                    and active.get("track_index") == track_index
+                    and active.get("scene_index") == clip_index
+                ]
+                for key in keys_to_clear:
+                    del self._active_follow_actions[key]
+                if keys_to_clear:
+                    self._send_follow_action_state()
             else:
                 clip_slot.set_fire_button_state(1)
+                self._activate_follow_action_for_clip(track_index, clip_index, clip_slot)
         else:
             clip_slot.set_fire_button_state(1)
+            self._activate_follow_action_for_clip(track_index, clip_index, clip_slot)
 
     def _delete_clip(self, track_index, clip_index):
         track = self.song().tracks[track_index]
         clip_slot = track.clip_slots[clip_index]
+        self._remove_clip_follow_action_rule(track_index, clip_index)
         clip_slot.delete_clip()
+        self._send_follow_action_state()
 
     def _duplicate_loop(self, track_index, clip_index):
         track = self.song().tracks[track_index]
@@ -2907,6 +3736,8 @@ class Tap(ControlSurface):
         paste_clip_slot = paste_track.clip_slots[to_clip]
 
         copy_clip_slot.duplicate_clip_to(paste_clip_slot)
+        self._copy_clip_follow_action_rule(from_track, from_clip, to_track, to_clip)
+        self._send_follow_action_state()
         
         # set up new clip listeners
         self._register_clip_listeners()
@@ -2936,6 +3767,8 @@ class Tap(ControlSurface):
         
         if not source_clip.is_midi_clip or not dest_clip.is_midi_clip:
             return
+
+        _, dest_follow_rule = self._find_clip_follow_action_rule(to_track, to_clip)
         
         # Get source clip looped region only
         source_loop_start = source_clip.loop_start
@@ -2994,7 +3827,12 @@ class Tap(ControlSurface):
             dest_clip.end_marker = new_end
         
         # Remove the source clip
+        if not dest_follow_rule:
+            self._copy_clip_follow_action_rule(from_track, from_clip, to_track, to_clip, remove_source=True)
+        else:
+            self._remove_clip_follow_action_rule(from_track, from_clip)
         source_clip_slot.delete_clip()
+        self._send_follow_action_state()
 
     def _set_scale_root_note(self, scale, root):
         song = self.song()
@@ -3011,6 +3849,7 @@ class Tap(ControlSurface):
         if value < len(scenes):
             scene = scenes[value]
             scene.fire()
+            self._activate_follow_action_for_scene(value)
 
     def _select_clip_scene(self, value):
         scenes = self.song().scenes
@@ -3023,6 +3862,8 @@ class Tap(ControlSurface):
 
     def _delete_scene(self, value):
         self.song().delete_scene(value)
+        self._shift_follow_actions_after_scene_delete(value)
+        self._send_follow_action_state()
 
     def _on_selected_scene_changed(self):
         selected_scene = self.song().view.selected_scene
@@ -3109,10 +3950,12 @@ class Tap(ControlSurface):
     def _add_midi_track(self, value):
         song = self.song()
         song.create_midi_track(value)
+        self._sync_follow_actions_to_track_topology()
 
     def _delete_midi_track(self, value):
         song = self.song()
         song.delete_track(value)
+        self._sync_follow_actions_to_track_topology()
 
     def _add_return_track(self, value):
         if value:
