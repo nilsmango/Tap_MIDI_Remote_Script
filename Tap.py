@@ -1942,6 +1942,12 @@ class Tap(ControlSurface):
             pass
         return 0.0
 
+    def _clip_slot_is_triggered(self, clip_slot):
+        try:
+            return bool(clip_slot and clip_slot.is_triggered)
+        except Exception:
+            return False
+
     def _scene_length_beats(self, scene_index):
         longest = 0.0
         try:
@@ -2059,6 +2065,7 @@ class Tap(ControlSurface):
             "scene_index": scene_index,
             "clip_slot": clip_slot,
             "started_at": None,
+            "waiting_for_launch": (not clip_slot.is_playing) or self._clip_slot_is_triggered(clip_slot),
             "executed": False,
         }
         self._send_follow_action_state()
@@ -2108,8 +2115,21 @@ class Tap(ControlSurface):
             clip_slot = active.get("clip_slot")
 
             if target_kind == "clip":
-                if not clip_slot or not clip_slot.has_clip or not clip_slot.is_playing:
+                if not clip_slot or not clip_slot.has_clip:
                     del self._active_follow_actions[key]
+                    changed = True
+                    continue
+                if not clip_slot.is_playing:
+                    if self._clip_slot_is_triggered(clip_slot):
+                        continue
+                    del self._active_follow_actions[key]
+                    changed = True
+                    continue
+                if active.get("waiting_for_launch"):
+                    if self._clip_slot_is_triggered(clip_slot):
+                        continue
+                    active["waiting_for_launch"] = False
+                    active["started_at"] = song_time
                     changed = True
                     continue
                 base_length = self._clip_slot_length_beats(clip_slot)
@@ -2134,8 +2154,9 @@ class Tap(ControlSurface):
             if song_time - active["started_at"] >= trigger_after:
                 active["executed"] = True
                 del self._active_follow_actions[key]
-                self._handled_follow_action_launches.add(key)
-                self._execute_follow_action(active)
+                launched_key = self._execute_follow_action(active)
+                if launched_key != key:
+                    self._handled_follow_action_launches.add(key)
                 changed = True
 
         if changed:
@@ -2150,12 +2171,12 @@ class Tap(ControlSurface):
         action = self._choose_follow_action(rule)
         action_type = action.get("type")
         if action_type in (None, "", "none"):
-            return
+            return None
 
         if active.get("target_kind") == "scene":
-            self._execute_scene_follow_action(active.get("scene_index"), action)
+            return self._execute_scene_follow_action(active.get("scene_index"), action)
         else:
-            self._execute_clip_follow_action(active.get("track_index"), active.get("scene_index"), action)
+            return self._execute_clip_follow_action(active.get("track_index"), active.get("scene_index"), action)
 
     def _valid_scene_indexes(self):
         return list(range(len(self.song().scenes)))
@@ -2200,7 +2221,11 @@ class Tap(ControlSurface):
         target_index = self._pick_index_for_action(self._valid_scene_indexes(), scene_index, action)
         if target_index is not None and target_index < len(self.song().scenes):
             self.song().scenes[target_index].fire()
+            target_key = self._follow_action_key("scene", None, target_index)
+            self._handled_follow_action_launches.discard(target_key)
             self._activate_follow_action_for_scene(target_index)
+            return target_key
+        return None
 
     def _execute_clip_follow_action(self, track_index, scene_index, action):
         try:
@@ -2212,7 +2237,7 @@ class Tap(ControlSurface):
         action_type = action.get("type")
         if action_type == "stop":
             clip_slot.stop()
-            return
+            return None
 
         if action_type == "jump":
             target_index = action.get("jump_index")
@@ -2221,7 +2246,11 @@ class Tap(ControlSurface):
         if target_index is not None and 0 <= target_index < len(track.clip_slots):
             target_slot = track.clip_slots[target_index]
             target_slot.fire()
+            target_key = self._follow_action_key("clip", track_index, target_index)
+            self._handled_follow_action_launches.discard(target_key)
             self._activate_follow_action_for_clip(track_index, target_index, target_slot)
+            return target_key
+        return None
 
     def _encode_follow_action_rule(self, rule):
         action_a, action_b = rule.get("actions", ({}, {}))
@@ -3107,11 +3136,7 @@ class Tap(ControlSurface):
         for track in self.song().tracks:
             track_id = id(track)
             current_track_ids.add(track_id)
-            
-            # Skip tracks that already have all their listeners registered
-            if track_id in self._registered_track_ids:
-                continue
-            
+
             for clip_slot in track.clip_slots:
 
                 if clip_slot == None:
