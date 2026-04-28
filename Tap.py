@@ -1994,6 +1994,15 @@ class Tap(ControlSurface):
             pass
         return False
 
+    def _scene_has_clip(self, scene_index):
+        try:
+            for track in self.song().tracks:
+                if scene_index < len(track.clip_slots) and track.clip_slots[scene_index].has_clip:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _song_is_playing(self):
         try:
             return bool(self.song().is_playing)
@@ -2246,7 +2255,7 @@ class Tap(ControlSurface):
             return self._execute_clip_follow_action(active.get("track_index"), active.get("scene_index"), action)
 
     def _valid_scene_indexes(self):
-        return list(range(len(self.song().scenes)))
+        return [index for index, _ in enumerate(self.song().scenes) if self._scene_has_clip(index)]
 
     def _valid_clip_indexes(self, track_index):
         try:
@@ -2285,7 +2294,10 @@ class Tap(ControlSurface):
         if action_type == "stop":
             self.song().stop_all_clips()
             return
-        target_index = self._pick_index_for_action(self._valid_scene_indexes(), scene_index, action)
+        if action_type == "jump":
+            target_index = action.get("jump_index")
+        else:
+            target_index = self._pick_index_for_action(self._valid_scene_indexes(), scene_index, action)
         if target_index is not None and target_index < len(self.song().scenes):
             self.song().scenes[target_index].fire()
             target_key = self._follow_action_key("scene", None, target_index)
