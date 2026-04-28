@@ -20,7 +20,7 @@ import re
 from itertools import zip_longest
 import time
 
-secret_version_number = 5
+secret_version_number = 6
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
