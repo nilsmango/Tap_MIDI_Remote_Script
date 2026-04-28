@@ -1985,6 +1985,15 @@ class Tap(ControlSurface):
             pass
         return False
 
+    def _scene_is_triggered(self, scene_index):
+        try:
+            for track in self.song().tracks:
+                if scene_index < len(track.clip_slots) and self._clip_slot_is_triggered(track.clip_slots[scene_index]):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _song_is_playing(self):
         try:
             return bool(self.song().is_playing)
@@ -2006,12 +2015,10 @@ class Tap(ControlSurface):
                 self._clear_follow_action_launch_state()
                 return
             self._clear_finished_follow_action_launches()
-            self._activate_follow_actions_for_playing_scenes()
             self._activate_follow_actions_for_playing_clips()
             return
 
         if song_is_playing:
-            self._activate_follow_actions_for_playing_scenes()
             self._activate_follow_actions_for_playing_clips()
 
     def _on_song_is_playing_changed(self):
@@ -2136,6 +2143,7 @@ class Tap(ControlSurface):
             "track_index": None,
             "scene_index": scene_index,
             "started_at": None,
+            "waiting_for_launch": True,
             "executed": False,
         }
         self._send_follow_action_state()
@@ -2153,7 +2161,7 @@ class Tap(ControlSurface):
         changed = False
         active_items = sorted(
             list(self._active_follow_actions.items()),
-            key=lambda item: 0 if item[1].get("target_kind") == "scene" else 1
+            key=lambda item: 1 if item[1].get("target_kind") == "scene" else 0
         )
 
         for key, active in active_items:
@@ -2185,7 +2193,16 @@ class Tap(ControlSurface):
                 base_length = self._clip_slot_length_beats(clip_slot)
             else:
                 if not self._scene_is_playing(scene_index):
+                    if active.get("waiting_for_launch") and self._scene_is_triggered(scene_index):
+                        continue
                     del self._active_follow_actions[key]
+                    changed = True
+                    continue
+                if active.get("waiting_for_launch"):
+                    if self._scene_is_triggered(scene_index):
+                        continue
+                    active["waiting_for_launch"] = False
+                    active["started_at"] = song_time
                     changed = True
                     continue
                 base_length = self._scene_length_beats(scene_index)
@@ -3319,18 +3336,6 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
-    def _activate_follow_actions_for_playing_scenes(self):
-        self._clear_finished_follow_action_launches()
-        try:
-            for scene_index, _ in enumerate(self.song().scenes):
-                key = self._follow_action_key("scene", None, scene_index)
-                if key in self._active_follow_actions:
-                    continue
-                if key in self._follow_action_rules and self._scene_is_playing(scene_index):
-                    self._activate_follow_action_for_scene(scene_index)
-        except Exception:
-            pass
-
     def _clear_finished_follow_action_launches(self):
         for key in list(self._handled_follow_action_launches):
             try:
@@ -3910,6 +3915,7 @@ class Tap(ControlSurface):
         if value < len(scenes):
             scene = scenes[value]
             scene.fire()
+            self._handled_follow_action_launches.discard(self._follow_action_key("scene", None, value))
             self._activate_follow_action_for_scene(value)
 
     def _select_clip_scene(self, value):
