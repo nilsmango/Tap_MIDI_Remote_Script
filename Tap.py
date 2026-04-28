@@ -3748,6 +3748,10 @@ class Tap(ControlSurface):
             self._delete_follow_action_rule(message)
         if len(message) >= 2 and message[1] == 37:
             self._send_follow_action_state(force=True)
+        if len(message) >= 2 and message[1] == 38:
+            values = self.extract_values_from_sysex_message(message)
+            if len(values) == 1:
+                self._stop_track_clips(values[0])
             
 
             
@@ -3790,6 +3794,23 @@ class Tap(ControlSurface):
         else:
             clip_slot.set_fire_button_state(1)
             self._activate_follow_action_for_clip(track_index, clip_index, clip_slot)
+
+    def _stop_track_clips(self, track_index):
+        try:
+            track = self.song().tracks[track_index]
+        except Exception:
+            return
+
+        track.stop_all_clips()
+        keys_to_clear = [
+            key for key, active in self._active_follow_actions.items()
+            if active.get("target_kind") == "clip"
+            and active.get("track_index") == track_index
+        ]
+        for key in keys_to_clear:
+            del self._active_follow_actions[key]
+        if keys_to_clear:
+            self._send_follow_action_state()
 
     def _delete_clip(self, track_index, clip_index):
         track = self.song().tracks[track_index]
