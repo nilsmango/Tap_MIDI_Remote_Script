@@ -114,6 +114,7 @@ class Tap(ControlSurface):
             self._follow_action_track_signature = None
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
+            self._last_song_is_playing = False
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -1582,6 +1583,14 @@ class Tap(ControlSurface):
                 song.add_root_note_listener(self._on_scale_changed)
                 # add song tempo listener
                 song.add_tempo_listener(self._update_tempo)
+                try:
+                    if hasattr(song, 'add_is_playing_listener') and (
+                        not hasattr(song, 'is_playing_has_listener')
+                        or not song.is_playing_has_listener(self._on_song_is_playing_changed)
+                    ):
+                        song.add_is_playing_listener(self._on_song_is_playing_changed)
+                except Exception:
+                    pass
                 # updating tempo
                 self._update_tempo()
                 # rest
@@ -1596,6 +1605,14 @@ class Tap(ControlSurface):
                self._on_tracks_changed()
                self.song_instance = current_song
                current_song.add_tempo_listener(self._update_tempo)
+               try:
+                   if hasattr(current_song, 'add_is_playing_listener') and (
+                       not hasattr(current_song, 'is_playing_has_listener')
+                       or not current_song.is_playing_has_listener(self._on_song_is_playing_changed)
+                   ):
+                       current_song.add_is_playing_listener(self._on_song_is_playing_changed)
+               except Exception:
+                   pass
                self._update_tempo()
 
     def _send_project(self, value):
@@ -1612,6 +1629,7 @@ class Tap(ControlSurface):
 
     def _periodic_check(self):
         self._reconcile_follow_action_rules()
+        self._sync_follow_actions_to_transport()
         self._evaluate_follow_actions()
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
@@ -1966,6 +1984,38 @@ class Tap(ControlSurface):
         except Exception:
             pass
         return False
+
+    def _song_is_playing(self):
+        try:
+            return bool(self.song().is_playing)
+        except Exception:
+            return False
+
+    def _clear_follow_action_launch_state(self):
+        changed = bool(self._active_follow_actions or self._handled_follow_action_launches)
+        self._active_follow_actions = {}
+        self._handled_follow_action_launches = set()
+        if changed:
+            self._send_follow_action_state()
+
+    def _sync_follow_actions_to_transport(self):
+        song_is_playing = self._song_is_playing()
+        if song_is_playing != self._last_song_is_playing:
+            self._last_song_is_playing = song_is_playing
+            if not song_is_playing:
+                self._clear_follow_action_launch_state()
+                return
+            self._clear_finished_follow_action_launches()
+            self._activate_follow_actions_for_playing_scenes()
+            self._activate_follow_actions_for_playing_clips()
+            return
+
+        if song_is_playing:
+            self._activate_follow_actions_for_playing_scenes()
+            self._activate_follow_actions_for_playing_clips()
+
+    def _on_song_is_playing_changed(self):
+        self._sync_follow_actions_to_transport()
 
     def _normalize_follow_action(self, action_name):
         action = str(action_name or "").strip().lower().replace(" ", "_").replace("-", "_")
@@ -3266,6 +3316,18 @@ class Tap(ControlSurface):
                         continue
                     if key in self._follow_action_rules:
                         self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
+        except Exception:
+            pass
+
+    def _activate_follow_actions_for_playing_scenes(self):
+        self._clear_finished_follow_action_launches()
+        try:
+            for scene_index, _ in enumerate(self.song().scenes):
+                key = self._follow_action_key("scene", None, scene_index)
+                if key in self._active_follow_actions:
+                    continue
+                if key in self._follow_action_rules and self._scene_is_playing(scene_index):
+                    self._activate_follow_action_for_scene(scene_index)
         except Exception:
             pass
 
@@ -4676,6 +4738,14 @@ class Tap(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
+        try:
+            if hasattr(song, 'remove_is_playing_listener') and (
+                not hasattr(song, 'is_playing_has_listener')
+                or song.is_playing_has_listener(self._on_song_is_playing_changed)
+            ):
+                song.remove_is_playing_listener(self._on_song_is_playing_changed)
+        except Exception:
+            pass
         # Clean up level listeners
         for track, (left_listener, right_listener) in self._track_level_listeners.items():
             if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
