@@ -1587,7 +1587,7 @@ class Tap(ControlSurface):
                 # rest
                 self._setup_device_control()
                 self._register_clip_listeners()
-                self._load_follow_actions_from_names(force_send=True)
+                self._send_current_project_state()
                 self.periodic_timer = 1
                 self._periodic_execution()
             
@@ -1642,11 +1642,25 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
+    def _send_selected_device_state(self):
+        try:
+            selected_track = self.song().view.selected_track
+            selected_device = selected_track.view.selected_device if selected_track else None
+            if hasattr(self, "_device") and hasattr(self._device, "set_device"):
+                self._device.set_device(selected_device)
+            if selected_device:
+                self._clear_cached_metadata(selected_device)
+            self._last_automation_signature = None
+            self._on_device_changed()
+        except Exception:
+            pass
+
     def _send_current_project_state(self):
         self.old_clips_array = []
         self._update_tempo()
         self._update_mixer_and_tracks()
         self._send_selected_track_state()
+        self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
 
