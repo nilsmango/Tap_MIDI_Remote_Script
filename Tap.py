@@ -16,6 +16,7 @@ from Live.Clip import MidiNoteSpecification
 
 import threading
 import random
+import re
 from itertools import zip_longest
 import time
 
@@ -30,6 +31,7 @@ swing_amount_value = 0.0
 class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
+    FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
@@ -1596,6 +1598,7 @@ class Tap(ControlSurface):
                 # rest
                 self._setup_device_control()
                 self._register_clip_listeners()
+                self._load_follow_actions_from_names(force_send=True)
                 self.periodic_timer = 1
                 self._periodic_execution()
             
@@ -1604,6 +1607,7 @@ class Tap(ControlSurface):
             if current_song != self.song_instance:
                self._on_tracks_changed()
                self.song_instance = current_song
+               self._load_follow_actions_from_names(force_send=True)
                current_song.add_tempo_listener(self._update_tempo)
                try:
                    if hasattr(current_song, 'add_is_playing_listener') and (
@@ -1618,6 +1622,7 @@ class Tap(ControlSurface):
     def _send_project(self, value):
         if value:
             self.old_clips_array = []
+            self._load_follow_actions_from_names(force_send=True)
             self._update_mixer_and_tracks()
             self._update_clip_slots()
     
@@ -1678,6 +1683,7 @@ class Tap(ControlSurface):
 
         if remove_source and source_key in self._follow_action_rules:
             del self._follow_action_rules[source_key]
+            self._remove_follow_action_rule_from_name("clip", from_track, from_clip)
             self._handled_follow_action_launches.discard(source_key)
             self._follow_action_missing_clip_counts.pop(source_key, None)
 
@@ -1687,11 +1693,13 @@ class Tap(ControlSurface):
 
         dest_key = self._follow_action_key("clip", to_track, to_clip)
         self._follow_action_rules[dest_key] = new_rule
+        self._save_follow_action_rule_to_name(new_rule)
 
     def _remove_clip_follow_action_rule(self, track_index, scene_index):
         key, _ = self._find_clip_follow_action_rule(track_index, scene_index)
         if key and key in self._follow_action_rules:
             del self._follow_action_rules[key]
+        self._remove_follow_action_rule_from_name("clip", track_index, scene_index)
         if key in self._active_follow_actions:
             del self._active_follow_actions[key]
         self._handled_follow_action_launches.discard(key)
@@ -1764,6 +1772,7 @@ class Tap(ControlSurface):
             new_rule = dict(scene_rule)
             new_rule["scene_index"] = dest_scene_index
             self._follow_action_rules[self._follow_action_key("scene", None, dest_scene_index)] = new_rule
+            self._save_follow_action_rule_to_name(new_rule)
 
         try:
             for track_index, track in enumerate(self.song().tracks):
@@ -1912,7 +1921,12 @@ class Tap(ControlSurface):
             return
 
         if not set(previous_signature).intersection(set(current_signature)):
-            self._reset_follow_action_state()
+            self._follow_action_rules = {}
+            self._active_follow_actions = {}
+            self._handled_follow_action_launches = set()
+            self._follow_action_missing_clip_counts = {}
+            self._last_follow_action_state = None
+            self._load_follow_actions_from_names(force_send=True)
             return
 
         self._remap_follow_actions_to_track_signature(previous_signature, current_signature)
@@ -2049,6 +2063,126 @@ class Tap(ControlSurface):
             return message[3:-1]
         return message[2:-1]
 
+    def _strip_follow_action_name_marker(self, name):
+        return self.FOLLOW_ACTION_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
+
+    def _follow_action_name_payload(self, rule):
+        action_a, action_b = rule.get("actions", ({}, {}))
+        return "|".join([
+            str(max(1, int(rule.get("play_count", 1)))),
+            str(max(0, min(100, int(rule.get("chance_a", 100))))),
+            self._normalize_follow_action(action_a.get("type", "")),
+            "" if action_a.get("jump_index") is None else str(int(action_a.get("jump_index"))),
+            self._normalize_follow_action(action_b.get("type", "")),
+            "" if action_b.get("jump_index") is None else str(int(action_b.get("jump_index"))),
+        ])
+
+    def _follow_action_marker_for_rule(self, rule):
+        return "[TapFA:v1|{}]".format(self._follow_action_name_payload(rule))
+
+    def _decode_follow_action_name_payload(self, payload, target_kind, track_index, scene_index):
+        fields = str(payload or "").split("|")
+        if len(fields) != 6:
+            return None
+
+        try:
+            play_count = max(1, int(fields[0]))
+            chance_a = max(0, min(100, int(fields[1])))
+            action_a = self._normalize_follow_action(fields[2])
+            jump_a = int(fields[3]) if fields[3] != "" else None
+            action_b = self._normalize_follow_action(fields[4])
+            jump_b = int(fields[5]) if fields[5] != "" else None
+        except Exception:
+            return None
+
+        return {
+            "target_kind": target_kind,
+            "track_index": track_index,
+            "scene_index": scene_index,
+            "play_count": play_count,
+            "chance_a": chance_a,
+            "actions": (
+                {"type": action_a, "jump_index": jump_a},
+                {"type": action_b, "jump_index": jump_b},
+            ),
+        }
+
+    def _follow_action_rule_from_name(self, name, target_kind, track_index, scene_index):
+        matches = self.FOLLOW_ACTION_NAME_MARKER_RE.findall(str(name or ""))
+        if not matches:
+            return None
+        return self._decode_follow_action_name_payload(matches[-1], target_kind, track_index, scene_index)
+
+    def _follow_action_name_target(self, target_kind, track_index, scene_index):
+        try:
+            if target_kind == "clip":
+                clip_slot = self.song().tracks[track_index].clip_slots[scene_index]
+                if clip_slot.has_clip:
+                    return clip_slot.clip
+                return None
+            if target_kind == "scene":
+                return self.song().scenes[scene_index]
+        except Exception:
+            return None
+        return None
+
+    def _save_follow_action_rule_to_name(self, rule):
+        target = self._follow_action_name_target(
+            rule.get("target_kind"),
+            rule.get("track_index"),
+            rule.get("scene_index")
+        )
+        if target is None or not hasattr(target, "name"):
+            return
+
+        try:
+            clean_name = self._strip_follow_action_name_marker(target.name)
+            marker = self._follow_action_marker_for_rule(rule)
+            new_name = "{} {}".format(clean_name, marker).strip() if clean_name else marker
+            if target.name != new_name:
+                target.name = new_name
+        except Exception:
+            pass
+
+    def _remove_follow_action_rule_from_name(self, target_kind, track_index, scene_index):
+        target = self._follow_action_name_target(target_kind, track_index, scene_index)
+        if target is None or not hasattr(target, "name"):
+            return
+
+        try:
+            clean_name = self._strip_follow_action_name_marker(target.name)
+            if target.name != clean_name:
+                target.name = clean_name
+        except Exception:
+            pass
+
+    def _load_follow_actions_from_names(self, force_send=False):
+        loaded_rules = {}
+
+        try:
+            for scene_index, scene in enumerate(self.song().scenes):
+                rule = self._follow_action_rule_from_name(scene.name, "scene", None, scene_index)
+                if rule:
+                    loaded_rules[self._follow_action_key("scene", None, scene_index)] = rule
+
+            for track_index, track in enumerate(self.song().tracks):
+                for scene_index, clip_slot in enumerate(track.clip_slots):
+                    if not clip_slot.has_clip:
+                        continue
+                    rule = self._follow_action_rule_from_name(clip_slot.clip.name, "clip", track_index, scene_index)
+                    if rule:
+                        loaded_rules[self._follow_action_key("clip", track_index, scene_index)] = rule
+        except Exception:
+            return
+
+        if force_send or loaded_rules != self._follow_action_rules:
+            self._follow_action_rules = loaded_rules
+            self._active_follow_actions = {}
+            self._handled_follow_action_launches = set()
+            self._follow_action_missing_clip_counts = {}
+            self._last_follow_action_state = None
+            self._send_follow_action_state(force=True)
+
     def _decode_follow_action_rule(self, message):
         try:
             raw_payload = bytes(self._follow_action_payload_bytes(message)).decode("ascii")
@@ -2093,6 +2227,7 @@ class Tap(ControlSurface):
             return
         key = self._follow_action_key(rule["target_kind"], rule.get("track_index"), rule["scene_index"])
         self._follow_action_rules[key] = rule
+        self._save_follow_action_rule_to_name(rule)
         self._send_follow_action_state()
 
     def _delete_follow_action_rule(self, message):
@@ -2105,6 +2240,7 @@ class Tap(ControlSurface):
             key = self._follow_action_key(target_kind, track_index, scene_index)
             if key in self._follow_action_rules:
                 del self._follow_action_rules[key]
+            self._remove_follow_action_rule_from_name(target_kind, track_index, scene_index)
             if key in self._active_follow_actions:
                 del self._active_follow_actions[key]
             self._handled_follow_action_launches.discard(key)
