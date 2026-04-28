@@ -1561,6 +1561,7 @@ class Tap(ControlSurface):
             # send midi note on channel 3, note number 1 to confirm handshake
             midi_event_bytes = (0x90 | 0x03, 0x01, secret_version_number)
             self._send_midi(midi_event_bytes)
+            was_initialized = self.was_initialized
             
             # initializing everything else if this is not just the handshake
             if self.was_initialized is False:
@@ -1579,20 +1580,8 @@ class Tap(ControlSurface):
                 self._on_scale_changed()
                 # track = self.song().view.selected_track
                 # track.view.add_selected_device_listener(self._on_selected_device_changed)
-                song.add_tracks_listener(self._on_tracks_changed)  # hier für return tracks: .add_return_tracks_listener()
                 # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
-                song.add_scale_name_listener(self._on_scale_changed)
-                song.add_root_note_listener(self._on_scale_changed)
-                # add song tempo listener
-                song.add_tempo_listener(self._update_tempo)
-                try:
-                    if hasattr(song, 'add_is_playing_listener') and (
-                        not hasattr(song, 'is_playing_has_listener')
-                        or not song.is_playing_has_listener(self._on_song_is_playing_changed)
-                    ):
-                        song.add_is_playing_listener(self._on_song_is_playing_changed)
-                except Exception:
-                    pass
+                self._ensure_song_listeners(song)
                 # updating tempo
                 self._update_tempo()
                 # rest
@@ -1603,28 +1592,13 @@ class Tap(ControlSurface):
                 self._periodic_execution()
             
             # hack to get new tracks if we have a new song.
-            current_song = self.song()
-            if current_song != self.song_instance:
-               self._on_tracks_changed()
-               self.song_instance = current_song
-               self._load_follow_actions_from_names(force_send=True)
-               current_song.add_tempo_listener(self._update_tempo)
-               try:
-                   if hasattr(current_song, 'add_is_playing_listener') and (
-                       not hasattr(current_song, 'is_playing_has_listener')
-                       or not current_song.is_playing_has_listener(self._on_song_is_playing_changed)
-                   ):
-                       current_song.add_is_playing_listener(self._on_song_is_playing_changed)
-               except Exception:
-                   pass
-               self._update_tempo()
+            did_send_new_song = self._check_for_new_song()
+            if was_initialized and not did_send_new_song:
+                self._send_current_project_state()
 
     def _send_project(self, value):
         if value:
-            self.old_clips_array = []
-            self._load_follow_actions_from_names(force_send=True)
-            self._update_mixer_and_tracks()
-            self._update_clip_slots()
+            self._send_current_project_state()
     
     def _periodic_execution(self):
         self._periodic_check()
@@ -1633,6 +1607,7 @@ class Tap(ControlSurface):
             self._periodic_timer_ref.start()
 
     def _periodic_check(self):
+        self._check_for_new_song()
         self._reconcile_follow_action_rules()
         self._sync_follow_actions_to_transport()
         self._evaluate_follow_actions()
@@ -1641,6 +1616,62 @@ class Tap(ControlSurface):
         # meaning not in the device view
         if self.device_status is False:
             self._update_clip_slots()
+
+    def _ensure_song_listener(self, song, listener_name, listener):
+        try:
+            has_listener = getattr(song, "{}_has_listener".format(listener_name), None)
+            add_listener = getattr(song, "add_{}_listener".format(listener_name), None)
+            if add_listener and (not has_listener or not has_listener(listener)):
+                add_listener(listener)
+        except Exception:
+            pass
+
+    def _ensure_song_listeners(self, song):
+        self._ensure_song_listener(song, "tracks", self._on_tracks_changed)
+        self._ensure_song_listener(song, "scale_name", self._on_scale_changed)
+        self._ensure_song_listener(song, "root_note", self._on_scale_changed)
+        self._ensure_song_listener(song, "tempo", self._update_tempo)
+        self._ensure_song_listener(song, "is_playing", self._on_song_is_playing_changed)
+
+    def _send_selected_track_state(self):
+        try:
+            selected_track = self.song().view.selected_track
+            self._send_selected_track_index(selected_track)
+            track_has_midi_input = 1 if selected_track and selected_track.has_midi_input else 0
+            self._send_sys_ex_message(str(track_has_midi_input), 0x0B)
+        except Exception:
+            pass
+
+    def _send_current_project_state(self):
+        self.old_clips_array = []
+        self._update_tempo()
+        self._update_mixer_and_tracks()
+        self._send_selected_track_state()
+        self._load_follow_actions_from_names(force_send=True)
+        self._update_clip_slots()
+
+    def _check_for_new_song(self):
+        if not self.was_initialized:
+            return False
+        current_song = self.song()
+        if current_song == self.song_instance:
+            return False
+
+        self.song_instance = current_song
+        self._track_list_signature = None
+        self._follow_action_track_signature = self._track_signature(current_song.tracks)
+        self._follow_action_rules = {}
+        self._active_follow_actions = {}
+        self._handled_follow_action_launches = set()
+        self._follow_action_missing_clip_counts = {}
+        self._last_follow_action_state = None
+        self._ensure_song_listeners(current_song)
+        self._on_selected_track_changed.subject = current_song.view
+        self._update_tempo()
+        self._on_scale_changed()
+        self._register_clip_listeners()
+        self._send_current_project_state()
+        return True
 
     def _follow_action_key(self, target_kind, track_index, scene_index):
         if target_kind == "clip":
