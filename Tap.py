@@ -117,6 +117,12 @@ class Tap(ControlSurface):
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
             self._last_song_is_playing = False
+            self._follow_action_scene_triggered_listeners = {}
+            self._follow_action_clip_slot_runtime_listeners = {}
+            self._follow_action_scene_name_listeners = {}
+            self._follow_action_clip_name_listeners = {}
+            self._follow_action_clip_has_clip_listeners = {}
+            self._follow_action_song_listener_subject = None
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -125,6 +131,7 @@ class Tap(ControlSurface):
             self._track_list_signature = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
+            self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
@@ -136,6 +143,11 @@ class Tap(ControlSurface):
             self.song_instance = self.song()
             
             self._last_playing_pos_sent = 0.0
+            self._ensure_follow_action_song_listeners(self.song_instance)
+            self._sync_follow_action_name_listeners()
+            self._load_follow_actions_from_names(force_send=True)
+            self._sync_follow_action_runtime_listeners()
+            self._start_periodic_execution()
 
     def _setup_device_control(self):
         self._device = DeviceComponent()
@@ -1588,8 +1600,7 @@ class Tap(ControlSurface):
                 self._setup_device_control()
                 self._register_clip_listeners()
                 self._send_current_project_state()
-                self.periodic_timer = 1
-                self._periodic_execution()
+                self._start_periodic_execution()
             
             # hack to get new tracks if we have a new song.
             did_send_new_song = self._check_for_new_song()
@@ -1599,6 +1610,11 @@ class Tap(ControlSurface):
     def _send_project(self, value):
         if value:
             self._send_current_project_state()
+
+    def _start_periodic_execution(self):
+        self.periodic_timer = 1
+        if self._periodic_timer_ref is None or not self._periodic_timer_ref.is_alive():
+            self._periodic_execution()
     
     def _periodic_execution(self):
         self._periodic_check()
@@ -1607,10 +1623,17 @@ class Tap(ControlSurface):
             self._periodic_timer_ref.start()
 
     def _periodic_check(self):
-        self._check_for_new_song()
+        if self.was_initialized:
+            self._check_for_new_song()
+        else:
+            self._check_for_follow_action_song_change()
+        self._sync_follow_actions_to_track_topology()
         self._reconcile_follow_action_rules()
+        self._sync_follow_action_runtime_listeners()
         self._sync_follow_actions_to_transport()
         self._evaluate_follow_actions()
+        if not self.was_initialized:
+            return
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
@@ -1632,6 +1655,40 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
         self._ensure_song_listener(song, "is_playing", self._on_song_is_playing_changed)
+
+    def _remove_song_listener(self, song, listener_name, listener):
+        try:
+            has_listener = getattr(song, "{}_has_listener".format(listener_name), None)
+            remove_listener = getattr(song, "remove_{}_listener".format(listener_name), None)
+            if remove_listener and (not has_listener or has_listener(listener)):
+                remove_listener(listener)
+        except Exception:
+            pass
+
+    def _ensure_follow_action_song_listeners(self, song):
+        if self._follow_action_song_listener_subject is not None and self._follow_action_song_listener_subject != song:
+            self._remove_follow_action_song_listeners()
+        self._follow_action_song_listener_subject = song
+        self._ensure_song_listener(song, "tracks", self._on_follow_action_topology_changed)
+        self._ensure_song_listener(song, "scenes", self._on_follow_action_topology_changed)
+
+    def _remove_follow_action_song_listeners(self):
+        song = self._follow_action_song_listener_subject
+        if song is None:
+            return
+        self._remove_song_listener(song, "tracks", self._on_follow_action_topology_changed)
+        self._remove_song_listener(song, "scenes", self._on_follow_action_topology_changed)
+        self._follow_action_song_listener_subject = None
+
+    def _on_follow_action_topology_changed(self):
+        self._sync_follow_actions_to_track_topology()
+        self._sync_follow_action_name_listeners()
+        self._load_follow_actions_from_names()
+        self._sync_follow_action_runtime_listeners()
+
+    def _on_follow_action_name_changed(self):
+        self._load_follow_actions_from_names()
+        self._sync_follow_action_runtime_listeners()
 
     def _send_selected_track_state(self):
         try:
@@ -1679,12 +1736,35 @@ class Tap(ControlSurface):
         self._handled_follow_action_launches = set()
         self._follow_action_missing_clip_counts = {}
         self._last_follow_action_state = None
+        self._remove_follow_action_runtime_listeners()
+        self._remove_follow_action_name_listeners()
+        self._ensure_follow_action_song_listeners(current_song)
         self._ensure_song_listeners(current_song)
         self._on_selected_track_changed.subject = current_song.view
         self._update_tempo()
         self._on_scale_changed()
         self._register_clip_listeners()
         self._send_current_project_state()
+        return True
+
+    def _check_for_follow_action_song_change(self):
+        current_song = self.song()
+        if current_song == self.song_instance:
+            return False
+
+        self.song_instance = current_song
+        self._follow_action_track_signature = self._track_signature(current_song.tracks)
+        self._follow_action_rules = {}
+        self._active_follow_actions = {}
+        self._handled_follow_action_launches = set()
+        self._follow_action_missing_clip_counts = {}
+        self._last_follow_action_state = None
+        self._remove_follow_action_runtime_listeners()
+        self._remove_follow_action_name_listeners()
+        self._ensure_follow_action_song_listeners(current_song)
+        self._sync_follow_action_name_listeners()
+        self._load_follow_actions_from_names(force_send=True)
+        self._sync_follow_action_runtime_listeners()
         return True
 
     def _follow_action_key(self, target_kind, track_index, scene_index):
@@ -2053,6 +2133,28 @@ class Tap(ControlSurface):
             pass
         return False
 
+    def _scene_object_is_triggered(self, scene):
+        try:
+            return bool(scene and scene.is_triggered)
+        except Exception:
+            return False
+
+    def _scene_is_launched(self, scene_index):
+        has_clip = False
+        try:
+            for track in self.song().tracks:
+                if scene_index >= len(track.clip_slots):
+                    continue
+                clip_slot = track.clip_slots[scene_index]
+                if not clip_slot.has_clip:
+                    continue
+                has_clip = True
+                if not clip_slot.is_playing and not self._clip_slot_is_triggered(clip_slot):
+                    return False
+        except Exception:
+            return False
+        return has_clip
+
     def _scene_has_clip(self, scene_index):
         try:
             for track in self.song().tracks:
@@ -2085,9 +2187,6 @@ class Tap(ControlSurface):
             self._clear_finished_follow_action_launches()
             self._activate_follow_actions_for_playing_clips()
             return
-
-        if song_is_playing:
-            self._activate_follow_actions_for_playing_clips()
 
     def _on_song_is_playing_changed(self):
         self._sync_follow_actions_to_transport()
@@ -2541,6 +2640,8 @@ class Tap(ControlSurface):
         payload = ";".join(rules)
         if force or payload != self._last_follow_action_state:
             self._last_follow_action_state = payload
+            if not self.was_initialized:
+                return
             self._send_sys_ex_message(payload, 0x18)
 
     def _reconcile_follow_action_rules(self, force=False, remove_missing_clips=True):
@@ -3528,6 +3629,240 @@ class Tap(ControlSurface):
                         self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
         except Exception:
             pass
+
+    def _make_follow_action_scene_triggered_listener(self, scene_index):
+        def listener():
+            try:
+                key = self._follow_action_key("scene", None, scene_index)
+                if key not in self._follow_action_rules:
+                    return
+                scene = self.song().scenes[scene_index]
+                if self._scene_object_is_triggered(scene) or self._scene_is_launched(scene_index):
+                    self._activate_follow_action_for_scene(scene_index)
+            except Exception:
+                pass
+        return listener
+
+    def _make_follow_action_clip_slot_listener(self, track_index, scene_index, clip_slot):
+        def listener():
+            try:
+                key = self._follow_action_key("clip", track_index, scene_index)
+                if key not in self._follow_action_rules:
+                    return
+                if clip_slot.has_clip and (clip_slot.is_playing or self._clip_slot_is_triggered(clip_slot)):
+                    self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
+            except Exception:
+                pass
+        return listener
+
+    def _make_follow_action_name_listener(self):
+        def listener():
+            self._on_follow_action_name_changed()
+        return listener
+
+    def _make_follow_action_clip_has_clip_listener(self):
+        def listener():
+            self._sync_follow_action_name_listeners()
+            self._load_follow_actions_from_names()
+            self._sync_follow_action_runtime_listeners()
+        return listener
+
+    def _remove_named_object_listener(self, listener_map, key):
+        listener_info = listener_map.pop(key, None)
+        if not listener_info:
+            return
+        named_object, listener = listener_info
+        try:
+            remove_listener = getattr(named_object, "remove_name_listener", None)
+            has_listener = getattr(named_object, "name_has_listener", None)
+            if remove_listener and (not has_listener or has_listener(listener)):
+                remove_listener(listener)
+        except Exception:
+            pass
+
+    def _remove_follow_action_clip_has_clip_listener(self, key):
+        listener_info = self._follow_action_clip_has_clip_listeners.pop(key, None)
+        if not listener_info:
+            return
+        clip_slot, listener = listener_info
+        try:
+            remove_listener = getattr(clip_slot, "remove_has_clip_listener", None)
+            has_listener = getattr(clip_slot, "has_clip_has_listener", None)
+            if remove_listener and (not has_listener or has_listener(listener)):
+                remove_listener(listener)
+        except Exception:
+            pass
+
+    def _sync_follow_action_name_listeners(self):
+        expected_scene_keys = set()
+        expected_clip_keys = set()
+        expected_clip_slot_keys = set()
+
+        try:
+            scenes = self.song().scenes
+            for scene in scenes:
+                key = self._live_object_identity(scene)
+                expected_scene_keys.add(key)
+                existing = self._follow_action_scene_name_listeners.get(key)
+                if existing and existing[0] is scene:
+                    continue
+                self._remove_named_object_listener(self._follow_action_scene_name_listeners, key)
+                try:
+                    listener = self._make_follow_action_name_listener()
+                    add_listener = getattr(scene, "add_name_listener", None)
+                    has_listener = getattr(scene, "name_has_listener", None)
+                    if add_listener and (not has_listener or not has_listener(listener)):
+                        add_listener(listener)
+                    self._follow_action_scene_name_listeners[key] = (scene, listener)
+                except Exception:
+                    pass
+
+            for track in self.song().tracks:
+                for clip_slot in track.clip_slots:
+                    slot_key = self._live_object_identity(clip_slot)
+                    expected_clip_slot_keys.add(slot_key)
+                    existing_slot = self._follow_action_clip_has_clip_listeners.get(slot_key)
+                    if not existing_slot or existing_slot[0] is not clip_slot:
+                        self._remove_follow_action_clip_has_clip_listener(slot_key)
+                        try:
+                            listener = self._make_follow_action_clip_has_clip_listener()
+                            add_listener = getattr(clip_slot, "add_has_clip_listener", None)
+                            has_listener = getattr(clip_slot, "has_clip_has_listener", None)
+                            if add_listener and (not has_listener or not has_listener(listener)):
+                                add_listener(listener)
+                            self._follow_action_clip_has_clip_listeners[slot_key] = (clip_slot, listener)
+                        except Exception:
+                            pass
+
+                    if not clip_slot.has_clip:
+                        continue
+                    clip = clip_slot.clip
+                    clip_key = self._live_object_identity(clip)
+                    expected_clip_keys.add(clip_key)
+                    existing_clip = self._follow_action_clip_name_listeners.get(clip_key)
+                    if existing_clip and existing_clip[0] is clip:
+                        continue
+                    self._remove_named_object_listener(self._follow_action_clip_name_listeners, clip_key)
+                    try:
+                        listener = self._make_follow_action_name_listener()
+                        add_listener = getattr(clip, "add_name_listener", None)
+                        has_listener = getattr(clip, "name_has_listener", None)
+                        if add_listener and (not has_listener or not has_listener(listener)):
+                            add_listener(listener)
+                        self._follow_action_clip_name_listeners[clip_key] = (clip, listener)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        for key in list(self._follow_action_scene_name_listeners.keys()):
+            if key not in expected_scene_keys:
+                self._remove_named_object_listener(self._follow_action_scene_name_listeners, key)
+        for key in list(self._follow_action_clip_name_listeners.keys()):
+            if key not in expected_clip_keys:
+                self._remove_named_object_listener(self._follow_action_clip_name_listeners, key)
+        for key in list(self._follow_action_clip_has_clip_listeners.keys()):
+            if key not in expected_clip_slot_keys:
+                self._remove_follow_action_clip_has_clip_listener(key)
+
+    def _remove_follow_action_name_listeners(self):
+        for key in list(self._follow_action_scene_name_listeners.keys()):
+            self._remove_named_object_listener(self._follow_action_scene_name_listeners, key)
+        for key in list(self._follow_action_clip_name_listeners.keys()):
+            self._remove_named_object_listener(self._follow_action_clip_name_listeners, key)
+        for key in list(self._follow_action_clip_has_clip_listeners.keys()):
+            self._remove_follow_action_clip_has_clip_listener(key)
+
+    def _remove_follow_action_scene_listener(self, key):
+        listener_info = self._follow_action_scene_triggered_listeners.pop(key, None)
+        if not listener_info:
+            return
+        scene, listener = listener_info
+        try:
+            remove_listener = getattr(scene, "remove_is_triggered_listener", None)
+            has_listener = getattr(scene, "is_triggered_has_listener", None)
+            if remove_listener and (not has_listener or has_listener(listener)):
+                remove_listener(listener)
+        except Exception:
+            pass
+
+    def _remove_follow_action_clip_slot_listeners(self, key):
+        listener_info = self._follow_action_clip_slot_runtime_listeners.pop(key, None)
+        if not listener_info:
+            return
+        clip_slot, triggered_listener, playing_listener = listener_info
+        try:
+            remove_listener = getattr(clip_slot, "remove_is_triggered_listener", None)
+            has_listener = getattr(clip_slot, "is_triggered_has_listener", None)
+            if remove_listener and (not has_listener or has_listener(triggered_listener)):
+                remove_listener(triggered_listener)
+        except Exception:
+            pass
+        try:
+            remove_listener = getattr(clip_slot, "remove_is_playing_listener", None)
+            has_listener = getattr(clip_slot, "is_playing_has_listener", None)
+            if remove_listener and (not has_listener or has_listener(playing_listener)):
+                remove_listener(playing_listener)
+        except Exception:
+            pass
+
+    def _sync_follow_action_runtime_listeners(self):
+        expected_scene_keys = set()
+        expected_clip_keys = set()
+
+        for key, rule in self._follow_action_rules.items():
+            target_kind = rule.get("target_kind")
+            scene_index = rule.get("scene_index")
+
+            if target_kind == "scene":
+                expected_scene_keys.add(key)
+                try:
+                    scene = self.song().scenes[scene_index]
+                except Exception:
+                    continue
+                existing = self._follow_action_scene_triggered_listeners.get(key)
+                if existing and existing[0] is scene:
+                    continue
+                self._remove_follow_action_scene_listener(key)
+                try:
+                    listener = self._make_follow_action_scene_triggered_listener(scene_index)
+                    scene.add_is_triggered_listener(listener)
+                    self._follow_action_scene_triggered_listeners[key] = (scene, listener)
+                except Exception:
+                    pass
+
+            elif target_kind == "clip":
+                track_index = rule.get("track_index")
+                expected_clip_keys.add(key)
+                try:
+                    clip_slot = self.song().tracks[track_index].clip_slots[scene_index]
+                except Exception:
+                    continue
+                existing = self._follow_action_clip_slot_runtime_listeners.get(key)
+                if existing and existing[0] is clip_slot:
+                    continue
+                self._remove_follow_action_clip_slot_listeners(key)
+                try:
+                    triggered_listener = self._make_follow_action_clip_slot_listener(track_index, scene_index, clip_slot)
+                    playing_listener = self._make_follow_action_clip_slot_listener(track_index, scene_index, clip_slot)
+                    clip_slot.add_is_triggered_listener(triggered_listener)
+                    clip_slot.add_is_playing_listener(playing_listener)
+                    self._follow_action_clip_slot_runtime_listeners[key] = (clip_slot, triggered_listener, playing_listener)
+                except Exception:
+                    pass
+
+        for key in list(self._follow_action_scene_triggered_listeners.keys()):
+            if key not in expected_scene_keys:
+                self._remove_follow_action_scene_listener(key)
+        for key in list(self._follow_action_clip_slot_runtime_listeners.keys()):
+            if key not in expected_clip_keys:
+                self._remove_follow_action_clip_slot_listeners(key)
+
+    def _remove_follow_action_runtime_listeners(self):
+        for key in list(self._follow_action_scene_triggered_listeners.keys()):
+            self._remove_follow_action_scene_listener(key)
+        for key in list(self._follow_action_clip_slot_runtime_listeners.keys()):
+            self._remove_follow_action_clip_slot_listeners(key)
 
     def _clear_finished_follow_action_launches(self):
         for key in list(self._handled_follow_action_launches):
@@ -4917,6 +5252,9 @@ class Tap(ControlSurface):
         if hasattr(self, '_periodic_timer_ref') and self._periodic_timer_ref:
             self._periodic_timer_ref.cancel()
             self._periodic_timer_ref = None
+        self._remove_follow_action_runtime_listeners()
+        self._remove_follow_action_name_listeners()
+        self._remove_follow_action_song_listeners()
         
         # Stop periodic execution
         self.periodic_timer = 0
