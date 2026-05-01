@@ -114,6 +114,9 @@ class Tap(ControlSurface):
             self._active_follow_actions = {}
             self._handled_follow_action_launches = set()
             self._active_high_resolution_gestures = set()
+            self._parameter_value_listeners = {}
+            self._last_sent_parameter_displays = {}
+            self._last_sent_parameter_cc_values = {}
             self._follow_action_track_signature = None
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
@@ -179,11 +182,13 @@ class Tap(ControlSurface):
     def _connect_device_controls(self):
         if hasattr(self, '_device_controls'):
             self._device.set_parameter_controls(self._device_controls)
+        self._refresh_parameter_value_listeners_current_bank()
         self._readd_disabled_parameter_listeners()
     
     def _disconnect_device_controls(self):
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
+        self._remove_parameter_value_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
 
@@ -200,6 +205,60 @@ class Tap(ControlSurface):
             return mapped_parameter if mapped_parameter and liveobj_valid(mapped_parameter) else None
         except Exception:
             return None
+
+    def _parameter_normalized_value(self, device_param):
+        try:
+            if not device_param or not hasattr(device_param, 'value') or not hasattr(device_param, 'min') or not hasattr(device_param, 'max'):
+                return 0.0
+            min_val = device_param.min
+            max_val = device_param.max
+            if max_val == min_val:
+                return 0.0
+            normalized = (device_param.value - min_val) / (max_val - min_val)
+            return max(0.0, min(1.0, normalized))
+        except Exception:
+            return 0.0
+
+    def _parameter_display_value(self, device_param):
+        try:
+            if device_param and hasattr(device_param, 'str_for_value') and hasattr(device_param, 'value'):
+                return device_param.str_for_value(device_param.value).replace('∞', 'Inf')
+        except Exception:
+            pass
+        try:
+            return str(device_param.value).replace('∞', 'Inf')
+        except Exception:
+            return ""
+
+    def _send_parameter_display_value(self, control_index, device_param, force=False):
+        if not device_param or not liveobj_valid(device_param):
+            return
+
+        display_value = self._parameter_display_value(device_param)
+        normalized_value = self._parameter_normalized_value(device_param)
+
+        if not force and self._last_sent_parameter_displays.get(control_index) == display_value:
+            return
+
+        payload = "{}|{}|{}".format(
+            control_index,
+            round(normalized_value, 6),
+            self._escape_sysex_string(display_value)
+        )
+        self._send_sys_ex_message(payload, 0x28)
+        self._last_sent_parameter_displays[control_index] = display_value
+
+    def _send_parameter_feedback(self, control_index, device_param, send_cc=True, force_display=False):
+        if not device_param or not liveobj_valid(device_param):
+            return
+
+        if send_cc:
+            cc_value = self._parameter_value_to_cc(device_param)
+            if self._last_sent_parameter_cc_values.get(control_index) != cc_value:
+                self.send_cc(72 + control_index, 8, cc_value)
+                self._last_sent_parameter_cc_values[control_index] = cc_value
+
+        self._send_parameter_display_value(control_index, device_param, force=force_display)
 
     def _select_parameter_if_possible(self, mapped_parameter):
         try:
@@ -251,6 +310,7 @@ class Tap(ControlSurface):
                     target_value = round(target_value)
                 target_value = max(min_val, min(max_val, target_value))
                 mapped_parameter.value = target_value
+                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False)
 
             if gesture_state == 2 and control_index in self._active_high_resolution_gestures:
                 if hasattr(mapped_parameter, 'end_gesture'):
@@ -661,6 +721,7 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(current_metadata, 0x7D)
             self._set_cached_metadata(metadata_device, current_metadata)
             self._mark_metadata_sent(metadata_device)
+            self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
             
             if is_drum_pad_device:
                 self._last_drum_pad_metadata = current_metadata
@@ -876,6 +937,7 @@ class Tap(ControlSurface):
                         for control_index in range(8):
                             cc_number = 72 + control_index
                             self.send_cc(cc_number, 8, 0)
+                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
                 self._refresh_automation_state_listeners_current_bank()
                 self._last_automation_signature = self._get_automation_signature()
             
@@ -1261,6 +1323,8 @@ class Tap(ControlSurface):
                     self._last_drum_pad_metadata = None
                     self._drum_pad_change_recheck_count = 0
 
+                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
         end_byte = 0xF7  # SysEx message end
@@ -1452,11 +1516,47 @@ class Tap(ControlSurface):
 
     def _create_disabled_param_listener(self, device_param, control_index):
         def listener():
-            cc_value = self._parameter_value_to_cc(device_param)
-            cc_number = 72 + control_index
-            channel = 8
-            self.send_cc(cc_number, channel, cc_value)
+            self._send_parameter_feedback(control_index, device_param, force_display=True)
         return listener
+
+    def _create_parameter_value_listener(self, device_param, control_index):
+        def listener():
+            self._send_parameter_feedback(control_index, device_param)
+        return listener
+
+    def _remove_parameter_value_listeners(self):
+        for (param, control_index), listener in list(getattr(self, '_parameter_value_listeners', {}).items()):
+            if liveobj_valid(param) and hasattr(param, 'remove_value_listener'):
+                try:
+                    if param.value_has_listener(listener):
+                        param.remove_value_listener(listener)
+                except Exception:
+                    pass
+        self._parameter_value_listeners.clear()
+        self._last_sent_parameter_displays.clear()
+        self._last_sent_parameter_cc_values.clear()
+
+    def _refresh_parameter_value_listeners_current_bank(self, send_current_values=False):
+        self._remove_parameter_value_listeners()
+        if not hasattr(self, '_device') or not liveobj_valid(self._device):
+            return
+        if not hasattr(self._device, '_parameter_controls'):
+            return
+
+        for control_index, control in enumerate(self._device._parameter_controls):
+            mapped_param = control.mapped_parameter() if control else None
+            if mapped_param and liveobj_valid(mapped_param) and hasattr(mapped_param, 'add_value_listener'):
+                listener = self._create_parameter_value_listener(mapped_param, control_index)
+                self._parameter_value_listeners[(mapped_param, control_index)] = listener
+                try:
+                    if not mapped_param.value_has_listener(listener):
+                        mapped_param.add_value_listener(listener)
+                except Exception:
+                    pass
+                self._last_sent_parameter_cc_values[control_index] = self._parameter_value_to_cc(mapped_param)
+                self._last_sent_parameter_displays[control_index] = self._parameter_display_value(mapped_param)
+                if send_current_values:
+                    self._send_parameter_feedback(control_index, mapped_param, force_display=True)
 
     def _create_automation_state_listener(self, device_param):
         def listener():
@@ -1543,6 +1643,7 @@ class Tap(ControlSurface):
                 self._set_cached_metadata(selected_device, current_metadata)
                 self._mark_metadata_sent(selected_device)
                 self._last_automation_signature = self._get_automation_signature()
+                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
             
             if metadata_changed and hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index in range(8):
@@ -5343,6 +5444,7 @@ class Tap(ControlSurface):
                     pass
         self._active_high_resolution_gestures.clear()
         
+        self._remove_parameter_value_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
