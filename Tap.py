@@ -113,6 +113,7 @@ class Tap(ControlSurface):
             self._follow_action_rules = {}
             self._active_follow_actions = {}
             self._handled_follow_action_launches = set()
+            self._active_high_resolution_gestures = set()
             self._follow_action_track_signature = None
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
@@ -157,6 +158,7 @@ class Tap(ControlSurface):
         for index in range(8):
             control = EncoderElement(MIDI_CC_TYPE, 8, 72 + index, Live.MidiMap.MapMode.absolute)
             control.name = 'Ctrl_' + str(index)
+            control.add_value_listener(lambda value, control=control: self._on_device_control_value(value, control))
             self._device_controls.append(control)
         
         nav_left_button = ButtonElement(1, MIDI_CC_TYPE, 0, 33)
@@ -188,6 +190,74 @@ class Tap(ControlSurface):
     def _on_nav_button_pressed(self, value):
         if value:
             self._on_device_changed()
+
+    def _mapped_parameter_for_device_control(self, control_index):
+        try:
+            if not hasattr(self, '_device_controls') or control_index < 0 or control_index >= len(self._device_controls):
+                return None
+            control = self._device_controls[control_index]
+            mapped_parameter = control.mapped_parameter() if control else None
+            return mapped_parameter if mapped_parameter and liveobj_valid(mapped_parameter) else None
+        except Exception:
+            return None
+
+    def _select_parameter_if_possible(self, mapped_parameter):
+        try:
+            if mapped_parameter and liveobj_valid(mapped_parameter) and hasattr(self.song().view, 'selected_parameter'):
+                self.song().view.selected_parameter = mapped_parameter
+        except Exception:
+            pass
+
+    def _on_device_control_value(self, value, control):
+        try:
+            mapped_parameter = control.mapped_parameter() if control and control.mapped_parameter() else None
+            self._select_parameter_if_possible(mapped_parameter)
+        except Exception as e:
+            self._debug_log("Error selecting touched parameter: {}".format(str(e)))
+
+    def _set_device_control_high_resolution(self, message):
+        try:
+            if len(message) < 7:
+                return
+
+            control_index = int(message[2])
+            gesture_state = int(message[3])
+            raw_value = ((int(message[4]) & 0x7F) << 14) | ((int(message[5]) & 0x7F) << 7) | (int(message[6]) & 0x7F)
+            raw_value = max(0, min(65535, raw_value))
+
+            mapped_parameter = self._mapped_parameter_for_device_control(control_index)
+            if not mapped_parameter:
+                return
+
+            if hasattr(mapped_parameter, 'is_enabled') and not mapped_parameter.is_enabled:
+                return
+
+            if gesture_state == 1 and control_index not in self._active_high_resolution_gestures:
+                if hasattr(mapped_parameter, 'begin_gesture'):
+                    mapped_parameter.begin_gesture()
+                self._active_high_resolution_gestures.add(control_index)
+
+            self._select_parameter_if_possible(mapped_parameter)
+
+            if gesture_state != 2:
+                min_val = mapped_parameter.min
+                max_val = mapped_parameter.max
+                if max_val == min_val:
+                    return
+
+                normalized = float(raw_value) / 65535.0
+                target_value = min_val + (max_val - min_val) * normalized
+                if hasattr(mapped_parameter, 'is_quantized') and mapped_parameter.is_quantized:
+                    target_value = round(target_value)
+                target_value = max(min_val, min(max_val, target_value))
+                mapped_parameter.value = target_value
+
+            if gesture_state == 2 and control_index in self._active_high_resolution_gestures:
+                if hasattr(mapped_parameter, 'end_gesture'):
+                    mapped_parameter.end_gesture()
+                self._active_high_resolution_gestures.discard(control_index)
+        except Exception as e:
+            self._debug_log("Error setting high resolution parameter: {}".format(str(e)))
 
     def _bank_select(self, value):
         if not liveobj_valid(self._device):
@@ -437,7 +507,7 @@ class Tap(ControlSurface):
                         value_items = ';'.join(self._escape_sysex_string(item) for item in device_param.value_items)
                     else:
                         value_items = ''
-                    
+
                     default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
                     min_val_str = self._escape_sysex_string(min_val_str.strip())
                     max_val_str = self._escape_sysex_string(max_val_str.strip())
@@ -4268,6 +4338,8 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 1:
                 self._stop_track_clips(values[0])
+        if len(message) >= 2 and message[1] == 39:
+            self._set_device_control_high_resolution(message)
             
 
             
@@ -5262,6 +5334,14 @@ class Tap(ControlSurface):
         # Clear caches
         self._metadata_cache.clear()
         self._metadata_send_seq_by_device.clear()
+        for control_index in list(getattr(self, '_active_high_resolution_gestures', set())):
+            mapped_parameter = self._mapped_parameter_for_device_control(control_index)
+            if mapped_parameter and hasattr(mapped_parameter, 'end_gesture'):
+                try:
+                    mapped_parameter.end_gesture()
+                except Exception:
+                    pass
+        self._active_high_resolution_gestures.clear()
         
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
