@@ -32,6 +32,7 @@ class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
+    PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
@@ -117,6 +118,7 @@ class Tap(ControlSurface):
             self._parameter_value_listeners = {}
             self._last_sent_parameter_displays = {}
             self._last_sent_parameter_cc_values = {}
+            self._last_parameter_display_feedback_times = {}
             self._follow_action_track_signature = None
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
@@ -230,9 +232,15 @@ class Tap(ControlSurface):
         except Exception:
             return ""
 
-    def _send_parameter_display_value(self, control_index, device_param, force=False):
+    def _send_parameter_display_value(self, control_index, device_param, force=False, throttle=False):
         if not device_param or not liveobj_valid(device_param):
             return
+
+        now = time.time()
+        if throttle and not force:
+            last_sent_at = self._last_parameter_display_feedback_times.get(control_index, 0.0)
+            if now - last_sent_at < self.PARAMETER_DISPLAY_FEEDBACK_INTERVAL:
+                return
 
         display_value = self._parameter_display_value(device_param)
         normalized_value = self._parameter_normalized_value(device_param)
@@ -247,8 +255,9 @@ class Tap(ControlSurface):
         )
         self._send_sys_ex_message(payload, 0x28)
         self._last_sent_parameter_displays[control_index] = display_value
+        self._last_parameter_display_feedback_times[control_index] = now
 
-    def _send_parameter_feedback(self, control_index, device_param, send_cc=True, force_display=False):
+    def _send_parameter_feedback(self, control_index, device_param, send_cc=True, force_display=False, throttle_display=False):
         if not device_param or not liveobj_valid(device_param):
             return
 
@@ -258,7 +267,12 @@ class Tap(ControlSurface):
                 self.send_cc(72 + control_index, 8, cc_value)
                 self._last_sent_parameter_cc_values[control_index] = cc_value
 
-        self._send_parameter_display_value(control_index, device_param, force=force_display)
+        self._send_parameter_display_value(
+            control_index,
+            device_param,
+            force=force_display,
+            throttle=throttle_display
+        )
 
     def _select_parameter_if_possible(self, mapped_parameter):
         try:
@@ -310,12 +324,13 @@ class Tap(ControlSurface):
                     target_value = round(target_value)
                 target_value = max(min_val, min(max_val, target_value))
                 mapped_parameter.value = target_value
-                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False)
+                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, throttle_display=True)
 
             if gesture_state == 2 and control_index in self._active_high_resolution_gestures:
                 if hasattr(mapped_parameter, 'end_gesture'):
                     mapped_parameter.end_gesture()
                 self._active_high_resolution_gestures.discard(control_index)
+                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, force_display=True)
         except Exception as e:
             self._debug_log("Error setting high resolution parameter: {}".format(str(e)))
 
@@ -1535,6 +1550,7 @@ class Tap(ControlSurface):
         self._parameter_value_listeners.clear()
         self._last_sent_parameter_displays.clear()
         self._last_sent_parameter_cc_values.clear()
+        self._last_parameter_display_feedback_times.clear()
 
     def _refresh_parameter_value_listeners_current_bank(self, send_current_values=False):
         self._remove_parameter_value_listeners()
