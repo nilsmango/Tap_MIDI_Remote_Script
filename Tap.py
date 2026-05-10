@@ -33,6 +33,11 @@ class Tap(ControlSurface):
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
+    PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
+    PARAMETER_METADATA_RECHECK_DURATION = 1.2
+    UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
+    UNMAPPED_PARAMETER_METADATA = ",".join([UNMAPPED_PARAMETER_METADATA_ITEM] * 8)
+    
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
@@ -640,6 +645,38 @@ class Tap(ControlSurface):
         
         return "*--&&-" in metadata
 
+    def _metadata_is_all_unmapped(self, metadata):
+        if not metadata:
+            return False
+
+        params = self._split_escaped_sysex_fields(metadata, ',')
+        if len(params) < 8:
+            return False
+
+        for param in params[:8]:
+            fields = self._split_escaped_sysex_fields(param, '|')
+            if not fields or fields[0] != "*--&&-":
+                return False
+        return True
+
+    def _send_unmapped_parameter_metadata(self):
+        self._send_sys_ex_message(self.UNMAPPED_PARAMETER_METADATA, 0x7D)
+
+        for control_index in range(8):
+            cc_number = 72 + control_index
+            self.send_cc(cc_number, 8, 0)
+
+    def _schedule_parameter_metadata_recheck(self, delay=None):
+        if self._metadata_recheck_timer:
+            self._metadata_recheck_timer.cancel()
+
+        self._drum_pad_change_recheck_count = 0
+        self._drum_pad_recheck_start = time.time()
+
+        recheck_delay = delay if delay is not None else self.PARAMETER_METADATA_RECHECK_INTERVAL
+        self._metadata_recheck_timer = threading.Timer(recheck_delay, self._recheck_parameter_metadata)
+        self._metadata_recheck_timer.start()
+
     def _metadata_needs_rack_recheck(self, metadata):
         return (
             self._metadata_has_unmapped(metadata)
@@ -699,13 +736,11 @@ class Tap(ControlSurface):
         is_rack_device = isinstance(metadata_device, Live.RackDevice.RackDevice)
         is_drum_rack = self._drum_rack_device and metadata_device == self._drum_rack_device
         is_drum_pad_device = self._drum_rack_device and self._is_device_in_drum_pad(metadata_device)
-        
-        if not is_rack_device and not is_drum_pad_device:
-            return
-        
+
         current_metadata = self._build_parameter_metadata(metadata_device)
         has_unmapped = self._metadata_has_unmapped(current_metadata)
         has_only_numbers = self._metadata_has_only_numbers(current_metadata)
+        all_unmapped = self._metadata_is_all_unmapped(current_metadata)
         
         if self._drum_pad_recheck_start is None:
             self._drum_pad_recheck_start = time.time()
@@ -717,11 +752,16 @@ class Tap(ControlSurface):
             f"elapsed={round(elapsed, 3)}s "
             f"device='{metadata_device.name if metadata_device else 'None'}' "
             f"rack={is_rack_device} drum_rack={bool(is_drum_rack)} drum_pad_device={bool(is_drum_pad_device)} "
-            f"unmapped={has_unmapped} only_numbers={has_only_numbers}"
+            f"unmapped={has_unmapped} all_unmapped={all_unmapped} only_numbers={has_only_numbers}"
         )
         
-        if elapsed >= 0.8:
-            self._debug_log("Recheck metadata: reached max duration 0.8s, stopping")
+        if elapsed >= self.PARAMETER_METADATA_RECHECK_DURATION:
+            if all_unmapped:
+                self._debug_log("Recheck metadata: controls stayed unmapped, sending placeholder metadata")
+                self._send_unmapped_parameter_metadata()
+                self._set_cached_metadata(metadata_device, current_metadata)
+                self._mark_metadata_sent(metadata_device)
+            self._debug_log("Recheck metadata: reached max duration {}s, stopping".format(self.PARAMETER_METADATA_RECHECK_DURATION))
             self._drum_pad_change_recheck_count = 0
             self._drum_pad_recheck_start = None
             return
@@ -731,7 +771,7 @@ class Tap(ControlSurface):
         if current_metadata and cached_metadata != current_metadata:
             should_resend = True
         
-        if should_resend:
+        if should_resend and not all_unmapped:
             self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
             self._send_sys_ex_message(current_metadata, 0x7D)
             self._set_cached_metadata(metadata_device, current_metadata)
@@ -762,27 +802,29 @@ class Tap(ControlSurface):
                             cc_number = 72 + control_index
                             self.send_cc(cc_number, 8, cc_value)
         
-        max_iterations = 8
+        max_iterations = int(self.PARAMETER_METADATA_RECHECK_DURATION / self.PARAMETER_METADATA_RECHECK_INTERVAL) + 1
         should_continue = False
         if is_drum_pad_device or is_drum_rack:
             should_continue = has_unmapped
         elif is_rack_device:
             should_continue = has_only_numbers
+        else:
+            should_continue = all_unmapped
         
         if should_continue:
             self._drum_pad_change_recheck_count += 1
             if self._drum_pad_change_recheck_count <= max_iterations:
-                self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
+                self._metadata_recheck_timer = threading.Timer(self.PARAMETER_METADATA_RECHECK_INTERVAL, self._recheck_parameter_metadata)
                 self._metadata_recheck_timer.start()
             else:
                 if is_drum_pad_device:
-                    self._debug_log(f"Drum pad recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                    self._debug_log(f"Drum pad recheck: Reached max iterations, last metadata: {current_metadata[:100]}...")
                     self._last_drum_pad_metadata = None
                 else:
                     if is_drum_rack:
-                        self._debug_log(f"Drum rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                        self._debug_log(f"Drum rack recheck: Reached max iterations, last metadata: {current_metadata[:100]}...")
                     else:
-                        self._debug_log(f"Rack recheck: Reached max iterations (0.8s), last metadata: {current_metadata[:100]}...")
+                        self._debug_log(f"Rack recheck: Reached max iterations, last metadata: {current_metadata[:100]}...")
                 self._drum_pad_change_recheck_count = 0
                 self._drum_pad_recheck_start = None
                 return
@@ -940,18 +982,16 @@ class Tap(ControlSurface):
                     # _build_parameter_metadata, which may succeed even when the
                     # device component's own remapping is still in progress
                     current_metadata = self._build_parameter_metadata(selected_device)
-                    if current_metadata and not self._metadata_has_unmapped(current_metadata):
+                    if current_metadata and not self._metadata_is_all_unmapped(current_metadata):
                         self._send_sys_ex_message(current_metadata, 0x7D)
                         self._set_cached_metadata(selected_device, current_metadata)
                         self._mark_metadata_sent(selected_device)
                     else:
-                        # Truly unmapped — send placeholder
-                        self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
-                        
-                        # Send CC 0 for all encoders
-                        for control_index in range(8):
-                            cc_number = 72 + control_index
-                            self.send_cc(cc_number, 8, 0)
+                        # Live sometimes needs another update tick after controls
+                        # are reattached. Do not tell the app "no encoders" during
+                        # that transient window; retry first and only send the
+                        # placeholder if controls stay unmapped.
+                        self._schedule_parameter_metadata_recheck(delay=0.05)
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
                 self._refresh_automation_state_listeners_current_bank()
                 self._last_automation_signature = self._get_automation_signature()
@@ -979,12 +1019,7 @@ class Tap(ControlSurface):
                             self.send_cc(cc_number, 8, cc_value)
             else:
                 # Device has no parameters - send not mapped for all controls
-                self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
-                
-                # Send CC 0 for all encoders
-                for control_index in range(8):
-                    cc_number = 72 + control_index
-                    self.send_cc(cc_number, 8, 0)
+                self._send_unmapped_parameter_metadata()
 
             # In mixer mode, disconnect device controls after a short delay
             # instead of immediately, so the framework has time to finish
@@ -1005,12 +1040,7 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(available_devices_string, 0x01)
             # Send not mapped for all controls when no device is selected
-            self._send_sys_ex_message("*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|,*--&&-|0|127|0.0|0.0|32|", 0x7D)
-            
-            # Send CC 0 for all encoders
-            for control_index in range(8):
-                cc_number = 72 + control_index
-                self.send_cc(cc_number, 8, 0)
+            self._send_unmapped_parameter_metadata()
     
     def _get_all_nested_devices(self, devices):
         """
@@ -1277,7 +1307,7 @@ class Tap(ControlSurface):
 
     def _send_parameter_info(self, parameter_names):
         if parameter_names == "":
-            self._send_sys_ex_message("", 0x7D)
+            self._send_unmapped_parameter_metadata()
         else:
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
@@ -1285,6 +1315,11 @@ class Tap(ControlSurface):
             current_metadata = self._build_parameter_metadata(selected_device)
             
             if current_metadata:
+                if self._metadata_is_all_unmapped(current_metadata) and hasattr(selected_device, 'parameters') and selected_device.parameters:
+                    self._debug_log("Parameter metadata is temporarily unmapped; scheduling recheck")
+                    self._schedule_parameter_metadata_recheck(delay=0.05)
+                    return
+
                 cached_metadata = self._get_cached_metadata(selected_device)
                 metadata_changed = cached_metadata != current_metadata
                 if metadata_changed:
@@ -1328,11 +1363,7 @@ class Tap(ControlSurface):
                         self._device_recheck_count = 0
                         self._device_recheck_start = time.time()
                     
-                    if self._metadata_recheck_timer:
-                        self._metadata_recheck_timer.cancel()
-                    
-                    self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
-                    self._metadata_recheck_timer.start()
+                    self._schedule_parameter_metadata_recheck()
                 else:
                     self._last_sent_metadata = None
                     self._last_drum_pad_metadata = None
@@ -1652,6 +1683,22 @@ class Tap(ControlSurface):
             return
         current_metadata = self._build_parameter_metadata(selected_device)
         if current_metadata:
+            if self._metadata_is_all_unmapped(current_metadata) and hasattr(selected_device, 'parameters') and selected_device.parameters:
+                elapsed = 0.0
+                if self._automation_metadata_retry_start is not None:
+                    elapsed = time.time() - self._automation_metadata_retry_start
+                if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
+                    self._automation_metadata_retry_count += 1
+                    new_timer = threading.Timer(
+                        0.05,
+                        self._send_refreshed_parameter_metadata,
+                        args=[selected_device, seq_at_schedule]
+                    )
+                    with self._automation_timer_lock:
+                        self._automation_metadata_update_timer = new_timer
+                    new_timer.start()
+                return
+
             cached_metadata = self._get_cached_metadata(selected_device)
             metadata_changed = cached_metadata != current_metadata
             if metadata_changed:
@@ -4776,11 +4823,14 @@ class Tap(ControlSurface):
             self.mixer_status = False
             self._set_up_mixer_controls()
             self._connect_device_controls()
+            self._send_selected_device_state()
 
     def _update_device_status(self, value):
         if value:
             self.device_status = True
             self._check_clip_playing_status()
+            if not self.mixer_status:
+                self._send_selected_device_state()
         else:
             self.device_status = False
     
