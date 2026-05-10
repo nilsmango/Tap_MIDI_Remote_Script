@@ -666,6 +666,11 @@ class Tap(ControlSurface):
             cc_number = 72 + control_index
             self.send_cc(cc_number, 8, 0)
 
+    def _send_unmapped_parameter_metadata_for_device(self, device, metadata=None):
+        self._send_unmapped_parameter_metadata()
+        self._set_cached_metadata(device, metadata or self.UNMAPPED_PARAMETER_METADATA)
+        self._mark_metadata_sent(device)
+
     def _schedule_parameter_metadata_recheck(self, delay=None):
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
@@ -756,11 +761,6 @@ class Tap(ControlSurface):
         )
         
         if elapsed >= self.PARAMETER_METADATA_RECHECK_DURATION:
-            if all_unmapped:
-                self._debug_log("Recheck metadata: controls stayed unmapped, sending placeholder metadata")
-                self._send_unmapped_parameter_metadata()
-                self._set_cached_metadata(metadata_device, current_metadata)
-                self._mark_metadata_sent(metadata_device)
             self._debug_log("Recheck metadata: reached max duration {}s, stopping".format(self.PARAMETER_METADATA_RECHECK_DURATION))
             self._drum_pad_change_recheck_count = 0
             self._drum_pad_recheck_start = None
@@ -771,19 +771,23 @@ class Tap(ControlSurface):
         if current_metadata and cached_metadata != current_metadata:
             should_resend = True
         
-        if should_resend and not all_unmapped:
-            self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
-            self._send_sys_ex_message(current_metadata, 0x7D)
-            self._set_cached_metadata(metadata_device, current_metadata)
-            self._mark_metadata_sent(metadata_device)
-            self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+        if should_resend:
+            if all_unmapped:
+                self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Sending unmapped metadata")
+                self._send_unmapped_parameter_metadata_for_device(metadata_device, current_metadata)
+            else:
+                self._debug_log(f"Recheck metadata (iteration {getattr(self, '_drum_pad_change_recheck_count', 0)}): Resending changed metadata")
+                self._send_sys_ex_message(current_metadata, 0x7D)
+                self._set_cached_metadata(metadata_device, current_metadata)
+                self._mark_metadata_sent(metadata_device)
+                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
             
             if is_drum_pad_device:
                 self._last_drum_pad_metadata = current_metadata
             else:
                 self._last_sent_metadata = current_metadata
             
-            if hasattr(metadata_device, 'parameters') and metadata_device.parameters:
+            if not all_unmapped and hasattr(metadata_device, 'parameters') and metadata_device.parameters:
                 device_parameters = list(metadata_device.parameters)
                 
                 for control_index in range(8):
@@ -988,9 +992,9 @@ class Tap(ControlSurface):
                         self._mark_metadata_sent(selected_device)
                     else:
                         # Live sometimes needs another update tick after controls
-                        # are reattached. Do not tell the app "no encoders" during
-                        # that transient window; retry first and only send the
-                        # placeholder if controls stay unmapped.
+                        # are reattached, so keep rechecking after sending the
+                        # current empty state.
+                        self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
                         self._schedule_parameter_metadata_recheck(delay=0.05)
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
                 self._refresh_automation_state_listeners_current_bank()
@@ -1316,7 +1320,8 @@ class Tap(ControlSurface):
             
             if current_metadata:
                 if self._metadata_is_all_unmapped(current_metadata) and hasattr(selected_device, 'parameters') and selected_device.parameters:
-                    self._debug_log("Parameter metadata is temporarily unmapped; scheduling recheck")
+                    self._debug_log("Parameter metadata is all unmapped; sending placeholder and scheduling recheck")
+                    self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
                     self._schedule_parameter_metadata_recheck(delay=0.05)
                     return
 
@@ -1687,6 +1692,10 @@ class Tap(ControlSurface):
                 elapsed = 0.0
                 if self._automation_metadata_retry_start is not None:
                     elapsed = time.time() - self._automation_metadata_retry_start
+                cached_metadata = self._get_cached_metadata(selected_device)
+                if cached_metadata != current_metadata:
+                    self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
+                    seq_at_schedule = self._metadata_send_seq_by_device.get(id(selected_device), seq_at_schedule)
                 if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
                     self._automation_metadata_retry_count += 1
                     new_timer = threading.Timer(
