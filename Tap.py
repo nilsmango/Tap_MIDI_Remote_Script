@@ -698,8 +698,18 @@ class Tap(ControlSurface):
         }
         for symbol, replacement in symbol_replacements.items():
             sanitized_value = sanitized_value.replace(symbol, replacement)
+
+        def remove_ascii_empty_bracket_group(match):
+            inner_value = match.group(1)
+            ascii_inner_value = inner_value.encode('ascii', errors='ignore').decode('ascii')
+            if inner_value.strip() and not ascii_inner_value.strip():
+                return ''
+            return match.group(0)
+
+        sanitized_value = re.sub(r'\(([^()]*)\)', remove_ascii_empty_bracket_group, sanitized_value)
+        sanitized_value = re.sub(r'\[([^\[\]]*)\]', remove_ascii_empty_bracket_group, sanitized_value)
+        sanitized_value = re.sub(r'\{([^{}]*)\}', remove_ascii_empty_bracket_group, sanitized_value)
         sanitized_value = sanitized_value.encode('ascii', errors='ignore').decode('ascii')
-        sanitized_value = re.sub(r'\s*[\(\[\{]\s*[\)\]\}]', '', sanitized_value)
         sanitized_value = re.sub(r'\s{2,}', ' ', sanitized_value)
         return sanitized_value.strip()
 
