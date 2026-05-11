@@ -687,8 +687,24 @@ class Tap(ControlSurface):
         start_idx, end_idx = macro_ranges[bank_name]
         return any(device.macros_mapped[start_idx:end_idx])
 
+    def _sanitize_sysex_text(self, value):
+        sanitized_value = str(value)
+        symbol_replacements = {
+            '♭': 'b',
+            '♯': '#',
+            '♮': 'nat',
+            '𝄫': 'bb',
+            '𝄪': '##'
+        }
+        for symbol, replacement in symbol_replacements.items():
+            sanitized_value = sanitized_value.replace(symbol, replacement)
+        sanitized_value = sanitized_value.encode('ascii', errors='ignore').decode('ascii')
+        sanitized_value = re.sub(r'\s*[\(\[\{]\s*[\)\]\}]', '', sanitized_value)
+        sanitized_value = re.sub(r'\s{2,}', ' ', sanitized_value)
+        return sanitized_value.strip()
+
     def _escape_sysex_string(self, value):
-        escaped_value = str(value)
+        escaped_value = self._sanitize_sysex_text(value)
         escaped_value = escaped_value.replace(
             self.SYSEX_STRING_ESCAPE_CHAR,
             self.SYSEX_STRING_ESCAPE_CHAR + self.SYSEX_STRING_ESCAPE_CHAR
@@ -1621,6 +1637,7 @@ class Tap(ControlSurface):
         status_byte = 0xF0  # SysEx message start
         end_byte = 0xF7  # SysEx message end
         device_id = 0x01
+        name_string = self._sanitize_sysex_text(name_string)
         data = name_string.encode('ascii', errors='ignore')
         max_chunk_length = 240
         if len(data) <= max_chunk_length:
