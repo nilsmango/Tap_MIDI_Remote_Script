@@ -262,7 +262,7 @@ class Tap(ControlSurface):
         self._last_sent_parameter_displays[control_index] = display_value
         self._last_parameter_display_feedback_times[control_index] = now
 
-    def _send_parameter_feedback(self, control_index, device_param, send_cc=True, force_display=False, throttle_display=False):
+    def _send_parameter_feedback(self, control_index, device_param, send_cc=False, force_display=False, throttle_display=False):
         if not device_param or not liveobj_valid(device_param):
             return
 
@@ -310,14 +310,18 @@ class Tap(ControlSurface):
             if hasattr(mapped_parameter, 'is_enabled') and not mapped_parameter.is_enabled:
                 return
 
-            if gesture_state == 1 and control_index not in self._active_high_resolution_gestures:
-                if hasattr(mapped_parameter, 'begin_gesture'):
-                    mapped_parameter.begin_gesture()
-                self._active_high_resolution_gestures.add(control_index)
-
             self._select_parameter_if_possible(mapped_parameter)
 
-            if gesture_state != 2:
+            if gesture_state == 1:
+                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, force_display=True)
+                return
+
+            if gesture_state == 0:
+                if control_index not in self._active_high_resolution_gestures:
+                    if hasattr(mapped_parameter, 'begin_gesture'):
+                        mapped_parameter.begin_gesture()
+                    self._active_high_resolution_gestures.add(control_index)
+
                 min_val = mapped_parameter.min
                 max_val = mapped_parameter.max
                 if max_val == min_val:
@@ -802,9 +806,7 @@ class Tap(ControlSurface):
                                 break
                         
                         if device_param:
-                            cc_value = self._parameter_value_to_cc(device_param)
-                            cc_number = 72 + control_index
-                            self.send_cc(cc_number, 8, cc_value)
+                            self._send_parameter_feedback(control_index, device_param, force_display=True)
         
         max_iterations = int(self.PARAMETER_METADATA_RECHECK_DURATION / self.PARAMETER_METADATA_RECHECK_INTERVAL) + 1
         should_continue = False
@@ -1018,9 +1020,7 @@ class Tap(ControlSurface):
                             self._disabled_parameters.append(device_param)
                             self._current_disabled_controls.append(control_index)
                             
-                            cc_value = self._parameter_value_to_cc(device_param)
-                            cc_number = 72 + control_index
-                            self.send_cc(cc_number, 8, cc_value)
+                            self._send_parameter_feedback(control_index, device_param, force_display=True)
             else:
                 # Device has no parameters - send not mapped for all controls
                 self._send_unmapped_parameter_metadata()
@@ -1726,9 +1726,7 @@ class Tap(ControlSurface):
                         device_param = mapped_param
                         
                         if device_param:
-                            cc_value = self._parameter_value_to_cc(device_param)
-                            cc_number = 72 + control_index
-                            self.send_cc(cc_number, 8, cc_value)
+                            self._send_parameter_feedback(control_index, device_param, force_display=True)
             
             if not metadata_changed:
                 elapsed = 0.0
@@ -1806,9 +1804,7 @@ class Tap(ControlSurface):
                             self._disabled_parameters.append(device_param)
                             self._current_disabled_controls.append(control_index)
                             
-                            cc_value = self._parameter_value_to_cc(device_param)
-                            cc_number = 72 + control_index
-                            self.send_cc(cc_number, 8, cc_value)
+                            self._send_parameter_feedback(control_index, device_param, force_display=True)
 
     def _connection_established(self, value):
         if value:            
