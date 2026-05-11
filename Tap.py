@@ -416,9 +416,6 @@ class Tap(ControlSurface):
         except Exception:
             return ""
 
-    def _round_half_up(self, value):
-        return int(math.floor(float(value) + 0.5))
-
     def _parameter_target_value_from_normalized(self, device_param, normalized):
         min_val = device_param.min
         max_val = device_param.max
@@ -427,19 +424,49 @@ class Tap(ControlSurface):
 
         normalized = max(0.0, min(1.0, float(normalized)))
 
-        if hasattr(device_param, 'is_quantized') and device_param.is_quantized:
-            if hasattr(device_param, 'value_items') and device_param.value_items:
-                item_count = len(device_param.value_items)
-                if item_count > 1:
-                    item_index = self._round_half_up(normalized * (item_count - 1))
-                    item_index = max(0, min(item_count - 1, item_index))
-                    target_value = min_val + (max_val - min_val) * (float(item_index) / float(item_count - 1))
-                    return max(min_val, min(max_val, target_value))
-
-            target_value = min_val + (max_val - min_val) * normalized
-            return max(min_val, min(max_val, self._round_half_up(target_value)))
-
         return max(min_val, min(max_val, min_val + (max_val - min_val) * normalized))
+
+    def _normalized_option_text(self, value):
+        try:
+            return str(value).strip().lower()
+        except Exception:
+            return ""
+
+    def _parameter_current_value_item_index(self, device_param, item_count):
+        display_value = self._normalized_option_text(self._parameter_display_value(device_param))
+        if display_value and hasattr(device_param, 'value_items') and device_param.value_items:
+            for index, item in enumerate(device_param.value_items):
+                if self._normalized_option_text(item) == display_value:
+                    return index
+
+        try:
+            normalized = self._parameter_normalized_value(device_param)
+            return max(0, min(item_count - 1, int(math.floor(normalized * (item_count - 1) + 0.5))))
+        except Exception:
+            return 0
+
+    def _set_device_control_next_option(self, control_index, device_param):
+        if not hasattr(device_param, 'is_quantized') or not device_param.is_quantized:
+            return
+        if not hasattr(device_param, 'value_items') or not device_param.value_items:
+            return
+
+        item_count = len(device_param.value_items)
+        if item_count <= 1:
+            return
+
+        current_index = self._parameter_current_value_item_index(device_param, item_count)
+        next_index = (current_index + 1) % item_count
+        normalized = float(next_index) / float(item_count - 1)
+        target_value = self._parameter_target_value_from_normalized(device_param, normalized)
+
+        if hasattr(device_param, 'begin_gesture'):
+            device_param.begin_gesture()
+        device_param.value = target_value
+        if hasattr(device_param, 'end_gesture'):
+            device_param.end_gesture()
+
+        self._send_parameter_feedback(control_index, device_param, send_cc=False, force_display=True)
 
     def _send_parameter_display_value(self, control_index, device_param, force=False, throttle=False):
         if not device_param or not liveobj_valid(device_param):
@@ -518,6 +545,10 @@ class Tap(ControlSurface):
                 return
 
             self._select_parameter_if_possible(mapped_parameter)
+
+            if gesture_state == 3:
+                self._set_device_control_next_option(control_index, mapped_parameter)
+                return
 
             if gesture_state == 1:
                 self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, force_display=True)
