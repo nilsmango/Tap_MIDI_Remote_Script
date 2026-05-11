@@ -29,6 +29,175 @@ quantize_strength_value = 1.0
 swing_amount_value = 0.0
 
 
+class TapDeviceComponent(DeviceComponent):
+    SAFE_PARAMETER_BANK_SIZE = 8
+
+    def __init__(self, *a, **k):
+        DeviceComponent.__init__(self, *a, **k)
+        self._use_safe_parameter_banks = False
+
+    def set_device(self, device):
+        self._use_safe_parameter_banks = False
+        try:
+            return DeviceComponent.set_device(self, device)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            self._bank_index = 0
+            try:
+                self.update()
+            except Exception:
+                pass
+            try:
+                self.notify_device()
+            except Exception:
+                pass
+
+    def update(self):
+        try:
+            return DeviceComponent.update(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            self._clamp_bank_index_to_safe_banks()
+            try:
+                return DeviceComponent.update(self)
+            except IndexError:
+                pass
+
+    def _current_bank_details(self):
+        try:
+            return DeviceComponent._current_bank_details(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            self._clamp_bank_index_to_safe_banks()
+            try:
+                return DeviceComponent._current_bank_details(self)
+            except IndexError:
+                return '', tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
+
+    def _parameter_banks(self):
+        if self._use_safe_parameter_banks:
+            return self._safe_parameter_banks()
+        try:
+            return DeviceComponent._parameter_banks(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            return self._safe_parameter_banks()
+
+    def _parameter_bank_names(self):
+        if self._use_safe_parameter_banks:
+            return self._safe_parameter_bank_names()
+        try:
+            return DeviceComponent._parameter_bank_names(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            return self._safe_parameter_bank_names()
+
+    def _best_of_parameter_bank(self):
+        if self._use_safe_parameter_banks:
+            return []
+        try:
+            return DeviceComponent._best_of_parameter_bank(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            return []
+
+    def _number_of_parameter_banks(self):
+        if self._use_safe_parameter_banks:
+            return len(self._safe_parameter_banks())
+        try:
+            return DeviceComponent._number_of_parameter_banks(self)
+        except IndexError:
+            self._use_safe_parameter_banks = True
+            return len(self._safe_parameter_banks())
+
+    def _clamp_bank_index_to_safe_banks(self):
+        safe_banks = self._safe_parameter_banks()
+        bank_count = len(safe_banks)
+        if bank_count == 0:
+            self._bank_index = 0
+        else:
+            self._bank_index = max(0, min(self._bank_index, bank_count - 1))
+
+    def _safe_parameter_banks(self):
+        device = getattr(self, '_device', None)
+        if not device or not liveobj_valid(device) or not hasattr(device, 'parameters'):
+            return []
+
+        parameters = list(device.parameters)
+        if not parameters:
+            return []
+
+        live_banks = self._safe_live_parameter_banks(device, parameters)
+        if live_banks:
+            return live_banks
+
+        parameters = parameters[1:]
+        if not parameters:
+            return []
+
+        banks = []
+        for index in range(0, len(parameters), self.SAFE_PARAMETER_BANK_SIZE):
+            bank = list(parameters[index:index + self.SAFE_PARAMETER_BANK_SIZE])
+            bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
+            banks.append(tuple(bank))
+        return banks
+
+    def _safe_live_parameter_banks(self, device, parameters):
+        if not hasattr(device, 'get_bank_count') or not hasattr(device, 'get_bank_parameters'):
+            return []
+
+        try:
+            bank_count = int(device.get_bank_count())
+        except Exception:
+            bank_count = 0
+
+        if bank_count <= 0:
+            return []
+
+        banks = []
+        empty_bank = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
+        for bank_index in range(bank_count):
+            try:
+                parameter_indices = list(device.get_bank_parameters(bank_index))
+            except Exception:
+                parameter_indices = []
+
+            if len(parameter_indices) != self.SAFE_PARAMETER_BANK_SIZE:
+                banks.append(empty_bank)
+                continue
+
+            bank = []
+            for parameter_index in parameter_indices:
+                if parameter_index == -1:
+                    bank.append(None)
+                elif 0 <= parameter_index < len(parameters):
+                    bank.append(parameters[parameter_index])
+                else:
+                    bank.append(None)
+            banks.append(tuple(bank))
+
+        return banks
+
+    def _safe_parameter_bank_names(self):
+        bank_count = len(self._safe_parameter_banks())
+        if bank_count == 0:
+            return []
+
+        device = getattr(self, '_device', None)
+        names = []
+        for index in range(bank_count):
+            name = None
+            if device and hasattr(device, 'get_bank_name'):
+                try:
+                    name = device.get_bank_name(index)
+                except Exception:
+                    name = None
+            if name:
+                name = ''.join(char for char in str(name) if ord(char) < 128)
+            names.append(name or "Bank {}".format(index + 1))
+        return tuple(names)
+
+
 class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
@@ -169,7 +338,7 @@ class Tap(ControlSurface):
             self._start_periodic_execution()
 
     def _setup_device_control(self):
-        self._device = DeviceComponent()
+        self._device = TapDeviceComponent()
         self._device.name = 'Device_Component'
         
         self._device_controls = []
