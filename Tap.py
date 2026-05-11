@@ -293,6 +293,7 @@ class Tap(ControlSurface):
             self._parameter_value_listeners = {}
             self._parameter_name_listeners = {}
             self._parameter_name_update_timer = None
+            self._bank_metadata_refresh_timers = []
             self._parameter_source_device = None
             self._parameter_source_listener = None
             self._bank_parameter_source_device = None
@@ -381,6 +382,7 @@ class Tap(ControlSurface):
     def _on_nav_button_pressed(self, value):
         if value:
             self._on_device_changed()
+            self._schedule_bank_metadata_refreshes()
 
     def _mapped_parameter_for_device_control(self, control_index):
         try:
@@ -595,6 +597,7 @@ class Tap(ControlSurface):
             self._device._bank_index = new_index
             self._device.update()
             self._on_device_changed()
+            self._schedule_bank_metadata_refreshes()
 
     def _find_drum_rack_in_track(self, track):
         for device in track.devices:
@@ -774,6 +777,23 @@ class Tap(ControlSurface):
             else:
                 return f"*-{raw_name}"
         return raw_name
+
+    def _current_bank_parameter_for_control(self, selected_device, control_index):
+        try:
+            if not hasattr(self, '_device') or not liveobj_valid(self._device):
+                return None
+
+            _, bank_parameters = self._device._current_bank_details()
+            if bank_parameters and control_index < len(bank_parameters):
+                bank_param = bank_parameters[control_index]
+                if bank_param and liveobj_valid(bank_param):
+                    if selected_device and hasattr(selected_device, 'parameters'):
+                        if not any(device_param == bank_param for device_param in selected_device.parameters):
+                            return None
+                    return bank_param
+        except Exception:
+            pass
+        return None
     
     def _build_parameter_metadata(self, selected_device):
         if not hasattr(selected_device, 'parameters'):
@@ -788,8 +808,10 @@ class Tap(ControlSurface):
         unmapped_encoder_indices = []
         
         for control_index in range(8):
-            control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-            mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+            mapped_param = self._current_bank_parameter_for_control(selected_device, control_index)
+            if not mapped_param:
+                control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
+                mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
             
             if mapped_param:
                 device_param = mapped_param
@@ -944,6 +966,54 @@ class Tap(ControlSurface):
         recheck_delay = delay if delay is not None else self.PARAMETER_METADATA_RECHECK_INTERVAL
         self._metadata_recheck_timer = threading.Timer(recheck_delay, self._recheck_parameter_metadata)
         self._metadata_recheck_timer.start()
+
+    def _cancel_bank_metadata_refreshes(self):
+        for timer in list(getattr(self, '_bank_metadata_refresh_timers', [])):
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._bank_metadata_refresh_timers = []
+
+    def _schedule_bank_metadata_refreshes(self):
+        self._cancel_bank_metadata_refreshes()
+        for delay in (0.05, 0.15, 0.35, 0.75):
+            timer = threading.Timer(delay, self._refresh_active_bank_metadata)
+            self._bank_metadata_refresh_timers.append(timer)
+            timer.start()
+
+    def _refresh_active_bank_metadata(self):
+        if not liveobj_valid(self._device):
+            return
+
+        try:
+            if hasattr(self._device, 'update'):
+                self._device.update()
+            self._on_device_changed()
+            self._force_send_current_bank_metadata()
+        except Exception as e:
+            self._debug_log("Error refreshing bank metadata after bank change: {}".format(str(e)))
+
+    def _force_send_current_bank_metadata(self):
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device if selected_track else None
+        if not selected_device or not hasattr(selected_device, 'parameters') or not selected_device.parameters:
+            return
+
+        current_metadata = self._build_parameter_metadata(selected_device)
+        if not current_metadata:
+            return
+
+        if self._metadata_is_all_unmapped(current_metadata):
+            self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
+            return
+
+        self._send_sys_ex_message(current_metadata, 0x7D)
+        self._set_cached_metadata(selected_device, current_metadata)
+        self._mark_metadata_sent(selected_device)
+        self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+        self._refresh_parameter_name_listeners_current_bank()
+        self._refresh_automation_state_listeners_current_bank()
 
     def _metadata_needs_rack_recheck(self, metadata):
         return (
@@ -5887,6 +5957,7 @@ class Tap(ControlSurface):
         if hasattr(self, '_mixer_disconnect_timer') and self._mixer_disconnect_timer:
             self._mixer_disconnect_timer.cancel()
             self._mixer_disconnect_timer = None
+        self._cancel_bank_metadata_refreshes()
         if hasattr(self, '_periodic_timer_ref') and self._periodic_timer_ref:
             self._periodic_timer_ref.cancel()
             self._periodic_timer_ref = None
