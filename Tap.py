@@ -122,6 +122,12 @@ class Tap(ControlSurface):
             self._handled_follow_action_launches = set()
             self._active_high_resolution_gestures = set()
             self._parameter_value_listeners = {}
+            self._parameter_name_listeners = {}
+            self._parameter_name_update_timer = None
+            self._parameter_source_device = None
+            self._parameter_source_listener = None
+            self._bank_parameter_source_device = None
+            self._bank_parameter_source_listener = None
             self._last_sent_parameter_displays = {}
             self._last_sent_parameter_normalized_values = {}
             self._last_sent_parameter_cc_values = {}
@@ -192,12 +198,14 @@ class Tap(ControlSurface):
         if hasattr(self, '_device_controls'):
             self._device.set_parameter_controls(self._device_controls)
         self._refresh_parameter_value_listeners_current_bank()
+        self._refresh_parameter_name_listeners_current_bank()
         self._readd_disabled_parameter_listeners()
     
     def _disconnect_device_controls(self):
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
         self._remove_parameter_value_listeners()
+        self._remove_parameter_name_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
 
@@ -810,6 +818,8 @@ class Tap(ControlSurface):
                 self._set_cached_metadata(metadata_device, current_metadata)
                 self._mark_metadata_sent(metadata_device)
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                self._refresh_parameter_name_listeners_current_bank()
+                self._refresh_automation_state_listeners_current_bank()
             
             if is_drum_pad_device:
                 self._last_drum_pad_metadata = current_metadata
@@ -868,6 +878,8 @@ class Tap(ControlSurface):
         if self._drum_rack_device:
             self._remove_drum_pad_name_listeners()
             self._drum_rack_device = None
+        self._remove_parameter_name_listeners()
+        self._remove_parameter_source_listener()
         self._remove_automation_state_listeners()
         self._automation_metadata_device_id = None
             
@@ -875,6 +887,7 @@ class Tap(ControlSurface):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device
+            self._set_parameter_source_listener(selected_device)
             
             # Get all available devices of the selected track, including nested devices
             all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
@@ -1024,6 +1037,7 @@ class Tap(ControlSurface):
                         self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
                         self._schedule_parameter_metadata_recheck(delay=0.05)
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                self._refresh_parameter_name_listeners_current_bank()
                 self._refresh_automation_state_listeners_current_bank()
                 self._last_automation_signature = self._get_automation_signature()
             
@@ -1400,6 +1414,8 @@ class Tap(ControlSurface):
                     self._drum_pad_change_recheck_count = 0
 
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                self._refresh_parameter_name_listeners_current_bank()
+                self._refresh_automation_state_listeners_current_bank()
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
@@ -1600,6 +1616,43 @@ class Tap(ControlSurface):
             self._send_parameter_feedback(control_index, device_param)
         return listener
 
+    def _create_parameter_name_listener(self, device_param, control_index):
+        def listener():
+            self._schedule_active_bank_parameter_refresh()
+        return listener
+
+    def _create_parameter_source_listener(self):
+        def listener():
+            self._schedule_active_bank_parameter_refresh()
+        return listener
+
+    def _create_bank_parameter_source_listener(self):
+        def listener():
+            self._schedule_active_bank_parameter_refresh()
+        return listener
+
+    def _schedule_active_bank_parameter_refresh(self):
+        if not liveobj_valid(self._device):
+            return
+
+        if self._parameter_name_update_timer:
+            self._parameter_name_update_timer.cancel()
+
+        self._parameter_name_update_timer = threading.Timer(0.05, self._refresh_active_bank_parameters)
+        self._parameter_name_update_timer.start()
+
+    def _refresh_active_bank_parameters(self):
+        self._parameter_name_update_timer = None
+        if not liveobj_valid(self._device):
+            return
+
+        try:
+            if hasattr(self._device, 'update'):
+                self._device.update()
+            self._on_device_changed()
+        except Exception as e:
+            self._debug_log("Error refreshing active bank after parameter metadata change: {}".format(str(e)))
+
     def _remove_parameter_value_listeners(self):
         for (param, control_index), listener in list(getattr(self, '_parameter_value_listeners', {}).items()):
             if liveobj_valid(param) and hasattr(param, 'remove_value_listener'):
@@ -1613,6 +1666,73 @@ class Tap(ControlSurface):
         self._last_sent_parameter_normalized_values.clear()
         self._last_sent_parameter_cc_values.clear()
         self._last_parameter_display_feedback_times.clear()
+
+    def _remove_parameter_name_listeners(self):
+        if self._parameter_name_update_timer:
+            self._parameter_name_update_timer.cancel()
+            self._parameter_name_update_timer = None
+
+        for (param, control_index), listener in list(getattr(self, '_parameter_name_listeners', {}).items()):
+            if liveobj_valid(param) and hasattr(param, 'remove_name_listener'):
+                try:
+                    if not hasattr(param, 'name_has_listener') or param.name_has_listener(listener):
+                        param.remove_name_listener(listener)
+                except Exception:
+                    pass
+        self._parameter_name_listeners.clear()
+
+    def _remove_parameter_source_listener(self):
+        device = getattr(self, '_parameter_source_device', None)
+        listener = getattr(self, '_parameter_source_listener', None)
+        if device and listener and liveobj_valid(device) and hasattr(device, 'remove_parameters_listener'):
+            try:
+                if not hasattr(device, 'parameters_has_listener') or device.parameters_has_listener(listener):
+                    device.remove_parameters_listener(listener)
+            except Exception:
+                pass
+        self._parameter_source_device = None
+        self._parameter_source_listener = None
+
+        bank_device = getattr(self, '_bank_parameter_source_device', None)
+        bank_listener = getattr(self, '_bank_parameter_source_listener', None)
+        if bank_device and bank_listener and liveobj_valid(bank_device) and hasattr(bank_device, 'remove_bank_parameters_changed_listener'):
+            try:
+                if not hasattr(bank_device, 'bank_parameters_changed_has_listener') or bank_device.bank_parameters_changed_has_listener(bank_listener):
+                    bank_device.remove_bank_parameters_changed_listener(bank_listener)
+            except Exception:
+                pass
+        self._bank_parameter_source_device = None
+        self._bank_parameter_source_listener = None
+
+    def _set_parameter_source_listener(self, selected_device):
+        if selected_device == getattr(self, '_parameter_source_device', None):
+            return
+
+        self._remove_parameter_source_listener()
+        if not selected_device or not liveobj_valid(selected_device):
+            return
+
+        if hasattr(selected_device, 'add_parameters_listener'):
+            listener = self._create_parameter_source_listener()
+            self._parameter_source_device = selected_device
+            self._parameter_source_listener = listener
+            try:
+                if not hasattr(selected_device, 'parameters_has_listener') or not selected_device.parameters_has_listener(listener):
+                    selected_device.add_parameters_listener(listener)
+            except Exception:
+                self._parameter_source_device = None
+                self._parameter_source_listener = None
+
+        if hasattr(selected_device, 'add_bank_parameters_changed_listener'):
+            bank_listener = self._create_bank_parameter_source_listener()
+            self._bank_parameter_source_device = selected_device
+            self._bank_parameter_source_listener = bank_listener
+            try:
+                if not hasattr(selected_device, 'bank_parameters_changed_has_listener') or not selected_device.bank_parameters_changed_has_listener(bank_listener):
+                    selected_device.add_bank_parameters_changed_listener(bank_listener)
+            except Exception:
+                self._bank_parameter_source_device = None
+                self._bank_parameter_source_listener = None
 
     def _refresh_parameter_value_listeners_current_bank(self, send_current_values=False):
         self._remove_parameter_value_listeners()
@@ -1636,6 +1756,24 @@ class Tap(ControlSurface):
                 self._last_sent_parameter_normalized_values[control_index] = round(self._parameter_normalized_value(mapped_param), 9)
                 if send_current_values:
                     self._send_parameter_feedback(control_index, mapped_param, force_display=True)
+
+    def _refresh_parameter_name_listeners_current_bank(self):
+        self._remove_parameter_name_listeners()
+        if not hasattr(self, '_device') or not liveobj_valid(self._device):
+            return
+        if not hasattr(self._device, '_parameter_controls'):
+            return
+
+        for control_index, control in enumerate(self._device._parameter_controls):
+            mapped_param = control.mapped_parameter() if control else None
+            if mapped_param and liveobj_valid(mapped_param) and hasattr(mapped_param, 'add_name_listener'):
+                listener = self._create_parameter_name_listener(mapped_param, control_index)
+                self._parameter_name_listeners[(mapped_param, control_index)] = listener
+                try:
+                    if not hasattr(mapped_param, 'name_has_listener') or not mapped_param.name_has_listener(listener):
+                        mapped_param.add_name_listener(listener)
+                except Exception:
+                    pass
 
     def _create_automation_state_listener(self, device_param):
         def listener():
@@ -1743,6 +1881,8 @@ class Tap(ControlSurface):
                 self._mark_metadata_sent(selected_device)
                 self._last_automation_signature = self._get_automation_signature()
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                self._refresh_parameter_name_listeners_current_bank()
+                self._refresh_automation_state_listeners_current_bank()
             
             if metadata_changed and hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index in range(8):
@@ -5543,6 +5683,8 @@ class Tap(ControlSurface):
         self._active_high_resolution_gestures.clear()
         
         self._remove_parameter_value_listeners()
+        self._remove_parameter_name_listeners()
+        self._remove_parameter_source_listener()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
