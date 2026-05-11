@@ -17,6 +17,7 @@ from Live.Clip import MidiNoteSpecification
 import threading
 import random
 import re
+import math
 from itertools import zip_longest
 import time
 
@@ -122,6 +123,7 @@ class Tap(ControlSurface):
             self._active_high_resolution_gestures = set()
             self._parameter_value_listeners = {}
             self._last_sent_parameter_displays = {}
+            self._last_sent_parameter_normalized_values = {}
             self._last_sent_parameter_cc_values = {}
             self._last_parameter_display_feedback_times = {}
             self._follow_action_track_signature = None
@@ -237,6 +239,31 @@ class Tap(ControlSurface):
         except Exception:
             return ""
 
+    def _round_half_up(self, value):
+        return int(math.floor(float(value) + 0.5))
+
+    def _parameter_target_value_from_normalized(self, device_param, normalized):
+        min_val = device_param.min
+        max_val = device_param.max
+        if max_val == min_val:
+            return min_val
+
+        normalized = max(0.0, min(1.0, float(normalized)))
+
+        if hasattr(device_param, 'is_quantized') and device_param.is_quantized:
+            if hasattr(device_param, 'value_items') and device_param.value_items:
+                item_count = len(device_param.value_items)
+                if item_count > 1:
+                    item_index = self._round_half_up(normalized * (item_count - 1))
+                    item_index = max(0, min(item_count - 1, item_index))
+                    target_value = min_val + (max_val - min_val) * (float(item_index) / float(item_count - 1))
+                    return max(min_val, min(max_val, target_value))
+
+            target_value = min_val + (max_val - min_val) * normalized
+            return max(min_val, min(max_val, self._round_half_up(target_value)))
+
+        return max(min_val, min(max_val, min_val + (max_val - min_val) * normalized))
+
     def _send_parameter_display_value(self, control_index, device_param, force=False, throttle=False):
         if not device_param or not liveobj_valid(device_param):
             return
@@ -248,18 +275,21 @@ class Tap(ControlSurface):
                 return
 
         display_value = self._parameter_display_value(device_param)
-        normalized_value = self._parameter_normalized_value(device_param)
+        normalized_value = round(self._parameter_normalized_value(device_param), 9)
 
-        if not force and self._last_sent_parameter_displays.get(control_index) == display_value:
+        if (not force and
+            self._last_sent_parameter_displays.get(control_index) == display_value and
+            self._last_sent_parameter_normalized_values.get(control_index) == normalized_value):
             return
 
         payload = "{}|{}|{}".format(
             control_index,
-            round(normalized_value, 6),
+            normalized_value,
             self._escape_sysex_string(display_value)
         )
         self._send_sys_ex_message(payload, 0x28)
         self._last_sent_parameter_displays[control_index] = display_value
+        self._last_sent_parameter_normalized_values[control_index] = normalized_value
         self._last_parameter_display_feedback_times[control_index] = now
 
     def _send_parameter_feedback(self, control_index, device_param, send_cc=False, force_display=False, throttle_display=False):
@@ -322,16 +352,11 @@ class Tap(ControlSurface):
                         mapped_parameter.begin_gesture()
                     self._active_high_resolution_gestures.add(control_index)
 
-                min_val = mapped_parameter.min
-                max_val = mapped_parameter.max
-                if max_val == min_val:
+                if mapped_parameter.max == mapped_parameter.min:
                     return
 
                 normalized = float(raw_value) / 65535.0
-                target_value = min_val + (max_val - min_val) * normalized
-                if hasattr(mapped_parameter, 'is_quantized') and mapped_parameter.is_quantized:
-                    target_value = round(target_value)
-                target_value = max(min_val, min(max_val, target_value))
+                target_value = self._parameter_target_value_from_normalized(mapped_parameter, normalized)
                 mapped_parameter.value = target_value
                 self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, throttle_display=True)
 
@@ -1585,6 +1610,7 @@ class Tap(ControlSurface):
                     pass
         self._parameter_value_listeners.clear()
         self._last_sent_parameter_displays.clear()
+        self._last_sent_parameter_normalized_values.clear()
         self._last_sent_parameter_cc_values.clear()
         self._last_parameter_display_feedback_times.clear()
 
@@ -1607,6 +1633,7 @@ class Tap(ControlSurface):
                     pass
                 self._last_sent_parameter_cc_values[control_index] = self._parameter_value_to_cc(mapped_param)
                 self._last_sent_parameter_displays[control_index] = self._parameter_display_value(mapped_param)
+                self._last_sent_parameter_normalized_values[control_index] = round(self._parameter_normalized_value(mapped_param), 9)
                 if send_current_values:
                     self._send_parameter_feedback(control_index, mapped_param, force_display=True)
 
