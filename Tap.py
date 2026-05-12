@@ -325,6 +325,9 @@ class Tap(ControlSurface):
             self._automation_parameter_action = None
             self._automation_removal_suppressed_controls = set()
             self._mixer_automation_controls = []
+            self._mixer_automation_status_specs = []
+            self._mixer_automation_state_listeners = []
+            self._mixer_automation_status_timers = []
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -2553,6 +2556,8 @@ class Tap(ControlSurface):
             return
         self._re_enable_automation_enabled_state = enabled
         self._send_sys_ex_message("1" if enabled else "0", 0x29)
+        if getattr(self, 'mixer_status', False):
+            self._schedule_mixer_automation_status_resends()
 
     def _on_re_enable_automation_enabled_changed(self):
         self._send_re_enable_automation_enabled()
@@ -4149,7 +4154,71 @@ class Tap(ControlSurface):
                 self._on_mixer_automation_control_value(value, channel_type, track_index, parameter_name, send_index)
         )
         self._mixer_automation_controls.append(control)
+        self._register_mixer_automation_status(midi_channel, cc, channel_type, track_index, parameter_name, send_index)
         return control
+
+    def _register_mixer_automation_status(self, midi_channel, cc, channel_type, track_index, parameter_name, send_index=None):
+        self._mixer_automation_status_specs.append((midi_channel, cc, channel_type, track_index, parameter_name, send_index))
+        parameter = self._mixer_parameter(channel_type, track_index, parameter_name, send_index)
+        if parameter and liveobj_valid(parameter) and hasattr(parameter, 'add_automation_state_listener'):
+            listener = self._create_mixer_automation_state_listener()
+            self._mixer_automation_state_listeners.append((parameter, listener))
+            if not hasattr(parameter, 'automation_state_has_listener') or not parameter.automation_state_has_listener(listener):
+                parameter.add_automation_state_listener(listener)
+
+    def _create_mixer_automation_state_listener(self):
+        def listener():
+            self._schedule_mixer_automation_status_resends()
+        return listener
+
+    def _remove_mixer_automation_state_listeners(self):
+        for parameter, listener in self._mixer_automation_state_listeners:
+            try:
+                if liveobj_valid(parameter) and hasattr(parameter, 'remove_automation_state_listener'):
+                    if not hasattr(parameter, 'automation_state_has_listener') or parameter.automation_state_has_listener(listener):
+                        parameter.remove_automation_state_listener(listener)
+            except Exception:
+                pass
+        self._mixer_automation_state_listeners = []
+
+    def _cancel_mixer_automation_status_resends(self):
+        for timer in list(getattr(self, '_mixer_automation_status_timers', [])):
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._mixer_automation_status_timers = []
+
+    def _schedule_mixer_automation_status_resends(self, send_now=True):
+        self._cancel_mixer_automation_status_resends()
+        if send_now:
+            self._send_mixer_automation_statuses()
+        if not getattr(self, 'mixer_status', False):
+            return
+        for delay in (0.05, 0.15, 0.35):
+            timer = threading.Timer(delay, self._send_mixer_automation_statuses)
+            self._mixer_automation_status_timers.append(timer)
+            timer.start()
+
+    def _mixer_automation_state_for_parameter(self, parameter):
+        try:
+            if parameter and liveobj_valid(parameter) and hasattr(parameter, 'automation_state'):
+                return int(parameter.automation_state)
+        except Exception:
+            pass
+        return 0
+
+    def _send_mixer_automation_statuses(self):
+        if not self.mixer_status:
+            self._send_sys_ex_message("", 0x2A)
+            return
+
+        entries = []
+        for midi_channel, cc, channel_type, track_index, parameter_name, send_index in self._mixer_automation_status_specs:
+            parameter = self._mixer_parameter(channel_type, track_index, parameter_name, send_index)
+            state = self._mixer_automation_state_for_parameter(parameter)
+            entries.append("{}:{}:{}".format(midi_channel, cc, state))
+        self._send_sys_ex_message(",".join(entries), 0x2A)
 
     def _mixer_track(self, channel_type, track_index):
         try:
@@ -4178,6 +4247,7 @@ class Tap(ControlSurface):
             return None
 
     def _on_mixer_automation_control_value(self, value, channel_type, track_index, parameter_name, send_index=None):
+        self._schedule_mixer_automation_status_resends(send_now=False)
         if not self._pending_parameter_automation_action():
             return
 
@@ -4189,7 +4259,9 @@ class Tap(ControlSurface):
         song = self.song()
         tracks = song.tracks
         return_tracks = song.return_tracks
+        self._remove_mixer_automation_state_listeners()
         self._mixer_automation_controls = []
+        self._mixer_automation_status_specs = []
         # - 1 because visible_channels is starting at 0
         last_track_index = len(tracks) - 1
         
@@ -4268,6 +4340,8 @@ class Tap(ControlSurface):
                 strip.set_solo_button(None)
                 strip.set_send_controls(None)
                 strip.set_pan_control(None)
+
+        self._schedule_mixer_automation_status_resends()
         
     def _on_output_level_changed(self, index):
         if self.mixer_status:
@@ -6174,6 +6248,8 @@ class Tap(ControlSurface):
         self._remove_parameter_source_listener()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
+        self._remove_mixer_automation_state_listeners()
+        self._cancel_mixer_automation_status_resends()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         if hasattr(self, 'duplicate_button'):
             self.duplicate_button.remove_value_listener(self._duplicate_button_value)
