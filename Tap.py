@@ -1131,7 +1131,11 @@ class Tap(ControlSurface):
             return
 
         if self._metadata_is_all_unmapped(current_metadata):
-            self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
+            if self._get_cached_metadata(selected_device) != current_metadata:
+                self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
+            return
+
+        if self._get_cached_metadata(selected_device) == current_metadata:
             return
 
         self._send_sys_ex_message(current_metadata, 0x7D)
