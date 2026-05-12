@@ -231,6 +231,7 @@ class Tap(ControlSurface):
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
             self.last_sent_out_playing_pos = 0.0
+            self._last_sent_playing_pos_cc_pair = None
             self.clip_length_trick = 110.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
@@ -1115,7 +1116,6 @@ class Tap(ControlSurface):
         try:
             if hasattr(self._device, 'update'):
                 self._device.update()
-            self._on_device_changed()
             self._force_send_current_bank_metadata()
         except Exception as e:
             self._debug_log("Error refreshing bank metadata after bank change: {}".format(str(e)))
@@ -3866,13 +3866,13 @@ class Tap(ControlSurface):
                         
                         if self.seq_status:
                             if song.view.highlighted_clip_slot.is_playing:
-                                self.send_out_playing_pos(clip_position)
+                                self.send_out_playing_pos(clip_position, clip_playing.signature_numerator)
                                 self.last_sent_out_playing_pos = clip_position
                             else:
                                 # reseting the playing position
                                 if self.last_sent_out_playing_pos != 0.0:
                                     self.last_sent_out_playing_pos = 0.0
-                                    self.send_out_playing_pos(self.last_sent_out_playing_pos)
+                                    self.send_out_playing_pos(self.last_sent_out_playing_pos, 1.0, force=True, hidden=True)
                                 
                         else:
                             # making sure we have the right starting position, when jumping back to the start of clip or loop
@@ -5812,23 +5812,35 @@ class Tap(ControlSurface):
                 # self.log_message("Sending SysEx chunk")
                 self._send_midi(sys_ex_message)
     
-    def send_out_playing_pos(self, value):
-        now = time.time()
-        if now - self._last_playing_pos_sent < 1.0 / 60.0:
+    def send_out_playing_pos(self, value, beats_per_bar, force=False, hidden=False):
+        if hidden:
+            cc_pair = (127, 0)
+            if not force and self._last_sent_playing_pos_cc_pair == cc_pair:
+                return
+            self._last_sent_playing_pos_cc_pair = cc_pair
+            self.send_cc(65, 11, cc_pair[0])
+            self.send_cc(66, 11, cc_pair[1])
             return
-        self._last_playing_pos_sent = now
-    
-        status_byte = 0xF0
-        end_byte = 0xF7
-        manufacturer_id = 0x0F
-        device_id = 0x01
-            
-        playing_pos_in_ms = int(value * 1000)
-        
-        pos_data = self._to_3_7bit_bytes(playing_pos_in_ms)
-        
-        sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(pos_data) + (end_byte,)
-        self._send_midi(sys_ex_message)
+
+        if beats_per_bar <= 0:
+            return
+
+        beats_per_bar = float(beats_per_bar)
+        position = max(0.0, float(value))
+        bar_index = int(math.floor(position / beats_per_bar))
+        bar_position = position - (bar_index * beats_per_bar)
+        fine_value = max(0.0, min(1.0, bar_position / beats_per_bar))
+
+        cc_pair = (
+            max(0, min(126, bar_index)),
+            max(0, min(127, int(round(fine_value * 127.0))))
+        )
+        if not force and self._last_sent_playing_pos_cc_pair == cc_pair:
+            return
+
+        self._last_sent_playing_pos_cc_pair = cc_pair
+        self.send_cc(65, 11, cc_pair[0])
+        self.send_cc(66, 11, cc_pair[1])
             
     
     def _delete_return_track(self, value):
