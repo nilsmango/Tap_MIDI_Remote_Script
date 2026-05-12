@@ -1290,9 +1290,6 @@ class Tap(ControlSurface):
     
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
-        if self._drum_rack_device:
-            self._remove_drum_pad_name_listeners()
-            self._drum_rack_device = None
         self._remove_parameter_value_listeners()
         self._remove_parameter_name_listeners()
         self._remove_parameter_source_listener()
@@ -1350,9 +1347,14 @@ class Tap(ControlSurface):
             drum_rack_device = self._find_drum_rack_in_track(selected_track)
             if drum_rack_device is not None:
                 track_has_drums = 1
-                # set up drum pad names, with listener
-                self._drum_rack_device = drum_rack_device
-                self._setup_drum_pad_listeners()
+                if drum_rack_device != self._drum_rack_device:
+                    if self._drum_rack_device:
+                        self._remove_drum_pad_name_listeners()
+                    self._drum_rack_device = drum_rack_device
+                    self._setup_drum_pad_listeners()
+            elif self._drum_rack_device:
+                self._remove_drum_pad_name_listeners()
+                self._drum_rack_device = None
                 
             # bank names, list and if has drum
             current_bank_name = self._device._bank_name
