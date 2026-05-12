@@ -473,6 +473,8 @@ class Tap(ControlSurface):
     def _send_parameter_display_value(self, control_index, device_param, force=False, throttle=False):
         if not device_param or not liveobj_valid(device_param):
             return
+        if not self._is_current_parameter_for_control(control_index, device_param):
+            return
 
         now = time.time()
         if throttle and not force:
@@ -501,6 +503,8 @@ class Tap(ControlSurface):
     def _send_parameter_feedback(self, control_index, device_param, send_cc=False, force_display=False, throttle_display=False):
         if not device_param or not liveobj_valid(device_param):
             return
+        if not self._is_current_parameter_for_control(control_index, device_param):
+            return
 
         if send_cc:
             cc_value = self._parameter_value_to_cc(device_param)
@@ -524,7 +528,8 @@ class Tap(ControlSurface):
 
     def _on_device_control_value(self, value, control):
         try:
-            mapped_parameter = control.mapped_parameter() if control and control.mapped_parameter() else None
+            control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
+            mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
             self._select_parameter_if_possible(mapped_parameter)
         except Exception as e:
             self._debug_log("Error selecting touched parameter: {}".format(str(e)))
@@ -539,7 +544,7 @@ class Tap(ControlSurface):
             raw_value = ((int(message[4]) & 0x7F) << 14) | ((int(message[5]) & 0x7F) << 7) | (int(message[6]) & 0x7F)
             raw_value = max(0, min(65535, raw_value))
 
-            mapped_parameter = self._mapped_parameter_for_device_control(control_index)
+            mapped_parameter = self._current_connected_parameter_for_control(control_index)
             if not mapped_parameter:
                 return
 
@@ -794,6 +799,35 @@ class Tap(ControlSurface):
         except Exception:
             pass
         return None
+
+    def _selected_device(self):
+        try:
+            selected_track = self.song().view.selected_track
+            return selected_track.view.selected_device if selected_track else None
+        except Exception:
+            return None
+
+    def _current_connected_parameter_for_control(self, control_index, selected_device=None):
+        selected_device = selected_device or self._selected_device()
+        bank_param = self._current_bank_parameter_for_control(selected_device, control_index)
+        if bank_param and liveobj_valid(bank_param):
+            return bank_param
+
+        mapped_param = self._mapped_parameter_for_device_control(control_index)
+        if mapped_param and selected_device and hasattr(selected_device, 'parameters'):
+            try:
+                if not any(device_param == mapped_param for device_param in selected_device.parameters):
+                    return None
+            except Exception:
+                return None
+        return mapped_param
+
+    def _is_current_parameter_for_control(self, control_index, device_param):
+        if not device_param or not liveobj_valid(device_param):
+            return False
+
+        current_param = self._current_connected_parameter_for_control(control_index)
+        return current_param and liveobj_valid(current_param) and current_param == device_param
     
     def _build_parameter_metadata(self, selected_device):
         if not hasattr(selected_device, 'parameters'):
@@ -808,10 +842,7 @@ class Tap(ControlSurface):
         unmapped_encoder_indices = []
         
         for control_index in range(8):
-            mapped_param = self._current_bank_parameter_for_control(selected_device, control_index)
-            if not mapped_param:
-                control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-                mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+            mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
             
             if mapped_param:
                 device_param = mapped_param
@@ -1123,21 +1154,10 @@ class Tap(ControlSurface):
                 self._last_sent_metadata = current_metadata
             
             if not all_unmapped and hasattr(metadata_device, 'parameters') and metadata_device.parameters:
-                device_parameters = list(metadata_device.parameters)
-                
                 for control_index in range(8):
-                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
-                    
+                    mapped_param = self._current_connected_parameter_for_control(control_index, metadata_device)
                     if mapped_param:
-                        device_param = None
-                        for dp in device_parameters:
-                            if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                                device_param = dp
-                                break
-                        
-                        if device_param:
-                            self._send_parameter_feedback(control_index, device_param, force_display=True)
+                        self._send_parameter_feedback(control_index, mapped_param, force_display=True)
         
         max_iterations = int(self.PARAMETER_METADATA_RECHECK_DURATION / self.PARAMETER_METADATA_RECHECK_INTERVAL) + 1
         should_continue = False
@@ -1174,6 +1194,7 @@ class Tap(ControlSurface):
         if self._drum_rack_device:
             self._remove_drum_pad_name_listeners()
             self._drum_rack_device = None
+        self._remove_parameter_value_listeners()
         self._remove_parameter_name_listeners()
         self._remove_parameter_source_listener()
         self._remove_automation_state_listeners()
@@ -1268,9 +1289,9 @@ class Tap(ControlSurface):
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
                 def _build_parameter_names():
                     names = []
-                    for control in self._device._parameter_controls:
-                        if control.mapped_parameter():
-                            mapped_param = control.mapped_parameter()
+                    for control_index, control in enumerate(self._device._parameter_controls):
+                        mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
+                        if mapped_param:
                             
                             device_param = mapped_param
                             
@@ -1341,8 +1362,8 @@ class Tap(ControlSurface):
             
             if hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index, control in enumerate(self._device._parameter_controls):
-                    if control.mapped_parameter():
-                        mapped_param = control.mapped_parameter()
+                    mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
+                    if mapped_param:
                         
                         device_param = mapped_param
                         
@@ -1670,8 +1691,7 @@ class Tap(ControlSurface):
                 if metadata_changed:
                     unmapped_encoder_indices = []
                     for control_index in range(8):
-                        control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-                        mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
+                        mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
                         if not mapped_param:
                             unmapped_encoder_indices.append(control_index)
                     
@@ -1905,16 +1925,22 @@ class Tap(ControlSurface):
 
     def _create_disabled_param_listener(self, device_param, control_index):
         def listener():
+            if not self._is_current_parameter_for_control(control_index, device_param):
+                return
             self._send_parameter_feedback(control_index, device_param, force_display=True)
         return listener
 
     def _create_parameter_value_listener(self, device_param, control_index):
         def listener():
+            if not self._is_current_parameter_for_control(control_index, device_param):
+                return
             self._send_parameter_feedback(control_index, device_param)
         return listener
 
     def _create_parameter_name_listener(self, device_param, control_index):
         def listener():
+            if not self._is_current_parameter_for_control(control_index, device_param):
+                return
             self._schedule_active_bank_parameter_refresh()
         return listener
 
@@ -2038,8 +2064,9 @@ class Tap(ControlSurface):
         if not hasattr(self._device, '_parameter_controls'):
             return
 
+        selected_device = self._selected_device()
         for control_index, control in enumerate(self._device._parameter_controls):
-            mapped_param = control.mapped_parameter() if control else None
+            mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
             if mapped_param and liveobj_valid(mapped_param) and hasattr(mapped_param, 'add_value_listener'):
                 listener = self._create_parameter_value_listener(mapped_param, control_index)
                 self._parameter_value_listeners[(mapped_param, control_index)] = listener
@@ -2061,8 +2088,9 @@ class Tap(ControlSurface):
         if not hasattr(self._device, '_parameter_controls'):
             return
 
+        selected_device = self._selected_device()
         for control_index, control in enumerate(self._device._parameter_controls):
-            mapped_param = control.mapped_parameter() if control else None
+            mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
             if mapped_param and liveobj_valid(mapped_param) and hasattr(mapped_param, 'add_name_listener'):
                 listener = self._create_parameter_name_listener(mapped_param, control_index)
                 self._parameter_name_listeners[(mapped_param, control_index)] = listener
@@ -2081,22 +2109,23 @@ class Tap(ControlSurface):
         self._remove_automation_state_listeners()
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return
-        for control in self._device._parameter_controls:
-            if control.mapped_parameter():
-                device_param = control.mapped_parameter()
-                if device_param:
-                    listener = self._create_automation_state_listener(device_param)
-                    if device_param not in self._automation_state_listeners:
-                        self._automation_state_listeners[device_param] = listener
-                        if hasattr(device_param, 'add_automation_state_listener'):
-                            device_param.add_automation_state_listener(listener)
+        selected_device = self._selected_device()
+        for control_index, control in enumerate(self._device._parameter_controls):
+            device_param = self._current_connected_parameter_for_control(control_index, selected_device)
+            if device_param:
+                listener = self._create_automation_state_listener(device_param)
+                if device_param not in self._automation_state_listeners:
+                    self._automation_state_listeners[device_param] = listener
+                    if hasattr(device_param, 'add_automation_state_listener'):
+                        device_param.add_automation_state_listener(listener)
 
     def _get_automation_signature(self):
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return None
         signature = []
-        for control in self._device._parameter_controls:
-            mapped_param = control.mapped_parameter() if control else None
+        selected_device = self._selected_device()
+        for control_index, control in enumerate(self._device._parameter_controls):
+            mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
             if mapped_param and hasattr(mapped_param, 'automation_state'):
                 signature.append(mapped_param.automation_state)
             else:
@@ -2183,14 +2212,9 @@ class Tap(ControlSurface):
             
             if metadata_changed and hasattr(selected_device, 'parameters') and selected_device.parameters:
                 for control_index in range(8):
-                    control = self._device_controls[control_index] if control_index < len(self._device_controls) else None
-                    mapped_param = control.mapped_parameter() if control and control.mapped_parameter() else None
-                    
+                    mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
                     if mapped_param:
-                        device_param = mapped_param
-                        
-                        if device_param:
-                            self._send_parameter_feedback(control_index, device_param, force_display=True)
+                        self._send_parameter_feedback(control_index, mapped_param, force_display=True)
             
             if not metadata_changed:
                 elapsed = 0.0
@@ -2242,33 +2266,23 @@ class Tap(ControlSurface):
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return
         
-        selected_track = self.song().view.selected_track
-        selected_device = selected_track.view.selected_device
+        selected_device = self._selected_device()
         
         if hasattr(selected_device, 'parameters') and selected_device.parameters:
-            device_parameters = list(selected_device.parameters)
-            
             for control_index, control in enumerate(self._device._parameter_controls):
-                if control.mapped_parameter():
-                    mapped_param = control.mapped_parameter()
-                    
-                    device_param = None
-                    for dp in device_parameters:
-                        if hasattr(dp, 'name') and dp.name == mapped_param.name:
-                            device_param = dp
-                            break
-                    
-                    if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
-                        if (device_param, control_index) not in self._disabled_parameter_listeners:
-                            listener = self._create_disabled_param_listener(device_param, control_index)
-                            if not device_param.value_has_listener(listener):
-                                device_param.add_value_listener(listener)
-                            
-                            self._disabled_parameter_listeners[(device_param, control_index)] = listener
-                            self._disabled_parameters.append(device_param)
-                            self._current_disabled_controls.append(control_index)
-                            
-                            self._send_parameter_feedback(control_index, device_param, force_display=True)
+                device_param = self._current_connected_parameter_for_control(control_index, selected_device)
+
+                if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
+                    if (device_param, control_index) not in self._disabled_parameter_listeners:
+                        listener = self._create_disabled_param_listener(device_param, control_index)
+                        if not device_param.value_has_listener(listener):
+                            device_param.add_value_listener(listener)
+
+                        self._disabled_parameter_listeners[(device_param, control_index)] = listener
+                        self._disabled_parameters.append(device_param)
+                        self._current_disabled_controls.append(control_index)
+
+                        self._send_parameter_feedback(control_index, device_param, force_display=True)
 
     def _connection_established(self, value):
         if value:            
