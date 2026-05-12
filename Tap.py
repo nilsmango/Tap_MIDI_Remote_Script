@@ -390,7 +390,7 @@ class Tap(ControlSurface):
 
     def _on_nav_button_pressed(self, value):
         if value:
-            self._on_device_changed()
+            self._on_device_changed(False)
             self._schedule_bank_metadata_refreshes()
 
     def _mapped_parameter_for_device_control(self, control_index):
@@ -697,7 +697,7 @@ class Tap(ControlSurface):
         if new_index != current_index:
             self._device._bank_index = new_index
             self._device.update()
-            self._on_device_changed()
+            self._on_device_changed(False)
             self._schedule_bank_metadata_refreshes()
 
     def _find_drum_rack_in_track(self, track):
@@ -1289,7 +1289,7 @@ class Tap(ControlSurface):
             self._drum_pad_recheck_start = None
     
     @subject_slot('device')
-    def _on_device_changed(self):
+    def _on_device_changed(self, send_device_navigation=True):
         if self._drum_rack_device:
             self._remove_drum_pad_name_listeners()
             self._drum_rack_device = None
@@ -1305,36 +1305,45 @@ class Tap(ControlSurface):
             selected_device = selected_track.view.selected_device
             self._set_parameter_source_listener(selected_device)
             
-            # Get all available devices of the selected track, including nested devices
-            all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
-            
-            # Convert device objects to names for display, adding chain markers
-            all_device_names = []
-            for i, device in enumerate(all_devices):
-                name = device.name
+            selected_device_index = "not found"
+            available_devices_string = ""
+            if send_device_navigation:
+                # Get all available devices of the selected track, including nested devices
+                all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
                 
-                # collect all starts/ends for this index
-                starts = [info for info in chain_info if info['start_index'] == i]
-                ends   = [info for info in chain_info if info['end_index'] == i]
+                # Convert device objects to names for display, adding chain markers
+                all_device_names = []
+                for i, device in enumerate(all_devices):
+                    name = device.name
+                    
+                    # collect all starts/ends for this index
+                    starts = [info for info in chain_info if info['start_index'] == i]
+                    ends   = [info for info in chain_info if info['end_index'] == i]
+                    
+                    # there should never be more than one rack or chain at the same index
+                    prefix = ""
+                    for s in starts:
+                        if s['type'] == 'rack':
+                            prefix += "||"
+                        elif s['type'] == 'chain':
+                            prefix += "|*"
                 
-                # there should never be more than one rack or chain at the same index
-                prefix = ""
-                for s in starts:
-                    if s['type'] == 'rack':
-                        prefix += "||"
-                    elif s['type'] == 'chain':
-                        prefix += "|*"
-            
-                # make sure chains come first, racks after
-                suffix = ""
-                for e in [e for e in ends if e['type'] == 'chain']:
-                    suffix += "*|"
-                for e in [e for e in ends if e['type'] == 'rack']:
-                    suffix += "||"
-            
-                all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
-            
-            available_devices_string = ','.join(all_device_names)
+                    # make sure chains come first, racks after
+                    suffix = ""
+                    for e in [e for e in ends if e['type'] == 'chain']:
+                        suffix += "*|"
+                    for e in [e for e in ends if e['type'] == 'rack']:
+                        suffix += "||"
+                
+                    all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
+                
+                available_devices_string = ','.join(all_device_names)
+                
+                # CHANGE 2: Find index of selected device in our comprehensive nested devices list
+                for index, device in enumerate(all_devices):
+                    if device == selected_device:
+                        selected_device_index = str(index)
+                        break
             
             # find out if track has a drum rack.
             track_has_drums = 0
@@ -1345,13 +1354,6 @@ class Tap(ControlSurface):
                 self._drum_rack_device = drum_rack_device
                 self._setup_drum_pad_listeners()
                 
-            # CHANGE 2: Find index of selected device in our comprehensive nested devices list
-            selected_device_index = "not found"
-            for index, device in enumerate(all_devices):
-                if device == selected_device:
-                    selected_device_index = str(index)
-                    break
-            
             # bank names, list and if has drum
             current_bank_name = self._device._bank_name
             all_bank_names = self._device._parameter_bank_names()
@@ -1373,11 +1375,12 @@ class Tap(ControlSurface):
             # sending sysex of bank name, device name, bank names
             self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
-            # CHANGE 3: Send the index from our comprehensive device list
-            self._send_sys_ex_message(selected_device_index, 0x4D)
-            
-            # Send the comprehensive list of available devices
-            self._send_sys_ex_message(available_devices_string, 0x01)
+            if send_device_navigation:
+                # CHANGE 3: Send the index from our comprehensive device list
+                self._send_sys_ex_message(selected_device_index, 0x4D)
+                
+                # Send the comprehensive list of available devices
+                self._send_sys_ex_message(available_devices_string, 0x01)
             
             # In mixer mode, temporarily reconnect device controls so we can
             # build parameter metadata. Do this early so the framework has more
