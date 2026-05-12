@@ -321,6 +321,10 @@ class Tap(ControlSurface):
             self._previous_selected_track = None
             self._periodic_timer_ref = None
             self._re_enable_automation_enabled_state = None
+            self._remove_automation_from_next_encoder = False
+            self._automation_parameter_action = None
+            self._automation_removal_suppressed_controls = set()
+            self._mixer_automation_controls = []
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -527,10 +531,88 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
+    def _arm_remove_automation_from_next_encoder(self, value):
+        if value:
+            self._remove_automation_from_next_encoder = True
+            self._automation_parameter_action = "remove"
+            self._automation_removal_suppressed_controls.clear()
+
+    def _arm_re_enable_automation_from_next_encoder(self, value):
+        if value:
+            self._remove_automation_from_next_encoder = False
+            self._automation_parameter_action = "re_enable"
+            self._automation_removal_suppressed_controls.clear()
+
+    def _pending_parameter_automation_action(self):
+        if self._automation_parameter_action:
+            return self._automation_parameter_action
+        return "remove" if self._remove_automation_from_next_encoder else None
+
+    def _consume_remove_automation_request(self, device_param, track=None):
+        action = self._pending_parameter_automation_action()
+        if not action:
+            return False
+
+        self._remove_automation_from_next_encoder = False
+        self._automation_parameter_action = None
+        if not device_param or not liveobj_valid(device_param):
+            return True
+
+        self._select_parameter_if_possible(device_param)
+        if action == "re_enable":
+            self._re_enable_automation_for_parameter(device_param)
+        else:
+            self._remove_automation_for_parameter(device_param, track)
+        return True
+
+    def _playing_clip_slot_for_track(self, track):
+        try:
+            if track is None or not hasattr(track, 'clip_slots'):
+                return None
+            for clip_slot in track.clip_slots:
+                if clip_slot is not None and clip_slot.has_clip and clip_slot.is_playing:
+                    return clip_slot
+        except Exception:
+            pass
+        return None
+
+    def _remove_automation_for_parameter(self, device_param, track=None):
+        try:
+            song = self.song()
+            clip_slot = self._playing_clip_slot_for_track(track or song.view.selected_track)
+            envelope_was_cleared = False
+            if clip_slot is not None and clip_slot.has_clip:
+                clip = clip_slot.clip
+                envelope = None
+                if hasattr(clip, 'automation_envelope'):
+                    try:
+                        envelope = clip.automation_envelope(device_param)
+                    except Exception:
+                        envelope = None
+                if envelope is not None and hasattr(clip, 'clear_envelope'):
+                    clip.clear_envelope(device_param)
+                    envelope_was_cleared = True
+
+            if envelope_was_cleared:
+                self._refresh_parameter_metadata_on_automation_change()
+        except Exception as e:
+            self._debug_log("Error removing automation: {}".format(str(e)))
+
+    def _re_enable_automation_for_parameter(self, device_param):
+        try:
+            if hasattr(device_param, 're_enable_automation'):
+                device_param.re_enable_automation()
+                self._refresh_parameter_metadata_on_automation_change()
+                self._send_re_enable_automation_enabled(force=True)
+        except Exception as e:
+            self._debug_log("Error re-enabling parameter automation: {}".format(str(e)))
+
     def _on_device_control_value(self, value, control):
         try:
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
             mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
+            if self._consume_remove_automation_request(mapped_parameter):
+                return
             self._select_parameter_if_possible(mapped_parameter)
         except Exception as e:
             self._debug_log("Error selecting touched parameter: {}".format(str(e)))
@@ -547,6 +629,15 @@ class Tap(ControlSurface):
 
             mapped_parameter = self._current_connected_parameter_for_control(control_index)
             if not mapped_parameter:
+                return
+
+            if control_index in self._automation_removal_suppressed_controls:
+                if gesture_state == 2:
+                    self._automation_removal_suppressed_controls.discard(control_index)
+                return
+
+            if self._consume_remove_automation_request(mapped_parameter):
+                self._automation_removal_suppressed_controls.add(control_index)
                 return
 
             if hasattr(mapped_parameter, 'is_enabled') and not mapped_parameter.is_enabled:
@@ -1885,6 +1976,10 @@ class Tap(ControlSurface):
         self.browser_back_button.add_value_listener(self._browser_go_back)
         self.re_enable_automation_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 78)
         self.re_enable_automation_button.add_value_listener(self._re_enable_automation)
+        self.remove_automation_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 77)
+        self.remove_automation_button.add_value_listener(self._arm_remove_automation_from_next_encoder)
+        self.re_enable_parameter_automation_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 76)
+        self.re_enable_parameter_automation_button.add_value_listener(self._arm_re_enable_automation_from_next_encoder)
         # direct bank selection (CC channel 11, CC 64) - value = 64 + offset
         bank_select_button = ButtonElement(1, MIDI_CC_TYPE, 11, 64)
         bank_select_button.add_value_listener(self._bank_select)
@@ -4042,11 +4137,59 @@ class Tap(ControlSurface):
                 self._master_level_listeners[master_track] = (left_handler, right_handler)
 
         self._set_up_mixer_controls()
+
+    def _create_mixer_automation_control(self, control_type, midi_channel, cc, channel_type, track_index, parameter_name, send_index=None):
+        if control_type == "slider":
+            control = SliderElement(MIDI_CC_TYPE, midi_channel, cc)
+        else:
+            control = EncoderElement(MIDI_CC_TYPE, midi_channel, cc, Live.MidiMap.MapMode.absolute)
+
+        control.add_value_listener(
+            lambda value, channel_type=channel_type, track_index=track_index, parameter_name=parameter_name, send_index=send_index:
+                self._on_mixer_automation_control_value(value, channel_type, track_index, parameter_name, send_index)
+        )
+        self._mixer_automation_controls.append(control)
+        return control
+
+    def _mixer_track(self, channel_type, track_index):
+        try:
+            song = self.song()
+            if channel_type == "track":
+                return song.tracks[track_index]
+            elif channel_type == "return":
+                return song.return_tracks[track_index]
+            return song.master_track
+        except Exception:
+            return None
+
+    def _mixer_parameter(self, channel_type, track_index, parameter_name, send_index=None):
+        try:
+            track = self._mixer_track(channel_type, track_index)
+            if track is None:
+                return None
+            mixer_device = track.mixer_device
+            if parameter_name == "send":
+                sends = mixer_device.sends
+                if send_index is not None and send_index < len(sends):
+                    return sends[send_index]
+                return None
+            return getattr(mixer_device, parameter_name, None)
+        except Exception:
+            return None
+
+    def _on_mixer_automation_control_value(self, value, channel_type, track_index, parameter_name, send_index=None):
+        if not self._pending_parameter_automation_action():
+            return
+
+        parameter = self._mixer_parameter(channel_type, track_index, parameter_name, send_index)
+        track = self._mixer_track(channel_type, track_index)
+        self._consume_remove_automation_request(parameter, track)
         
     def _set_up_mixer_controls(self):
         song = self.song()
         tracks = song.tracks
         return_tracks = song.return_tracks
+        self._mixer_automation_controls = []
         # - 1 because visible_channels is starting at 0
         last_track_index = len(tracks) - 1
         
@@ -4071,12 +4214,12 @@ class Tap(ControlSurface):
 
             # Configure strip controls for each channel track
             if self.mixer_status and index >= self.visible_channels[0] and index <= self.visible_channels[1]:
-                strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 2, index))
+                strip.set_volume_control(self._create_mixer_automation_control("slider", 2, index, "track", index, "volume"))
                 strip.set_send_controls((
-                    EncoderElement(MIDI_CC_TYPE, 3, index, Live.MidiMap.MapMode.absolute),
-                    EncoderElement(MIDI_CC_TYPE, 4, index, Live.MidiMap.MapMode.absolute)
+                    self._create_mixer_automation_control("encoder", 3, index, "track", index, "send", 0),
+                    self._create_mixer_automation_control("encoder", 4, index, "track", index, "send", 1)
                 ))
-                strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 5, index, Live.MidiMap.MapMode.absolute))
+                strip.set_pan_control(self._create_mixer_automation_control("encoder", 5, index, "track", index, "panning"))
                 strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 6, index))
                 strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 7, index))
                 # reseting volume just in case
@@ -4094,9 +4237,9 @@ class Tap(ControlSurface):
 
         # Master / channel 7 cc 127
         if self.mixer_status and master_track_visible:
-            mixer.master_strip().set_volume_control(SliderElement(MIDI_CC_TYPE, 0, 127))
-            mixer.set_prehear_volume_control(EncoderElement(MIDI_CC_TYPE, 0, 126, Live.MidiMap.MapMode.absolute))
-            mixer.master_strip().set_pan_control(EncoderElement(MIDI_CC_TYPE, 0, 125, Live.MidiMap.MapMode.absolute))
+            mixer.master_strip().set_volume_control(self._create_mixer_automation_control("slider", 0, 127, "master", 0, "volume"))
+            mixer.set_prehear_volume_control(self._create_mixer_automation_control("encoder", 0, 126, "master", 0, "cue_volume"))
+            mixer.master_strip().set_pan_control(self._create_mixer_automation_control("encoder", 0, 125, "master", 0, "panning"))
             # reseting volume just in case
             self._on_output_level_changed(127)
         else:
@@ -4109,14 +4252,14 @@ class Tap(ControlSurface):
             strip = mixer.return_strip(index)
 
             if self.mixer_status and index <= last_visible_return_index and index >= first_visible_return_index:
-                strip.set_volume_control(SliderElement(MIDI_CC_TYPE, 8, index))
+                strip.set_volume_control(self._create_mixer_automation_control("slider", 8, index, "return", index, "volume"))
                 strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 12))
                 strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 24))
                 strip.set_send_controls((
-                    EncoderElement(MIDI_CC_TYPE, 8, index + 36, Live.MidiMap.MapMode.absolute),
-                    EncoderElement(MIDI_CC_TYPE, 8, index + 48, Live.MidiMap.MapMode.absolute)
+                    self._create_mixer_automation_control("encoder", 8, index + 36, "return", index, "send", 0),
+                    self._create_mixer_automation_control("encoder", 8, index + 48, "return", index, "send", 1)
                 ))
-                strip.set_pan_control(EncoderElement(MIDI_CC_TYPE, 8, index + 60, Live.MidiMap.MapMode.absolute))
+                strip.set_pan_control(self._create_mixer_automation_control("encoder", 8, index + 60, "return", index, "panning"))
                 # reseting volume just in case
                 self._on_output_level_changed(index + len(tracks))
             else:
@@ -6055,6 +6198,10 @@ class Tap(ControlSurface):
             self.browser_back_button.remove_value_listener(self._browser_go_back)
         if hasattr(self, 're_enable_automation_button'):
             self.re_enable_automation_button.remove_value_listener(self._re_enable_automation)
+        if hasattr(self, 'remove_automation_button'):
+            self.remove_automation_button.remove_value_listener(self._arm_remove_automation_from_next_encoder)
+        if hasattr(self, 're_enable_parameter_automation_button'):
+            self.re_enable_parameter_automation_button.remove_value_listener(self._arm_re_enable_automation_from_next_encoder)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
