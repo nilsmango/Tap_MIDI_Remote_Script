@@ -320,6 +320,7 @@ class Tap(ControlSurface):
             self._track_list_signature = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
+            self._re_enable_automation_enabled_state = None
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -1882,6 +1883,8 @@ class Tap(ControlSurface):
         # browser go back button (MIDI note channel 15, note 79) - go one level back, remembers page
         self.browser_back_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 79)
         self.browser_back_button.add_value_listener(self._browser_go_back)
+        self.re_enable_automation_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 78)
+        self.re_enable_automation_button.add_value_listener(self._re_enable_automation)
         # direct bank selection (CC channel 11, CC 64) - value = 64 + offset
         bank_select_button = ButtonElement(1, MIDI_CC_TYPE, 11, 64)
         bank_select_button.add_value_listener(self._bank_select)
@@ -2372,6 +2375,7 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
         self._ensure_song_listener(song, "is_playing", self._on_song_is_playing_changed)
+        self._ensure_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
 
     def _remove_song_listener(self, song, listener_name, listener):
         try:
@@ -2432,11 +2436,31 @@ class Tap(ControlSurface):
     def _send_current_project_state(self):
         self.old_clips_array = []
         self._update_tempo()
+        self._send_re_enable_automation_enabled()
         self._update_mixer_and_tracks()
         self._send_selected_track_state()
         self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
+
+    def _re_enable_automation_value(self):
+        try:
+            song = self.song()
+            if hasattr(song, "re_enable_automation_enabled"):
+                return bool(song.re_enable_automation_enabled)
+        except Exception:
+            pass
+        return False
+
+    def _send_re_enable_automation_enabled(self, force=False):
+        enabled = self._re_enable_automation_value()
+        if not force and enabled == self._re_enable_automation_enabled_state:
+            return
+        self._re_enable_automation_enabled_state = enabled
+        self._send_sys_ex_message("1" if enabled else "0", 0x29)
+
+    def _on_re_enable_automation_enabled_changed(self):
+        self._send_re_enable_automation_enabled()
 
     def _check_for_new_song(self):
         if not self.was_initialized:
@@ -5292,6 +5316,14 @@ class Tap(ControlSurface):
         song.delete_track(value)
         self._sync_follow_actions_to_track_topology()
 
+    def _re_enable_automation(self, value):
+        if value:
+            try:
+                self.song().re_enable_automation()
+            except Exception:
+                pass
+            self._send_re_enable_automation_enabled(force=True)
+
     def _add_return_track(self, value):
         if value:
             self.song().create_return_track()
@@ -6021,6 +6053,8 @@ class Tap(ControlSurface):
             self.browser_load_button.remove_value_listener(self._browser_load_item)
         if hasattr(self, 'browser_back_button'):
             self.browser_back_button.remove_value_listener(self._browser_go_back)
+        if hasattr(self, 're_enable_automation_button'):
+            self.re_enable_automation_button.remove_value_listener(self._re_enable_automation)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
         song.remove_tracks_listener(self._on_tracks_changed)
@@ -6030,6 +6064,7 @@ class Tap(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
+        self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
         try:
             if hasattr(song, 'remove_is_playing_listener') and (
                 not hasattr(song, 'is_playing_has_listener')
