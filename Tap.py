@@ -791,6 +791,29 @@ class Tap(ControlSurface):
         start_idx, end_idx = macro_ranges[bank_name]
         return any(device.macros_mapped[start_idx:end_idx])
 
+    def _send_bank_state(self, selected_device, track_has_drums):
+        current_bank_name = self._device._bank_name
+        all_bank_names = self._device._parameter_bank_names()
+        connected_bank_names = [name for name in all_bank_names if self._is_bank_connected(selected_device, name)]
+
+        # Handle case where current bank was filtered out
+        if current_bank_name and isinstance(selected_device, Live.RackDevice.RackDevice):
+            if current_bank_name in all_bank_names and current_bank_name not in connected_bank_names:
+                # Current bank was filtered, navigate to first connected bank
+                if connected_bank_names:
+                    # Simulate bank navigation to trigger device change with valid bank
+                    self._device._bank_index = all_bank_names.index(connected_bank_names[0])
+                    current_bank_name = connected_bank_names[0]
+                else:
+                    current_bank_name = ""
+
+        bank_name_drum = self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums)
+        bank_names_list = ','.join(self._escape_sysex_string(name) for name in connected_bank_names)
+
+        self._send_sys_ex_message(bank_name_drum, 0x6D)
+        self._send_sys_ex_message(bank_names_list, 0x5D)
+        return current_bank_name, all_bank_names, connected_bank_names
+
     def _sanitize_sysex_text(self, value):
         sanitized_value = str(value)
         symbol_replacements = {
@@ -1290,16 +1313,23 @@ class Tap(ControlSurface):
     
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
-        self._remove_parameter_value_listeners()
-        self._remove_parameter_name_listeners()
-        self._remove_parameter_source_listener()
-        self._remove_automation_state_listeners()
-        self._automation_metadata_device_id = None
-            
         if liveobj_valid(self._device):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
-            selected_device = selected_track.view.selected_device
+            selected_device = selected_track.view.selected_device if selected_track else None
+
+            # Send the light bank update before listener and metadata work.
+            track_has_drums = 0
+            drum_rack_device = self._find_drum_rack_in_track(selected_track) if selected_track else None
+            if drum_rack_device is not None:
+                track_has_drums = 1
+            current_bank_name, all_bank_names, connected_bank_names = self._send_bank_state(selected_device, track_has_drums)
+
+            self._remove_parameter_value_listeners()
+            self._remove_parameter_name_listeners()
+            self._remove_parameter_source_listener()
+            self._remove_automation_state_listeners()
+            self._automation_metadata_device_id = None
             self._set_parameter_source_listener(selected_device)
             
             selected_device_index = "not found"
@@ -1342,11 +1372,8 @@ class Tap(ControlSurface):
                         selected_device_index = str(index)
                         break
             
-            # find out if track has a drum rack.
-            track_has_drums = 0
-            drum_rack_device = self._find_drum_rack_in_track(selected_track)
+            # set up drum pad listeners after the fast bank update
             if drum_rack_device is not None:
-                track_has_drums = 1
                 if drum_rack_device != self._drum_rack_device:
                     if self._drum_rack_device:
                         self._remove_drum_pad_name_listeners()
@@ -1356,27 +1383,6 @@ class Tap(ControlSurface):
                 self._remove_drum_pad_name_listeners()
                 self._drum_rack_device = None
                 
-            # bank names, list and if has drum
-            current_bank_name = self._device._bank_name
-            all_bank_names = self._device._parameter_bank_names()
-            connected_bank_names = [name for name in all_bank_names if self._is_bank_connected(selected_device, name)]
-            
-            # Handle case where current bank was filtered out
-            if current_bank_name and isinstance(selected_device, Live.RackDevice.RackDevice):
-                if current_bank_name in all_bank_names and current_bank_name not in connected_bank_names:
-                    # Current bank was filtered, navigate to first connected bank
-                    if connected_bank_names:
-                        # Simulate bank navigation to trigger device change with valid bank
-                        self._device._bank_index = all_bank_names.index(connected_bank_names[0])
-                    else:
-                        current_bank_name = ""
-            
-            bank_name_drum = self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums)
-            bank_names_list = ','.join(self._escape_sysex_string(name) for name in connected_bank_names)
-            
-            # sending sysex of bank name, device name, bank names
-            self._send_sys_ex_message(bank_name_drum, 0x6D)
-            self._send_sys_ex_message(bank_names_list, 0x5D)
             if send_device_navigation:
                 # CHANGE 3: Send the index from our comprehensive device list
                 self._send_sys_ex_message(selected_device_index, 0x4D)
@@ -1417,6 +1423,7 @@ class Tap(ControlSurface):
                     return [name for name in names if name != ""]
                 
                 parameter_names = _build_parameter_names()
+                parameter_state_refreshed = False
                 if not parameter_names and self.mixer_status:
                     if hasattr(self._device, 'set_device'):
                         try:
@@ -1441,7 +1448,7 @@ class Tap(ControlSurface):
                 # Filter out empty names but keep "-" for disabled parameters
                 
                 if parameter_names:
-                    self._send_parameter_info(parameter_names)
+                    parameter_state_refreshed = bool(self._send_parameter_info(parameter_names))
                 else:
                     # parameter_names empty — try building metadata directly from
                     # _build_parameter_metadata, which may succeed even when the
@@ -1457,9 +1464,10 @@ class Tap(ControlSurface):
                         # current empty state.
                         self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
                         self._schedule_parameter_metadata_recheck(delay=0.05)
-                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
-                self._refresh_parameter_name_listeners_current_bank()
-                self._refresh_automation_state_listeners_current_bank()
+                if not parameter_state_refreshed:
+                    self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                    self._refresh_parameter_name_listeners_current_bank()
+                    self._refresh_automation_state_listeners_current_bank()
                 self._last_automation_signature = self._get_automation_signature()
             
             self._remove_disabled_parameter_listeners()
@@ -1783,7 +1791,7 @@ class Tap(ControlSurface):
                     self._debug_log("Parameter metadata is all unmapped; sending placeholder and scheduling recheck")
                     self._send_unmapped_parameter_metadata_for_device(selected_device, current_metadata)
                     self._schedule_parameter_metadata_recheck(delay=0.05)
-                    return
+                    return False
 
                 cached_metadata = self._get_cached_metadata(selected_device)
                 metadata_changed = cached_metadata != current_metadata
@@ -1836,6 +1844,8 @@ class Tap(ControlSurface):
                 self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
                 self._refresh_parameter_name_listeners_current_bank()
                 self._refresh_automation_state_listeners_current_bank()
+                return True
+        return False
 
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
