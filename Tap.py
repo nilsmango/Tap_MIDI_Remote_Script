@@ -319,6 +319,8 @@ class Tap(ControlSurface):
             self._clip_listener_track_slots = {}
             self._clip_slot_color_map = {}
             self._track_list_signature = None
+            self._last_group_fold_states = None
+            self._last_group_hidden_states = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
             self._re_enable_automation_enabled_state = None
@@ -2481,6 +2483,7 @@ class Tap(ControlSurface):
         self._evaluate_follow_actions()
         if not self.was_initialized:
             return
+        self._send_group_fold_states_if_changed()
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
@@ -2602,6 +2605,8 @@ class Tap(ControlSurface):
 
         self.song_instance = current_song
         self._track_list_signature = None
+        self._last_group_fold_states = None
+        self._last_group_hidden_states = None
         self._follow_action_track_signature = self._track_signature(current_song.tracks)
         self._follow_action_rules = {}
         self._active_follow_actions = {}
@@ -4047,6 +4052,67 @@ class Tap(ControlSurface):
         def handler():
             self._on_output_level_changed(index)
         return handler
+
+    def _foldable_group_track_for_track(self, track):
+        try:
+            if track and liveobj_valid(track) and getattr(track, 'is_foldable', False):
+                return track
+        except Exception:
+            pass
+
+        try:
+            if track and liveobj_valid(track) and getattr(track, 'is_grouped', False):
+                group_track = getattr(track, 'group_track', None)
+                if group_track and liveobj_valid(group_track) and getattr(group_track, 'is_foldable', False):
+                    return group_track
+        except Exception:
+            pass
+
+        return None
+
+    def _group_fold_state_codes(self, tracks):
+        fold_states = []
+        for track in tracks:
+            group_track = self._foldable_group_track_for_track(track)
+            if group_track is None:
+                fold_states.append("-")
+                continue
+
+            try:
+                fold_states.append("1" if bool(group_track.fold_state) else "0")
+            except Exception:
+                fold_states.append("-")
+
+        return tuple(fold_states)
+
+    def _send_group_fold_states_if_changed(self, tracks=None, force=False):
+        if tracks is None:
+            tracks = list(self.song().tracks)
+
+        fold_states = self._group_fold_state_codes(tracks)
+        if force or fold_states != self._last_group_fold_states:
+            self._last_group_fold_states = fold_states
+            self._send_sys_ex_message(",".join(fold_states), 0x2B)
+
+        hidden_states = self._group_hidden_state_codes(tracks)
+        if force or hidden_states != self._last_group_hidden_states:
+            self._last_group_hidden_states = hidden_states
+            self._send_sys_ex_message(",".join(hidden_states), 0x2D)
+
+    def _group_hidden_state_codes(self, tracks):
+        hidden_states = []
+        for track in tracks:
+            hidden = False
+            try:
+                if track and liveobj_valid(track) and getattr(track, 'is_grouped', False):
+                    group_track = getattr(track, 'group_track', None)
+                    hidden = bool(group_track and liveobj_valid(group_track) and group_track.fold_state)
+            except Exception:
+                hidden = False
+
+            hidden_states.append("1" if hidden else "0")
+
+        return tuple(hidden_states)
     
     # Updating names and number of tracks
     def _update_mixer_and_tracks(self):
@@ -4137,6 +4203,8 @@ class Tap(ControlSurface):
             return_track_colors.append(color_string)
             self._send_sys_ex_message(",".join(self._escape_sysex_string(name) for name in return_track_names), 0x06)
             self._send_sys_ex_message("-".join(return_track_colors), 0x07)
+
+        self._send_group_fold_states_if_changed(tracks)
         
         # 3. Set up level meter listeners (idempotent, safe to call every time)
         for index, track in enumerate(tracks):
@@ -4184,9 +4252,72 @@ class Tap(ControlSurface):
             lambda value, channel_type=channel_type, track_index=track_index, parameter_name=parameter_name, send_index=send_index:
                 self._on_mixer_automation_control_value(value, channel_type, track_index, parameter_name, send_index)
         )
+        parameter = self._mixer_parameter(channel_type, track_index, parameter_name, send_index)
+        if parameter and liveobj_valid(parameter):
+            control.connect_to(parameter)
         self._mixer_automation_controls.append(control)
         self._register_mixer_automation_status(midi_channel, cc, channel_type, track_index, parameter_name, send_index)
         return control
+
+    def _create_mixer_toggle_control(self, midi_channel, cc, channel_type, track_index, property_name):
+        control = ButtonElement(1, MIDI_CC_TYPE, midi_channel, cc)
+        control.add_value_listener(
+            lambda value, channel_type=channel_type, track_index=track_index, property_name=property_name:
+                self._on_mixer_toggle_control_value(value, channel_type, track_index, property_name)
+        )
+        self._mixer_automation_controls.append(control)
+        return control
+
+    def _on_mixer_toggle_control_value(self, value, channel_type, track_index, property_name):
+        if value == 0:
+            return
+
+        track = self._mixer_track(channel_type, track_index)
+        if track is None:
+            return
+
+        try:
+            setattr(track, property_name, not bool(getattr(track, property_name)))
+        except Exception:
+            pass
+
+    def _release_mixer_controls(self):
+        for control in list(getattr(self, '_mixer_automation_controls', [])):
+            try:
+                control.release_parameter()
+            except Exception:
+                pass
+        self._mixer_automation_controls = []
+
+    def _disconnect_mixer_component_controls(self):
+        try:
+            for index in range(127):
+                strip = mixer.channel_strip(index)
+                strip.set_volume_control(None)
+                strip.set_send_controls(None)
+                strip.set_pan_control(None)
+                strip.set_mute_button(None)
+                strip.set_solo_button(None)
+        except Exception:
+            pass
+
+        try:
+            mixer.master_strip().set_volume_control(None)
+            mixer.set_prehear_volume_control(None)
+            mixer.master_strip().set_pan_control(None)
+        except Exception:
+            pass
+
+        try:
+            for index in range(12):
+                strip = mixer.return_strip(index)
+                strip.set_volume_control(None)
+                strip.set_mute_button(None)
+                strip.set_solo_button(None)
+                strip.set_send_controls(None)
+                strip.set_pan_control(None)
+        except Exception:
+            pass
 
     def _register_mixer_automation_status(self, midi_channel, cc, channel_type, track_index, parameter_name, send_index=None):
         self._mixer_automation_status_specs.append((midi_channel, cc, channel_type, track_index, parameter_name, send_index))
@@ -4290,49 +4421,32 @@ class Tap(ControlSurface):
         song = self.song()
         tracks = song.tracks
         return_tracks = song.return_tracks
+        hidden_track_states = self._group_hidden_state_codes(tracks)
+        visible_track_indexes = set(
+            index for index, hidden in enumerate(hidden_track_states)
+            if hidden != "1"
+        )
         self._remove_mixer_automation_state_listeners()
-        self._mixer_automation_controls = []
+        self._release_mixer_controls()
+        self._disconnect_mixer_component_controls()
         self._mixer_automation_status_specs = []
-        # - 1 because visible_channels is starting at 0
-        last_track_index = len(tracks) - 1
-        
-        number_of_return_tracks = len(return_tracks)
-        number_of_return_tracks_visible = self.visible_channels[1] - last_track_index
-        master_track_visible = number_of_return_tracks_visible > number_of_return_tracks
-        # self.log_message(f"visible_channels[0]: {self.visible_channels[0]}")
-        # self.log_message(f"visible_channels[1]: {self.visible_channels[1]}")
-        # self.log_message(f"master_track_visible: {master_track_visible}")
-        
-        # if last is 9, and last track is 7 -> last visible return is 1
-        last_visible_return_index = self.visible_channels[1] - len(tracks)
-        # if first is 8, and last track is 7 -> first visible return is 0
-        first_visible_return_index = self.visible_channels[0] - len(tracks)
-        # self.log_message(f"first_visible_return_index: {first_visible_return_index}")
-        # self.log_message(f"last_visible_return_index: {last_visible_return_index}")
+        first_visible_channel = self.visible_channels[0]
+        last_visible_channel = self.visible_channels[1]
+        master_track_index = len(tracks) + len(return_tracks)
+        master_track_visible = first_visible_channel <= master_track_index <= last_visible_channel
         
         # Channels
         for index, track in enumerate(tracks):
 
-            strip = mixer.channel_strip(index)
-
-            # Configure strip controls for each channel track
-            if self.mixer_status and index >= self.visible_channels[0] and index <= self.visible_channels[1]:
-                strip.set_volume_control(self._create_mixer_automation_control("slider", 2, index, "track", index, "volume"))
-                strip.set_send_controls((
-                    self._create_mixer_automation_control("encoder", 3, index, "track", index, "send", 0),
-                    self._create_mixer_automation_control("encoder", 4, index, "track", index, "send", 1)
-                ))
-                strip.set_pan_control(self._create_mixer_automation_control("encoder", 5, index, "track", index, "panning"))
-                strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 6, index))
-                strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 7, index))
+            if self.mixer_status and index in visible_track_indexes and index >= first_visible_channel and index <= last_visible_channel:
+                self._create_mixer_automation_control("slider", 2, index, "track", index, "volume")
+                self._create_mixer_automation_control("encoder", 3, index, "track", index, "send", 0)
+                self._create_mixer_automation_control("encoder", 4, index, "track", index, "send", 1)
+                self._create_mixer_automation_control("encoder", 5, index, "track", index, "panning")
+                self._create_mixer_toggle_control(6, index, "track", index, "mute")
+                self._create_mixer_toggle_control(7, index, "track", index, "solo")
                 # reseting volume just in case
                 self._on_output_level_changed(index)
-            else:
-                strip.set_volume_control(None)
-                strip.set_send_controls(None)
-                strip.set_pan_control(None)
-                strip.set_mute_button(None)
-                strip.set_solo_button(None)
 
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
@@ -4340,37 +4454,24 @@ class Tap(ControlSurface):
 
         # Master / channel 7 cc 127
         if self.mixer_status and master_track_visible:
-            mixer.master_strip().set_volume_control(self._create_mixer_automation_control("slider", 0, 127, "master", 0, "volume"))
-            mixer.set_prehear_volume_control(self._create_mixer_automation_control("encoder", 0, 126, "master", 0, "cue_volume"))
-            mixer.master_strip().set_pan_control(self._create_mixer_automation_control("encoder", 0, 125, "master", 0, "panning"))
+            self._create_mixer_automation_control("slider", 0, 127, "master", 0, "volume")
+            self._create_mixer_automation_control("encoder", 0, 126, "master", 0, "cue_volume")
+            self._create_mixer_automation_control("encoder", 0, 125, "master", 0, "panning")
             # reseting volume just in case
             self._on_output_level_changed(127)
-        else:
-            mixer.master_strip().set_volume_control(None)
-            mixer.set_prehear_volume_control(None)
-            mixer.master_strip().set_pan_control(None)
 
         # Return Tracks
         for index, returnTrack in enumerate(return_tracks):
-            strip = mixer.return_strip(index)
-
-            if self.mixer_status and index <= last_visible_return_index and index >= first_visible_return_index:
-                strip.set_volume_control(self._create_mixer_automation_control("slider", 8, index, "return", index, "volume"))
-                strip.set_mute_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 12))
-                strip.set_solo_button(ButtonElement(1, MIDI_CC_TYPE, 8, index + 24))
-                strip.set_send_controls((
-                    self._create_mixer_automation_control("encoder", 8, index + 36, "return", index, "send", 0),
-                    self._create_mixer_automation_control("encoder", 8, index + 48, "return", index, "send", 1)
-                ))
-                strip.set_pan_control(self._create_mixer_automation_control("encoder", 8, index + 60, "return", index, "panning"))
+            combined_index = len(tracks) + index
+            if self.mixer_status and combined_index >= first_visible_channel and combined_index <= last_visible_channel:
+                self._create_mixer_automation_control("slider", 8, index, "return", index, "volume")
+                self._create_mixer_toggle_control(8, index + 12, "return", index, "mute")
+                self._create_mixer_toggle_control(8, index + 24, "return", index, "solo")
+                self._create_mixer_automation_control("encoder", 8, index + 36, "return", index, "send", 0)
+                self._create_mixer_automation_control("encoder", 8, index + 48, "return", index, "send", 1)
+                self._create_mixer_automation_control("encoder", 8, index + 60, "return", index, "panning")
                 # reseting volume just in case
                 self._on_output_level_changed(index + len(tracks))
-            else:
-                strip.set_volume_control(None)
-                strip.set_mute_button(None)
-                strip.set_solo_button(None)
-                strip.set_send_controls(None)
-                strip.set_pan_control(None)
 
         self._schedule_mixer_automation_status_resends()
         
@@ -4381,10 +4482,29 @@ class Tap(ControlSurface):
             song = self.song()
             tracks = song.tracks
             return_tracks = song.return_tracks
-            is_visible_track = index >= self.visible_channels[0] and index <= self.visible_channels[1]            
-            is_visible_master = index == 127 and (len(tracks) + len(return_tracks) - 1) < self.visible_channels[1]
+            hidden_track_states = self._group_hidden_state_codes(tracks)
+            visible_track_indexes = set(
+                track_index for track_index, hidden in enumerate(hidden_track_states)
+                if hidden != "1"
+            )
+            first_visible_channel = self.visible_channels[0]
+            last_visible_channel = self.visible_channels[1]
+            master_track_index = len(tracks) + len(return_tracks)
+            is_visible_track = (
+                index < len(tracks)
+                and index in visible_track_indexes
+                and index >= first_visible_channel
+                and index <= last_visible_channel
+            )
+            is_visible_return = (
+                index >= len(tracks)
+                and index < master_track_index
+                and index >= first_visible_channel
+                and index <= last_visible_channel
+            )
+            is_visible_master = index == 127 and first_visible_channel <= master_track_index <= last_visible_channel
             
-            if is_visible_track or is_visible_master:
+            if is_visible_track or is_visible_return or is_visible_master:
                 if index < len(tracks):
                     track = tracks[index]
                 elif index - len(tracks) < len(return_tracks):
@@ -5266,6 +5386,8 @@ class Tap(ControlSurface):
                 self._stop_track_clips(values[0])
         if len(message) >= 2 and message[1] == 39:
             self._set_device_control_high_resolution(message)
+        if len(message) >= 3 and message[1] == 44:
+            self._toggle_group_fold(message[2])
             
 
             
@@ -5576,6 +5698,21 @@ class Tap(ControlSurface):
         song = self.song()
         song.delete_track(value)
         self._sync_follow_actions_to_track_topology()
+
+    def _toggle_group_fold(self, track_index):
+        try:
+            tracks = list(self.song().tracks)
+            if track_index < 0 or track_index >= len(tracks):
+                return
+
+            group_track = self._foldable_group_track_for_track(tracks[track_index])
+            if group_track is None:
+                return
+
+            group_track.fold_state = not bool(group_track.fold_state)
+            self._send_group_fold_states_if_changed(tracks, force=True)
+        except Exception:
+            pass
 
     def _re_enable_automation(self, value):
         if value:
