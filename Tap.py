@@ -769,6 +769,15 @@ class Tap(ControlSurface):
     def _update_tempo(self):
         new_tempo = round(self.song().tempo, 2)
         self._send_sys_ex_message(str(new_tempo), 0x12)
+
+    def _metronome_value(self):
+        try:
+            return bool(self.song().metronome)
+        except Exception:
+            return False
+
+    def _update_metronome(self):
+        self._send_sys_ex_message("1" if self._metronome_value() else "0", 0x17)
     
     def _is_bank_connected(self, device, bank_name):
         if not isinstance(device, Live.RackDevice.RackDevice):
@@ -2431,8 +2440,9 @@ class Tap(ControlSurface):
                 # track.view.add_selected_device_listener(self._on_selected_device_changed)
                 # self.song().view.add_selected_scene_listener(self._on_selected_scene_changed)
                 self._ensure_song_listeners(song)
-                # updating tempo
+                # updating tempo and metronome
                 self._update_tempo()
+                self._update_metronome()
                 # rest
                 self._setup_device_control()
                 self._register_clip_listeners()
@@ -2491,6 +2501,7 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "scale_name", self._on_scale_changed)
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
+        self._ensure_song_listener(song, "metronome", self._update_metronome)
         self._ensure_song_listener(song, "is_playing", self._on_song_is_playing_changed)
         self._ensure_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
 
@@ -2553,6 +2564,7 @@ class Tap(ControlSurface):
     def _send_current_project_state(self):
         self.old_clips_array = []
         self._update_tempo()
+        self._update_metronome()
         self._send_re_enable_automation_enabled()
         self._update_mixer_and_tracks()
         self._send_selected_track_state()
@@ -5235,6 +5247,11 @@ class Tap(ControlSurface):
                 # Optional: log error
                 # self.canonical_parent.log_message("Tempo decode error: " + str(e))
                 pass
+        if len(message) >= 3 and message[1] == 23:
+            try:
+                self.song().metronome = bool(message[2])
+            except Exception:
+                pass
         if len(message) >= 2 and message[1] == 35:
             self._set_follow_action_rule(message)
         if len(message) >= 2 and message[1] == 36:
@@ -6318,6 +6335,7 @@ class Tap(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
+        self._remove_song_listener(song, "metronome", self._update_metronome)
         self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
         try:
             if hasattr(song, 'remove_is_playing_listener') and (
