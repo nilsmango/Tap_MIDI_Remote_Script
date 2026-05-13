@@ -5252,6 +5252,8 @@ class Tap(ControlSurface):
                 self.song().metronome = bool(message[2])
             except Exception:
                 pass
+        if len(message) >= 2 and message[1] == 43:
+            self._handle_tap_tempo()
         if len(message) >= 2 and message[1] == 35:
             self._set_follow_action_rule(message)
         if len(message) >= 2 and message[1] == 36:
@@ -5268,6 +5270,12 @@ class Tap(ControlSurface):
 
             
 
+
+    def _handle_tap_tempo(self):
+        try:
+            self.song().tap_tempo()
+        except Exception:
+            pass
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
