@@ -255,6 +255,7 @@ class Tap(ControlSurface):
             self.browser_current_page = 0
             self.browser_pages_count = 0
             self.browser_items_per_page = 12
+            self.browser_insert_after_device_index = None
             # browser navigation history for back button
             self.browser_history = []
             self.browser_folder_mapping = {
@@ -5388,6 +5389,12 @@ class Tap(ControlSurface):
             self._set_device_control_high_resolution(message)
         if len(message) >= 3 and message[1] == 44:
             self._toggle_group_fold(message[2])
+        if len(message) >= 3 and message[1] == 45:
+            self._add_random_effect_after_device(message[2])
+        if len(message) >= 3 and message[1] == 46:
+            self._set_browser_insert_after_device(message[2])
+        if len(message) >= 4 and message[1] == 47:
+            self._move_device_after_index(message[2], message[3])
             
 
             
@@ -5618,6 +5625,118 @@ class Tap(ControlSurface):
     def _send_selected_clip_slot(self, clip_index):
         self._send_sys_ex_message(str(clip_index), 0x10)
 
+    def _is_instrument_device(self, device):
+        try:
+            if hasattr(device, 'type') and device.type == Live.Device.DeviceType.instrument:
+                return True
+        except Exception:
+            pass
+
+        try:
+            class_name = str(device.class_name) if hasattr(device, 'class_name') else ''
+            return class_name in ('InstrumentGroupDevice', 'DrumGroupDevice')
+        except Exception:
+            return False
+
+    def _valid_chains(self, rack):
+        if not liveobj_valid(rack) or not hasattr(rack, 'chains'):
+            return []
+        return [chain for chain in rack.chains if liveobj_valid(chain) and hasattr(chain, 'devices')]
+
+    def _find_device_location(self, container, target_device, rack_context=None):
+        if not liveobj_valid(container) or not hasattr(container, 'devices'):
+            return None
+
+        for index, device in enumerate(container.devices):
+            if device == target_device:
+                return {
+                    'container': container,
+                    'index': index,
+                    'rack_context': rack_context
+                }
+
+            for chain in self._valid_chains(device):
+                result = self._find_device_location(chain, target_device, {
+                    'rack': device,
+                    'rack_container': container,
+                    'rack_index': index,
+                    'chain': chain
+                })
+                if result:
+                    return result
+
+        return None
+
+    def _move_device_after_device(self, source_device, target_device):
+        if not liveobj_valid(source_device) or not liveobj_valid(target_device):
+            return False
+        if source_device == target_device or self._is_instrument_device(source_device):
+            return False
+
+        song = self.song()
+        selected_track = song.view.selected_track
+        source_location = self._find_device_location(selected_track, source_device)
+        target_location = self._find_device_location(selected_track, target_device)
+        if not source_location or not target_location:
+            return False
+
+        try:
+            song.move_device(source_device, target_location['container'], target_location['index'] + 1)
+            return True
+        except Exception as e:
+            self._debug_log("Move after failed: {}".format(str(e)))
+            return False
+
+    def _devices_changed_since(self, before_devices, after_devices):
+        return [device for device in after_devices if not any(device == before for before in before_devices)]
+
+    def _load_item_after_device(self, item, target_index):
+        selected_track = self.song().view.selected_track
+        before_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        if target_index < 0 or target_index >= len(before_devices):
+            return False
+
+        target_device = before_devices[target_index]
+        self.application().browser.load_item(item)
+
+        after_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        new_devices = self._devices_changed_since(before_devices, after_devices)
+        selected_device = selected_track.view.selected_device if selected_track else None
+        source_device = selected_device if selected_device and not any(selected_device == before for before in before_devices) else None
+        if source_device is None and new_devices:
+            source_device = new_devices[-1]
+
+        if source_device:
+            self._move_device_after_device(source_device, target_device)
+            try:
+                self.song().view.select_device(source_device)
+            except Exception:
+                pass
+            return True
+
+        return False
+
+    def _set_browser_insert_after_device(self, value):
+        self.browser_insert_after_device_index = value
+
+    def _add_random_effect_after_device(self, value):
+        if value is None:
+            return
+        selected_effect = self._random_audio_effect_item()
+        if selected_effect:
+            self._load_item_after_device(selected_effect, value)
+            self._on_tracks_changed()
+            self._on_device_changed()
+
+    def _move_device_after_index(self, source_index, target_index):
+        selected_track = self.song().view.selected_track
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        if source_index < 0 or target_index < 0 or source_index >= len(all_devices) or target_index >= len(all_devices):
+            return
+
+        if self._move_device_after_device(all_devices[source_index], all_devices[target_index]):
+            self._on_device_changed()
+
     def _delete_device(self, value):
         selected_track = self.song().view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
@@ -5659,35 +5778,80 @@ class Tap(ControlSurface):
         song = self.song()
         selected_track = song.view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        if value < 0 or value >= len(all_devices):
+            return
         device_to_move = all_devices[value]
+        if self._is_instrument_device(device_to_move):
+            return
+        location = self._find_device_location(selected_track, device_to_move)
+        if not location:
+            return
+        moved = False
         
         # Check if it's a top-level device
-        if device_to_move in selected_track.devices:
-            real_index = list(selected_track.devices).index(device_to_move)
+        if location['container'] == selected_track:
+            real_index = location['index']
             if real_index > 0:
-                song.move_device(device_to_move, selected_track, real_index - 1)
+                previous_device = list(selected_track.devices)[real_index - 1]
+                if self._is_instrument_device(previous_device):
+                    return
+                chains = self._valid_chains(previous_device)
+                if chains:
+                    target_chain = chains[-1]
+                    song.move_device(device_to_move, target_chain, len(target_chain.devices))
+                    moved = True
+                elif not self._is_instrument_device(previous_device):
+                    song.move_device(device_to_move, selected_track, real_index - 1)
+                    moved = True
         else:
             # Device is inside a rack, move within its chain
-            parent_chain, device_idx = self._find_parent_chain(selected_track.devices, device_to_move)
-            if parent_chain and device_idx > 0:
+            parent_chain = location['container']
+            device_idx = location['index']
+            if device_idx > 0:
+                previous_device = list(parent_chain.devices)[device_idx - 1]
+                if self._is_instrument_device(previous_device):
+                    return
                 song.move_device(device_to_move, parent_chain, device_idx - 1)
+                moved = True
+        if moved:
+            self._on_device_changed()
     
     def _move_device_right(self, value):
         song = self.song()
         selected_track = song.view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        if value < 0 or value >= len(all_devices):
+            return
         device_to_move = all_devices[value]
+        if self._is_instrument_device(device_to_move):
+            return
+        location = self._find_device_location(selected_track, device_to_move)
+        if not location:
+            return
+        moved = False
         
         # Check if it's a top-level device
-        if device_to_move in selected_track.devices:
-            real_index = list(selected_track.devices).index(device_to_move)
+        if location['container'] == selected_track:
+            real_index = location['index']
             if real_index < len(selected_track.devices) - 1:
                 song.move_device(device_to_move, selected_track, real_index + 2)
+                moved = True
         else:
             # Device is inside a rack, move within its chain
-            parent_chain, device_idx = self._find_parent_chain(selected_track.devices, device_to_move)
-            if parent_chain and device_idx < len(parent_chain.devices) - 1:
+            parent_chain = location['container']
+            device_idx = location['index']
+            if device_idx < len(parent_chain.devices) - 1:
                 song.move_device(device_to_move, parent_chain, device_idx + 2)
+                moved = True
+            else:
+                rack_context = location.get('rack_context')
+                if rack_context:
+                    rack_container = rack_context['rack_container']
+                    rack_index = rack_context['rack_index']
+                    song.move_device(device_to_move, rack_container, rack_index + 1)
+                    moved = True
+        if moved:
+            self._on_device_changed()
 
     def _add_midi_track(self, value):
         song = self.song()
@@ -6084,52 +6248,56 @@ class Tap(ControlSurface):
             self._on_tracks_changed()
             self._on_device_changed()
 
+    def _random_audio_effect_item(self):
+        browser = self.application().browser
+        # Tried loading max for live effects but gave up
+        # random_index = random.randint(0, 1)
+        # if random_index == 0:
+        #     max_effects = browser.max_for_live.children
+        #     max_number = len(max_effects)
+        #     random_max = random.randint(0, max_number - 1)
+        #     selected_folder = max_effects[random_max].children
+        #     max_number = len(selected_folder)
+        #     finished = False
+        #     number_of_tries = 0
+        #     if max_number == 0:
+        #         selected_effect = selected_folder
+        #         finished = True
+        #     while not finished and number_of_tries < 10:
+        #         random_max = random.randint(0, max_number - 1)
+        #         selected_effect = selected_folder[random_max]
+        #         number_of_tries += 1
+        #         self.log_message("Selected Device: {}".format(selected_effect.name))
+        #         if not any(selected_effect.name.lower().startswith(substring.lower()) for substring in ["IR", "Api", "Map8", "Max Audio Effect"]):
+        #             finished = True
+
+        # else:
+        effects = browser.audio_effects
+        effect_children = effects.children
+        number_of_effects = len(effect_children)
+        # check if effects are in folders or not
+        if number_of_effects >= 10:
+            random_effect_index = random.randint(0, number_of_effects - 1)
+            return effect_children[random_effect_index]
+
+        finished = False
+        while not finished:
+            random_folder_index = random.randint(0, number_of_effects - 1)
+            selected_folder = effect_children[random_folder_index]
+            self._debug_log("Selected FOlder: {}".format(selected_folder.name))
+            if selected_folder.name != "Utilities":
+                finished = True
+
+        folder_children = selected_folder.children
+        number_folder_children = len(folder_children)
+        random_folder_child_index = random.randint(0, number_folder_children - 1)
+        return folder_children[random_folder_child_index]
+
     def _add_random_effect(self, value):
         if value:
-            browser = self.application().browser
-            # Tried loading max for live effects but gave up
-            # random_index = random.randint(0, 1)
-            # if random_index == 0:
-            #     max_effects = browser.max_for_live.children
-            #     max_number = len(max_effects)
-            #     random_max = random.randint(0, max_number - 1)
-            #     selected_folder = max_effects[random_max].children
-            #     max_number = len(selected_folder)
-            #     finished = False
-            #     number_of_tries = 0
-            #     if max_number == 0:
-            #         selected_effect = selected_folder
-            #         finished = True
-            #     while not finished and number_of_tries < 10:
-            #         random_max = random.randint(0, max_number - 1)
-            #         selected_effect = selected_folder[random_max]
-            #         number_of_tries += 1
-            #         self.log_message("Selected Device: {}".format(selected_effect.name))
-            #         if not any(selected_effect.name.lower().startswith(substring.lower()) for substring in ["IR", "Api", "Map8", "Max Audio Effect"]):
-            #             finished = True
-
-            # else:
-            effects = browser.audio_effects
-            effect_children = effects.children
-            number_of_effects = len(effect_children)
-            # check if effects are in folders or not
-            if number_of_effects >= 10:
-                random_effect_index = random.randint(0, number_of_effects - 1)
-                selected_effect = effect_children[random_effect_index]
-            else:
-                finished = False
-                while not finished:
-                    random_folder_index = random.randint(0, number_of_effects - 1)
-                    selected_folder = effect_children[random_folder_index]
-                    self._debug_log("Selected FOlder: {}".format(selected_folder.name))
-                    if selected_folder.name != "Utilities":
-                        finished = True
-
-                folder_children = selected_folder.children
-                number_folder_children = len(folder_children)
-                random_folder_child_index = random.randint(0, number_folder_children - 1)
-                selected_effect = folder_children[random_folder_child_index]
-            browser.load_item(selected_effect)
+            selected_effect = self._random_audio_effect_item()
+            if selected_effect:
+                self.application().browser.load_item(selected_effect)
             self._on_tracks_changed()
             self._on_device_changed()
 
@@ -6298,6 +6466,14 @@ class Tap(ControlSurface):
         item = self.browser_current_items[index]
         browser = self.application().browser
 
+        def load_item(item_to_load):
+            target_index = self.browser_insert_after_device_index
+            self.browser_insert_after_device_index = None
+            if target_index is not None:
+                self._load_item_after_device(item_to_load, target_index)
+            else:
+                browser.load_item(item_to_load)
+
         if hasattr(item, 'is_folder') and item.is_folder:
             if hasattr(item, 'children'):
                 # Save current state to history before navigating
@@ -6325,15 +6501,15 @@ class Tap(ControlSurface):
                     self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
                     self._send_browser_page(self.browser_current_page)
                 else:
-                    browser.load_item(item)
+                    load_item(item)
                     self._on_tracks_changed()
                     self._on_device_changed()
             except Exception:
-                browser.load_item(item)
+                load_item(item)
                 self._on_tracks_changed()
                 self._on_device_changed()
         else:
-            browser.load_item(item)
+            load_item(item)
             self._on_tracks_changed()
             self._on_device_changed()
 
@@ -6361,7 +6537,12 @@ class Tap(ControlSurface):
 
         item = self.browser_current_items[index]
         browser = self.application().browser
-        browser.load_item(item)
+        target_index = self.browser_insert_after_device_index
+        self.browser_insert_after_device_index = None
+        if target_index is not None:
+            self._load_item_after_device(item, target_index)
+        else:
+            browser.load_item(item)
         self._on_tracks_changed()
         self._on_device_changed()
 
