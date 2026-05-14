@@ -324,6 +324,8 @@ class Tap(ControlSurface):
             self._last_group_hidden_states = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
+            self._smooth_macro_randomize_token = 0
+            self._smooth_macro_randomize_state = None
             self._re_enable_automation_enabled_state = None
             self._remove_automation_from_next_encoder = False
             self._automation_parameter_action = None
@@ -618,6 +620,7 @@ class Tap(ControlSurface):
         try:
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
             mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
+            self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
             if self._consume_remove_automation_request(mapped_parameter):
                 return
             self._select_parameter_if_possible(mapped_parameter)
@@ -661,6 +664,8 @@ class Tap(ControlSurface):
                 return
 
             if gesture_state == 0:
+                self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
+                
                 if control_index not in self._active_high_resolution_gestures:
                     if hasattr(mapped_parameter, 'begin_gesture'):
                         mapped_parameter.begin_gesture()
@@ -1401,6 +1406,7 @@ class Tap(ControlSurface):
                 
                 # Send the comprehensive list of available devices
                 self._send_sys_ex_message(available_devices_string, 0x01)
+                self._send_rack_snapshot_state(all_devices)
             
             # In mixer mode, temporarily reconnect device controls so we can
             # build parameter metadata. Do this early so the framework has more
@@ -1523,6 +1529,7 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(bank_name_drum, 0x6D)
             self._send_sys_ex_message(bank_names_list, 0x5D)
             self._send_sys_ex_message(available_devices_string, 0x01)
+            self._send_rack_snapshot_state([])
             # Send not mapped for all controls when no device is selected
             self._send_unmapped_parameter_metadata()
     
@@ -1605,6 +1612,62 @@ class Tap(ControlSurface):
                                 })
                             
         return all_devices, chain_info
+    
+    def _rack_snapshot_info_for_device(self, device):
+        if not liveobj_valid(device) or not isinstance(device, Live.RackDevice.RackDevice):
+            return None
+        
+        has_mapped_macros = False
+        try:
+            if hasattr(device, 'has_macro_mappings'):
+                has_mapped_macros = bool(device.has_macro_mappings)
+        except Exception:
+            has_mapped_macros = False
+        
+        if not has_mapped_macros and hasattr(device, 'macros_mapped'):
+            try:
+                has_mapped_macros = any(device.macros_mapped)
+            except Exception:
+                has_mapped_macros = False
+        
+        variation_count = 0
+        if hasattr(device, 'variation_count'):
+            try:
+                variation_count = int(device.variation_count)
+            except Exception:
+                variation_count = 0
+        
+        selected_variation_index = -1
+        if variation_count > 0 and hasattr(device, 'selected_variation_index'):
+            try:
+                selected_variation_index = int(device.selected_variation_index)
+            except Exception:
+                selected_variation_index = -1
+        
+        return has_mapped_macros, variation_count, selected_variation_index
+    
+    def _send_rack_snapshot_state(self, all_devices=None):
+        if all_devices is None:
+            selected_track = self.song().view.selected_track
+            if not selected_track or not hasattr(selected_track, 'devices'):
+                self._send_sys_ex_message("", 0x30)
+                return
+            all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        
+        entries = []
+        for index, device in enumerate(all_devices):
+            info = self._rack_snapshot_info_for_device(device)
+            if info is None:
+                continue
+            has_mapped_macros, variation_count, selected_variation_index = info
+            entries.append("{}|{}|{}|{}".format(
+                index,
+                1 if has_mapped_macros else 0,
+                variation_count,
+                selected_variation_index
+            ))
+        
+        self._send_sys_ex_message(",".join(entries), 0x30)
     
     def _get_selected_drum_pad(self, drum_rack):
         """
@@ -5395,6 +5458,8 @@ class Tap(ControlSurface):
             self._set_browser_insert_after_device(message[2])
         if len(message) >= 4 and message[1] == 47:
             self._move_device_after_index(message[2], message[3])
+        if len(message) >= 4 and message[1] == 48:
+            self._handle_rack_snapshot_command(message)
             
 
             
@@ -5666,6 +5731,241 @@ class Tap(ControlSurface):
                     return result
 
         return None
+
+    def _rack_device_at_navigation_index(self, device_index):
+        selected_track = self.song().view.selected_track
+        if not selected_track or not hasattr(selected_track, 'devices'):
+            return None
+        
+        all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        if device_index < 0 or device_index >= len(all_devices):
+            return None
+        
+        device = all_devices[device_index]
+        if not isinstance(device, Live.RackDevice.RackDevice):
+            return None
+        return device
+
+    def _handle_rack_snapshot_command(self, message):
+        device_index = message[2]
+        action = message[3]
+        device = self._rack_device_at_navigation_index(device_index)
+        if not liveobj_valid(device):
+            return
+        if action != 4:
+            self._cancel_smooth_macro_randomize()
+        
+        try:
+            if action == 0:
+                previous_variation_count = self._rack_variation_count(device)
+                device.store_variation()
+                self._select_newly_stored_variation(device, previous_variation_count)
+                self._schedule_rack_snapshot_state_refresh()
+            elif action == 1:
+                device.recall_last_used_variation()
+            elif action == 2:
+                device.randomize_macros()
+            elif action == 3 and len(message) >= 5:
+                variation_index = message[4]
+                if hasattr(device, 'selected_variation_index'):
+                    device.selected_variation_index = variation_index
+                device.recall_selected_variation()
+            elif action == 4 and len(message) >= 5:
+                duration = max(1.0, float(message[4]))
+                self._randomize_rack_macros_smoothly(device, duration)
+                return
+        except Exception as e:
+            self._debug_log("Rack snapshot command failed: {}".format(str(e)))
+        
+        self._refresh_after_rack_snapshot_action(device)
+
+    def _rack_variation_count(self, device):
+        if not liveobj_valid(device) or not hasattr(device, 'variation_count'):
+            return 0
+        try:
+            return int(device.variation_count)
+        except Exception:
+            return 0
+
+    def _select_newly_stored_variation(self, device, previous_variation_count):
+        if not liveobj_valid(device):
+            return
+        if not hasattr(device, 'variation_count') or not hasattr(device, 'selected_variation_index'):
+            return
+        
+        try:
+            variation_count = int(device.variation_count)
+            if variation_count > previous_variation_count:
+                device.selected_variation_index = variation_count - 1
+        except Exception as e:
+            self._debug_log("Selecting stored variation failed: {}".format(str(e)))
+
+    def _schedule_rack_snapshot_state_refresh(self):
+        self.schedule_message(1, self._send_rack_snapshot_state)
+        self.schedule_message(3, self._send_rack_snapshot_state)
+
+    def _macro_parameters_for_rack(self, device):
+        if not liveobj_valid(device) or not hasattr(device, 'parameters'):
+            return []
+        
+        try:
+            mapped_flags = list(device.macros_mapped) if hasattr(device, 'macros_mapped') else []
+        except Exception:
+            mapped_flags = []
+        
+        try:
+            parameters = list(device.parameters)
+        except Exception:
+            parameters = []
+        
+        macro_parameters = []
+        for macro_index, is_mapped in enumerate(mapped_flags):
+            parameter_index = macro_index + 1
+            if not is_mapped or parameter_index >= len(parameters):
+                continue
+            
+            parameter = parameters[parameter_index]
+            if not liveobj_valid(parameter):
+                continue
+            if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
+                continue
+            if getattr(parameter, 'max', 0) == getattr(parameter, 'min', 0):
+                continue
+            
+            macro_parameters.append(parameter)
+        
+        return macro_parameters
+
+    def _randomize_rack_macros_smoothly(self, device, duration):
+        parameters = self._macro_parameters_for_rack(device)
+        if not parameters:
+            self._refresh_after_rack_snapshot_action(device)
+            return
+        
+        self._cancel_smooth_macro_randomize()
+        
+        starts = [parameter.value for parameter in parameters]
+        try:
+            device.randomize_macros()
+        except Exception as e:
+            self._debug_log("Smooth macro randomize target failed: {}".format(str(e)))
+            return
+        
+        targets = [parameter.value for parameter in parameters]
+        for parameter, start in zip(parameters, starts):
+            parameter.value = start
+            if hasattr(parameter, 'begin_gesture'):
+                try:
+                    parameter.begin_gesture()
+                except Exception:
+                    pass
+
+        self._smooth_macro_randomize_token += 1
+        token = self._smooth_macro_randomize_token
+        steps = max(1, int(duration * 10))
+        self._smooth_macro_randomize_state = {
+            'token': token,
+            'device': device,
+            'parameters': parameters,
+            'starts': starts,
+            'targets': targets,
+            'step': 0,
+            'steps': steps
+        }
+        self._schedule_smooth_macro_randomize_step(token)
+
+    def _cancel_smooth_macro_randomize(self):
+        self._smooth_macro_randomize_token += 1
+        state = getattr(self, '_smooth_macro_randomize_state', None)
+        parameters = state.get('parameters', []) if state else []
+        for parameter in parameters:
+            if hasattr(parameter, 'end_gesture'):
+                try:
+                    parameter.end_gesture()
+                except Exception:
+                    pass
+        self._smooth_macro_randomize_state = None
+
+    def _remove_parameter_from_smooth_macro_randomize(self, parameter):
+        if not liveobj_valid(parameter):
+            return
+        
+        state = getattr(self, '_smooth_macro_randomize_state', None)
+        if not state:
+            return
+        
+        parameters = state.get('parameters', [])
+        if not any(parameter == smooth_parameter for smooth_parameter in parameters):
+            return
+        
+        zipped_values = [
+            (smooth_parameter, start, target)
+            for smooth_parameter, start, target in zip(
+                state.get('parameters', []),
+                state.get('starts', []),
+                state.get('targets', [])
+            )
+            if smooth_parameter != parameter
+        ]
+        
+        if hasattr(parameter, 'end_gesture'):
+            try:
+                parameter.end_gesture()
+            except Exception:
+                pass
+        
+        if not zipped_values:
+            self._smooth_macro_randomize_token += 1
+            self._smooth_macro_randomize_state = None
+            return
+        
+        state['parameters'] = [item[0] for item in zipped_values]
+        state['starts'] = [item[1] for item in zipped_values]
+        state['targets'] = [item[2] for item in zipped_values]
+
+    def _schedule_smooth_macro_randomize_step(self, token):
+        self.schedule_message(1, lambda: self._smooth_macro_randomize_step(token))
+
+    def _smooth_macro_randomize_step(self, token):
+        state = getattr(self, '_smooth_macro_randomize_state', None)
+        if not state or token != self._smooth_macro_randomize_token or token != state.get('token'):
+            return
+        
+        state['step'] += 1
+        progress = min(1.0, float(state['step']) / float(state['steps']))
+        eased_progress = 1.0 - pow(1.0 - progress, 3)
+        
+        try:
+            for parameter, start, target in zip(state['parameters'], state['starts'], state['targets']):
+                if not liveobj_valid(parameter):
+                    continue
+                value = start + ((target - start) * eased_progress)
+                parameter.value = max(parameter.min, min(parameter.max, value))
+        except Exception as e:
+            self._debug_log("Smooth macro randomize step failed: {}".format(str(e)))
+            self._cancel_smooth_macro_randomize()
+            return
+        
+        if progress < 1.0:
+            self._schedule_smooth_macro_randomize_step(token)
+            return
+        
+        for parameter in state['parameters']:
+            if hasattr(parameter, 'end_gesture'):
+                try:
+                    parameter.end_gesture()
+                except Exception:
+                    pass
+        device = state.get('device')
+        self._smooth_macro_randomize_state = None
+        self._refresh_after_rack_snapshot_action(device)
+
+    def _refresh_after_rack_snapshot_action(self, device):
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device if selected_track else None
+        if selected_device == device:
+            self._on_device_changed(False)
+        self._send_rack_snapshot_state()
 
     def _move_device_after_device(self, source_device, target_device):
         if not liveobj_valid(source_device) or not liveobj_valid(target_device):
@@ -6595,6 +6895,7 @@ class Tap(ControlSurface):
             self._mixer_disconnect_timer.cancel()
             self._mixer_disconnect_timer = None
         self._cancel_bank_metadata_refreshes()
+        self._cancel_smooth_macro_randomize()
         if hasattr(self, '_periodic_timer_ref') and self._periodic_timer_ref:
             self._periodic_timer_ref.cancel()
             self._periodic_timer_ref = None
