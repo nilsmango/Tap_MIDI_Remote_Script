@@ -5460,6 +5460,8 @@ class Tap(ControlSurface):
             self._move_device_after_index(message[2], message[3])
         if len(message) >= 4 and message[1] == 48:
             self._handle_rack_snapshot_command(message)
+        if len(message) >= 2 and message[1] == 49:
+            self._send_automation_envelope(message)
             
 
             
@@ -5470,6 +5472,55 @@ class Tap(ControlSurface):
             self.song().tap_tempo()
         except Exception:
             pass
+
+    def _send_automation_envelope(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
+            fields = self._split_escaped_sysex_fields(payload, "|")
+            if len(fields) < 4:
+                return
+
+            control_index = max(0, min(7, int(fields[0])))
+            start = float(fields[1])
+            step_duration = max(0.0001, float(fields[2]))
+            count = max(1, min(128, int(fields[3])))
+            device_param = self._current_connected_parameter_for_control(control_index)
+            current_value = self._parameter_normalized_value(device_param)
+
+            clip_slot = self.song().view.highlighted_clip_slot
+            envelope = None
+            if clip_slot is not None and clip_slot.has_clip and device_param and liveobj_valid(device_param):
+                clip = clip_slot.clip
+                if hasattr(clip, 'automation_envelope'):
+                    try:
+                        envelope = clip.automation_envelope(device_param)
+                    except Exception:
+                        envelope = None
+
+            entries = []
+            has_envelope = 1 if envelope is not None else 0
+            for index in range(count):
+                time_value = start + (float(index) * step_duration)
+                normalized = current_value
+                if envelope is not None:
+                    try:
+                        raw_value = envelope.value_at_time(time_value)
+                        if device_param.max != device_param.min:
+                            normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                    except Exception:
+                        normalized = current_value
+                normalized = max(0.0, min(1.0, normalized))
+                entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
+
+            response = "{}|{}|{:.6f}|{}".format(
+                control_index,
+                has_envelope,
+                current_value,
+                ",".join(entries)
+            )
+            self._send_sys_ex_message(response, 0x31)
+        except Exception as e:
+            self._debug_log("Error sending automation envelope: {}".format(str(e)))
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
