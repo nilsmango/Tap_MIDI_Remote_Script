@@ -18,6 +18,9 @@ import threading
 import random
 import re
 import math
+import os
+import gzip
+import xml.etree.ElementTree as ET
 from itertools import zip_longest
 import time
 
@@ -326,6 +329,8 @@ class Tap(ControlSurface):
             self._periodic_timer_ref = None
             self._smooth_macro_randomize_token = 0
             self._smooth_macro_randomize_state = None
+            self._macro_mapping_watch_rack = None
+            self._macro_mapping_watch_active = False
             self._re_enable_automation_enabled_state = None
             self._remove_automation_from_next_encoder = False
             self._automation_parameter_action = None
@@ -5774,10 +5779,701 @@ class Tap(ControlSurface):
                 duration = max(1.0, float(message[4]))
                 self._randomize_rack_macros_smoothly(device, duration)
                 return
+            elif action == 5:
+                target_count = message[4] if len(message) >= 5 else self._visible_macro_count(device) + 1
+                self._set_visible_macro_count(device, target_count)
+            elif action == 6:
+                target_count = message[4] if len(message) >= 5 else self._visible_macro_count(device) - 1
+                self._set_visible_macro_count(device, target_count)
+            elif action == 7 and len(message) >= 5:
+                self._try_map_selected_parameter_to_macro(device, message[4])
+            elif action == 8:
+                self._try_map_first_rack_device_parameter_to_macro_one(device)
+            elif action == 9:
+                self._inspect_macro_mapping_api(device)
+            elif action == 10:
+                self._start_macro_mapping_watch(device)
+            elif action == 11:
+                self._send_first_rack_parameter_to_live_map_mode(device)
+            elif action == 12:
+                self._create_adg_macro_mapping_test_preset()
         except Exception as e:
             self._debug_log("Rack snapshot command failed: {}".format(str(e)))
         
         self._refresh_after_rack_snapshot_action(device)
+
+    def _send_macro_command_result(self, status, detail):
+        self._send_sys_ex_message("{};{}".format(status, self._escape_sysex_string(str(detail))), 0x31)
+
+    def _adg_macro_keymidi_element(self, macro_index):
+        keymidi = ET.Element("KeyMidi")
+        fields = [
+            ("PersistentKeyString", {"Value": ""}),
+            ("IsNote", {"Value": "false"}),
+            ("Channel", {"Value": "16"}),
+            ("NoteOrController", {"Value": str(int(macro_index))}),
+            ("LowerRangeNote", {"Value": "-1"}),
+            ("UpperRangeNote", {"Value": "-1"}),
+            ("ControllerMapMode", {"Value": "0"}),
+        ]
+        for tag, attrs in fields:
+            ET.SubElement(keymidi, tag, attrs)
+        return keymidi
+
+    def _patch_adg_first_native_parameter_to_macro(self, text, macro_index):
+        root = ET.fromstring(text)
+        skipped_tags = set(["MacroControls.0", "MacroControls.1", "MacroControls.2", "MacroControls.3",
+                            "MacroControls.4", "MacroControls.5", "MacroControls.6", "MacroControls.7",
+                            "MacroControls.8", "MacroControls.9", "MacroControls.10", "MacroControls.11",
+                            "MacroControls.12", "MacroControls.13", "MacroControls.14", "MacroControls.15",
+                            "ChainSelector", "On"])
+        target = None
+        for element in root.iter():
+            children = list(element)
+            child_tags = [child.tag for child in children]
+            if element.tag in skipped_tags or element.tag.startswith("MacroControls."):
+                continue
+            if "KeyMidi" in child_tags:
+                continue
+            if ("LomId" in child_tags and "Manual" in child_tags and
+                    "MidiControllerRange" in child_tags and
+                    "AutomationTarget" in child_tags and
+                    "ModulationTarget" in child_tags):
+                target = element
+                break
+
+        if target is None:
+            return None, None
+
+        macro_element = root.find(".//MacroControls.{}".format(int(macro_index)))
+        if macro_element is not None:
+            manual_element = macro_element.find("Manual")
+            if manual_element is not None:
+                manual_element.set("Value", "0.5")
+
+        children = list(target)
+        insert_index = 1
+        for index, child in enumerate(children):
+            if child.tag == "LomId":
+                insert_index = index + 1
+                break
+
+        keymidi = self._adg_macro_keymidi_element(macro_index)
+        child_indent = target.text or "\n"
+        nested_indent = "{}\t".format(child_indent)
+        keymidi.text = nested_indent
+        keymidi.tail = child_indent
+        keymidi_children = list(keymidi)
+        for child in keymidi_children:
+            child.tail = nested_indent
+        if keymidi_children:
+            keymidi_children[-1].tail = child_indent
+
+        target.insert(insert_index, keymidi)
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True), target.tag
+
+    def _create_adg_macro_mapping_test_preset(self):
+        folder = os.path.expanduser("~/Music/Ableton/User Library/Presets/Instruments/Instrument Rack")
+        source_path = os.path.join(folder, "Unmapped.adg")
+        output_name = "Tap Macro Hack Test.adg"
+        output_path = os.path.join(folder, output_name)
+
+        if not os.path.exists(source_path):
+            self._send_macro_command_result("error", "missing test source: {}".format(source_path))
+            return False
+
+        try:
+            with gzip.open(source_path, "rb") as source:
+                text = source.read().decode("utf-8")
+            patched_bytes, target_name = self._patch_adg_first_native_parameter_to_macro(text, 0)
+            if patched_bytes is None:
+                self._send_macro_command_result("unsupported", "no native ADG parameter block found to patch")
+                return False
+            with gzip.open(output_path, "wb") as output:
+                output.write(patched_bytes)
+            self._send_macro_command_result(
+                "ok",
+                "created {}; mapped {} to Macro 1. Load it from Instrument Rack presets.".format(output_name, target_name)
+            )
+            return True
+        except Exception as e:
+            self._send_macro_command_result("error", "ADG macro patch failed: {}".format(str(e)))
+            return False
+
+    def _object_summary_for_macro_watch(self, obj):
+        if not liveobj_valid(obj):
+            return "None"
+        
+        try:
+            name = str(obj.name)
+        except Exception:
+            name = ""
+        
+        try:
+            class_name = "{}.{}".format(obj.__class__.__module__, obj.__class__.__name__)
+        except Exception:
+            class_name = str(type(obj))
+        
+        return "{}({})".format(name, class_name) if name else class_name
+
+    def _macro_mapping_watch_changed(self):
+        rack = getattr(self, "_macro_mapping_watch_rack", None)
+        try:
+            view = self.song().view
+        except Exception:
+            return
+        
+        try:
+            mod_device = view.mod_mapping_device
+        except Exception:
+            mod_device = None
+        
+        try:
+            mod_parameter = view.mod_mapping_parameter
+        except Exception:
+            mod_parameter = None
+        
+        try:
+            selected_parameter = view.selected_parameter
+        except Exception:
+            selected_parameter = None
+        
+        try:
+            mapped = ",".join("1" if value else "0" for value in list(rack.macros_mapped)[:16])
+        except Exception:
+            mapped = "unknown"
+        
+        detail = "mod_device={} | mod_parameter={} | selected={} | mapped={}".format(
+            self._object_summary_for_macro_watch(mod_device),
+            self._object_summary_for_macro_watch(mod_parameter),
+            self._object_summary_for_macro_watch(selected_parameter),
+            mapped
+        )
+        try:
+            self.log_message("Tap macro mapping watch: {}".format(detail))
+        except Exception:
+            self._debug_log("Tap macro mapping watch: {}".format(detail))
+        self._send_macro_command_result("watch", detail)
+
+    def _remove_macro_mapping_watch_listener(self, remove_method_name, has_method_name):
+        try:
+            view = self.song().view
+            remove_method = getattr(view, remove_method_name, None)
+            has_method = getattr(view, has_method_name, None)
+            if callable(remove_method) and (not callable(has_method) or has_method(self._macro_mapping_watch_changed)):
+                remove_method(self._macro_mapping_watch_changed)
+        except Exception:
+            pass
+
+    def _stop_macro_mapping_watch(self):
+        self._remove_macro_mapping_watch_listener("remove_mod_mapping_device_listener", "mod_mapping_device_has_listener")
+        self._remove_macro_mapping_watch_listener("remove_mod_mapping_parameter_listener", "mod_mapping_parameter_has_listener")
+        self._remove_macro_mapping_watch_listener("remove_selected_parameter_listener", "selected_parameter_has_listener")
+        self._macro_mapping_watch_active = False
+        self._macro_mapping_watch_rack = None
+
+    def _add_macro_mapping_watch_listener(self, add_method_name, has_method_name):
+        view = self.song().view
+        add_method = getattr(view, add_method_name, None)
+        has_method = getattr(view, has_method_name, None)
+        if not callable(add_method):
+            return False
+        if callable(has_method) and has_method(self._macro_mapping_watch_changed):
+            return True
+        add_method(self._macro_mapping_watch_changed)
+        return True
+
+    def _start_macro_mapping_watch(self, rack):
+        self._stop_macro_mapping_watch()
+        self._macro_mapping_watch_rack = rack
+        
+        try:
+            added = [
+                self._add_macro_mapping_watch_listener("add_mod_mapping_device_listener", "mod_mapping_device_has_listener"),
+                self._add_macro_mapping_watch_listener("add_mod_mapping_parameter_listener", "mod_mapping_parameter_has_listener"),
+                self._add_macro_mapping_watch_listener("add_selected_parameter_listener", "selected_parameter_has_listener"),
+            ]
+            self._macro_mapping_watch_active = any(added)
+            self._send_macro_command_result(
+                "watching",
+                "manually map a rack parameter to Macro 1 now; listening={}".format(",".join("1" if value else "0" for value in added))
+            )
+            self._macro_mapping_watch_changed()
+            return self._macro_mapping_watch_active
+        except Exception as e:
+            self._stop_macro_mapping_watch()
+            self._send_macro_command_result("error", "macro mapping watch failed: {}".format(str(e)))
+            return False
+
+    def _select_rack_context_for_parameter(self, rack, device):
+        try:
+            track = rack.canonical_parent
+            while liveobj_valid(track) and not hasattr(track, "view"):
+                track = track.canonical_parent
+            if liveobj_valid(track):
+                self.song().view.selected_track = track
+                if hasattr(track, "view") and hasattr(track.view, "selected_device") and liveobj_valid(device):
+                    track.view.selected_device = device
+        except Exception:
+            pass
+        
+        try:
+            app_view = self.application().view
+            app_view.show_view("Detail")
+            app_view.show_view("Detail/DeviceChain")
+            app_view.focus_view("Detail/DeviceChain")
+        except Exception:
+            pass
+
+    def _send_first_rack_parameter_to_live_map_mode(self, rack):
+        device = self._first_device_in_rack(rack)
+        if not liveobj_valid(device):
+            self._send_macro_command_result("error", "rack has no device in its first chain")
+            return False
+        
+        parameter = self._first_mappable_parameter_for_device(device)
+        if not liveobj_valid(parameter):
+            self._send_macro_command_result("error", "first rack device has no mappable parameter")
+            return False
+        
+        self._set_visible_macro_count(rack, 1)
+        was_mapped = self._macro_mapped_at_index(rack, 0)
+        self._macro_mapping_watch_rack = rack
+        self._select_rack_context_for_parameter(rack, device)
+        selected = self._set_selected_parameter(parameter)
+        detail = "sent {} to Live map mode; selected={}; was_mapped={}".format(
+            getattr(parameter, "name", "parameter"),
+            1 if selected else 0,
+            1 if was_mapped else 0
+        )
+        self._send_macro_command_result("sent", detail)
+        self.schedule_message(2, lambda: self._send_live_map_mode_result(rack, parameter, was_mapped))
+        self.schedule_message(6, lambda: self._send_live_map_mode_result(rack, parameter, was_mapped))
+        return True
+
+    def _send_live_map_mode_result(self, rack, parameter, was_mapped):
+        mapped = self._macro_mapped_at_index(rack, 0)
+        self._send_macro_command_result(
+            "result",
+            "{} mapped_before={} mapped_now={}".format(
+                getattr(parameter, "name", "parameter"),
+                1 if was_mapped else 0,
+                1 if mapped else 0
+            )
+        )
+
+    def _visible_macro_count(self, device):
+        if not liveobj_valid(device) or not hasattr(device, 'visible_macro_count'):
+            return 0
+        try:
+            return int(device.visible_macro_count)
+        except Exception:
+            return 0
+
+    def _set_visible_macro_count(self, device, target_count):
+        if not liveobj_valid(device):
+            return False
+        
+        target_count = max(1, min(16, int(target_count)))
+        current_count = self._visible_macro_count(device)
+        try:
+            while current_count < target_count:
+                device.add_macro()
+                current_count += 1
+            while current_count > target_count:
+                device.remove_macro()
+                current_count -= 1
+            self._send_macro_command_result("ok", "visible_macro_count={}".format(current_count))
+            return True
+        except Exception as e:
+            self._send_macro_command_result("error", "visible macro count failed: {}".format(str(e)))
+            self._debug_log("Visible macro count failed: {}".format(str(e)))
+            return False
+
+    def _selected_parameter(self):
+        try:
+            return self.song().view.selected_parameter
+        except Exception:
+            return None
+
+    def _set_selected_parameter(self, parameter):
+        try:
+            if liveobj_valid(parameter) and hasattr(self.song().view, 'selected_parameter'):
+                self.song().view.selected_parameter = parameter
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _rack_contains_device(self, rack, target_device):
+        if not liveobj_valid(rack) or not liveobj_valid(target_device):
+            return False
+        
+        for chain in self._valid_chains(rack):
+            try:
+                devices = list(chain.devices)
+            except Exception:
+                devices = []
+            for device in devices:
+                if device == target_device:
+                    return True
+                if self._rack_contains_device(device, target_device):
+                    return True
+        
+        return False
+
+    def _parameter_belongs_to_rack(self, rack, parameter):
+        if not liveobj_valid(rack) or not liveobj_valid(parameter):
+            return False
+        
+        try:
+            parameter_device = parameter.canonical_parent
+        except Exception:
+            parameter_device = None
+        
+        if parameter_device == rack:
+            try:
+                if hasattr(rack, 'chain_selector') and parameter == rack.chain_selector:
+                    return True
+            except Exception:
+                pass
+            try:
+                if parameter in list(rack.parameters)[1:]:
+                    return False
+            except Exception:
+                pass
+            return True
+        
+        return self._rack_contains_device(rack, parameter_device)
+
+    def _first_device_in_rack(self, rack):
+        if not liveobj_valid(rack):
+            return None
+        
+        for chain in self._valid_chains(rack):
+            try:
+                devices = list(chain.devices)
+            except Exception:
+                devices = []
+            for device in devices:
+                if liveobj_valid(device):
+                    return device
+        
+        return None
+
+    def _first_mappable_parameter_for_device(self, device):
+        if not liveobj_valid(device) or not hasattr(device, 'parameters'):
+            return None
+        
+        try:
+            parameters = list(device.parameters)[1:]
+        except Exception:
+            parameters = []
+        
+        for parameter in parameters:
+            if not liveobj_valid(parameter):
+                continue
+            try:
+                if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
+                    continue
+            except Exception:
+                continue
+            try:
+                if getattr(parameter, 'max', 0) == getattr(parameter, 'min', 0):
+                    continue
+            except Exception:
+                continue
+            return parameter
+        
+        return None
+
+    def _macro_parameter_at_index(self, rack, macro_index):
+        try:
+            parameters = list(rack.parameters)
+        except Exception:
+            return None
+        
+        parameter_index = macro_index + 1
+        if parameter_index < 0 or parameter_index >= len(parameters):
+            return None
+        return parameters[parameter_index]
+
+    def _macro_mapped_at_index(self, rack, macro_index):
+        try:
+            mapped = list(rack.macros_mapped)
+            return bool(mapped[macro_index])
+        except Exception:
+            return False
+
+    def _macro_mapping_succeeded(self, rack, parameter, macro_index, was_mapped):
+        is_mapped = self._macro_mapped_at_index(rack, macro_index)
+        try:
+            parameter_disabled = not bool(parameter.is_enabled)
+        except Exception:
+            parameter_disabled = False
+        return (is_mapped and not was_mapped) or (is_mapped and parameter_disabled)
+
+    def _try_macro_mapping_call(self, owner, method_name, argument_variants, rack, parameter, macro_index, was_mapped):
+        if not hasattr(owner, method_name):
+            return False, None
+        
+        method = getattr(owner, method_name)
+        if not callable(method):
+            return False, None
+        
+        last_error = None
+        for arguments in argument_variants:
+            try:
+                method(*arguments)
+                if self._macro_mapping_succeeded(rack, parameter, macro_index, was_mapped):
+                    return True, method_name
+            except Exception as e:
+                last_error = str(e)
+        
+        return False, last_error
+
+    def _try_view_mod_mapping_assignment(self, rack, parameter, macro_parameter, macro_index, was_mapped):
+        try:
+            view = self.song().view
+        except Exception as e:
+            return False, "song view unavailable: {}".format(str(e))
+        
+        variants = (
+            ("device=rack parameter=target", (("mod_mapping_device", rack), ("mod_mapping_parameter", parameter))),
+            ("parameter=target device=rack", (("mod_mapping_parameter", parameter), ("mod_mapping_device", rack))),
+            ("device=rack selected=target parameter=target", (("mod_mapping_device", rack), ("selected_parameter", parameter), ("mod_mapping_parameter", parameter))),
+            ("device=rack parameter=macro selected=target", (("mod_mapping_device", rack), ("mod_mapping_parameter", macro_parameter), ("selected_parameter", parameter))),
+            ("device=macro parameter=target", (("mod_mapping_device", macro_parameter), ("mod_mapping_parameter", parameter))),
+        )
+        
+        errors = []
+        for label, assignments in variants:
+            try:
+                for attr_name, value in assignments:
+                    if not hasattr(view, attr_name):
+                        raise AttributeError("song view has no {}".format(attr_name))
+                    setattr(view, attr_name, value)
+                if self._macro_mapping_succeeded(rack, parameter, macro_index, was_mapped):
+                    return True, label
+            except Exception as e:
+                errors.append("{}: {}".format(label, str(e)))
+        
+        return False, " | ".join(errors[:4])
+
+    def _try_map_parameter_to_macro(self, rack, parameter, macro_index, parameter_label):
+        macro_index = max(0, min(15, int(macro_index)))
+        if not liveobj_valid(parameter):
+            self._send_macro_command_result("error", "no {}".format(parameter_label))
+            return False
+        
+        if not self._parameter_belongs_to_rack(rack, parameter):
+            self._send_macro_command_result("error", "{} is not inside selected rack".format(parameter_label))
+            return False
+        
+        if self._visible_macro_count(rack) <= macro_index:
+            self._set_visible_macro_count(rack, macro_index + 1)
+        
+        macro_parameter = self._macro_parameter_at_index(rack, macro_index)
+        if not liveobj_valid(macro_parameter):
+            self._send_macro_command_result("error", "macro parameter not available")
+            return False
+        
+        was_mapped = self._macro_mapped_at_index(rack, macro_index)
+        view_mapping_success, view_mapping_detail = self._try_view_mod_mapping_assignment(
+            rack,
+            parameter,
+            macro_parameter,
+            macro_index,
+            was_mapped
+        )
+        if view_mapping_success:
+            self._send_macro_command_result("ok", "mapped with song.view {}".format(view_mapping_detail))
+            return True
+        
+        rack_argument_variants = (
+            (parameter, macro_index),
+            (macro_index, parameter),
+            (parameter, macro_parameter),
+            (macro_parameter, parameter),
+        )
+        parameter_argument_variants = (
+            (rack, macro_index),
+            (macro_index, rack),
+            (macro_parameter,),
+        )
+        macro_argument_variants = (
+            (parameter,),
+        )
+        
+        candidates = (
+            (rack, (
+                'map_parameter_to_macro',
+                'map_parameter_to_macro_control',
+                'assign_parameter_to_macro',
+                'add_macro_mapping',
+                'create_macro_mapping',
+                'set_macro_mapping',
+                'set_macro_control_mapping',
+                'map_parameter',
+                'map_to_macro',
+            ), rack_argument_variants),
+            (parameter, (
+                'map_to_macro',
+                'assign_to_macro',
+                'create_macro_mapping',
+            ), parameter_argument_variants),
+            (macro_parameter, (
+                'map_to_parameter',
+                'assign_to_parameter',
+                'set_mapping',
+                'connect_to',
+            ), macro_argument_variants),
+        )
+        
+        errors = []
+        if view_mapping_detail:
+            errors.append("song.view:{}".format(view_mapping_detail))
+        for owner, method_names, argument_variants in candidates:
+            for method_name in method_names:
+                success, detail = self._try_macro_mapping_call(
+                    owner,
+                    method_name,
+                    argument_variants,
+                    rack,
+                    parameter,
+                    macro_index,
+                    was_mapped
+                )
+                if success:
+                    self._send_macro_command_result("ok", "mapped with {}".format(method_name))
+                    return True
+                if detail:
+                    errors.append("{}:{}".format(method_name, detail))
+        
+        if errors:
+            self._send_macro_command_result("unsupported", "no macro mapping API exposed; {}".format(" | ".join(errors[:3])))
+            self._debug_log("Macro mapping attempts failed: {}".format(" | ".join(errors[:5])))
+        else:
+            self._send_macro_command_result("unsupported", "no macro mapping API exposed")
+            self._debug_log("No macro mapping methods exposed on RackDevice, DeviceParameter, or macro parameter")
+        return False
+
+    def _try_map_selected_parameter_to_macro(self, rack, macro_index):
+        return self._try_map_parameter_to_macro(rack, self._selected_parameter(), macro_index, "selected parameter")
+
+    def _try_map_first_rack_device_parameter_to_macro_one(self, rack):
+        device = self._first_device_in_rack(rack)
+        if not liveobj_valid(device):
+            self._send_macro_command_result("error", "rack has no device in its first chain")
+            return False
+        
+        parameter = self._first_mappable_parameter_for_device(device)
+        if not liveobj_valid(parameter):
+            self._send_macro_command_result("error", "first rack device has no mappable parameter")
+            return False
+        
+        self._set_visible_macro_count(rack, 1)
+        self._set_selected_parameter(parameter)
+        self._send_macro_command_result("trying", "mapping {} to Macro 1".format(getattr(parameter, 'name', 'parameter')))
+        return self._try_map_parameter_to_macro(rack, parameter, 0, "rack device parameter")
+
+    def _safe_object_class_name(self, obj):
+        try:
+            return "{}.{}".format(obj.__class__.__module__, obj.__class__.__name__)
+        except Exception:
+            return str(type(obj))
+
+    def _safe_object_name(self, obj):
+        try:
+            return str(obj.name)
+        except Exception:
+            return ""
+
+    def _filtered_api_names(self, obj):
+        if obj is None:
+            return []
+        
+        keywords = (
+            "macro",
+            "map",
+            "assign",
+            "learn",
+            "remote",
+            "control",
+            "parameter",
+            "modulat",
+            "automation",
+            "lom",
+            "canonical",
+            "range",
+            "target",
+        )
+        names = set()
+        try:
+            names.update(dir(obj))
+        except Exception:
+            pass
+        try:
+            names.update(obj.__class__.__dict__.keys())
+        except Exception:
+            pass
+        
+        filtered = []
+        for name in names:
+            lowered = name.lower()
+            if any(keyword in lowered for keyword in keywords):
+                filtered.append(name)
+        
+        return sorted(filtered)
+
+    def _format_api_names(self, label, obj):
+        names = self._filtered_api_names(obj)
+        if not names:
+            return "{}: none".format(label)
+        return "{}: {}".format(label, ", ".join(names[:80]))
+
+    def _inspect_macro_mapping_api(self, rack):
+        device = self._first_device_in_rack(rack)
+        parameter = self._first_mappable_parameter_for_device(device)
+        macro_parameter = self._macro_parameter_at_index(rack, 0)
+        objects = (
+            ("rack", rack),
+            ("first_device", device),
+            ("first_parameter", parameter),
+            ("macro_1", macro_parameter),
+            ("song_view", getattr(self.song(), "view", None)),
+            ("application_view", getattr(self.application(), "view", None)),
+        )
+        
+        lines = ["Tap Macro API inspection"]
+        for label, obj in objects:
+            lines.append("{} object: class={} name={}".format(
+                label,
+                self._safe_object_class_name(obj),
+                self._safe_object_name(obj)
+            ))
+            lines.append(self._format_api_names(label, obj))
+        
+        try:
+            if liveobj_valid(parameter):
+                lines.append("first_parameter parent: {}".format(self._safe_object_class_name(parameter.canonical_parent)))
+        except Exception:
+            pass
+        
+        for line in lines:
+            try:
+                self.log_message(line)
+            except Exception:
+                self._debug_log(line)
+        
+        summary_parts = []
+        for label, obj in objects[:4]:
+            names = self._filtered_api_names(obj)
+            interesting = [name for name in names if "macro" in name.lower() or "map" in name.lower() or "assign" in name.lower() or "learn" in name.lower()]
+            summary_parts.append("{}=[{}]".format(label, ",".join(interesting[:12]) if interesting else "none"))
+        
+        self._send_macro_command_result("inspect", "; ".join(summary_parts))
+        return True
 
     def _rack_variation_count(self, device):
         if not liveobj_valid(device) or not hasattr(device, 'variation_count'):
