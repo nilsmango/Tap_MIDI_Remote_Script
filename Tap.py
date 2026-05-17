@@ -5176,7 +5176,7 @@ class Tap(ControlSurface):
     
         # Check if this message is chunked. Existing Tap app -> script chunks
         # always use the prefix directly after the manufacturer id.
-        if manufacturer_id in (14, 15, 16):
+        if manufacturer_id in (14, 15, 16, 50):
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -5193,8 +5193,8 @@ class Tap(ControlSurface):
                 return
             
             else:
-                # Cancel chunking, something went wrong
                 self._sysex_buffer = []
+                self._handle_full_sysex(message)
                 return
         
         else:
@@ -5465,6 +5465,8 @@ class Tap(ControlSurface):
             self._handle_rack_snapshot_command(message)
         if len(message) >= 2 and message[1] == 49:
             self._send_automation_envelope(message)
+        if len(message) >= 2 and message[1] == 50:
+            self._set_automation_envelope(message)
             
 
             
@@ -5515,21 +5517,256 @@ class Tap(ControlSurface):
                 normalized = max(0.0, min(1.0, normalized))
                 samples.append((time_value, normalized))
 
-            samples = self._compress_automation_samples(samples)
+            points = self._compress_automation_samples(samples)
             entries = []
-            for sample in samples:
+            for sample in points:
                 time_value, normalized = sample
                 entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
+            render_entries = []
+            for sample in samples:
+                time_value, normalized = sample
+                render_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
 
-            response = "{}|{}|{:.6f}|{}".format(
+            response = "{}|{}|{:.6f}|{}|{}".format(
                 control_index,
                 has_envelope,
                 current_value,
-                ",".join(entries)
+                ",".join(entries),
+                ",".join(render_entries)
             )
             self._send_sys_ex_message(response, 0x31)
         except Exception as e:
             self._debug_log("Error sending automation envelope: {}".format(str(e)))
+
+    def _set_automation_envelope(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
+            fields = self._split_escaped_sysex_fields(payload, "|")
+            if len(fields) < 5:
+                return
+
+            control_index = max(0, min(7, int(fields[0])))
+            page_start = float(fields[1])
+            page_end = max(page_start, float(fields[2]))
+            sample_duration = max(0.0001, float(fields[3]))
+            step_entries = self._split_escaped_sysex_fields(fields[4], ",") if fields[4] else []
+
+            device_param = self._current_connected_parameter_for_control(control_index)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip or not device_param or not liveobj_valid(device_param):
+                return
+
+            clip = clip_slot.clip
+            envelope = None
+            if hasattr(clip, 'automation_envelope'):
+                try:
+                    envelope = clip.automation_envelope(device_param)
+                except Exception:
+                    envelope = None
+
+            current_normalized = self._parameter_normalized_value(device_param)
+            steps = []
+            for entry in step_entries:
+                components = entry.split(":")
+                if len(components) < 3:
+                    continue
+                try:
+                    time_value = max(page_start, min(page_end, float(components[0])))
+                    if time_value >= page_end - 0.000001:
+                        continue
+                    duration = max(0.0001, float(components[1]))
+                    normalized = max(0.0, min(1.0, float(components[2])))
+                    steps.append((time_value, duration, normalized))
+                except Exception:
+                    pass
+
+            steps.sort(key=lambda item: item[0])
+
+            try:
+                clip_end = max(
+                    page_end,
+                    float(getattr(clip, 'loop_end', 0.0)),
+                    float(getattr(clip, 'end_marker', 0.0)),
+                    float(getattr(clip, 'length', 0.0))
+                )
+            except Exception:
+                clip_end = page_end
+
+            def existing_normalized_value(time_value):
+                normalized = current_normalized
+                if envelope is not None:
+                    try:
+                        raw_value = envelope.value_at_time(time_value)
+                        if device_param.max != device_param.min:
+                            normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                    except Exception:
+                        normalized = current_normalized
+                return max(0.0, min(1.0, normalized))
+
+            def edited_page_value(time_value):
+                if not steps:
+                    return current_normalized
+
+                first_step = steps[0]
+                if time_value <= first_step[0]:
+                    return first_step[2]
+
+                previous_step = first_step
+                for next_step in steps[1:]:
+                    if abs(next_step[0] - previous_step[0]) <= 0.000001:
+                        if time_value >= next_step[0]:
+                            previous_step = next_step
+                        continue
+
+                    if time_value <= next_step[0]:
+                        progress = max(0.0, min(1.0, (time_value - previous_step[0]) / (next_step[0] - previous_step[0])))
+                        return max(0.0, min(1.0, previous_step[2] + ((next_step[2] - previous_step[2]) * progress)))
+
+                    previous_step = next_step
+
+                return previous_step[2]
+
+            max_write_steps = max(self.AUTOMATION_ENVELOPE_MAX_SAMPLES * 8, self.AUTOMATION_ENVELOPE_MAX_SAMPLES)
+            outside_sample_duration = sample_duration
+            if clip_end > 0.0:
+                estimated_write_steps = int(clip_end / outside_sample_duration) + len(steps) + 4
+                if estimated_write_steps > max_write_steps:
+                    outside_sample_duration = max(0.0001, clip_end / float(max(1, max_write_steps)))
+
+            all_steps = []
+
+            def append_target_step(time_value, duration, normalized):
+                if time_value < -0.000001 or time_value >= clip_end - 0.000001:
+                    return
+
+                time_value = max(0.0, time_value)
+                normalized = max(0.0, min(1.0, normalized))
+                if all_steps:
+                    previous_time, _, previous_value = all_steps[-1]
+                    if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                        return
+
+                all_steps.append((time_value, max(0.0001, duration), normalized))
+
+            def append_existing_range(start, end):
+                if end <= start + 0.000001:
+                    return
+
+                time_value = max(0.0, start)
+                while time_value < end - 0.000001:
+                    append_target_step(time_value, outside_sample_duration, existing_normalized_value(time_value))
+                    time_value += outside_sample_duration
+
+            def append_edited_page():
+                time_value = page_start
+                while time_value < page_end - 0.000001:
+                    append_target_step(time_value, sample_duration, edited_page_value(time_value))
+                    time_value += sample_duration
+
+                for step in steps:
+                    append_target_step(step[0], step[1], step[2])
+
+            append_existing_range(0.0, page_start)
+            append_edited_page()
+            append_existing_range(page_end, clip_end)
+
+            if envelope is not None:
+                if hasattr(clip, 'clear_envelope'):
+                    try:
+                        clip.clear_envelope(device_param)
+                    except Exception:
+                        pass
+                    envelope = None
+
+            if not all_steps:
+                self._refresh_parameter_metadata_on_automation_change()
+                return
+
+            if hasattr(clip, 'create_automation_envelope'):
+                try:
+                    envelope = clip.create_automation_envelope(device_param)
+                except Exception:
+                    envelope = None
+
+            if envelope is None:
+                return
+
+            all_steps.sort(key=lambda item: item[0])
+            coalesced_steps = []
+            for step in all_steps:
+                if not coalesced_steps:
+                    coalesced_steps.append(step)
+                    continue
+
+                previous_time, _, previous_value = coalesced_steps[-1]
+                time_value, _, normalized = step
+                if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                    continue
+                if abs(previous_time - time_value) > 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                    continue
+
+                coalesced_steps.append(step)
+
+            all_steps = coalesced_steps
+            minimum_duration = 0.0001
+            previous_insert_time = None
+            for index, step in enumerate(all_steps):
+                time_value, duration, normalized = step
+                raw_value = self._parameter_target_value_from_normalized(device_param, normalized)
+                if previous_insert_time is not None and time_value <= previous_insert_time:
+                    time_value = previous_insert_time + minimum_duration
+
+                next_time = None
+                for next_step in all_steps[index + 1:]:
+                    if next_step[0] > time_value:
+                        next_time = next_step[0]
+                        break
+
+                if next_time is not None:
+                    duration = max(minimum_duration, next_time - time_value)
+                else:
+                    duration = max(minimum_duration, clip_end - time_value if clip_end > time_value else duration)
+
+                try:
+                    envelope.insert_step(time_value, duration, raw_value)
+                    previous_insert_time = time_value
+                except Exception:
+                    pass
+
+            response_samples = []
+            count = max(2, min(self.AUTOMATION_ENVELOPE_MAX_SAMPLES, int((page_end - page_start) / sample_duration) + 1))
+            for index in range(count):
+                time_value = page_start + (float(index) * sample_duration)
+                normalized = current_normalized
+                try:
+                    raw_value = envelope.value_at_time(time_value)
+                    if device_param.max != device_param.min:
+                        normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                except Exception:
+                    normalized = current_normalized
+                response_samples.append((time_value, max(0.0, min(1.0, normalized))))
+
+            point_entries = []
+            for step in steps:
+                time_value, duration, normalized = step
+                point_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized))
+
+            render_entries = []
+            for sample in response_samples:
+                time_value, normalized = sample
+                render_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, sample_duration, normalized))
+
+            response = "{}|{}|{:.6f}|{}|{}".format(
+                control_index,
+                1,
+                current_normalized,
+                ",".join(point_entries),
+                ",".join(render_entries)
+            )
+            self._send_sys_ex_message(response, 0x31)
+            self._refresh_parameter_metadata_on_automation_change()
+        except Exception as e:
+            self._debug_log("Error setting automation envelope: {}".format(str(e)))
 
     def _compress_automation_samples(self, samples):
         if len(samples) <= 2:
