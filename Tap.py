@@ -207,6 +207,9 @@ class Tap(ControlSurface):
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
     UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
     UNMAPPED_PARAMETER_METADATA = ",".join([UNMAPPED_PARAMETER_METADATA_ITEM] * 8)
+    AUTOMATION_ENVELOPE_MAX_SAMPLES = 1024
+    AUTOMATION_ENVELOPE_LINEAR_EPSILON = 0.0015
+    AUTOMATION_ENVELOPE_JUMP_THRESHOLD = 0.1
     
 
     def __init__(self, c_instance):
@@ -5483,7 +5486,7 @@ class Tap(ControlSurface):
             control_index = max(0, min(7, int(fields[0])))
             start = float(fields[1])
             step_duration = max(0.0001, float(fields[2]))
-            count = max(1, min(128, int(fields[3])))
+            count = max(1, min(self.AUTOMATION_ENVELOPE_MAX_SAMPLES, int(fields[3])))
             device_param = self._current_connected_parameter_for_control(control_index)
             current_value = self._parameter_normalized_value(device_param)
 
@@ -5497,7 +5500,7 @@ class Tap(ControlSurface):
                     except Exception:
                         envelope = None
 
-            entries = []
+            samples = []
             has_envelope = 1 if envelope is not None else 0
             for index in range(count):
                 time_value = start + (float(index) * step_duration)
@@ -5510,6 +5513,12 @@ class Tap(ControlSurface):
                     except Exception:
                         normalized = current_value
                 normalized = max(0.0, min(1.0, normalized))
+                samples.append((time_value, normalized))
+
+            samples = self._compress_automation_samples(samples)
+            entries = []
+            for sample in samples:
+                time_value, normalized = sample
                 entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
 
             response = "{}|{}|{:.6f}|{}".format(
@@ -5521,6 +5530,77 @@ class Tap(ControlSurface):
             self._send_sys_ex_message(response, 0x31)
         except Exception as e:
             self._debug_log("Error sending automation envelope: {}".format(str(e)))
+
+    def _compress_automation_samples(self, samples):
+        if len(samples) <= 2:
+            return samples
+
+        result = []
+        segment = [samples[0]]
+        for index in range(1, len(samples)):
+            previous_sample = samples[index - 1]
+            current_sample = samples[index]
+            previous_flat = index >= 2 and abs(previous_sample[1] - samples[index - 2][1]) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON
+            next_flat = index + 1 < len(samples) and abs(current_sample[1] - samples[index + 1][1]) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON
+            is_jump = (
+                abs(current_sample[1] - previous_sample[1]) >= self.AUTOMATION_ENVELOPE_JUMP_THRESHOLD
+                and (previous_flat or next_flat)
+            )
+
+            if is_jump:
+                self._append_automation_samples(result, self._simplify_automation_segment(segment))
+                self._append_automation_sample(result, (current_sample[0], previous_sample[1]))
+                self._append_automation_sample(result, current_sample)
+                segment = [current_sample]
+            else:
+                segment.append(current_sample)
+
+        self._append_automation_samples(result, self._simplify_automation_segment(segment))
+        return result
+
+    def _simplify_automation_segment(self, samples):
+        if len(samples) <= 2:
+            return samples
+
+        first_time, first_value = samples[0]
+        last_time, last_value = samples[-1]
+        time_span = last_time - first_time
+        if abs(time_span) <= 0.000001:
+            return [samples[0], samples[-1]]
+
+        max_deviation = 0.0
+        split_index = 0
+        for index in range(1, len(samples) - 1):
+            time_value, normalized = samples[index]
+            progress = (time_value - first_time) / time_span
+            linear_value = first_value + ((last_value - first_value) * progress)
+            deviation = abs(normalized - linear_value)
+            if deviation > max_deviation:
+                max_deviation = deviation
+                split_index = index
+
+        if max_deviation <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+            return [samples[0], samples[-1]]
+
+        left = self._simplify_automation_segment(samples[:split_index + 1])
+        right = self._simplify_automation_segment(samples[split_index:])
+        return left[:-1] + right
+
+    def _append_automation_samples(self, result, samples):
+        for sample in samples:
+            self._append_automation_sample(result, sample)
+
+    def _append_automation_sample(self, result, sample):
+        if not result:
+            result.append(sample)
+            return
+
+        previous_time, previous_value = result[-1]
+        current_time, current_value = sample
+        if abs(previous_time - current_time) <= 0.000001 and abs(previous_value - current_value) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+            return
+
+        result.append(sample)
 
     def decode_sys_ex_scale_root(self, message):
         scale_name_bytes = message[2:-2]
