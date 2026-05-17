@@ -5521,11 +5521,11 @@ class Tap(ControlSurface):
             entries = []
             for sample in points:
                 time_value, normalized = sample
-                entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
+                entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
             render_entries = []
             for sample in samples:
                 time_value, normalized = sample
-                render_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized))
+                render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
 
             response = "{}|{}|{:.6f}|{}|{}".format(
                 control_index,
@@ -5572,11 +5572,10 @@ class Tap(ControlSurface):
                     continue
                 try:
                     time_value = max(page_start, min(page_end, float(components[0])))
-                    if time_value >= page_end - 0.000001:
-                        continue
                     duration = max(0.0001, float(components[1]))
                     normalized = max(0.0, min(1.0, float(components[2])))
-                    steps.append((time_value, duration, normalized))
+                    curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
+                    steps.append((time_value, duration, normalized, curve))
                 except Exception:
                     pass
 
@@ -5620,11 +5619,28 @@ class Tap(ControlSurface):
 
                     if time_value <= next_step[0]:
                         progress = max(0.0, min(1.0, (time_value - previous_step[0]) / (next_step[0] - previous_step[0])))
-                        return max(0.0, min(1.0, previous_step[2] + ((next_step[2] - previous_step[2]) * progress)))
+                        return curve_segment_value(previous_step[2], next_step[2], progress, previous_step[3])
 
                     previous_step = next_step
 
                 return previous_step[2]
+
+            def curve_segment_value(start_value, end_value, progress, curve):
+                progress = max(0.0, min(1.0, progress))
+                curve = max(-1.0, min(1.0, curve))
+                if abs(curve) <= 0.000001:
+                    return max(0.0, min(1.0, start_value + ((end_value - start_value) * progress)))
+
+                exponent = 1.0 + (abs(curve) * 14.0)
+                rises = end_value >= start_value
+                bows_up = curve > 0.0
+                if bows_up == rises:
+                    shaped_progress = 1.0 - pow(1.0 - progress, exponent)
+                else:
+                    shaped_progress = pow(progress, exponent)
+
+                blended_progress = progress + ((shaped_progress - progress) * abs(curve))
+                return max(0.0, min(1.0, start_value + ((end_value - start_value) * blended_progress)))
 
             max_write_steps = max(self.AUTOMATION_ENVELOPE_MAX_SAMPLES * 8, self.AUTOMATION_ENVELOPE_MAX_SAMPLES)
             outside_sample_duration = sample_duration
@@ -5708,6 +5724,7 @@ class Tap(ControlSurface):
                 coalesced_steps.append(step)
 
             all_steps = coalesced_steps
+            all_steps = self._smooth_automation_boundary_steps(all_steps, clip_end, sample_duration)
             minimum_duration = 0.0001
             previous_insert_time = None
             for index, step in enumerate(all_steps):
@@ -5748,13 +5765,13 @@ class Tap(ControlSurface):
 
             point_entries = []
             for step in steps:
-                time_value, duration, normalized = step
-                point_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized))
+                time_value, duration, normalized, curve = step
+                point_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
 
             render_entries = []
             for sample in response_samples:
                 time_value, normalized = sample
-                render_entries.append("{:.6f}:{:.6f}:{:.6f}".format(time_value, sample_duration, normalized))
+                render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, sample_duration, normalized, 0.0))
 
             response = "{}|{}|{:.6f}|{}|{}".format(
                 control_index,
@@ -5767,6 +5784,26 @@ class Tap(ControlSurface):
             self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
             self._debug_log("Error setting automation envelope: {}".format(str(e)))
+
+    def _smooth_automation_boundary_steps(self, steps, clip_end, sample_duration):
+        if len(steps) <= 1:
+            return steps
+
+        threshold = 0.25
+        boundary_window = max(sample_duration * 2.0, 0.03125)
+        smoothed_steps = list(steps)
+
+        first_time, first_duration, first_value = smoothed_steps[0]
+        second_time, _, second_value = smoothed_steps[1]
+        if first_time <= 0.000001 and second_time <= boundary_window and abs(first_value - second_value) >= threshold:
+            smoothed_steps[0] = (first_time, first_duration, second_value)
+
+        last_time, last_duration, last_value = smoothed_steps[-1]
+        previous_time, _, previous_value = smoothed_steps[-2]
+        if clip_end > 0.0 and clip_end - last_time <= boundary_window and clip_end - previous_time <= boundary_window * 2.0 and abs(last_value - previous_value) >= threshold:
+            smoothed_steps[-1] = (last_time, last_duration, previous_value)
+
+        return smoothed_steps
 
     def _compress_automation_samples(self, samples):
         if len(samples) <= 2:
