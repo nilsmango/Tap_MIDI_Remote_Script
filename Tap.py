@@ -5518,9 +5518,12 @@ class Tap(ControlSurface):
                 samples.append((time_value, normalized))
 
             points = self._compress_automation_samples(samples)
+            request_end = start + (float(count - 1) * step_duration)
             entries = []
             for sample in points:
                 time_value, normalized = sample
+                if abs(time_value - start) <= 0.000001 or abs(time_value - request_end) <= 0.000001:
+                    continue
                 entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
             render_entries = []
             for sample in samples:
@@ -5565,22 +5568,6 @@ class Tap(ControlSurface):
                     envelope = None
 
             current_normalized = self._parameter_normalized_value(device_param)
-            steps = []
-            for entry in step_entries:
-                components = entry.split(":")
-                if len(components) < 3:
-                    continue
-                try:
-                    time_value = max(page_start, min(page_end, float(components[0])))
-                    duration = max(0.0001, float(components[1]))
-                    normalized = max(0.0, min(1.0, float(components[2])))
-                    curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
-                    steps.append((time_value, duration, normalized, curve))
-                except Exception:
-                    pass
-
-            steps.sort(key=lambda item: item[0])
-
             try:
                 clip_end = max(
                     page_end,
@@ -5590,6 +5577,22 @@ class Tap(ControlSurface):
                 )
             except Exception:
                 clip_end = page_end
+
+            steps = []
+            for entry in step_entries:
+                components = entry.split(":")
+                if len(components) < 3:
+                    continue
+                try:
+                    time_value = max(0.0, min(clip_end, float(components[0])))
+                    duration = max(0.0001, float(components[1]))
+                    normalized = max(0.0, min(1.0, float(components[2])))
+                    curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
+                    steps.append((time_value, duration, normalized, curve))
+                except Exception:
+                    pass
+
+            steps.sort(key=lambda item: item[0])
 
             def existing_normalized_value(time_value):
                 normalized = current_normalized
@@ -5602,7 +5605,7 @@ class Tap(ControlSurface):
                         normalized = current_normalized
                 return max(0.0, min(1.0, normalized))
 
-            def edited_page_value(time_value):
+            def edited_span_value(time_value):
                 if not steps:
                     return current_normalized
 
@@ -5664,27 +5667,56 @@ class Tap(ControlSurface):
 
                 all_steps.append((time_value, max(0.0001, duration), normalized))
 
-            def append_existing_range(start, end):
+            def append_existing_range(start, end, skip_flat=False):
+                if envelope is None:
+                    return
                 if end <= start + 0.000001:
                     return
 
+                samples_to_append = []
                 time_value = max(0.0, start)
                 while time_value < end - 0.000001:
-                    append_target_step(time_value, outside_sample_duration, existing_normalized_value(time_value))
+                    samples_to_append.append((time_value, outside_sample_duration, existing_normalized_value(time_value)))
                     time_value += outside_sample_duration
 
-            def append_edited_page():
-                time_value = page_start
-                while time_value < page_end - 0.000001:
-                    append_target_step(time_value, sample_duration, edited_page_value(time_value))
-                    time_value += sample_duration
+                if skip_flat and samples_to_append:
+                    first_value = samples_to_append[0][2]
+                    if max(abs(sample[2] - first_value) for sample in samples_to_append) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                        return
 
-                for step in steps:
+                for time_value, duration, normalized in samples_to_append:
+                    append_target_step(time_value, duration, normalized)
+
+            def append_edited_span():
+                if not steps:
+                    return
+
+                if len(steps) == 1:
+                    step = steps[0]
                     append_target_step(step[0], step[1], step[2])
+                    return
 
-            append_existing_range(0.0, page_start)
-            append_edited_page()
-            append_existing_range(page_end, clip_end)
+                for index in range(len(steps) - 1):
+                    start_step = steps[index]
+                    next_step = steps[index + 1]
+                    append_target_step(start_step[0], start_step[1], start_step[2])
+
+                    time_value = start_step[0] + sample_duration
+                    while time_value < next_step[0] - 0.000001:
+                        append_target_step(time_value, sample_duration, edited_span_value(time_value))
+                        time_value += sample_duration
+
+                last_step = steps[-1]
+                append_target_step(last_step[0], last_step[1], last_step[2])
+
+            if steps:
+                edit_start = steps[0][0]
+                edit_end = steps[-1][0]
+                append_existing_range(0.0, edit_start, skip_flat=True)
+                append_edited_span()
+                append_existing_range(edit_end + outside_sample_duration, clip_end)
+            else:
+                append_existing_range(0.0, clip_end)
 
             if envelope is not None:
                 if hasattr(clip, 'clear_envelope'):
@@ -5765,6 +5797,8 @@ class Tap(ControlSurface):
             point_entries = []
             for step in steps:
                 time_value, duration, normalized, curve = step
+                if time_value < page_start - 0.000001 or time_value > page_end + 0.000001:
+                    continue
                 point_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
 
             render_entries = []
