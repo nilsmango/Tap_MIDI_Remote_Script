@@ -5724,7 +5724,6 @@ class Tap(ControlSurface):
                 coalesced_steps.append(step)
 
             all_steps = coalesced_steps
-            all_steps = self._smooth_automation_boundary_steps(all_steps, clip_end, sample_duration)
             minimum_duration = 0.0001
             previous_insert_time = None
             for index, step in enumerate(all_steps):
@@ -5781,29 +5780,36 @@ class Tap(ControlSurface):
                 ",".join(render_entries)
             )
             self._send_sys_ex_message(response, 0x31)
+            self._nudge_and_re_enable_automation_for_parameter(device_param)
             self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
             self._debug_log("Error setting automation envelope: {}".format(str(e)))
 
-    def _smooth_automation_boundary_steps(self, steps, clip_end, sample_duration):
-        if len(steps) <= 1:
-            return steps
+    def _nudge_and_re_enable_automation_for_parameter(self, device_param):
+        try:
+            if not device_param or not liveobj_valid(device_param):
+                return
 
-        threshold = 0.25
-        boundary_window = max(sample_duration * 2.0, 0.03125)
-        smoothed_steps = list(steps)
+            original_value = float(device_param.value)
+            min_value = float(device_param.min)
+            max_value = float(device_param.max)
+            if max_value > min_value:
+                nudge_amount = max((max_value - min_value) * 0.0001, 0.000001)
+                nudged_value = original_value + nudge_amount
+                if nudged_value > max_value:
+                    nudged_value = original_value - nudge_amount
+                nudged_value = max(min_value, min(max_value, nudged_value))
+                if abs(nudged_value - original_value) > 0.000000001:
+                    device_param.value = nudged_value
+                    device_param.value = original_value
 
-        first_time, first_duration, first_value = smoothed_steps[0]
-        second_time, _, second_value = smoothed_steps[1]
-        if first_time <= 0.000001 and second_time <= boundary_window and abs(first_value - second_value) >= threshold:
-            smoothed_steps[0] = (first_time, first_duration, second_value)
-
-        last_time, last_duration, last_value = smoothed_steps[-1]
-        previous_time, _, previous_value = smoothed_steps[-2]
-        if clip_end > 0.0 and clip_end - last_time <= boundary_window and clip_end - previous_time <= boundary_window * 2.0 and abs(last_value - previous_value) >= threshold:
-            smoothed_steps[-1] = (last_time, last_duration, previous_value)
-
-        return smoothed_steps
+            if hasattr(device_param, 're_enable_automation'):
+                device_param.re_enable_automation()
+            else:
+                self.song().re_enable_automation()
+            self._send_re_enable_automation_enabled(force=True)
+        except Exception as e:
+            self._debug_log("Error re-enabling written automation: {}".format(str(e)))
 
     def _compress_automation_samples(self, samples):
         if len(samples) <= 2:
