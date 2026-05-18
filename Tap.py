@@ -333,6 +333,7 @@ class Tap(ControlSurface):
             self._remove_automation_from_next_encoder = False
             self._automation_parameter_action = None
             self._automation_removal_suppressed_controls = set()
+            self._automation_authored_steps = {}
             self._mixer_automation_controls = []
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
@@ -603,6 +604,7 @@ class Tap(ControlSurface):
                         envelope = None
                 if envelope is not None and hasattr(clip, 'clear_envelope'):
                     clip.clear_envelope(device_param)
+                    self._clear_authored_automation_steps_for_parameter(clip, device_param)
                     envelope_was_cleared = True
 
             if envelope_was_cleared:
@@ -618,6 +620,54 @@ class Tap(ControlSurface):
                 self._send_re_enable_automation_enabled(force=True)
         except Exception as e:
             self._debug_log("Error re-enabling parameter automation: {}".format(str(e)))
+
+    def _automation_envelope_key(self, clip, device_param, control_index):
+        if clip is None or device_param is None:
+            return None
+
+        try:
+            clip_identity = self._live_object_identity(clip)
+        except Exception:
+            clip_identity = id(clip)
+
+        try:
+            parameter_identity = self._live_object_identity(device_param)
+        except Exception:
+            parameter_identity = id(device_param)
+
+        return (clip_identity, parameter_identity, int(control_index))
+
+    def _authored_automation_steps(self, clip, device_param, control_index):
+        key = self._automation_envelope_key(clip, device_param, control_index)
+        if key is None:
+            return None
+        return self._automation_authored_steps.get(key)
+
+    def _store_authored_automation_steps(self, clip, device_param, control_index, steps):
+        key = self._automation_envelope_key(clip, device_param, control_index)
+        if key is None:
+            return
+        self._automation_authored_steps[key] = tuple(steps)
+
+    def _clear_authored_automation_steps(self, clip, device_param, control_index):
+        key = self._automation_envelope_key(clip, device_param, control_index)
+        if key is None:
+            return
+        self._automation_authored_steps.pop(key, None)
+
+    def _clear_authored_automation_steps_for_parameter(self, clip, device_param):
+        if clip is None or device_param is None:
+            return
+
+        try:
+            clip_identity = self._live_object_identity(clip)
+            parameter_identity = self._live_object_identity(device_param)
+        except Exception:
+            return
+
+        for key in list(self._automation_authored_steps.keys()):
+            if len(key) >= 2 and key[0] == clip_identity and key[1] == parameter_identity:
+                self._automation_authored_steps.pop(key, None)
 
     def _on_device_control_value(self, value, control):
         try:
@@ -5493,6 +5543,7 @@ class Tap(ControlSurface):
             current_value = self._parameter_normalized_value(device_param)
 
             clip_slot = self.song().view.highlighted_clip_slot
+            clip = None
             envelope = None
             if clip_slot is not None and clip_slot.has_clip and device_param and liveobj_valid(device_param):
                 clip = clip_slot.clip
@@ -5517,14 +5568,20 @@ class Tap(ControlSurface):
                 normalized = max(0.0, min(1.0, normalized))
                 samples.append((time_value, normalized))
 
-            points = self._compress_automation_samples(samples)
+            authored_steps = self._authored_automation_steps(clip, device_param, control_index)
+            points = [] if authored_steps is not None else self._compress_automation_samples(samples)
             request_end = start + (float(count - 1) * step_duration)
             entries = []
-            for sample in points:
-                time_value, normalized = sample
-                if abs(time_value - start) <= 0.000001 or abs(time_value - request_end) <= 0.000001:
-                    continue
-                entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
+            if authored_steps is not None:
+                for step in authored_steps:
+                    time_value, duration, normalized, curve = step
+                    entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
+            else:
+                for sample in points:
+                    time_value, normalized = sample
+                    if abs(time_value - start) <= 0.000001 or abs(time_value - request_end) <= 0.000001:
+                        continue
+                    entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
             render_entries = []
             for sample in samples:
                 time_value, normalized = sample
@@ -5594,17 +5651,6 @@ class Tap(ControlSurface):
 
             steps.sort(key=lambda item: item[0])
 
-            def existing_normalized_value(time_value):
-                normalized = current_normalized
-                if envelope is not None:
-                    try:
-                        raw_value = envelope.value_at_time(time_value)
-                        if device_param.max != device_param.min:
-                            normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
-                    except Exception:
-                        normalized = current_normalized
-                return max(0.0, min(1.0, normalized))
-
             def edited_span_value(time_value):
                 if not steps:
                     return current_normalized
@@ -5645,47 +5691,33 @@ class Tap(ControlSurface):
                 blended_progress = progress + ((shaped_progress - progress) * abs(curve))
                 return max(0.0, min(1.0, start_value + ((end_value - start_value) * blended_progress)))
 
-            max_write_steps = max(self.AUTOMATION_ENVELOPE_MAX_SAMPLES * 8, self.AUTOMATION_ENVELOPE_MAX_SAMPLES)
-            outside_sample_duration = sample_duration
-            if clip_end > 0.0:
-                estimated_write_steps = int(clip_end / outside_sample_duration) + len(steps) + 4
-                if estimated_write_steps > max_write_steps:
-                    outside_sample_duration = max(0.0001, clip_end / float(max(1, max_write_steps)))
-
             all_steps = []
 
-            def append_target_step(time_value, duration, normalized):
-                if time_value < -0.000001 or time_value >= clip_end - 0.000001:
+            def append_target_step(time_value, duration, normalized, force=False):
+                if time_value < -0.000001 or time_value > clip_end + 0.000001:
                     return
 
-                time_value = max(0.0, time_value)
+                time_value = max(0.0, min(clip_end, time_value))
                 normalized = max(0.0, min(1.0, normalized))
-                if all_steps:
-                    previous_time, _, previous_value = all_steps[-1]
+                if all_steps and not force:
+                    previous_time, _, previous_value, _ = all_steps[-1]
                     if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
                         return
 
-                all_steps.append((time_value, max(0.0001, duration), normalized))
+                all_steps.append((time_value, max(0.0001, duration), normalized, bool(force)))
 
-            def append_existing_range(start, end, skip_flat=False):
-                if envelope is None:
-                    return
-                if end <= start + 0.000001:
+            def append_boundary_hold_steps():
+                if not steps:
                     return
 
-                samples_to_append = []
-                time_value = max(0.0, start)
-                while time_value < end - 0.000001:
-                    samples_to_append.append((time_value, outside_sample_duration, existing_normalized_value(time_value)))
-                    time_value += outside_sample_duration
+                guard_duration = 0.0001
+                first_step = steps[0]
+                if first_step[0] > guard_duration:
+                    append_target_step(0.0, max(guard_duration, first_step[0]), first_step[2], force=True)
 
-                if skip_flat and samples_to_append:
-                    first_value = samples_to_append[0][2]
-                    if max(abs(sample[2] - first_value) for sample in samples_to_append) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
-                        return
-
-                for time_value, duration, normalized in samples_to_append:
-                    append_target_step(time_value, duration, normalized)
+                last_step = steps[-1]
+                if clip_end > last_step[0] + guard_duration:
+                    append_target_step(clip_end - guard_duration, guard_duration, last_step[2], force=True)
 
             def append_edited_span():
                 if not steps:
@@ -5709,14 +5741,8 @@ class Tap(ControlSurface):
                 last_step = steps[-1]
                 append_target_step(last_step[0], last_step[1], last_step[2])
 
-            if steps:
-                edit_start = steps[0][0]
-                edit_end = steps[-1][0]
-                append_existing_range(0.0, edit_start, skip_flat=True)
-                append_edited_span()
-                append_existing_range(edit_end + outside_sample_duration, clip_end)
-            else:
-                append_existing_range(0.0, clip_end)
+            append_edited_span()
+            append_boundary_hold_steps()
 
             if envelope is not None:
                 if hasattr(clip, 'clear_envelope'):
@@ -5727,6 +5753,15 @@ class Tap(ControlSurface):
                     envelope = None
 
             if not all_steps:
+                self._clear_authored_automation_steps(clip, device_param, control_index)
+                response = "{}|{}|{:.6f}|{}|{}".format(
+                    control_index,
+                    0,
+                    current_normalized,
+                    "",
+                    ""
+                )
+                self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
                 return
 
@@ -5746,11 +5781,13 @@ class Tap(ControlSurface):
                     coalesced_steps.append(step)
                     continue
 
-                previous_time, _, previous_value = coalesced_steps[-1]
-                time_value, _, normalized = step
+                previous_time, _, previous_value, previous_force = coalesced_steps[-1]
+                time_value, _, normalized, force = step
                 if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                    if force and not previous_force:
+                        coalesced_steps[-1] = step
                     continue
-                if abs(previous_time - time_value) > 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                if not force and not previous_force and abs(previous_time - time_value) > 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
                     continue
 
                 coalesced_steps.append(step)
@@ -5759,7 +5796,7 @@ class Tap(ControlSurface):
             minimum_duration = 0.0001
             previous_insert_time = None
             for index, step in enumerate(all_steps):
-                time_value, duration, normalized = step
+                time_value, duration, normalized, _ = step
                 raw_value = self._parameter_target_value_from_normalized(device_param, normalized)
                 if previous_insert_time is not None and time_value <= previous_insert_time:
                     time_value = previous_insert_time + minimum_duration
@@ -5773,13 +5810,15 @@ class Tap(ControlSurface):
                 if next_time is not None:
                     duration = max(minimum_duration, next_time - time_value)
                 else:
-                    duration = max(minimum_duration, clip_end - time_value if clip_end > time_value else duration)
+                    duration = max(minimum_duration, clip_end - time_value) if clip_end > time_value else max(minimum_duration, duration)
 
                 try:
                     envelope.insert_step(time_value, duration, raw_value)
                     previous_insert_time = time_value
                 except Exception:
                     pass
+
+            self._store_authored_automation_steps(clip, device_param, control_index, steps)
 
             response_samples = []
             count = max(2, min(self.AUTOMATION_ENVELOPE_MAX_SAMPLES, int((page_end - page_start) / sample_duration) + 1))
@@ -5797,8 +5836,6 @@ class Tap(ControlSurface):
             point_entries = []
             for step in steps:
                 time_value, duration, normalized, curve = step
-                if time_value < page_start - 0.000001 or time_value > page_end + 0.000001:
-                    continue
                 point_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
 
             render_entries = []
