@@ -5569,8 +5569,20 @@ class Tap(ControlSurface):
                 samples.append((time_value, normalized))
 
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
-            points = [] if authored_steps is not None else self._compress_automation_samples(samples)
             request_end = start + (float(count - 1) * step_duration)
+            if authored_steps is not None and not self._authored_automation_steps_match_samples(authored_steps, samples):
+                points = self._compress_automation_samples(samples)
+                replacement_steps = []
+                for sample in points:
+                    time_value, normalized = sample
+                    if time_value > start + 0.000001 and time_value < request_end - 0.000001:
+                        replacement_steps.append((time_value, step_duration, normalized, 0.0))
+                authored_steps = tuple(sorted(
+                    list(step for step in authored_steps if step[0] < start - 0.000001 or step[0] > request_end + 0.000001)
+                    + replacement_steps
+                , key=lambda item: item[0]))
+                self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
+            points = [] if authored_steps is not None else self._compress_automation_samples(samples)
             entries = []
             if authored_steps is not None:
                 for step in authored_steps:
@@ -5882,34 +5894,6 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error re-enabling written automation: {}".format(str(e)))
 
-    def _nudge_and_re_enable_automation_for_parameter(self, device_param, should_re_enable=True):
-        try:
-            if not should_re_enable or not device_param or not liveobj_valid(device_param):
-                return
-
-            original_value = float(device_param.value)
-            min_value = float(device_param.min)
-            max_value = float(device_param.max)
-            if max_value > min_value:
-                nudge_amount = max((max_value - min_value) * 0.25, 0.000001)
-                nudged_value = original_value + nudge_amount
-                if nudged_value > max_value:
-                    nudged_value = original_value - nudge_amount
-                nudged_value = max(min_value, min(max_value, nudged_value))
-                if abs(nudged_value - original_value) > 0.000000001:
-                    if hasattr(device_param, 'begin_gesture'):
-                        device_param.begin_gesture()
-                    device_param.value = nudged_value
-                    if hasattr(device_param, 'end_gesture'):
-                        device_param.end_gesture()
-
-            self._re_enable_parameter_automation(device_param)
-            self.schedule_message(1, lambda: self._re_enable_written_automation_if_needed(device_param))
-            self.schedule_message(3, lambda: self._re_enable_written_automation_if_needed(device_param))
-            self._send_re_enable_automation_enabled(force=True)
-        except Exception as e:
-            self._debug_log("Error re-enabling written automation: {}".format(str(e)))
-
     def _re_enable_parameter_automation(self, device_param):
         if hasattr(device_param, 're_enable_automation'):
             device_param.re_enable_automation()
@@ -5923,6 +5907,65 @@ class Tap(ControlSurface):
                 self._send_re_enable_automation_enabled(force=True)
         except Exception as e:
             self._debug_log("Error retrying written automation re-enable: {}".format(str(e)))
+
+    def _authored_automation_steps_match_samples(self, steps, samples):
+        if not steps or not samples:
+            return False
+
+        close_threshold = 0.0125
+        maximum_difference_threshold = 0.02
+        required_close_ratio = 0.995
+        max_difference = 0.0
+        close_samples = 0
+        for time_value, normalized in samples:
+            difference = abs(self._automation_value_from_steps(time_value, steps) - normalized)
+            max_difference = max(max_difference, difference)
+            if difference <= close_threshold:
+                close_samples += 1
+
+        close_ratio = float(close_samples) / float(len(samples))
+        return close_ratio >= required_close_ratio and max_difference <= maximum_difference_threshold
+
+    def _automation_value_from_steps(self, time_value, steps):
+        if not steps:
+            return 0.0
+
+        sorted_steps = sorted(steps, key=lambda item: item[0])
+        first_step = sorted_steps[0]
+        if time_value <= first_step[0]:
+            return max(0.0, min(1.0, first_step[2]))
+
+        previous_step = first_step
+        for next_step in sorted_steps[1:]:
+            if abs(next_step[0] - previous_step[0]) <= 0.000001:
+                if time_value >= next_step[0]:
+                    previous_step = next_step
+                continue
+
+            if time_value <= next_step[0]:
+                progress = max(0.0, min(1.0, (time_value - previous_step[0]) / (next_step[0] - previous_step[0])))
+                return self._automation_curve_segment_value(previous_step[2], next_step[2], progress, previous_step[3] if len(previous_step) >= 4 else 0.0)
+
+            previous_step = next_step
+
+        return max(0.0, min(1.0, previous_step[2]))
+
+    def _automation_curve_segment_value(self, start_value, end_value, progress, curve):
+        progress = max(0.0, min(1.0, progress))
+        curve = max(-1.0, min(1.0, curve))
+        if abs(curve) <= 0.000001:
+            return max(0.0, min(1.0, start_value + ((end_value - start_value) * progress)))
+
+        exponent = 1.0 + (abs(curve) * 14.0)
+        rises = end_value >= start_value
+        bows_up = curve > 0.0
+        if bows_up == rises:
+            shaped_progress = 1.0 - pow(1.0 - progress, exponent)
+        else:
+            shaped_progress = pow(progress, exponent)
+
+        blended_progress = progress + ((shaped_progress - progress) * abs(curve))
+        return max(0.0, min(1.0, start_value + ((end_value - start_value) * blended_progress)))
 
     def _compress_automation_samples(self, samples):
         if len(samples) <= 2:
