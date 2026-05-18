@@ -5616,6 +5616,7 @@ class Tap(ControlSurface):
             if clip_slot is None or not clip_slot.has_clip or not device_param or not liveobj_valid(device_param):
                 return
 
+            automation_was_enabled = self._parameter_automation_is_enabled(device_param)
             clip = clip_slot.clip
             envelope = None
             if hasattr(clip, 'automation_envelope'):
@@ -5623,6 +5624,7 @@ class Tap(ControlSurface):
                     envelope = clip.automation_envelope(device_param)
                 except Exception:
                     envelope = None
+            automation_should_re_enable = automation_was_enabled or envelope is not None
 
             current_normalized = self._parameter_normalized_value(device_param)
             try:
@@ -5744,15 +5746,12 @@ class Tap(ControlSurface):
             append_edited_span()
             append_boundary_hold_steps()
 
-            if envelope is not None:
-                if hasattr(clip, 'clear_envelope'):
+            if not all_steps:
+                if envelope is not None and hasattr(clip, 'clear_envelope'):
                     try:
                         clip.clear_envelope(device_param)
                     except Exception:
                         pass
-                    envelope = None
-
-            if not all_steps:
                 self._clear_authored_automation_steps(clip, device_param, control_index)
                 response = "{}|{}|{:.6f}|{}|{}".format(
                     control_index,
@@ -5765,13 +5764,22 @@ class Tap(ControlSurface):
                 self._refresh_parameter_metadata_on_automation_change()
                 return
 
-            if hasattr(clip, 'create_automation_envelope'):
+            if envelope is None and hasattr(clip, 'create_automation_envelope'):
                 try:
                     envelope = clip.create_automation_envelope(device_param)
                 except Exception:
                     envelope = None
 
             if envelope is None:
+                response = "{}|{}|{:.6f}|{}|{}".format(
+                    control_index,
+                    0,
+                    current_normalized,
+                    "",
+                    ""
+                )
+                self._send_sys_ex_message(response, 0x31)
+                self._refresh_parameter_metadata_on_automation_change()
                 return
 
             all_steps.sort(key=lambda item: item[0])
@@ -5851,36 +5859,70 @@ class Tap(ControlSurface):
                 ",".join(render_entries)
             )
             self._send_sys_ex_message(response, 0x31)
-            self._nudge_and_re_enable_automation_for_parameter(device_param)
+            self._re_enable_after_automation_write(device_param, automation_should_re_enable)
             self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
             self._debug_log("Error setting automation envelope: {}".format(str(e)))
 
-    def _nudge_and_re_enable_automation_for_parameter(self, device_param):
+    def _parameter_automation_is_enabled(self, device_param):
         try:
-            if not device_param or not liveobj_valid(device_param):
+            return bool(device_param and liveobj_valid(device_param) and hasattr(device_param, 'automation_state') and int(device_param.automation_state) == 1)
+        except Exception:
+            return False
+
+    def _re_enable_after_automation_write(self, device_param, should_re_enable=True):
+        try:
+            if not should_re_enable or not device_param or not liveobj_valid(device_param):
+                return
+
+            self._re_enable_parameter_automation(device_param)
+            self.schedule_message(1, lambda: self._re_enable_written_automation_if_needed(device_param))
+            self.schedule_message(3, lambda: self._re_enable_written_automation_if_needed(device_param))
+            self._send_re_enable_automation_enabled(force=True)
+        except Exception as e:
+            self._debug_log("Error re-enabling written automation: {}".format(str(e)))
+
+    def _nudge_and_re_enable_automation_for_parameter(self, device_param, should_re_enable=True):
+        try:
+            if not should_re_enable or not device_param or not liveobj_valid(device_param):
                 return
 
             original_value = float(device_param.value)
             min_value = float(device_param.min)
             max_value = float(device_param.max)
             if max_value > min_value:
-                nudge_amount = max((max_value - min_value) * 0.0001, 0.000001)
+                nudge_amount = max((max_value - min_value) * 0.25, 0.000001)
                 nudged_value = original_value + nudge_amount
                 if nudged_value > max_value:
                     nudged_value = original_value - nudge_amount
                 nudged_value = max(min_value, min(max_value, nudged_value))
                 if abs(nudged_value - original_value) > 0.000000001:
+                    if hasattr(device_param, 'begin_gesture'):
+                        device_param.begin_gesture()
                     device_param.value = nudged_value
-                    device_param.value = original_value
+                    if hasattr(device_param, 'end_gesture'):
+                        device_param.end_gesture()
 
-            if hasattr(device_param, 're_enable_automation'):
-                device_param.re_enable_automation()
-            else:
-                self.song().re_enable_automation()
+            self._re_enable_parameter_automation(device_param)
+            self.schedule_message(1, lambda: self._re_enable_written_automation_if_needed(device_param))
+            self.schedule_message(3, lambda: self._re_enable_written_automation_if_needed(device_param))
             self._send_re_enable_automation_enabled(force=True)
         except Exception as e:
             self._debug_log("Error re-enabling written automation: {}".format(str(e)))
+
+    def _re_enable_parameter_automation(self, device_param):
+        if hasattr(device_param, 're_enable_automation'):
+            device_param.re_enable_automation()
+        if hasattr(self.song(), 're_enable_automation'):
+            self.song().re_enable_automation()
+
+    def _re_enable_written_automation_if_needed(self, device_param):
+        try:
+            if device_param and liveobj_valid(device_param) and not self._parameter_automation_is_enabled(device_param):
+                self._re_enable_parameter_automation(device_param)
+                self._send_re_enable_automation_enabled(force=True)
+        except Exception as e:
+            self._debug_log("Error retrying written automation re-enable: {}".format(str(e)))
 
     def _compress_automation_samples(self, samples):
         if len(samples) <= 2:
