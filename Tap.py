@@ -3379,8 +3379,9 @@ class Tap(ControlSurface):
 
         raw_value = self._parameter_target_value_from_normalized(device_param, normalized_value)
         minimum_duration = 0.0001
+        start_time = info["note_start"]
         try:
-            envelope.insert_step(0.0, max(minimum_duration, info["physical_end"]), raw_value)
+            envelope.insert_step(start_time, max(minimum_duration, info["physical_end"] - start_time), raw_value)
         except Exception:
             pass
 
@@ -3408,6 +3409,29 @@ class Tap(ControlSurface):
             if step[0] < page_start - epsilon or step[0] > page_end + epsilon
         ]
         return tuple(sorted(outside_steps + list(edited_steps), key=lambda item: item[0]))
+
+    def _normalize_decoupled_logical_automation_steps(self, info, steps):
+        if not info:
+            return tuple(steps or ())
+
+        loop_start = info["note_start"]
+        loop_end = info["note_start"] + info["automation_length"]
+        epsilon = 0.000001
+        normalized_steps = []
+        for time_value, duration, normalized, curve in tuple(steps or ()):
+            if time_value < loop_start - epsilon or time_value > loop_end + epsilon:
+                continue
+            folded_time = loop_start if time_value >= loop_end - epsilon else max(loop_start, time_value)
+            normalized_steps.append((folded_time, duration, normalized, curve))
+
+        normalized_steps.sort(key=lambda item: item[0])
+        deduplicated_steps = []
+        for step in normalized_steps:
+            if deduplicated_steps and abs(deduplicated_steps[-1][0] - step[0]) <= epsilon:
+                deduplicated_steps[-1] = step
+            else:
+                deduplicated_steps.append(step)
+        return tuple(deduplicated_steps)
 
     def _follow_action_name_payload(self, rule):
         action_a, action_b = rule.get("actions", ({}, {}))
@@ -5912,6 +5936,9 @@ class Tap(ControlSurface):
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
             request_end = start + (float(count - 1) * step_duration)
             decoupled_info = self._decoupled_automation_info(clip)
+            if authored_steps is not None and decoupled_info is not None:
+                authored_steps = self._normalize_decoupled_logical_automation_steps(decoupled_info, authored_steps)
+                self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
             authored_render_steps = None
             if authored_steps is not None and decoupled_info is not None:
                 authored_render_steps = self._expanded_decoupled_automation_steps(
@@ -5924,7 +5951,7 @@ class Tap(ControlSurface):
                 replacement_steps = []
                 for sample in points:
                     time_value, normalized = sample
-                    if time_value > start + 0.000001 and time_value < request_end - 0.000001:
+                    if time_value >= start - 0.000001 and time_value <= request_end + 0.000001:
                         replacement_steps.append((time_value, step_duration, normalized, 0.0))
                 authored_steps = tuple(sorted(
                     list(step for step in authored_steps if step[0] < start - 0.000001 or step[0] > request_end + 0.000001)
@@ -5940,7 +5967,7 @@ class Tap(ControlSurface):
             else:
                 for sample in points:
                     time_value, normalized = sample
-                    if abs(time_value - start) <= 0.000001 or abs(time_value - request_end) <= 0.000001:
+                    if decoupled_info is not None and abs(time_value - request_end) <= 0.000001:
                         continue
                     entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
             render_entries = []
@@ -6026,6 +6053,7 @@ class Tap(ControlSurface):
                     page_start,
                     page_end
                 )
+                logical_steps = self._normalize_decoupled_logical_automation_steps(decoupled_info, logical_steps)
                 steps = list(logical_steps)
             if decoupled_info and steps:
                 steps = list(self._expanded_decoupled_automation_steps(decoupled_info, steps, sample_duration))
@@ -6092,9 +6120,10 @@ class Tap(ControlSurface):
                     return
 
                 guard_duration = 0.0001
+                boundary_start = decoupled_info["note_start"] if decoupled_info else 0.0
                 first_step = steps[0]
-                if first_step[0] > guard_duration:
-                    append_target_step(0.0, max(guard_duration, first_step[0]), first_step[2], force=True)
+                if first_step[0] > boundary_start + guard_duration:
+                    append_target_step(boundary_start, max(guard_duration, first_step[0] - boundary_start), first_step[2], force=True)
 
                 last_step = steps[-1]
                 if clip_end > last_step[0] + guard_duration:
