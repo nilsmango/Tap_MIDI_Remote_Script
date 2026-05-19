@@ -718,6 +718,19 @@ class Tap(ControlSurface):
             if len(key) >= 2 and key[0] == clip_identity and key[1] == parameter_identity:
                 self._automation_authored_steps.pop(key, None)
 
+    def _clear_authored_automation_steps_for_clip(self, clip):
+        if clip is None:
+            return
+
+        try:
+            clip_identity = self._live_object_identity(clip)
+        except Exception:
+            return
+
+        for key in list(self._automation_authored_steps.keys()):
+            if len(key) >= 1 and key[0] == clip_identity:
+                self._automation_authored_steps.pop(key, None)
+
     def _on_device_control_value(self, value, control):
         try:
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
@@ -5858,6 +5871,10 @@ class Tap(ControlSurface):
             self._set_decoupled_automation_length(message)
         if len(message) >= 2 and message[1] == 52:
             self._unfold_decoupled_automation_clip()
+        if len(message) >= 2 and message[1] == 53:
+            self._clear_automation_envelope(message)
+        if len(message) >= 2 and message[1] == 54:
+            self._clear_all_automation_envelopes(message)
             
 
             
@@ -5935,6 +5952,60 @@ class Tap(ControlSurface):
             self.send_selected_clip_notes()
         except Exception as e:
             self._debug_log("Error unfolding decoupled automation clip: {}".format(str(e)))
+
+    def _automation_clear_response(self, control_index, current_value):
+        response = "{}|{}|{:.6f}|{}|{}".format(
+            control_index,
+            0,
+            current_value,
+            "",
+            ""
+        )
+        self._send_sys_ex_message(response, 0x31)
+
+    def _clear_automation_envelope(self, message):
+        try:
+            control_index = max(0, min(7, int(message[2]) if len(message) >= 4 else 0))
+            device_param = self._current_connected_parameter_for_control(control_index)
+            current_value = self._parameter_normalized_value(device_param)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip or not device_param or not liveobj_valid(device_param):
+                self._automation_clear_response(control_index, current_value)
+                return
+
+            clip = clip_slot.clip
+            if hasattr(clip, 'clear_envelope'):
+                try:
+                    clip.clear_envelope(device_param)
+                except Exception:
+                    pass
+            self._clear_authored_automation_steps_for_parameter(clip, device_param)
+            self._automation_clear_response(control_index, current_value)
+            self._refresh_parameter_metadata_on_automation_change()
+        except Exception as e:
+            self._debug_log("Error clearing automation envelope: {}".format(str(e)))
+
+    def _clear_all_automation_envelopes(self, message):
+        try:
+            control_index = max(0, min(7, int(message[2]) if len(message) >= 4 else 0))
+            device_param = self._current_connected_parameter_for_control(control_index)
+            current_value = self._parameter_normalized_value(device_param)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                self._automation_clear_response(control_index, current_value)
+                return
+
+            clip = clip_slot.clip
+            if hasattr(clip, 'clear_all_envelopes'):
+                try:
+                    clip.clear_all_envelopes()
+                except Exception:
+                    pass
+            self._clear_authored_automation_steps_for_clip(clip)
+            self._automation_clear_response(control_index, current_value)
+            self._refresh_parameter_metadata_on_automation_change()
+        except Exception as e:
+            self._debug_log("Error clearing all automation envelopes: {}".format(str(e)))
 
     def _send_automation_envelope(self, message):
         try:
