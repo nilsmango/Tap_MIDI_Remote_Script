@@ -648,7 +648,55 @@ class Tap(ControlSurface):
         key = self._automation_envelope_key(clip, device_param, control_index)
         if key is None:
             return
-        self._automation_authored_steps[key] = tuple(steps)
+        self._automation_authored_steps[key] = self._automation_sorted_steps(steps)
+
+    def _automation_step_id(self, step, fallback_index=0):
+        try:
+            if len(step) >= 5:
+                return max(0, int(step[4]))
+        except Exception:
+            pass
+        return max(0, int(fallback_index) + 1)
+
+    def _automation_step_order(self, step, fallback_index=0):
+        try:
+            if len(step) >= 6:
+                return max(0, int(step[5]))
+        except Exception:
+            pass
+        return self._automation_step_id(step, fallback_index)
+
+    def _automation_step_tuple(self, step, fallback_index=0):
+        return (
+            float(step[0]),
+            float(step[1]),
+            max(0.0, min(1.0, float(step[2]))),
+            max(-1.0, min(1.0, float(step[3]) if len(step) >= 4 else 0.0)),
+            self._automation_step_id(step, fallback_index),
+            self._automation_step_order(step, fallback_index)
+        )
+
+    def _automation_sort_key(self, indexed_step):
+        index, step = indexed_step
+        return (float(step[0]), self._automation_step_order(step, index), self._automation_step_id(step, index), index)
+
+    def _automation_sorted_steps(self, steps):
+        return tuple(
+            self._automation_step_tuple(step, index)
+            for index, step in sorted(enumerate(tuple(steps or ())), key=self._automation_sort_key)
+        )
+
+    def _automation_step_entry(self, step):
+        normalized_step = self._automation_step_tuple(step)
+        time_value, duration, normalized, curve, step_id, step_order = normalized_step
+        return "{:.6f}:{:.6f}:{:.6f}:{:.6f}:{}:{}".format(
+            time_value,
+            duration,
+            normalized,
+            curve,
+            step_id,
+            step_order
+        )
 
     def _clear_authored_automation_steps(self, clip, device_param, control_index):
         key = self._automation_envelope_key(clip, device_param, control_index)
@@ -3363,15 +3411,16 @@ class Tap(ControlSurface):
         repeat_count = max(1, int(round(info["physical_length"] / info["automation_length"])))
         for repeat_index in range(repeat_count):
             cycle_start = info["note_start"] + (float(repeat_index) * info["automation_length"])
-            for time_value, duration, normalized, curve in logical_steps:
+            for step in logical_steps:
+                time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step)
                 relative_time = self._positive_mod(time_value - info["note_start"], info["automation_length"])
                 expanded_time = cycle_start + relative_time
                 if expanded_time < info["physical_end"] - 0.000001:
-                    expanded_steps.append((expanded_time, duration, normalized, curve))
+                    expanded_steps.append((expanded_time, duration, normalized, curve, step_id, step_order))
             cycle_end = cycle_start + info["automation_length"]
             if cycle_end <= info["physical_end"] + 0.000001:
-                expanded_steps.append((min(cycle_end, info["physical_end"]), sample_duration, loop_start_value, 0.0))
-        return tuple(sorted(expanded_steps, key=lambda item: item[0]))
+                expanded_steps.append((min(cycle_end, info["physical_end"]), sample_duration, loop_start_value, 0.0, 0, 0))
+        return self._automation_sorted_steps(expanded_steps)
 
     def _neutralize_decoupled_automation_points(self, envelope, device_param, info, previous_logical_steps, normalized_value, sample_duration):
         if envelope is None or device_param is None or not info:
@@ -3401,14 +3450,14 @@ class Tap(ControlSurface):
     def _merge_decoupled_automation_span(self, previous_steps, edited_steps, page_start, page_end):
         edited_steps = tuple(edited_steps or ())
         if previous_steps is None:
-            return tuple(sorted(edited_steps, key=lambda item: item[0]))
+            return self._automation_sorted_steps(edited_steps)
 
         epsilon = 0.000001
         outside_steps = [
             step for step in previous_steps
             if step[0] < page_start - epsilon or step[0] > page_end + epsilon
         ]
-        return tuple(sorted(outside_steps + list(edited_steps), key=lambda item: item[0]))
+        return self._automation_sorted_steps(outside_steps + list(edited_steps))
 
     def _normalize_decoupled_logical_automation_steps(self, info, steps):
         if not info:
@@ -3418,20 +3467,14 @@ class Tap(ControlSurface):
         loop_end = info["note_start"] + info["automation_length"]
         epsilon = 0.000001
         normalized_steps = []
-        for time_value, duration, normalized, curve in tuple(steps or ()):
+        for index, step in enumerate(tuple(steps or ())):
+            time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step, index)
             if time_value < loop_start - epsilon or time_value > loop_end + epsilon:
                 continue
             folded_time = loop_start if time_value >= loop_end - epsilon else max(loop_start, time_value)
-            normalized_steps.append((folded_time, duration, normalized, curve))
+            normalized_steps.append((folded_time, duration, normalized, curve, step_id, step_order))
 
-        normalized_steps.sort(key=lambda item: item[0])
-        deduplicated_steps = []
-        for step in normalized_steps:
-            if deduplicated_steps and abs(deduplicated_steps[-1][0] - step[0]) <= epsilon:
-                deduplicated_steps[-1] = step
-            else:
-                deduplicated_steps.append(step)
-        return tuple(deduplicated_steps)
+        return self._automation_sorted_steps(normalized_steps)
 
     def _follow_action_name_payload(self, rule):
         action_a, action_b = rule.get("actions", ({}, {}))
@@ -5952,18 +5995,17 @@ class Tap(ControlSurface):
                 for sample in points:
                     time_value, normalized = sample
                     if time_value >= start - 0.000001 and time_value <= request_end + 0.000001:
-                        replacement_steps.append((time_value, step_duration, normalized, 0.0))
-                authored_steps = tuple(sorted(
+                        replacement_steps.append((time_value, step_duration, normalized, 0.0, 0, 0))
+                authored_steps = self._automation_sorted_steps(
                     list(step for step in authored_steps if step[0] < start - 0.000001 or step[0] > request_end + 0.000001)
                     + replacement_steps
-                , key=lambda item: item[0]))
+                )
                 self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
             points = [] if authored_steps is not None else self._compress_automation_samples(samples)
             entries = []
             if authored_steps is not None:
                 for step in authored_steps:
-                    time_value, duration, normalized, curve = step
-                    entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
+                    entries.append(self._automation_step_entry(step))
             else:
                 for sample in points:
                     time_value, normalized = sample
@@ -6038,12 +6080,14 @@ class Tap(ControlSurface):
                     duration = max(0.0001, float(components[1]))
                     normalized = max(0.0, min(1.0, float(components[2])))
                     curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
-                    steps.append((time_value, duration, normalized, curve))
+                    step_id = max(0, int(components[4])) if len(components) >= 5 else 0
+                    step_order = max(0, int(components[5])) if len(components) >= 6 else step_id
+                    steps.append((time_value, duration, normalized, curve, step_id, step_order))
                 except Exception:
                     pass
 
-            steps.sort(key=lambda item: item[0])
-            logical_steps = tuple(steps)
+            logical_steps = self._automation_sorted_steps(steps)
+            steps = list(logical_steps)
 
             decoupled_info = self._decoupled_automation_info(clip)
             if decoupled_info:
@@ -6264,8 +6308,7 @@ class Tap(ControlSurface):
 
             point_entries = []
             for step in logical_steps:
-                time_value, duration, normalized, curve = step
-                point_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, duration, normalized, curve))
+                point_entries.append(self._automation_step_entry(step))
 
             render_entries = []
             for sample in response_samples:
@@ -6339,7 +6382,7 @@ class Tap(ControlSurface):
         if not steps:
             return 0.0
 
-        sorted_steps = sorted(steps, key=lambda item: item[0])
+        sorted_steps = self._automation_sorted_steps(steps)
         first_step = sorted_steps[0]
         if time_value <= first_step[0]:
             return max(0.0, min(1.0, first_step[2]))
