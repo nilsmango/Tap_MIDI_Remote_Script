@@ -6360,7 +6360,11 @@ class Tap(ControlSurface):
         if len(message) >= 2 and message[1] == 55:
             self._set_mutator_clip(message)
         if len(message) >= 2 and message[1] == 56:
-            self._end_mutator_clip()
+            action = message[2] if len(message) >= 3 else 0
+            if action == 1:
+                self._unfold_mutator_clip()
+            else:
+                self._end_mutator_clip()
             
 
 
@@ -6379,6 +6383,9 @@ class Tap(ControlSurface):
                 return float(fields[index])
             except Exception:
                 return fallback
+        has_pitch_shift_field = len(fields) > 19
+        seed_index = 18 if has_pitch_shift_field else 17
+        algorithm_index = 19 if has_pitch_shift_field else 18
         return {
             "preset": int_field(0, 1),
             "mutations_per_pass": max(1, min(3, int_field(1, 1))),
@@ -6397,35 +6404,256 @@ class Tap(ControlSurface):
             "allow_rhythmic_shifts": int_field(14, 1) == 1,
             "allow_note_additions": int_field(15, 1) == 1,
             "allow_note_removals": int_field(16, 1) == 1,
-            "seed": int_field(17, random.randint(1, 2000000000)),
+            "allow_pitch_shifts": int_field(17, 1) == 1 if has_pitch_shift_field else True,
+            "seed": int_field(seed_index, random.randint(1, 2000000000)),
+            "algorithm": self._unescape_sysex_string(fields[algorithm_index]) if len(fields) > algorithm_index else "mutator",
             "settings_payload": payload.replace("|", "~")[:80],
         }
 
     def _mutator_pattern_roles(self, preset):
         patterns = {
             0: [0, 0, 0, 0, 5, 5, 5, 5],
-            1: [0, 0, 0, 0, 4, 4, 5, 5, 5, 5],
-            2: [0, 1, 2, 3, 2, 1, 0],
-            3: [0, 0, 1, 1, 5, 7, 0, 8],
+            1: [0, 0, 0, 0, 4, 4, 5, 5],
+            2: [0, 5, 6, 9, 6, 12, 5, 0],
+            3: [0, 0, 1, 1, 5, 7, 1, 8],
             4: [0, 0, 1, 1, 5, 7, 6, 6, 0, 8],
-            5: [0, 0, 0, 1, 1, 5, 7, 6, 6, 5, 7, 6, 6, 0, 8],
+            5: [0, 0, 0, 1, 1, 5, 7, 6, 6, 5, 7, 6, 6, 1, 8],
+            6: [0, 5, 6, 9],
+            7: [0, 0, 5, 5, 6, 6, 9, 9],
+            8: [0, 0, 0, 0, 5, 6, 9, 10],
+            9: [0, 5],
+            10: [0, 0, 5, 5],
         }
         return patterns.get(int(preset), patterns[1])
+
+    def _mutator_preset_is_chain(self, preset):
+        return int(preset) in (2, 6, 7, 8)
 
     def _mutator_role_depth(self, role, global_depth):
         ranges = {
             0: (0.0, 0.10),
-            1: (0.10, 0.30),
-            2: (0.30, 0.45),
-            3: (0.45, 0.60),
+            1: (0.18, 0.40),
+            2: (0.35, 0.52),
+            3: (0.50, 0.68),
             4: (0.25, 0.60),
             5: (0.35, 0.70),
             6: (0.20, 0.55),
             7: (0.45, 0.75),
             8: (0.0, 0.0),
+            9: (0.30, 0.60),
+            10: (0.35, 0.65),
+            11: (0.40, 0.70),
+            12: (0.38, 0.68),
         }
         low, high = ranges.get(role, (0.15, 0.45))
         return low + ((high - low) * max(0.0, min(1.0, global_depth)))
+
+    def _mutator_algorithm_kind(self, algorithm):
+        if algorithm in ("verse_weaver", "motif_ladder"):
+            return "expand"
+        if algorithm in ("sparse_echo",):
+            return "variations"
+        if algorithm in ("chorus_lift", "middle_eight", "tension_break"):
+            return "section"
+        if algorithm in ("skylight_hook", "glass_steps", "nocturne_line"):
+            return "melody"
+        if algorithm in ("modal_drift", "circle_resolve"):
+            return "chords"
+        return None
+
+    def _mutator_scale_notes(self, settings):
+        intervals = self._mutator_scale_intervals(settings.get("scale", "Minor"))
+        root = int(settings.get("root", 0)) % 12
+        notes = [pitch for pitch in range(128) if ((pitch - root) % 12) in intervals]
+        return notes if notes else list(range(128))
+
+    def _mutator_scale_index(self, pitch, scale_notes):
+        return min(range(len(scale_notes)), key=lambda index: abs(scale_notes[index] - int(round(pitch))))
+
+    def _mutator_transpose_scale_steps(self, pitch, steps, settings):
+        if settings.get("scale", "Minor") == "Chromatic":
+            return max(0, min(127, int(round(pitch + steps))))
+        scale_notes = self._mutator_scale_notes(settings)
+        index = self._mutator_scale_index(pitch, scale_notes)
+        return scale_notes[max(0, min(len(scale_notes) - 1, index + int(steps)))]
+
+    def _mutator_degree_pitch(self, degree, octave, settings):
+        intervals = self._mutator_scale_intervals(settings.get("scale", "Minor"))
+        degree = int(degree)
+        octave_shift = degree // len(intervals)
+        degree_index = degree % len(intervals)
+        pitch = 12 * (octave + 1 + octave_shift) + (int(settings.get("root", 0)) % 12) + intervals[degree_index]
+        return self._mutator_quantize_pitch(pitch, settings)
+
+    def _mutator_algorithm_source_steps(self, kind, algorithm, bar, total_bars, cycle):
+        expand_patterns = {
+            "verse_weaver": [0, 0, 1, 1, -1, -1, 2, 0],
+            "motif_ladder": [0, 1, 2, 3, 2, 1, 0, -1],
+        }
+        variation_patterns = {
+            "sparse_echo": [0, -2, 0, 2],
+        }
+        section_patterns = {
+            "chorus_lift": [2, 2, 3, 3, 4, 4, 2, 0],
+            "middle_eight": [-2, 1, -1, 2, -3, 2, 1, -1],
+            "tension_break": [4, 4, 3, 4, 5, 4, 3, 4],
+        }
+        if kind == "expand":
+            pattern = expand_patterns.get(algorithm, expand_patterns["verse_weaver"])
+        elif kind == "variations":
+            pattern = variation_patterns.get(algorithm, variation_patterns["sparse_echo"])
+        else:
+            pattern = section_patterns.get(algorithm, section_patterns["chorus_lift"])
+        return pattern[(bar + cycle) % len(pattern)]
+
+    def _mutator_algorithm_prune_values(self, values, loop_length):
+        cleaned = []
+        for value in values:
+            start = max(0.0, float(value.get("start", 0.0)))
+            if start >= loop_length:
+                continue
+            duration = max(0.03125, min(float(value.get("duration", 0.03125)), loop_length - start))
+            cleaned.append(dict(
+                value,
+                pitch=max(0, min(127, int(round(value.get("pitch", 60))))),
+                start=start,
+                duration=duration,
+                velocity=max(1, min(127, int(round(value.get("velocity", 96))))),
+                mute=bool(value.get("mute", False)),
+                probability=max(0.0, min(1.0, float(value.get("probability", 1.0)))),
+            ))
+        cleaned.sort(key=lambda item: (item["start"], item["pitch"], item["duration"]))
+        return cleaned
+
+    def _mutator_make_algorithm_section_values(self, source_values, role, source_start, loop_length, settings, rnd):
+        algorithm = settings.get("algorithm", "mutator")
+        kind = self._mutator_algorithm_kind(algorithm)
+        if not kind:
+            return None
+
+        try:
+            bar_beats = float(max(1, int(self.song().signature_numerator)))
+        except Exception:
+            bar_beats = 4.0
+        bar_beats = min(max(1.0, bar_beats), max(1.0, float(loop_length)))
+        total_bars = max(1, int(math.ceil(float(loop_length) / bar_beats)))
+
+        source = []
+        for value in tuple(source_values or ()):
+            relative_start = max(0.0, min(loop_length - 0.0001, float(value.get("start", 0.0)) - float(source_start)))
+            source.append(dict(value, start=relative_start, duration=min(float(value.get("duration", 0.03125)), loop_length - relative_start)))
+        if not source:
+            return None
+
+        chord_starts = {}
+        for value in source:
+            key = round(value["start"], 3)
+            chord_starts[key] = chord_starts.get(key, 0) + 1
+        result = []
+        variation = max(0.0, min(1.0, float(settings.get("depth", 0.5))))
+
+        def random_step_variation(spread=2, chance=None, upward_bias=0):
+            if chance is None:
+                chance = 0.18 + (variation * 0.42)
+            if rnd.random() >= chance:
+                return 0
+            choices = []
+            for amount in range(1, max(1, int(spread)) + 1):
+                choices.extend([-amount, amount])
+                if upward_bias > 0:
+                    choices.extend([amount] * int(upward_bias))
+            return rnd.choice(choices or [0])
+
+        melody_offsets = {
+            "skylight_hook": [0, 1, 2, 3, 2, 1, 0, -1],
+            "glass_steps": [0, 1, 1, 2, -1, 2, 1, 0],
+            "nocturne_line": [0, -1, -2, -1, 0, 1, -1, 0],
+        }
+        chord_progressions = {
+            "modal_drift": [0, -1, 2, 1, 3, 1, 2, 4],
+            "circle_resolve": [-2, 1, -1, 0, 2, -1, 1, 4],
+        }
+        role_weight = {
+            1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 2, 7: 2, 9: 3, 10: 4, 11: 5, 12: 4
+        }.get(role, 1)
+
+        for index, value in enumerate(source):
+            is_chord_note = chord_starts.get(round(value["start"], 3), 0) > 1
+            start = value["start"]
+            bar = int(start / bar_beats)
+            new_value = dict(value)
+
+            if kind == "melody":
+                offsets = melody_offsets.get(algorithm, melody_offsets["skylight_hook"])
+                steps = offsets[(index + role) % len(offsets)] + random_step_variation(spread=2, upward_bias=1 if algorithm in ("skylight_hook", "glass_steps") else 0)
+                if algorithm == "glass_steps":
+                    steps += 1 if role_weight >= 3 and index % 3 == 1 else 0
+                    if role_weight >= 4 and rnd.random() < 0.35 + (variation * 0.35):
+                        steps += 1
+                elif algorithm == "nocturne_line":
+                    steps = max(-3, min(2, steps))
+                elif algorithm == "skylight_hook" and role_weight >= 3 and rnd.random() < 0.25 + (variation * 0.35):
+                    steps += 1
+                new_value["pitch"] = self._mutator_transpose_scale_steps(value["pitch"], steps, settings)
+                new_value["duration"] = value["duration"]
+                velocity_lift = (4 if algorithm == "glass_steps" else 2) + rnd.randint(0, int(2 + (variation * 6)))
+                new_value["velocity"] = max(1, min(127, int(round(value["velocity"] + velocity_lift))))
+
+            elif kind == "chords":
+                progression = chord_progressions.get(algorithm, chord_progressions["modal_drift"])
+                steps = progression[(bar + role) % len(progression)] + random_step_variation(spread=2, chance=0.22 + (variation * 0.45))
+                if role in (10, 11) or (role_weight >= 4 and bar >= total_bars - 1):
+                    steps += 3
+                root_pitch = self._mutator_transpose_scale_steps(value["pitch"], steps, settings)
+                chord_velocity = max(1, min(127, int(round(value["velocity"] + 2 + rnd.randint(0, int(2 + variation * 6))))))
+                if is_chord_note:
+                    result.append(dict(value, pitch=root_pitch, start=start, duration=value["duration"], velocity=chord_velocity))
+                    continue
+                root_value = dict(value, pitch=root_pitch, start=start, duration=value["duration"], velocity=chord_velocity)
+                third = dict(root_value, pitch=self._mutator_transpose_scale_steps(root_pitch, 2, settings), velocity=max(1, min(127, root_value["velocity"] - 8)))
+                fifth_steps = 5 if role in (10, 11) else 4
+                fifth = dict(root_value, pitch=self._mutator_transpose_scale_steps(root_pitch, fifth_steps, settings), velocity=max(1, min(127, root_value["velocity"] - 12)))
+                result.extend([root_value, third, fifth])
+                if algorithm == "circle_resolve" and role_weight >= 3 and (bar + role) % 2 == 0:
+                    result.append(dict(root_value, pitch=self._mutator_transpose_scale_steps(root_pitch, 6, settings), velocity=max(1, min(127, root_value["velocity"] - 16))))
+                continue
+
+            else:
+                steps = self._mutator_algorithm_source_steps(kind, algorithm, bar, total_bars, role)
+                if algorithm == "motif_ladder":
+                    steps += random_step_variation(spread=2, chance=0.20 + (variation * 0.45), upward_bias=1)
+                elif algorithm in ("middle_eight", "tension_break"):
+                    steps += random_step_variation(spread=2, chance=0.25 + (variation * 0.45), upward_bias=1 if algorithm == "tension_break" else 0)
+                elif algorithm == "sparse_echo":
+                    steps += random_step_variation(spread=1, chance=0.12 + (variation * 0.25))
+                new_value["pitch"] = self._mutator_transpose_scale_steps(new_value["pitch"], steps, settings)
+
+            if kind == "section" and algorithm == "middle_eight" and bar % 2 == 1:
+                start += rnd.choice([0.0, 0.125, 0.25]) if variation > 0.25 else 0.125
+            if kind == "section" and algorithm == "middle_eight":
+                new_value["duration"] = value["duration"] * (1.35 if is_chord_note else 1.15)
+            elif kind == "section" and algorithm == "tension_break":
+                new_value["duration"] = max(0.0625, value["duration"] * rnd.choice([0.75, 0.9, 1.0]))
+            lift = 0
+            if kind == "section" and algorithm == "chorus_lift":
+                lift = 8 + role_weight
+            elif kind == "section" and algorithm == "tension_break":
+                lift = 4 + rnd.randint(0, int(4 + variation * 8))
+            elif kind == "variations" and algorithm == "sparse_echo":
+                lift = rnd.randint(8, int(14 + variation * 10))
+            elif kind == "expand":
+                lift = 4 + min(4, role_weight) + rnd.randint(0, int(2 + variation * 5))
+            new_value["start"] = start
+            new_value["velocity"] = max(1, min(127, int(round(value["velocity"] + lift))))
+            result.append(new_value)
+
+            if not is_chord_note and algorithm == "sparse_echo" and rnd.random() < 0.46:
+                echo_velocity = new_value["velocity"] if rnd.random() < 0.35 else max(1, int(round(new_value["velocity"] * rnd.uniform(0.78, 0.98))))
+                result.append(dict(new_value, start=start + min(0.5, max(0.125, value["duration"])), duration=max(0.0625, value["duration"] * 0.55), pitch=self._mutator_transpose_scale_steps(new_value["pitch"], 5 + random_step_variation(spread=1, chance=0.25 + variation * 0.25), settings), velocity=echo_velocity, probability=min(new_value.get("probability", 1.0), rnd.uniform(0.82, 1.0))))
+            elif kind == "section" and algorithm == "chorus_lift" and not is_chord_note and rnd.random() < 0.18:
+                result.append(dict(new_value, pitch=min(127, new_value["pitch"] + 12), velocity=max(1, new_value["velocity"] - 20)))
+
+        return self._mutator_algorithm_prune_values(result, loop_length)
 
     def _mutator_scale_intervals(self, scale_name):
         table = {
@@ -6477,12 +6705,32 @@ class Tap(ControlSurface):
             probability=max(0.0, min(1.0, float(values.get("probability", 1.0))))
         )
 
-    def _mutator_make_section(self, source_values, role, section_start, source_start, loop_length, settings, rnd):
+    def _mutator_place_section_values(self, values, section_start, loop_length):
+        specs = []
+        for value in tuple(values or ()):
+            relative_start = max(0.0, min(float(loop_length) - 0.0001, float(value.get("start", 0.0))))
+            duration = max(0.0001, min(float(value.get("duration", 0.0001)), float(loop_length) - relative_start))
+            specs.append(self._mutator_specs_from_values(dict(
+                value,
+                start=float(section_start) + relative_start,
+                duration=duration
+            )))
+        return specs
+
+    def _mutator_make_section_values(self, source_values, role, source_start, loop_length, settings, rnd):
         if role in (0, 8):
             return [
-                self._mutator_specs_from_values(dict(value, start=section_start + (value["start"] - source_start)))
+                dict(
+                    value,
+                    start=max(0.0, min(loop_length - 0.0001, value["start"] - source_start)),
+                    duration=min(value["duration"], loop_length - max(0.0, min(loop_length - 0.0001, value["start"] - source_start)))
+                )
                 for value in source_values
             ]
+
+        algorithm_values = self._mutator_make_algorithm_section_values(source_values, role, source_start, loop_length, settings, rnd)
+        if algorithm_values is not None:
+            return algorithm_values
 
         depth = self._mutator_role_depth(role, settings.get("depth", 0.5))
         values = [dict(value) for value in source_values]
@@ -6496,7 +6744,7 @@ class Tap(ControlSurface):
             remove_chance = min(0.45, depth * (0.35 if role != 5 else 0.55))
             values = [value for value in values if rnd.random() > remove_chance] or source_values[:1]
 
-        specs = []
+        section_values = []
         for index, value in enumerate(values):
             relative_start = value["start"] - source_start
             pitch = value["pitch"]
@@ -6504,11 +6752,22 @@ class Tap(ControlSurface):
             duration = value["duration"]
 
             if settings.get("allow_rhythmic_shifts", True) and role not in (6,) and rnd.random() < depth:
-                grid = 0.25 if depth > 0.35 else 0.125
-                relative_start += rnd.choice([-grid, grid, grid * 2]) * min(1.0, depth + 0.2)
+                backward_limit = min(0.5, max(0.125, depth))
+                forward_limit = min(1.0, max(0.25, depth * 2.0))
+                grid = 0.125
+                backward_steps = max(1, int(round(backward_limit / grid)))
+                forward_steps = max(1, int(round(forward_limit / grid)))
+                choices = [-step * grid for step in range(1, backward_steps + 1)]
+                choices += [step * grid for step in range(1, forward_steps + 1)]
+                relative_start += rnd.choice(choices)
 
             if settings.get("allow_octave_shifts", True) and rnd.random() < depth * 0.35:
                 pitch += rnd.choice([-12, 12])
+
+            if settings.get("allow_pitch_shifts", True) and rnd.random() < depth:
+                max_steps = max(1, min(4, int(math.ceil(depth * 4))))
+                step_choices = list(range(-max_steps, 0)) + list(range(1, max_steps + 1))
+                pitch = self._mutator_transpose_scale_steps(pitch, rnd.choice(step_choices), settings)
 
             if role in (3, 5) and rnd.random() < depth * 0.5:
                 center = source_values[len(source_values) // 2]["pitch"] if source_values else pitch
@@ -6525,17 +6784,19 @@ class Tap(ControlSurface):
 
             relative_start = max(0.0, min(loop_length - 0.0001, relative_start))
             pitch = self._mutator_quantize_pitch(pitch, settings)
-            specs.append(self._mutator_specs_from_values(dict(
+            section_values.append(dict(
                 value,
                 pitch=pitch,
-                start=section_start + relative_start,
+                start=relative_start,
                 duration=min(duration, loop_length - relative_start),
                 velocity=max(1, min(127, velocity + rnd.randint(-8, 10))),
-            )))
+            ))
 
         if settings.get("allow_note_additions", True) and role not in (0, 8):
             additions = int(round(depth * settings.get("mutations_per_pass", 1) * (3 if role in (4, 7) else 2)))
-            motif = source_values[:]
+            if depth >= 0.18 and role in (1, 2, 3, 4, 5, 6, 9, 10, 11, 12):
+                additions = max(1, additions)
+            motif = list(source_values)
             motif.sort(key=lambda item: item["velocity"], reverse=True)
             for add_index in range(additions):
                 if not motif:
@@ -6548,15 +6809,15 @@ class Tap(ControlSurface):
                     relative_start = (base["start"] - source_start + rnd.choice([0.25, 0.5, 0.75])) % loop_length
                     duration = min(base["duration"], loop_length - relative_start)
                 pitch = base["pitch"] + (12 if role == 6 and add_index % 2 == 0 else rnd.choice([-2, 2, 5, 7]))
-                specs.append(self._mutator_specs_from_values(dict(
+                section_values.append(dict(
                     base,
                     pitch=self._mutator_quantize_pitch(pitch, settings),
-                    start=section_start + relative_start,
+                    start=relative_start,
                     duration=max(0.0625, duration),
                     velocity=min(127, base["velocity"] + 12),
-                )))
+                ))
 
-        return specs
+        return section_values
 
     def _set_mutator_clip(self, message):
         try:
@@ -6582,19 +6843,66 @@ class Tap(ControlSurface):
             roles = self._mutator_pattern_roles(settings.get("preset", 1))
             sections = []
             specs = []
+            generated_section_cache = {}
+            chain_preset = self._mutator_preset_is_chain(settings.get("preset", 1))
+            original_section_values = self._mutator_make_section_values(
+                source_values,
+                0,
+                source_start,
+                original_loop_length,
+                settings,
+                random.Random(0)
+            )
+            previous_chain_values = tuple(dict(value) for value in original_section_values)
             rnd = random.Random(int(settings.get("seed", 1)))
             for index, role in enumerate(roles):
                 section_start = source_start + (index * original_loop_length)
                 sections.append({"role": role, "start": section_start, "length": original_loop_length})
-                specs.extend(self._mutator_make_section(
-                    source_values,
-                    role,
-                    section_start,
-                    source_start,
-                    original_loop_length,
-                    settings,
-                    rnd
-                ))
+
+                if chain_preset:
+                    if role == 0:
+                        section_values = original_section_values
+                        previous_chain_values = tuple(dict(value) for value in section_values)
+                    elif role in generated_section_cache:
+                        section_values = generated_section_cache[role]
+                        previous_chain_values = tuple(dict(value) for value in section_values)
+                    else:
+                        section_values = self._mutator_make_section_values(
+                            previous_chain_values,
+                            role,
+                            0.0,
+                            original_loop_length,
+                            settings,
+                            rnd
+                        )
+                        generated_section_cache[role] = tuple(dict(value) for value in section_values)
+                        previous_chain_values = tuple(dict(value) for value in section_values)
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    continue
+
+                if role in (0, 8):
+                    section_values = self._mutator_make_section_values(
+                        source_values,
+                        role,
+                        source_start,
+                        original_loop_length,
+                        settings,
+                        rnd
+                    )
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                elif role in generated_section_cache:
+                    specs.extend(self._mutator_place_section_values(generated_section_cache[role], section_start, original_loop_length))
+                else:
+                    section_values = self._mutator_make_section_values(
+                        source_values,
+                        role,
+                        source_start,
+                        original_loop_length,
+                        settings,
+                        rnd
+                    )
+                    generated_section_cache[role] = tuple(dict(value) for value in section_values)
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
 
             structure_length = original_loop_length * len(roles)
             remove_start = source_start
@@ -6637,15 +6945,47 @@ class Tap(ControlSurface):
             if not info:
                 return
             source_start = float(getattr(clip, "loop_start", 0.0))
+            original_loop_length = float(info.get("original_loop_length", max(0.0001, float(getattr(clip, "loop_end", source_start)) - source_start)))
+            source_end = source_start + max(0.0001, original_loop_length)
+            remove_end = max(
+                source_end,
+                source_start + float(info.get("structure_length", original_loop_length)),
+                float(getattr(clip, "loop_end", 0.0)),
+                float(getattr(clip, "end_marker", 0.0)),
+                float(getattr(clip, "length", 0.0))
+            )
+            if hasattr(clip, "remove_notes_extended"):
+                clip.remove_notes_extended(0, 128, source_end, max(0.0001, remove_end - source_end))
             clip.loop_start = source_start
             clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
-            clip.loop_end = source_start + float(info.get("structure_length", max(0.0001, float(getattr(clip, "loop_end", source_start)) - source_start)))
+            clip.loop_end = source_end
             clip.end_marker = clip.loop_end
             self._remove_mutator_info_from_name(clip)
             self.send_selected_clip_metadata()
             self.send_selected_clip_notes()
         except Exception as e:
             self._debug_log("Error ending mutator clip: {}".format(str(e)))
+
+    def _unfold_mutator_clip(self):
+        try:
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            info = self._mutator_info(clip)
+            if not info:
+                return
+            source_start = float(getattr(clip, "loop_start", 0.0))
+            structure_length = float(info.get("structure_length", max(0.0001, float(getattr(clip, "loop_end", source_start)) - source_start)))
+            clip.loop_start = source_start
+            clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
+            clip.loop_end = source_start + max(0.0001, structure_length)
+            clip.end_marker = clip.loop_end
+            self._remove_mutator_info_from_name(clip)
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error unfolding mutator clip: {}".format(str(e)))
 
     def _handle_tap_tempo(self):
         try:
