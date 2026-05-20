@@ -202,7 +202,9 @@ class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
-    DECOUPLED_AUTOMATION_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v1\|([^\]]*)\]")
+    DECOUPLED_AUTOMATION_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v2\|([^\]]*)\]")
+    DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
+    DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
@@ -603,8 +605,14 @@ class Tap(ControlSurface):
                         envelope = clip.automation_envelope(device_param)
                     except Exception:
                         envelope = None
-                if envelope is not None and hasattr(clip, 'clear_envelope'):
-                    clip.clear_envelope(device_param)
+                if envelope is not None:
+                    raw_value = self._parameter_target_value_from_normalized(device_param, self._parameter_normalized_value(device_param))
+                    start_time = float(getattr(clip, "loop_start", 0.0))
+                    end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
+                    try:
+                        envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
+                    except Exception:
+                        pass
                     self._clear_authored_automation_steps_for_parameter(clip, device_param)
                     envelope_was_cleared = True
 
@@ -3267,7 +3275,66 @@ class Tap(ControlSurface):
         return self.FOLLOW_ACTION_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
 
     def _strip_decoupled_automation_name_marker(self, name):
-        return self.DECOUPLED_AUTOMATION_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
+        return self.DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
+
+    def _stable_decoupled_hash(self, value):
+        result = 2166136261
+        for char in str(value or ""):
+            result ^= ord(char)
+            result = (result * 16777619) & 0xFFFFFFFF
+        return result
+
+    def _decoupled_automation_parameter_key(self, device_param):
+        try:
+            if device_param is None or not liveobj_valid(device_param):
+                return None
+
+            parts = []
+            parent = getattr(device_param, "canonical_parent", None)
+            while parent is not None and len(parts) < 4:
+                name = getattr(parent, "name", None)
+                if name:
+                    parts.append(str(name))
+                next_parent = getattr(parent, "canonical_parent", None)
+                if next_parent is parent:
+                    break
+                parent = next_parent
+
+            parts = list(reversed(parts))
+            parts.append(str(getattr(device_param, "name", "parameter")))
+            raw_key = "/".join(parts)
+            clean = re.sub(r"[^A-Za-z0-9]+", "_", raw_key).strip("_")
+            if not clean:
+                clean = "parameter"
+            return "{}_{}".format(clean[:36], format(self._stable_decoupled_hash(raw_key), "08x"))
+        except Exception:
+            return None
+
+    def _decode_decoupled_automation_lengths(self, payload):
+        lengths = {}
+        entries = [entry for entry in str(payload or "").split(",") if entry]
+        for entry in entries:
+            fields = entry.split(":")
+            if len(fields) != 2:
+                continue
+            try:
+                key = fields[0]
+                if not key:
+                    continue
+                lengths[key] = max(0.0001, float(fields[1]))
+            except Exception:
+                pass
+        return lengths
+
+    def _encode_decoupled_automation_lengths(self, lengths):
+        entries = []
+        for key in sorted((lengths or {}).keys()):
+            try:
+                length = max(0.0001, float(lengths[key]))
+                entries.append("{}:{:.6f}".format(key, length))
+            except Exception:
+                pass
+        return ",".join(entries)
 
     def _decode_decoupled_automation_payload(self, payload):
         fields = str(payload or "").split("|")
@@ -3277,16 +3344,19 @@ class Tap(ControlSurface):
         try:
             note_start = max(0.0, float(fields[0]))
             note_length = max(0.0001, float(fields[1]))
-            automation_length = max(0.0001, float(fields[2]))
+            automation_lengths = self._decode_decoupled_automation_lengths(fields[2])
         except Exception:
             return None
 
-        physical_length = self._smallest_shared_loop_length(note_length, automation_length)
+        if not automation_lengths:
+            return None
+
+        physical_length = self._decoupled_physical_length(note_length, automation_lengths.values())
         return {
             "note_start": note_start,
             "note_length": note_length,
             "note_end": note_start + note_length,
-            "automation_length": automation_length,
+            "automation_lengths": automation_lengths,
             "physical_length": physical_length,
             "physical_end": note_start + physical_length,
         }
@@ -3297,19 +3367,35 @@ class Tap(ControlSurface):
             return None
         return self._decode_decoupled_automation_payload(matches[-1])
 
-    def _decoupled_automation_info(self, clip):
+    def _decoupled_automation_info(self, clip, device_param=None):
         try:
             if clip is None or not hasattr(clip, "name"):
                 return None
-            return self._decoupled_automation_info_from_name(clip.name)
+            info = self._decoupled_automation_info_from_name(clip.name)
+            if not info:
+                return None
+            info = dict(info)
+            max_physical_length = self._decoupled_automation_max_physical_length(clip, info["note_length"])
+            info["physical_length"] = self._decoupled_physical_length(info["note_length"], info["automation_lengths"].values(), max_physical_length)
+            info["physical_end"] = info["note_start"] + info["physical_length"]
+            parameter_key = self._decoupled_automation_parameter_key(device_param)
+            if parameter_key:
+                info["parameter_key"] = parameter_key
+                info["has_parameter_length"] = parameter_key in info["automation_lengths"]
+                info["automation_length"] = info["automation_lengths"].get(parameter_key, info["note_length"])
+            else:
+                info["parameter_key"] = None
+                info["has_parameter_length"] = False
+                info["automation_length"] = info["note_length"]
+            return info
         except Exception:
             return None
 
     def _decoupled_automation_marker(self, info):
-        return "[TapAuto:v1|{:.6f}|{:.6f}|{:.6f}]".format(
+        return "[TapAuto:v2|{:.6f}|{:.6f}|{}]".format(
             info.get("note_start", 0.0),
             info.get("note_length", 0.0),
-            info.get("automation_length", 0.0),
+            self._encode_decoupled_automation_lengths(info.get("automation_lengths", {})),
         )
 
     def _save_decoupled_automation_info_to_name(self, clip, info):
@@ -3336,13 +3422,48 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
-    def _smallest_shared_loop_length(self, note_length, automation_length):
+    def _decoupled_automation_max_physical_length(self, clip=None, note_length=0.0001):
+        try:
+            numerator = int(getattr(clip, "signature_numerator", 4)) if clip is not None else 4
+        except Exception:
+            numerator = 4
+        return max(float(note_length or 0.0001), float(max(1, numerator) * self.DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS))
+
+    def _smallest_shared_loop_length(self, note_length, automation_length, max_length=None):
         try:
             note_ms = max(1, int(round(float(note_length) * 1000.0)))
             automation_ms = max(1, int(round(float(automation_length) * 1000.0)))
-            return float((note_ms * automation_ms) // math.gcd(note_ms, automation_ms)) / 1000.0
+            shared_ms = (note_ms * automation_ms) // math.gcd(note_ms, automation_ms)
+            if max_length is not None:
+                max_ms = max(1, int(round(float(max_length) * 1000.0)))
+                shared_ms = min(shared_ms, max_ms)
+            return float(shared_ms) / 1000.0
         except Exception:
-            return max(float(note_length or 0.0), float(automation_length or 0.0), 0.0001)
+            fallback = max(float(note_length or 0.0), float(automation_length or 0.0), 0.0001)
+            return min(fallback, max_length) if max_length is not None else fallback
+
+    def _decoupled_physical_length(self, note_length, automation_lengths, max_length=None):
+        lengths = [max(0.0001, float(note_length or 0.0001))]
+        for length in automation_lengths or ():
+            try:
+                lengths.append(max(0.0001, float(length)))
+            except Exception:
+                pass
+
+        if max_length is None:
+            max_length = self._decoupled_automation_max_physical_length(None, note_length)
+
+        try:
+            shared_ms = max(1, int(round(lengths[0] * 1000.0)))
+            max_ms = max(1, int(round(float(max_length) * 1000.0)))
+            for length in lengths[1:]:
+                length_ms = max(1, int(round(length * 1000.0)))
+                shared_ms = (shared_ms * length_ms) // math.gcd(shared_ms, length_ms)
+                if shared_ms >= max_ms:
+                    return float(max_ms) / 1000.0
+            return min(float(shared_ms) / 1000.0, float(max_length))
+        except Exception:
+            return min(max(lengths), float(max_length))
 
     def _positive_mod(self, value, length):
         if length <= 0.000001:
@@ -3459,6 +3580,202 @@ class Tap(ControlSurface):
                 envelope.insert_step(time_value, max(minimum_duration, sample_duration), raw_value)
             except Exception:
                 pass
+
+    def _automation_steps_from_envelope_samples(self, envelope, device_param, start, length, sample_duration):
+        if envelope is None or device_param is None or not liveobj_valid(device_param):
+            return tuple()
+
+        samples = []
+        count = max(2, min(self.AUTOMATION_ENVELOPE_MAX_SAMPLES, int(math.ceil(float(length) / sample_duration)) + 1))
+        if count > 1:
+            sample_duration = max(0.0001, float(length) / float(count - 1))
+        for index in range(count):
+            time_value = start + (float(index) * sample_duration)
+            try:
+                raw_value = envelope.value_at_time(time_value)
+                if device_param.max != device_param.min:
+                    normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                else:
+                    normalized = self._parameter_normalized_value(device_param)
+            except Exception:
+                normalized = self._parameter_normalized_value(device_param)
+            samples.append((time_value, max(0.0, min(1.0, normalized))))
+
+        return self._automation_sorted_steps(
+            (time_value, sample_duration, normalized, 0.0, 0, 0)
+            for time_value, normalized in self._compress_automation_samples(samples)
+        )
+
+    def _sampled_decoupled_automation_write_steps(self, info, logical_steps, sample_duration):
+        expanded_steps = list(self._expanded_decoupled_automation_steps(info, logical_steps, sample_duration))
+        if not expanded_steps:
+            return tuple()
+
+        clip_end = info["physical_end"]
+        boundary_start = info["note_start"]
+        guard_duration = 0.0001
+        all_steps = []
+
+        def append_target_step(time_value, duration, normalized, force=False):
+            if time_value < -0.000001 or time_value > clip_end + 0.000001:
+                return
+
+            time_value = max(0.0, min(clip_end, time_value))
+            normalized = max(0.0, min(1.0, normalized))
+            if all_steps and not force:
+                previous_time, _, previous_value, _ = all_steps[-1]
+                if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                    return
+
+            all_steps.append((time_value, max(guard_duration, duration), normalized, bool(force)))
+
+        if len(expanded_steps) == 1:
+            step = expanded_steps[0]
+            append_target_step(step[0], step[1], step[2])
+        else:
+            for index in range(len(expanded_steps) - 1):
+                start_step = expanded_steps[index]
+                next_step = expanded_steps[index + 1]
+                append_target_step(start_step[0], start_step[1], start_step[2])
+
+                time_value = start_step[0] + sample_duration
+                while time_value < next_step[0] - 0.000001:
+                    append_target_step(
+                        time_value,
+                        sample_duration,
+                        self._automation_value_from_steps(time_value, expanded_steps)
+                    )
+                    time_value += sample_duration
+
+            last_step = expanded_steps[-1]
+            append_target_step(last_step[0], last_step[1], last_step[2])
+
+        first_step = expanded_steps[0]
+        if first_step[0] > boundary_start + guard_duration:
+            append_target_step(boundary_start, max(guard_duration, first_step[0] - boundary_start), first_step[2], force=True)
+
+        last_step = expanded_steps[-1]
+        if clip_end > last_step[0] + guard_duration:
+            append_target_step(clip_end - guard_duration, guard_duration, last_step[2], force=True)
+
+        all_steps.sort(key=lambda item: item[0])
+        coalesced_steps = []
+        for step in all_steps:
+            if not coalesced_steps:
+                coalesced_steps.append(step)
+                continue
+
+            previous_time, _, previous_value, previous_force = coalesced_steps[-1]
+            time_value, _, normalized, force = step
+            if abs(previous_time - time_value) <= 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                if force and not previous_force:
+                    coalesced_steps[-1] = step
+                continue
+            if not force and not previous_force and abs(previous_time - time_value) > 0.000001 and abs(previous_value - normalized) <= self.AUTOMATION_ENVELOPE_LINEAR_EPSILON:
+                continue
+
+            coalesced_steps.append(step)
+
+        return tuple(coalesced_steps)
+
+    def _decoupled_info_for_parameter_key(self, info, parameter_key):
+        parameter_info = dict(info)
+        parameter_info["parameter_key"] = parameter_key
+        parameter_info["has_parameter_length"] = parameter_key in info.get("automation_lengths", {})
+        parameter_info["automation_length"] = info.get("automation_lengths", {}).get(parameter_key, info["note_length"])
+        return parameter_info
+
+    def _rewrite_decoupled_automation_for_parameter(self, clip, device_param, control_index, info, sample_duration):
+        if clip is None or device_param is None or not liveobj_valid(device_param) or not info:
+            return
+
+        parameter_key = self._decoupled_automation_parameter_key(device_param)
+        if not parameter_key:
+            return
+
+        parameter_info = self._decoupled_info_for_parameter_key(info, parameter_key)
+        envelope = None
+        if hasattr(clip, "automation_envelope"):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+
+        authored_steps = self._authored_automation_steps(clip, device_param, control_index)
+        if authored_steps is not None:
+            logical_steps = self._normalize_decoupled_logical_automation_steps(parameter_info, authored_steps)
+        elif envelope is not None:
+            logical_steps = self._automation_steps_from_envelope_samples(
+                envelope,
+                device_param,
+                parameter_info["note_start"],
+                parameter_info["automation_length"],
+                sample_duration
+            )
+        else:
+            return
+
+        if not logical_steps:
+            return
+
+        if envelope is None and hasattr(clip, "create_automation_envelope"):
+            try:
+                envelope = clip.create_automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        if envelope is None:
+            return
+
+        write_steps = self._sampled_decoupled_automation_write_steps(parameter_info, logical_steps, sample_duration)
+        if not write_steps:
+            return
+
+        self._neutralize_decoupled_automation_points(
+            envelope,
+            device_param,
+            parameter_info,
+            authored_steps or logical_steps,
+            write_steps[0][2],
+            sample_duration
+        )
+
+        minimum_duration = 0.0001
+        previous_insert_time = None
+        for index, step in enumerate(write_steps):
+            time_value, duration, normalized, _ = step
+            raw_value = self._parameter_target_value_from_normalized(device_param, normalized)
+            if previous_insert_time is not None and time_value <= previous_insert_time:
+                time_value = previous_insert_time + minimum_duration
+
+            next_time = None
+            for next_step in write_steps[index + 1:]:
+                if next_step[0] > time_value:
+                    next_time = next_step[0]
+                    break
+            if next_time is not None:
+                duration = max(minimum_duration, next_time - time_value)
+            else:
+                duration = max(minimum_duration, parameter_info["physical_end"] - time_value) if parameter_info["physical_end"] > time_value else max(minimum_duration, duration)
+
+            try:
+                envelope.insert_step(time_value, duration, raw_value)
+                previous_insert_time = time_value
+            except Exception:
+                pass
+
+        self._store_authored_automation_steps(clip, device_param, control_index, logical_steps)
+
+    def _rewrite_all_decoupled_automation_envelopes(self, clip, info):
+        if clip is None or not info:
+            return
+
+        sample_duration = 1.0 / 128.0
+        for control_index in range(8):
+            try:
+                device_param = self._current_connected_parameter_for_control(control_index)
+                self._rewrite_decoupled_automation_for_parameter(clip, device_param, control_index, info, sample_duration)
+            except Exception as e:
+                self._debug_log("Error rewriting decoupled automation for control {}: {}".format(control_index, str(e)))
 
     def _merge_decoupled_automation_span(self, previous_steps, edited_steps, page_start, page_end):
         edited_steps = tuple(edited_steps or ())
@@ -5894,6 +6211,12 @@ class Tap(ControlSurface):
                 return
 
             automation_length = max(0.0001, float(fields[0]))
+            control_index = max(0, min(7, int(fields[1]))) if len(fields) >= 2 and fields[1] != "" else 0
+            device_param = self._current_connected_parameter_for_control(control_index)
+            parameter_key = self._decoupled_automation_parameter_key(device_param)
+            if not parameter_key:
+                return
+
             clip_slot = self.song().view.highlighted_clip_slot
             if clip_slot is None or not clip_slot.has_clip:
                 return
@@ -5903,22 +6226,53 @@ class Tap(ControlSurface):
             if previous_info:
                 note_start = previous_info["note_start"]
                 note_length = previous_info["note_length"]
+                automation_lengths = dict(previous_info.get("automation_lengths", {}))
             else:
                 note_start = float(getattr(clip, "loop_start", 0.0))
                 note_end = float(getattr(clip, "loop_end", note_start + automation_length))
                 note_length = max(0.0001, note_end - note_start)
+                automation_lengths = {}
 
-            physical_length = self._smallest_shared_loop_length(note_length, automation_length)
+            max_physical_length = self._decoupled_automation_max_physical_length(clip, note_length)
+            automation_length = min(automation_length, max_physical_length)
+            if abs(automation_length - note_length) <= 0.000001:
+                automation_lengths.pop(parameter_key, None)
+            else:
+                automation_lengths[parameter_key] = automation_length
+
+            if not automation_lengths:
+                folded_info = {
+                    "note_start": note_start,
+                    "note_length": note_length,
+                    "note_end": note_start + note_length,
+                    "automation_lengths": {},
+                    "automation_length": note_length,
+                    "physical_length": note_length,
+                    "physical_end": note_start + note_length,
+                }
+                self._rewrite_decoupled_note_copies(clip, folded_info)
+                self._remove_decoupled_automation_info_from_name(clip)
+                clip.loop_start = note_start
+                clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
+                clip.loop_end = note_start + note_length
+                clip.end_marker = note_start + note_length
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
+                return
+
+            physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
             info = {
                 "note_start": note_start,
                 "note_length": note_length,
                 "note_end": note_start + note_length,
+                "automation_lengths": automation_lengths,
                 "automation_length": automation_length,
                 "physical_length": physical_length,
                 "physical_end": note_start + physical_length,
             }
 
             self._rewrite_decoupled_note_copies(clip, info)
+            self._rewrite_all_decoupled_automation_envelopes(clip, info)
             if info["physical_end"] > float(getattr(clip, "loop_end", 0.0)):
                 clip.loop_end = info["physical_end"]
                 clip.end_marker = info["physical_end"]
@@ -5963,6 +6317,16 @@ class Tap(ControlSurface):
         )
         self._send_sys_ex_message(response, 0x31)
 
+    def _automation_response_decoupled_fields(self, clip, device_param):
+        info = self._decoupled_automation_info(clip, device_param)
+        if not info:
+            return ["0", "0.000000", "0.000000"]
+        return [
+            "1" if info.get("has_parameter_length") else "0",
+            "{:.6f}".format(info.get("automation_length", info.get("note_length", 0.0))),
+            "{:.6f}".format(info.get("physical_end", info.get("note_end", 0.0))),
+        ]
+
     def _clear_automation_envelope(self, message):
         try:
             control_index = max(0, min(7, int(message[2]) if len(message) >= 4 else 0))
@@ -5974,9 +6338,18 @@ class Tap(ControlSurface):
                 return
 
             clip = clip_slot.clip
-            if hasattr(clip, 'clear_envelope'):
+            envelope = None
+            if hasattr(clip, 'automation_envelope'):
                 try:
-                    clip.clear_envelope(device_param)
+                    envelope = clip.automation_envelope(device_param)
+                except Exception:
+                    envelope = None
+            if envelope is not None:
+                raw_value = self._parameter_target_value_from_normalized(device_param, current_value)
+                start_time = float(getattr(clip, "loop_start", 0.0))
+                end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
+                try:
+                    envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
                 except Exception:
                     pass
             self._clear_authored_automation_steps_for_parameter(clip, device_param)
@@ -5996,9 +6369,23 @@ class Tap(ControlSurface):
                 return
 
             clip = clip_slot.clip
-            if hasattr(clip, 'clear_all_envelopes'):
+            for index in range(8):
+                device_param = self._current_connected_parameter_for_control(index)
+                if not device_param or not liveobj_valid(device_param):
+                    continue
+                envelope = None
+                if hasattr(clip, 'automation_envelope'):
+                    try:
+                        envelope = clip.automation_envelope(device_param)
+                    except Exception:
+                        envelope = None
+                if envelope is None:
+                    continue
+                raw_value = self._parameter_target_value_from_normalized(device_param, self._parameter_normalized_value(device_param))
+                start_time = float(getattr(clip, "loop_start", 0.0))
+                end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
                 try:
-                    clip.clear_all_envelopes()
+                    envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
                 except Exception:
                     pass
             self._clear_authored_automation_steps_for_clip(clip)
@@ -6049,7 +6436,7 @@ class Tap(ControlSurface):
 
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
             request_end = start + (float(count - 1) * step_duration)
-            decoupled_info = self._decoupled_automation_info(clip)
+            decoupled_info = self._decoupled_automation_info(clip, device_param)
             if authored_steps is not None and decoupled_info is not None:
                 authored_steps = self._normalize_decoupled_logical_automation_steps(decoupled_info, authored_steps)
                 self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
@@ -6090,12 +6477,13 @@ class Tap(ControlSurface):
                     normalized = self._automation_value_from_steps(time_value, authored_render_steps)
                 render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
 
-            response = "{}|{}|{:.6f}|{}|{}".format(
+            response = "{}|{}|{:.6f}|{}|{}|{}".format(
                 control_index,
                 has_envelope,
                 current_value,
                 ",".join(entries),
-                ",".join(render_entries)
+                ",".join(render_entries),
+                "|".join(self._automation_response_decoupled_fields(clip, device_param))
             )
             self._send_sys_ex_message(response, 0x31)
         except Exception as e:
@@ -6160,7 +6548,7 @@ class Tap(ControlSurface):
             logical_steps = self._automation_sorted_steps(steps)
             steps = list(logical_steps)
 
-            decoupled_info = self._decoupled_automation_info(clip)
+            decoupled_info = self._decoupled_automation_info(clip, device_param)
             if decoupled_info:
                 logical_steps = self._merge_decoupled_automation_span(
                     previous_authored_steps,
@@ -6270,18 +6658,26 @@ class Tap(ControlSurface):
             append_boundary_hold_steps()
 
             if not all_steps:
-                if envelope is not None and hasattr(clip, 'clear_envelope'):
+                if envelope is None and hasattr(clip, 'create_automation_envelope'):
                     try:
-                        clip.clear_envelope(device_param)
+                        envelope = clip.create_automation_envelope(device_param)
+                    except Exception:
+                        envelope = None
+                if envelope is not None:
+                    try:
+                        raw_value = self._parameter_target_value_from_normalized(device_param, current_normalized)
+                        boundary_start = decoupled_info["note_start"] if decoupled_info else 0.0
+                        envelope.insert_step(boundary_start, max(0.0001, clip_end - boundary_start), raw_value)
                     except Exception:
                         pass
                 self._clear_authored_automation_steps(clip, device_param, control_index)
-                response = "{}|{}|{:.6f}|{}|{}".format(
+                response = "{}|{}|{:.6f}|{}|{}|{}".format(
                     control_index,
                     0,
                     current_normalized,
                     "",
-                    ""
+                    "",
+                    "|".join(self._automation_response_decoupled_fields(clip, device_param))
                 )
                 self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
@@ -6294,12 +6690,13 @@ class Tap(ControlSurface):
                     envelope = None
 
             if envelope is None:
-                response = "{}|{}|{:.6f}|{}|{}".format(
+                response = "{}|{}|{:.6f}|{}|{}|{}".format(
                     control_index,
                     0,
                     current_normalized,
                     "",
-                    ""
+                    "",
+                    "|".join(self._automation_response_decoupled_fields(clip, device_param))
                 )
                 self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
@@ -6386,12 +6783,13 @@ class Tap(ControlSurface):
                 time_value, normalized = sample
                 render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, sample_duration, normalized, 0.0))
 
-            response = "{}|{}|{:.6f}|{}|{}".format(
+            response = "{}|{}|{:.6f}|{}|{}|{}".format(
                 control_index,
                 1,
                 current_normalized,
                 ",".join(point_entries),
-                ",".join(render_entries)
+                ",".join(render_entries),
+                "|".join(self._automation_response_decoupled_fields(clip, device_param))
             )
             self._send_sys_ex_message(response, 0x31)
             self._re_enable_after_automation_write(device_param, automation_should_re_enable)
@@ -7480,13 +7878,25 @@ class Tap(ControlSurface):
                         signature_numerator
                     ]
                     if decoupled_info:
+                        control_lengths = []
+                        for control_index in range(8):
+                            device_param = self._current_connected_parameter_for_control(control_index)
+                            parameter_key = self._decoupled_automation_parameter_key(device_param)
+                            if parameter_key in decoupled_info.get("automation_lengths", {}):
+                                control_lengths.append((control_index, decoupled_info["automation_lengths"][parameter_key]))
                         note_data.extend([
                             1,
                             *self._to_3_7bit_bytes(int(decoupled_info["note_start"] * 1000)),
                             *self._to_3_7bit_bytes(int(decoupled_info["note_end"] * 1000)),
-                            *self._to_3_7bit_bytes(int(decoupled_info["automation_length"] * 1000)),
+                            *self._to_3_7bit_bytes(int(decoupled_info["note_length"] * 1000)),
                             *self._to_3_7bit_bytes(int(decoupled_info["physical_end"] * 1000)),
+                            len(control_lengths),
                         ])
+                        for control_index, automation_length in control_lengths:
+                            note_data.extend([
+                                control_index,
+                                *self._to_3_7bit_bytes(int(automation_length * 1000)),
+                            ])
                     else:
                         note_data.append(0)
                     
