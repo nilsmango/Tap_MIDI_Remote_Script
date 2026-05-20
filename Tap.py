@@ -3521,13 +3521,14 @@ class Tap(ControlSurface):
         try:
             base_notes = clip.get_notes_extended(0, 128, info["note_start"], info["note_length"])
             if hasattr(clip, "remove_notes_extended"):
+                remove_start = float(info.get("remove_start", info["note_start"]))
                 current_end = max(
                     info["physical_end"],
                     float(getattr(clip, "loop_end", info["physical_end"])),
                     float(getattr(clip, "end_marker", info["physical_end"])),
                     float(getattr(clip, "length", info["physical_length"])),
                 )
-                clip.remove_notes_extended(0, 128, info["note_start"], max(info["physical_length"], current_end - info["note_start"]))
+                clip.remove_notes_extended(0, 128, remove_start, max(info["physical_length"], current_end - remove_start))
             specs = []
             for note in base_notes:
                 specs.extend(self._make_repeated_note_specs(note, info))
@@ -6094,9 +6095,20 @@ class Tap(ControlSurface):
                 elif marker_id == 1:
                     clip.end_marker = marker_time
                 elif marker_id == 2:
-                    clip.loop_start = marker_time
+                    decoupled_info = self._decoupled_automation_info(clip)
+                    if decoupled_info:
+                        note_end = decoupled_info["note_start"] + decoupled_info["note_length"]
+                        note_length = max(0.0001, note_end - marker_time)
+                        self._apply_decoupled_note_loop(clip, marker_time, note_length, send_updates=True)
+                    else:
+                        clip.loop_start = marker_time
                 else:
-                    clip.loop_end = marker_time
+                    decoupled_info = self._decoupled_automation_info(clip)
+                    if decoupled_info:
+                        note_length = max(0.0001, marker_time - decoupled_info["note_start"])
+                        self._apply_decoupled_note_loop(clip, decoupled_info["note_start"], note_length, send_updates=True)
+                    else:
+                        clip.loop_end = marker_time
         
         # visible channel and mixer status true
         if len(message) >= 2 and message[1] == 18:
@@ -6203,6 +6215,75 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
+    def _apply_decoupled_note_loop(self, clip, note_start, note_length, send_updates=True):
+        try:
+            if clip is None:
+                return
+
+            previous_info = self._decoupled_automation_info(clip)
+            if not previous_info:
+                return
+
+            note_start = max(0.0, float(note_start))
+            note_length = max(0.0001, float(note_length))
+            automation_lengths = {}
+            for key, length in previous_info.get("automation_lengths", {}).items():
+                try:
+                    length = max(0.0001, float(length))
+                    if abs(length - note_length) > 0.000001:
+                        automation_lengths[key] = length
+                except Exception:
+                    pass
+
+            if not automation_lengths:
+                folded_info = {
+                    "note_start": note_start,
+                    "note_length": note_length,
+                    "note_end": note_start + note_length,
+                    "automation_lengths": {},
+                    "automation_length": note_length,
+                    "physical_length": note_length,
+                    "physical_end": note_start + note_length,
+                    "remove_start": min(previous_info["note_start"], note_start),
+                }
+                self._rewrite_decoupled_note_copies(clip, folded_info)
+                self._rewrite_all_decoupled_automation_envelopes(clip, folded_info)
+                self._remove_decoupled_automation_info_from_name(clip)
+                clip.loop_start = note_start
+                clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
+                clip.loop_end = note_start + note_length
+                clip.end_marker = note_start + note_length
+                if send_updates:
+                    self.send_selected_clip_metadata()
+                    self.send_selected_clip_notes()
+                return
+
+            max_physical_length = self._decoupled_automation_max_physical_length(clip, note_length)
+            physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
+            info = {
+                "note_start": note_start,
+                "note_length": note_length,
+                "note_end": note_start + note_length,
+                "automation_lengths": automation_lengths,
+                "automation_length": note_length,
+                "physical_length": physical_length,
+                "physical_end": note_start + physical_length,
+                "remove_start": min(previous_info["note_start"], note_start),
+            }
+
+            self._rewrite_decoupled_note_copies(clip, info)
+            self._rewrite_all_decoupled_automation_envelopes(clip, info)
+            clip.loop_start = info["note_start"]
+            clip.start_marker = min(float(getattr(clip, "start_marker", info["note_start"])), info["note_start"])
+            clip.loop_end = info["physical_end"]
+            clip.end_marker = info["physical_end"]
+            self._save_decoupled_automation_info_to_name(clip, info)
+            if send_updates:
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error applying decoupled note loop: {}".format(str(e)))
+
     def _set_decoupled_automation_length(self, message):
         try:
             payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
@@ -6213,15 +6294,24 @@ class Tap(ControlSurface):
             automation_length = max(0.0001, float(fields[0]))
             control_index = max(0, min(7, int(fields[1]))) if len(fields) >= 2 and fields[1] != "" else 0
             device_param = self._current_connected_parameter_for_control(control_index)
-            parameter_key = self._decoupled_automation_parameter_key(device_param)
-            if not parameter_key:
-                return
-
             clip_slot = self.song().view.highlighted_clip_slot
             if clip_slot is None or not clip_slot.has_clip:
                 return
 
-            clip = clip_slot.clip
+            self._apply_decoupled_automation_length(clip_slot.clip, device_param, automation_length, send_updates=True)
+        except Exception as e:
+            self._debug_log("Error setting decoupled automation length: {}".format(str(e)))
+
+    def _apply_decoupled_automation_length(self, clip, device_param, automation_length, send_updates=True):
+        try:
+            parameter_key = self._decoupled_automation_parameter_key(device_param)
+            if not parameter_key:
+                return
+
+            if clip is None:
+                return
+
+            automation_length = max(0.0001, float(automation_length))
             previous_info = self._decoupled_automation_info(clip)
             if previous_info:
                 note_start = previous_info["note_start"]
@@ -6256,8 +6346,9 @@ class Tap(ControlSurface):
                 clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
                 clip.loop_end = note_start + note_length
                 clip.end_marker = note_start + note_length
-                self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                if send_updates:
+                    self.send_selected_clip_metadata()
+                    self.send_selected_clip_notes()
                 return
 
             physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
@@ -6281,10 +6372,11 @@ class Tap(ControlSurface):
             clip.loop_end = info["physical_end"]
             clip.end_marker = info["physical_end"]
             self._save_decoupled_automation_info_to_name(clip, info)
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            if send_updates:
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
         except Exception as e:
-            self._debug_log("Error setting decoupled automation length: {}".format(str(e)))
+            self._debug_log("Error applying decoupled automation length: {}".format(str(e)))
 
     def _unfold_decoupled_automation_clip(self):
         try:
