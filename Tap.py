@@ -204,6 +204,8 @@ class Tap(ControlSurface):
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v2\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
+    MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[TapMut:v1\|([^\]]*)\]")
+    MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapMut:v[0-9]+\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
@@ -3285,6 +3287,9 @@ class Tap(ControlSurface):
     def _strip_decoupled_automation_name_marker(self, name):
         return self.DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
 
+    def _strip_mutator_name_marker(self, name):
+        return self.MUTATOR_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
+
     def _stable_decoupled_hash(self, value):
         result = 2166136261
         for char in str(value or ""):
@@ -3425,6 +3430,81 @@ class Tap(ControlSurface):
 
         try:
             clean_name = self._strip_decoupled_automation_name_marker(clip.name)
+            if clip.name != clean_name:
+                clip.name = clean_name
+        except Exception:
+            pass
+
+    def _mutator_info_from_name(self, name):
+        try:
+            matches = self.MUTATOR_NAME_MARKER_RE.findall(str(name or ""))
+            if not matches:
+                return None
+            payload = matches[-1]
+            fields = {}
+            for item in payload.split("|"):
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                fields[key] = value
+            sections = []
+            for section in fields.get("sec", "").split(","):
+                if not section:
+                    continue
+                parts = section.split(":")
+                if len(parts) >= 3:
+                    sections.append({
+                        "role": int(parts[0]),
+                        "start": float(parts[1]),
+                        "length": float(parts[2]),
+                    })
+            return {
+                "original_loop_length": max(0.0001, float(fields.get("ol", "0.0001"))),
+                "structure_length": max(0.0001, float(fields.get("sl", fields.get("ol", "0.0001")))),
+                "preset": int(fields.get("pr", "1")),
+                "seed": int(fields.get("seed", "1")),
+                "settings": fields.get("set", ""),
+                "sections": sections,
+            }
+        except Exception:
+            return None
+
+    def _mutator_info(self, clip):
+        if clip is None or not hasattr(clip, "name"):
+            return None
+        return self._mutator_info_from_name(clip.name)
+
+    def _mutator_marker(self, info):
+        sections = ",".join(
+            "{}:{:.6f}:{:.6f}".format(section.get("role", 1), section.get("start", 0.0), section.get("length", 0.0))
+            for section in info.get("sections", [])
+        )
+        return "[TapMut:v1|ol={:.6f}|pr={}|sl={:.6f}|seed={}|set={}|sec={}]".format(
+            info.get("original_loop_length", 0.0001),
+            info.get("preset", 1),
+            info.get("structure_length", info.get("original_loop_length", 0.0001)),
+            info.get("seed", 1),
+            info.get("settings", ""),
+            sections,
+        )
+
+    def _save_mutator_info_to_name(self, clip, info):
+        if clip is None or not hasattr(clip, "name"):
+            return
+        try:
+            clean_name = self._strip_mutator_name_marker(clip.name)
+            marker = self._mutator_marker(info)
+            new_name = "{} {}".format(clean_name, marker).strip() if clean_name else marker
+            if clip.name != new_name:
+                clip.name = new_name
+        except Exception:
+            pass
+
+    def _remove_mutator_info_from_name(self, clip):
+        if clip is None or not hasattr(clip, "name"):
+            return
+        try:
+            clean_name = self._strip_mutator_name_marker(clip.name)
             if clip.name != clean_name:
                 clip.name = clean_name
         except Exception:
@@ -5902,7 +5982,7 @@ class Tap(ControlSurface):
     
         # Check if this message is chunked. Existing Tap app -> script chunks
         # always use the prefix directly after the manufacturer id.
-        if manufacturer_id in (14, 15, 16, 50, 51):
+        if manufacturer_id in (14, 15, 16, 50, 51, 55):
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -6277,10 +6357,295 @@ class Tap(ControlSurface):
             self._clear_automation_envelope(message)
         if len(message) >= 2 and message[1] == 54:
             self._clear_all_automation_envelopes(message)
+        if len(message) >= 2 and message[1] == 55:
+            self._set_mutator_clip(message)
+        if len(message) >= 2 and message[1] == 56:
+            self._end_mutator_clip()
             
 
-            
 
+
+
+    def _mutator_settings_from_message(self, message):
+        payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
+        fields = self._split_escaped_sysex_fields(payload, "|")
+        def int_field(index, fallback):
+            try:
+                return int(fields[index])
+            except Exception:
+                return fallback
+        def float_field(index, fallback):
+            try:
+                return float(fields[index])
+            except Exception:
+                return fallback
+        return {
+            "preset": int_field(0, 1),
+            "mutations_per_pass": max(1, min(3, int_field(1, 1))),
+            "return_after_passes": max(1, min(4, int_field(2, 2))),
+            "return_mode": int_field(3, 0),
+            "original_loops": max(0, int_field(4, 4)),
+            "loops_per_pass": max(1, int_field(5, 1)),
+            "regenerate_mode": int_field(6, 0),
+            "source_mode": int_field(7, 2),
+            "depth": max(0.0, min(1.0, float_field(8, 0.5))),
+            "scale": self._unescape_sysex_string(fields[9]) if len(fields) > 9 else "Minor",
+            "root": max(0, min(11, int_field(10, 0))),
+            "allow_fills": int_field(11, 1) == 1,
+            "allow_simplification": int_field(12, 1) == 1,
+            "allow_octave_shifts": int_field(13, 1) == 1,
+            "allow_rhythmic_shifts": int_field(14, 1) == 1,
+            "allow_note_additions": int_field(15, 1) == 1,
+            "allow_note_removals": int_field(16, 1) == 1,
+            "seed": int_field(17, random.randint(1, 2000000000)),
+            "settings_payload": payload.replace("|", "~")[:80],
+        }
+
+    def _mutator_pattern_roles(self, preset):
+        patterns = {
+            0: [0, 0, 0, 0, 5, 5, 5, 5],
+            1: [0, 0, 0, 0, 4, 4, 5, 5, 5, 5],
+            2: [0, 1, 2, 3, 2, 1, 0],
+            3: [0, 0, 1, 1, 5, 7, 0, 8],
+            4: [0, 0, 1, 1, 5, 7, 6, 6, 0, 8],
+            5: [0, 0, 0, 1, 1, 5, 7, 6, 6, 5, 7, 6, 6, 0, 8],
+        }
+        return patterns.get(int(preset), patterns[1])
+
+    def _mutator_role_depth(self, role, global_depth):
+        ranges = {
+            0: (0.0, 0.10),
+            1: (0.10, 0.30),
+            2: (0.30, 0.45),
+            3: (0.45, 0.60),
+            4: (0.25, 0.60),
+            5: (0.35, 0.70),
+            6: (0.20, 0.55),
+            7: (0.45, 0.75),
+            8: (0.0, 0.0),
+        }
+        low, high = ranges.get(role, (0.15, 0.45))
+        return low + ((high - low) * max(0.0, min(1.0, global_depth)))
+
+    def _mutator_scale_intervals(self, scale_name):
+        table = {
+            "Chromatic": list(range(12)),
+            "Major": [0, 2, 4, 5, 7, 9, 11],
+            "Minor": [0, 2, 3, 5, 7, 8, 10],
+            "Dorian": [0, 2, 3, 5, 7, 9, 10],
+            "Mixolydian": [0, 2, 4, 5, 7, 9, 10],
+            "Lydian": [0, 2, 4, 6, 7, 9, 11],
+            "Phrygian": [0, 1, 3, 5, 7, 8, 10],
+            "Locrian": [0, 1, 3, 5, 6, 8, 10],
+            "Minor Pentatonic": [0, 3, 5, 7, 10],
+            "Major Pentatonic": [0, 2, 4, 7, 9],
+            "Minor Blues": [0, 3, 5, 6, 7, 10],
+        }
+        return table.get(scale_name, table["Minor"])
+
+    def _mutator_quantize_pitch(self, pitch, settings):
+        intervals = self._mutator_scale_intervals(settings.get("scale", "Minor"))
+        root = int(settings.get("root", 0))
+        best = int(pitch)
+        best_distance = 128
+        for candidate in range(max(0, int(pitch) - 12), min(127, int(pitch) + 12) + 1):
+            rel = (candidate - root) % 12
+            if rel in intervals:
+                distance = abs(candidate - int(pitch))
+                if distance < best_distance:
+                    best = candidate
+                    best_distance = distance
+        return max(0, min(127, best))
+
+    def _mutator_note_values(self, note):
+        return {
+            "pitch": int(note.pitch),
+            "start": float(note.start_time),
+            "duration": max(0.0001, float(note.duration)),
+            "velocity": int(note.velocity),
+            "mute": bool(note.mute),
+            "probability": float(getattr(note, "probability", 1.0)),
+        }
+
+    def _mutator_specs_from_values(self, values):
+        return MidiNoteSpecification(
+            pitch=max(0, min(127, int(values["pitch"]))),
+            start_time=max(0.0, float(values["start"])),
+            duration=max(0.0001, float(values["duration"])),
+            velocity=max(1, min(127, int(values["velocity"]))),
+            mute=bool(values.get("mute", False)),
+            probability=max(0.0, min(1.0, float(values.get("probability", 1.0))))
+        )
+
+    def _mutator_make_section(self, source_values, role, section_start, source_start, loop_length, settings, rnd):
+        if role in (0, 8):
+            return [
+                self._mutator_specs_from_values(dict(value, start=section_start + (value["start"] - source_start)))
+                for value in source_values
+            ]
+
+        depth = self._mutator_role_depth(role, settings.get("depth", 0.5))
+        values = [dict(value) for value in source_values]
+        values.sort(key=lambda item: (item["start"], item["pitch"]))
+
+        if settings.get("allow_simplification", True) and role in (5, 6) and rnd.random() < depth:
+            keep_stride = 2 if role == 5 else 3
+            values = [value for index, value in enumerate(values) if index % keep_stride != 1] or values[:1]
+
+        if settings.get("allow_note_removals", True) and role not in (6, 7):
+            remove_chance = min(0.45, depth * (0.35 if role != 5 else 0.55))
+            values = [value for value in values if rnd.random() > remove_chance] or source_values[:1]
+
+        specs = []
+        for index, value in enumerate(values):
+            relative_start = value["start"] - source_start
+            pitch = value["pitch"]
+            velocity = value["velocity"]
+            duration = value["duration"]
+
+            if settings.get("allow_rhythmic_shifts", True) and role not in (6,) and rnd.random() < depth:
+                grid = 0.25 if depth > 0.35 else 0.125
+                relative_start += rnd.choice([-grid, grid, grid * 2]) * min(1.0, depth + 0.2)
+
+            if settings.get("allow_octave_shifts", True) and rnd.random() < depth * 0.35:
+                pitch += rnd.choice([-12, 12])
+
+            if role in (3, 5) and rnd.random() < depth * 0.5:
+                center = source_values[len(source_values) // 2]["pitch"] if source_values else pitch
+                pitch = int(center - (pitch - center))
+
+            if role == 6:
+                relative_start = round(relative_start / 0.5) * 0.5
+                if index % 2 == 0:
+                    velocity = min(127, velocity + 10)
+
+            if role == 4 and relative_start > loop_length * 0.65:
+                pitch += 2 if rnd.random() < 0.6 else -2
+                velocity = min(127, velocity + 8)
+
+            relative_start = max(0.0, min(loop_length - 0.0001, relative_start))
+            pitch = self._mutator_quantize_pitch(pitch, settings)
+            specs.append(self._mutator_specs_from_values(dict(
+                value,
+                pitch=pitch,
+                start=section_start + relative_start,
+                duration=min(duration, loop_length - relative_start),
+                velocity=max(1, min(127, velocity + rnd.randint(-8, 10))),
+            )))
+
+        if settings.get("allow_note_additions", True) and role not in (0, 8):
+            additions = int(round(depth * settings.get("mutations_per_pass", 1) * (3 if role in (4, 7) else 2)))
+            motif = source_values[:]
+            motif.sort(key=lambda item: item["velocity"], reverse=True)
+            for add_index in range(additions):
+                if not motif:
+                    break
+                base = dict(motif[add_index % len(motif)])
+                if role == 7:
+                    relative_start = loop_length * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
+                    duration = min(0.25, loop_length - relative_start)
+                else:
+                    relative_start = (base["start"] - source_start + rnd.choice([0.25, 0.5, 0.75])) % loop_length
+                    duration = min(base["duration"], loop_length - relative_start)
+                pitch = base["pitch"] + (12 if role == 6 and add_index % 2 == 0 else rnd.choice([-2, 2, 5, 7]))
+                specs.append(self._mutator_specs_from_values(dict(
+                    base,
+                    pitch=self._mutator_quantize_pitch(pitch, settings),
+                    start=section_start + relative_start,
+                    duration=max(0.0625, duration),
+                    velocity=min(127, base["velocity"] + 12),
+                )))
+
+        return specs
+
+    def _set_mutator_clip(self, message):
+        try:
+            settings = self._mutator_settings_from_message(message)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            if not getattr(clip, "is_midi_clip", False):
+                return
+
+            previous_info = self._mutator_info(clip)
+            source_start = float(getattr(clip, "loop_start", 0.0))
+            original_loop_length = previous_info.get("original_loop_length") if previous_info else None
+            if original_loop_length is None:
+                original_loop_length = max(0.0001, float(getattr(clip, "loop_end", source_start + 4.0)) - source_start)
+            source_end = source_start + original_loop_length
+            source_notes = clip.get_notes_extended(0, 128, source_start, original_loop_length)
+            source_values = [self._mutator_note_values(note) for note in source_notes if note.start_time >= source_start - 0.000001 and note.start_time < source_end - 0.000001]
+            if not source_values:
+                return
+
+            roles = self._mutator_pattern_roles(settings.get("preset", 1))
+            sections = []
+            specs = []
+            rnd = random.Random(int(settings.get("seed", 1)))
+            for index, role in enumerate(roles):
+                section_start = source_start + (index * original_loop_length)
+                sections.append({"role": role, "start": section_start, "length": original_loop_length})
+                specs.extend(self._mutator_make_section(
+                    source_values,
+                    role,
+                    section_start,
+                    source_start,
+                    original_loop_length,
+                    settings,
+                    rnd
+                ))
+
+            structure_length = original_loop_length * len(roles)
+            remove_start = source_start
+            remove_end = max(
+                source_start + structure_length,
+                float(getattr(clip, "loop_end", 0.0)),
+                float(getattr(clip, "end_marker", 0.0)),
+                float(getattr(clip, "length", 0.0))
+            )
+            if hasattr(clip, "remove_notes_extended"):
+                clip.remove_notes_extended(0, 128, remove_start, max(0.0001, remove_end - remove_start))
+            if specs:
+                clip.add_new_notes(tuple(specs))
+
+            clip.loop_start = source_start
+            clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
+            clip.loop_end = source_start + structure_length
+            clip.end_marker = source_start + structure_length
+            info = {
+                "original_loop_length": original_loop_length,
+                "structure_length": structure_length,
+                "preset": settings.get("preset", 1),
+                "seed": settings.get("seed", 1),
+                "settings": settings.get("settings_payload", ""),
+                "sections": sections,
+            }
+            self._save_mutator_info_to_name(clip, info)
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error setting mutator clip: {}".format(str(e)))
+
+    def _end_mutator_clip(self):
+        try:
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            info = self._mutator_info(clip)
+            if not info:
+                return
+            source_start = float(getattr(clip, "loop_start", 0.0))
+            clip.loop_start = source_start
+            clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
+            clip.loop_end = source_start + float(info.get("structure_length", max(0.0001, float(getattr(clip, "loop_end", source_start)) - source_start)))
+            clip.end_marker = clip.loop_end
+            self._remove_mutator_info_from_name(clip)
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error ending mutator clip: {}".format(str(e)))
 
     def _handle_tap_tempo(self):
         try:
@@ -8061,6 +8426,24 @@ class Tap(ControlSurface):
                             note_data.extend([
                                 control_index,
                                 *self._to_3_7bit_bytes(int(automation_length * 1000)),
+                            ])
+                    else:
+                        note_data.append(0)
+
+                    mutator_info = self._mutator_info(selected_clip)
+                    if mutator_info:
+                        note_data.extend([
+                            1,
+                            *self._to_3_7bit_bytes(int(mutator_info.get("original_loop_length", 0.0001) * 1000)),
+                            *self._to_3_7bit_bytes(int(mutator_info.get("structure_length", 0.0001) * 1000)),
+                            int(mutator_info.get("preset", 1)) & 0x7F,
+                            min(32, len(mutator_info.get("sections", []))),
+                        ])
+                        for section in mutator_info.get("sections", [])[:32]:
+                            note_data.extend([
+                                int(section.get("role", 1)) & 0x7F,
+                                *self._to_3_7bit_bytes(int(section.get("start", 0.0) * 1000)),
+                                *self._to_3_7bit_bytes(int(section.get("length", 0.0) * 1000)),
                             ])
                     else:
                         note_data.append(0)
