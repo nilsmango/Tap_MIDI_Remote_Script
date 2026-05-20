@@ -319,6 +319,7 @@ class Tap(ControlSurface):
             self._follow_action_scene_name_listeners = {}
             self._follow_action_clip_name_listeners = {}
             self._follow_action_clip_has_clip_listeners = {}
+            self._follow_action_clip_timing_listeners = {}
             self._follow_action_song_listener_subject = None
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
@@ -2728,6 +2729,10 @@ class Tap(ControlSurface):
     def _on_follow_action_name_changed(self):
         self._load_follow_actions_from_names()
         self._sync_follow_action_runtime_listeners()
+        self._evaluate_follow_actions()
+
+    def _on_follow_action_timing_changed(self):
+        self._evaluate_follow_actions()
 
     def _send_selected_track_state(self):
         try:
@@ -3158,6 +3163,9 @@ class Tap(ControlSurface):
         try:
             if clip_slot and clip_slot.has_clip:
                 clip = clip_slot.clip
+                folded_info = self._decoupled_automation_info(clip)
+                if folded_info:
+                    return max(0.0001, float(folded_info.get("note_length", 0.0001)))
                 return max(0.0, float(clip.loop_end) - float(clip.loop_start))
         except Exception:
             pass
@@ -3969,6 +3977,7 @@ class Tap(ControlSurface):
         key = self._follow_action_key(rule["target_kind"], rule.get("track_index"), rule["scene_index"])
         self._follow_action_rules[key] = rule
         self._save_follow_action_rule_to_name(rule)
+        self._sync_follow_action_name_listeners()
         self._send_follow_action_state()
 
     def _delete_follow_action_rule(self, message):
@@ -3986,6 +3995,7 @@ class Tap(ControlSurface):
                 del self._active_follow_actions[key]
             self._handled_follow_action_launches.discard(key)
             self._follow_action_missing_clip_counts.pop(key, None)
+            self._sync_follow_action_name_listeners()
         except Exception:
             pass
         self._send_follow_action_state()
@@ -5489,6 +5499,11 @@ class Tap(ControlSurface):
             self._on_follow_action_name_changed()
         return listener
 
+    def _make_follow_action_clip_timing_listener(self):
+        def listener():
+            self._on_follow_action_timing_changed()
+        return listener
+
     def _make_follow_action_clip_has_clip_listener(self):
         def listener():
             self._sync_follow_action_name_listeners()
@@ -5509,6 +5524,49 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
+    def _remove_follow_action_clip_timing_listeners(self, key):
+        listener_info = self._follow_action_clip_timing_listeners.pop(key, None)
+        if not listener_info:
+            return
+        clip, listeners = listener_info
+        for property_name, listener in listeners.items():
+            try:
+                remove_listener = getattr(clip, "remove_{}_listener".format(property_name), None)
+                has_listener = getattr(clip, "{}_has_listener".format(property_name), None)
+                if remove_listener and (not has_listener or has_listener(listener)):
+                    remove_listener(listener)
+            except Exception:
+                pass
+
+    def _ensure_follow_action_clip_timing_listeners(self, key, clip):
+        existing = self._follow_action_clip_timing_listeners.get(key)
+        if existing and existing[0] is clip:
+            return
+
+        self._remove_follow_action_clip_timing_listeners(key)
+        listeners = {}
+        for property_name in ("loop_start", "loop_end", "end_marker"):
+            try:
+                add_listener = getattr(clip, "add_{}_listener".format(property_name), None)
+                has_listener = getattr(clip, "{}_has_listener".format(property_name), None)
+                if not add_listener:
+                    continue
+                listener = self._make_follow_action_clip_timing_listener()
+                if not has_listener or not has_listener(listener):
+                    add_listener(listener)
+                listeners[property_name] = listener
+            except Exception:
+                pass
+
+        if listeners:
+            self._follow_action_clip_timing_listeners[key] = (clip, listeners)
+
+    def _clip_affects_follow_action_timing(self, track_index, scene_index):
+        return (
+            self._follow_action_key("clip", track_index, scene_index) in self._follow_action_rules
+            or self._follow_action_key("scene", None, scene_index) in self._follow_action_rules
+        )
+
     def _remove_follow_action_clip_has_clip_listener(self, key):
         listener_info = self._follow_action_clip_has_clip_listeners.pop(key, None)
         if not listener_info:
@@ -5526,6 +5584,7 @@ class Tap(ControlSurface):
         expected_scene_keys = set()
         expected_clip_keys = set()
         expected_clip_slot_keys = set()
+        expected_clip_timing_keys = set()
 
         try:
             scenes = self.song().scenes
@@ -5546,8 +5605,8 @@ class Tap(ControlSurface):
                 except Exception:
                     pass
 
-            for track in self.song().tracks:
-                for clip_slot in track.clip_slots:
+            for track_index, track in enumerate(self.song().tracks):
+                for scene_index, clip_slot in enumerate(track.clip_slots):
                     slot_key = self._live_object_identity(clip_slot)
                     expected_clip_slot_keys.add(slot_key)
                     existing_slot = self._follow_action_clip_has_clip_listeners.get(slot_key)
@@ -5569,7 +5628,14 @@ class Tap(ControlSurface):
                     clip_key = self._live_object_identity(clip)
                     expected_clip_keys.add(clip_key)
                     existing_clip = self._follow_action_clip_name_listeners.get(clip_key)
+                    needs_timing_listener = self._clip_affects_follow_action_timing(track_index, scene_index)
+                    if needs_timing_listener:
+                        expected_clip_timing_keys.add(clip_key)
+                    else:
+                        self._remove_follow_action_clip_timing_listeners(clip_key)
                     if existing_clip and existing_clip[0] is clip:
+                        if needs_timing_listener:
+                            self._ensure_follow_action_clip_timing_listeners(clip_key, clip)
                         continue
                     self._remove_named_object_listener(self._follow_action_clip_name_listeners, clip_key)
                     try:
@@ -5581,6 +5647,8 @@ class Tap(ControlSurface):
                         self._follow_action_clip_name_listeners[clip_key] = (clip, listener)
                     except Exception:
                         pass
+                    if needs_timing_listener:
+                        self._ensure_follow_action_clip_timing_listeners(clip_key, clip)
         except Exception:
             pass
 
@@ -5593,6 +5661,9 @@ class Tap(ControlSurface):
         for key in list(self._follow_action_clip_has_clip_listeners.keys()):
             if key not in expected_clip_slot_keys:
                 self._remove_follow_action_clip_has_clip_listener(key)
+        for key in list(self._follow_action_clip_timing_listeners.keys()):
+            if key not in expected_clip_timing_keys:
+                self._remove_follow_action_clip_timing_listeners(key)
 
     def _remove_follow_action_name_listeners(self):
         for key in list(self._follow_action_scene_name_listeners.keys()):
@@ -5601,6 +5672,8 @@ class Tap(ControlSurface):
             self._remove_named_object_listener(self._follow_action_clip_name_listeners, key)
         for key in list(self._follow_action_clip_has_clip_listeners.keys()):
             self._remove_follow_action_clip_has_clip_listener(key)
+        for key in list(self._follow_action_clip_timing_listeners.keys()):
+            self._remove_follow_action_clip_timing_listeners(key)
 
     def _remove_follow_action_scene_listener(self, key):
         listener_info = self._follow_action_scene_triggered_listeners.pop(key, None)
