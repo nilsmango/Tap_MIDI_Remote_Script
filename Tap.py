@@ -6416,13 +6416,17 @@ class Tap(ControlSurface):
             1: [0, 0, 0, 0, 4, 4, 5, 5],
             2: [0, 5, 6, 9, 6, 12, 5, 0],
             3: [0, 0, 1, 1, 5, 7, 1, 8],
-            4: [0, 0, 1, 1, 5, 7, 6, 6, 0, 8],
+            4: [0, 0, 1, 1, 5, 7, 6, 6, 1, 8],
             5: [0, 0, 0, 1, 1, 5, 7, 6, 6, 5, 7, 6, 6, 1, 8],
             6: [0, 5, 6, 9],
             7: [0, 0, 5, 5, 6, 6, 9, 9],
             8: [0, 0, 0, 0, 5, 6, 9, 10],
             9: [0, 5],
             10: [0, 0, 5, 5],
+            11: [0, 0, 5, 8],
+            12: [0, 5, 8, 5, 6, 5],
+            13: [0, 1, 2, 5, 6, 8],
+            14: [0, 1, 2, 7, 5, 13, 14, 6, 15, 8],
         }
         return patterns.get(int(preset), patterns[1])
 
@@ -6432,8 +6436,8 @@ class Tap(ControlSurface):
     def _mutator_role_depth(self, role, global_depth):
         ranges = {
             0: (0.0, 0.10),
-            1: (0.18, 0.40),
-            2: (0.35, 0.52),
+            1: (0.08, 0.22),
+            2: (0.10, 0.26),
             3: (0.50, 0.68),
             4: (0.25, 0.60),
             5: (0.35, 0.70),
@@ -6444,6 +6448,9 @@ class Tap(ControlSurface):
             10: (0.35, 0.65),
             11: (0.40, 0.70),
             12: (0.38, 0.68),
+            13: (0.42, 0.72),
+            14: (0.20, 0.50),
+            15: (0.45, 0.78),
         }
         low, high = ranges.get(role, (0.15, 0.45))
         return low + ((high - low) * max(0.0, min(1.0, global_depth)))
@@ -6736,11 +6743,14 @@ class Tap(ControlSurface):
         values = [dict(value) for value in source_values]
         values.sort(key=lambda item: (item["start"], item["pitch"]))
 
+        if role == 14:
+            values = [value for index, value in enumerate(values) if index % 3 == 0] or values[:1]
+
         if settings.get("allow_simplification", True) and role in (5, 6) and rnd.random() < depth:
             keep_stride = 2 if role == 5 else 3
             values = [value for index, value in enumerate(values) if index % keep_stride != 1] or values[:1]
 
-        if settings.get("allow_note_removals", True) and role not in (6, 7):
+        if settings.get("allow_note_removals", True) and role not in (6, 7, 15):
             remove_chance = min(0.45, depth * (0.35 if role != 5 else 0.55))
             values = [value for value in values if rnd.random() > remove_chance] or source_values[:1]
 
@@ -6782,6 +6792,21 @@ class Tap(ControlSurface):
                 pitch += 2 if rnd.random() < 0.6 else -2
                 velocity = min(127, velocity + 8)
 
+            if role == 13:
+                velocity = min(127, velocity + 6)
+                if rnd.random() < depth * 0.35:
+                    pitch = self._mutator_transpose_scale_steps(pitch, rnd.choice([-2, -1, 1, 2]), settings)
+
+            if role == 14:
+                velocity = max(1, velocity - 18)
+                duration *= 1.25
+
+            if role == 15:
+                relative_start = round(relative_start / 0.25) * 0.25
+                velocity = min(127, velocity + 18)
+                if index % 2 == 0:
+                    pitch += 12
+
             relative_start = max(0.0, min(loop_length - 0.0001, relative_start))
             pitch = self._mutator_quantize_pitch(pitch, settings)
             section_values.append(dict(
@@ -6792,7 +6817,7 @@ class Tap(ControlSurface):
                 velocity=max(1, min(127, velocity + rnd.randint(-8, 10))),
             ))
 
-        if settings.get("allow_note_additions", True) and role not in (0, 8):
+        if settings.get("allow_note_additions", True) and role not in (0, 8, 14):
             additions = int(round(depth * settings.get("mutations_per_pass", 1) * (3 if role in (4, 7) else 2)))
             if depth >= 0.18 and role in (1, 2, 3, 4, 5, 6, 9, 10, 11, 12):
                 additions = max(1, additions)
@@ -6892,6 +6917,39 @@ class Tap(ControlSurface):
                     specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
                 elif role in generated_section_cache:
                     specs.extend(self._mutator_place_section_values(generated_section_cache[role], section_start, original_loop_length))
+                elif role == 2 and 1 in generated_section_cache:
+                    section_values = self._mutator_make_section_values(
+                        generated_section_cache[1],
+                        role,
+                        0.0,
+                        original_loop_length,
+                        settings,
+                        rnd
+                    )
+                    generated_section_cache[role] = tuple(dict(value) for value in section_values)
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                elif role == 13 and 5 in generated_section_cache:
+                    section_values = self._mutator_make_section_values(
+                        generated_section_cache[5],
+                        role,
+                        0.0,
+                        original_loop_length,
+                        settings,
+                        rnd
+                    )
+                    generated_section_cache[role] = tuple(dict(value) for value in section_values)
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                elif role == 15 and 6 in generated_section_cache:
+                    section_values = self._mutator_make_section_values(
+                        generated_section_cache[6],
+                        role,
+                        0.0,
+                        original_loop_length,
+                        settings,
+                        rnd
+                    )
+                    generated_section_cache[role] = tuple(dict(value) for value in section_values)
+                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
                 else:
                     section_values = self._mutator_make_section_values(
                         source_values,
