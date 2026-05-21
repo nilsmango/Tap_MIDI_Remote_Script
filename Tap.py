@@ -661,13 +661,7 @@ class Tap(ControlSurface):
                     except Exception:
                         envelope = None
                 if envelope is not None:
-                    raw_value = self._parameter_target_value_from_normalized(device_param, self._parameter_normalized_value(device_param))
-                    start_time = float(getattr(clip, "loop_start", 0.0))
-                    end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
-                    try:
-                        envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
-                    except Exception:
-                        pass
+                    self._clear_clip_automation_envelope(clip, envelope, device_param, self._parameter_normalized_value(device_param))
                     self._clear_authored_automation_steps_for_parameter(clip, device_param)
                     envelope_was_cleared = True
 
@@ -675,6 +669,47 @@ class Tap(ControlSurface):
                 self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
             self._debug_log("Error removing automation: {}".format(str(e)))
+
+    def _automation_clear_end_time(self, clip):
+        try:
+            end_time = max(
+                float(getattr(clip, "loop_end", 0.0)),
+                float(getattr(clip, "end_marker", 0.0)),
+                float(getattr(clip, "length", 0.0)),
+                float(getattr(clip, "start_marker", 0.0)),
+                float(getattr(clip, "loop_start", 0.0))
+            )
+        except Exception:
+            end_time = 0.0
+
+        info = self._decoupled_automation_info(clip)
+        if info:
+            try:
+                end_time = max(end_time, float(info.get("physical_end", 0.0)))
+            except Exception:
+                pass
+
+        return max(0.0001, end_time)
+
+    def _clear_clip_automation_envelope(self, clip, envelope, device_param, normalized_value):
+        if clip is None or envelope is None or device_param is None:
+            return False
+
+        if hasattr(clip, "clear_envelope"):
+            try:
+                clip.clear_envelope(device_param)
+                return True
+            except Exception:
+                pass
+
+        try:
+            raw_value = self._parameter_target_value_from_normalized(device_param, normalized_value)
+            envelope.insert_step(0.0, self._automation_clear_end_time(clip), raw_value)
+            return True
+        except Exception:
+            pass
+
+        return False
 
     def _re_enable_automation_for_parameter(self, device_param):
         try:
@@ -7512,13 +7547,7 @@ class Tap(ControlSurface):
                 except Exception:
                     envelope = None
             if envelope is not None:
-                raw_value = self._parameter_target_value_from_normalized(device_param, current_value)
-                start_time = float(getattr(clip, "loop_start", 0.0))
-                end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
-                try:
-                    envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
-                except Exception:
-                    pass
+                self._clear_clip_automation_envelope(clip, envelope, device_param, current_value)
             self._clear_authored_automation_steps_for_parameter(clip, device_param)
             self._automation_clear_response(control_index, current_value)
             self._refresh_parameter_metadata_on_automation_change()
@@ -7548,13 +7577,7 @@ class Tap(ControlSurface):
                         envelope = None
                 if envelope is None:
                     continue
-                raw_value = self._parameter_target_value_from_normalized(device_param, self._parameter_normalized_value(device_param))
-                start_time = float(getattr(clip, "loop_start", 0.0))
-                end_time = max(start_time + 0.0001, float(getattr(clip, "loop_end", start_time + 0.0001)))
-                try:
-                    envelope.insert_step(start_time, max(0.0001, end_time - start_time), raw_value)
-                except Exception:
-                    pass
+                self._clear_clip_automation_envelope(clip, envelope, device_param, self._parameter_normalized_value(device_param))
             self._clear_authored_automation_steps_for_clip(clip)
             self._automation_clear_response(control_index, current_value)
             self._refresh_parameter_metadata_on_automation_change()
