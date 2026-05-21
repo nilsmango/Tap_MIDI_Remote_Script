@@ -204,8 +204,60 @@ class Tap(ControlSurface):
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v2\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
-    MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[TapMut:v1\|([^\]]*)\]")
-    MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapMut:v[0-9]+\|([^\]]*)\]")
+    MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v1\|([^\]]*)\]")
+    MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v[0-9]+\|([^\]]*)\]")
+    MUTATOR_ALGORITHMS = (
+        "mutator",
+        "verse_weaver",
+        "motif_ladder",
+        "sparse_echo",
+        "chorus_lift",
+        "middle_eight",
+        "tension_break",
+        "skylight_hook",
+        "glass_steps",
+        "nocturne_line",
+        "modal_drift",
+        "circle_resolve",
+    )
+    MUTATOR_SCALE_NAMES = (
+        "Chromatic",
+        "Major",
+        "Minor",
+        "Dorian",
+        "Mixolydian",
+        "Lydian",
+        "Phrygian",
+        "Locrian",
+        "Whole Tone",
+        "Half-whole Dim.",
+        "Whole-half Dim.",
+        "Minor Blues",
+        "Minor Pentatonic",
+        "Major Pentatonic",
+        "Harmonic Minor",
+        "Harmonic Major",
+        "Dorian #4",
+        "Phrygian Dominant",
+        "Melodic Minor",
+        "Lydian Augmented",
+        "Lydian Dominant",
+        "Super Locrian",
+        "8-Tone Spanish",
+        "Bhairav",
+        "Hungarian Minor",
+        "Hirajoshi",
+        "In-Sen",
+        "Iwato",
+        "Kumoi",
+        "Pelog Selisir",
+        "Pelog Tembung",
+        "Messiaen 3",
+        "Messiaen 4",
+        "Messiaen 5",
+        "Messiaen 6",
+        "Messiaen 7",
+    )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
@@ -3458,11 +3510,61 @@ class Tap(ControlSurface):
                         "start": float(parts[1]),
                         "length": float(parts[2]),
                     })
+            settings_fields = fields.get("set", "").split("~") if fields.get("set", "") else []
+            has_pitch_shift_field = len(settings_fields) > 19
+            seed_index = 18 if has_pitch_shift_field else 17
+            algorithm_index = 19 if has_pitch_shift_field else 18
+            flags = self._mutator_settings_flags_from_values(
+                fields.get("fl", None),
+                settings_fields,
+                has_pitch_shift_field
+            )
+            algorithm = fields.get("alg", "")
+            if fields.get("ai", "").isdigit():
+                algorithm = self._mutator_algorithm_from_code(int(fields.get("ai", "0")))
+            elif not algorithm and len(settings_fields) > algorithm_index:
+                algorithm = self._unescape_sysex_string(settings_fields[algorithm_index])
+
+            scale_index = self._mutator_scale_index_from_name(fields.get("sc", ""))
+            if fields.get("si", "").isdigit():
+                scale_index = max(0, min(len(self.MUTATOR_SCALE_NAMES) - 1, int(fields.get("si", "2"))))
+            elif scale_index is None and len(settings_fields) > 9:
+                scale_index = self._mutator_scale_index_from_name(self._unescape_sysex_string(settings_fields[9]))
+            if scale_index is None:
+                scale_index = 2
+            depth = 0.5
+            try:
+                if "dep" in fields:
+                    depth = float(fields.get("dep", "0.5"))
+                elif "dp" in fields:
+                    depth = float(fields.get("dp", "50")) / 100.0
+                elif len(settings_fields) > 8:
+                    depth = float(settings_fields[8])
+            except Exception:
+                depth = 0.5
+
+            preset = int(fields.get("pr", "1"))
+            settings_preset = int(fields.get("sp", fields.get("pr", "1")))
+            if "pd" in fields:
+                pending_settings_update = int(fields.get("pd", "0")) == 1
+            else:
+                pending_settings_update = settings_preset != preset
+
             return {
                 "original_loop_length": max(0.0001, float(fields.get("ol", "0.0001"))),
                 "structure_length": max(0.0001, float(fields.get("sl", fields.get("ol", "0.0001")))),
-                "preset": int(fields.get("pr", "1")),
-                "seed": int(fields.get("seed", "1")),
+                "preset": preset,
+                "settings_preset": settings_preset,
+                "seed": int(fields.get("seed", fields.get("sd", settings_fields[seed_index] if len(settings_fields) > seed_index else "1"))),
+                "algorithm": algorithm or "mutator",
+                "algorithm_code": self._mutator_algorithm_code(algorithm or "mutator"),
+                "depth": max(0.0, min(1.0, depth)),
+                "regenerate_mode": int(fields.get("rg", settings_fields[6] if len(settings_fields) > 6 else "0")),
+                "source_mode": int(fields.get("src", settings_fields[7] if len(settings_fields) > 7 else "2")),
+                "root": max(0, min(11, int(fields.get("rt", settings_fields[10] if len(settings_fields) > 10 else "0")))),
+                "scale_index": scale_index,
+                "flags": flags,
+                "pending_settings_update": pending_settings_update,
                 "settings": fields.get("set", ""),
                 "sections": sections,
             }
@@ -3472,20 +3574,91 @@ class Tap(ControlSurface):
     def _mutator_info(self, clip):
         if clip is None or not hasattr(clip, "name"):
             return None
-        return self._mutator_info_from_name(clip.name)
+        info = self._mutator_info_from_name(clip.name)
+        if not info:
+            return None
+        if not info.get("sections"):
+            original_loop_length = max(0.0001, float(info.get("original_loop_length", 0.0001)))
+            source_start = float(getattr(clip, "loop_start", 0.0))
+            roles = self._mutator_pattern_roles(info.get("preset", 1))
+            info["sections"] = [
+                {"role": role, "start": source_start + (index * original_loop_length), "length": original_loop_length}
+                for index, role in enumerate(roles)
+            ]
+            info["structure_length"] = max(
+                original_loop_length,
+                float(info.get("structure_length", 0.0)) or (original_loop_length * len(roles))
+            )
+        return info
+
+    def _mutator_algorithm_code(self, algorithm):
+        try:
+            return self.MUTATOR_ALGORITHMS.index(str(algorithm or "mutator"))
+        except Exception:
+            return 0
+
+    def _mutator_algorithm_from_code(self, code):
+        try:
+            index = max(0, min(len(self.MUTATOR_ALGORITHMS) - 1, int(code)))
+            return self.MUTATOR_ALGORITHMS[index]
+        except Exception:
+            return "mutator"
+
+    def _mutator_scale_index_from_name(self, scale_name):
+        try:
+            return self.MUTATOR_SCALE_NAMES.index(str(scale_name))
+        except Exception:
+            return None
+
+    def _mutator_settings_flags(self, settings):
+        flags = 0
+        if settings.get("allow_fills", True):
+            flags |= 1 << 0
+        if settings.get("allow_simplification", True):
+            flags |= 1 << 1
+        if settings.get("allow_octave_shifts", True):
+            flags |= 1 << 2
+        if settings.get("allow_rhythmic_shifts", True):
+            flags |= 1 << 3
+        if settings.get("allow_note_additions", True):
+            flags |= 1 << 4
+        if settings.get("allow_note_removals", True):
+            flags |= 1 << 5
+        if settings.get("allow_pitch_shifts", True):
+            flags |= 1 << 6
+        return flags
+
+    def _mutator_settings_flags_from_values(self, compact_flags, settings_fields, has_pitch_shift_field):
+        try:
+            if compact_flags is not None:
+                return max(0, min(127, int(compact_flags)))
+        except Exception:
+            pass
+        flags = 0
+        bool_indexes = (11, 12, 13, 14, 15, 16, 17)
+        for bit, index in enumerate(bool_indexes):
+            if index == 17 and not has_pitch_shift_field:
+                enabled = True
+            else:
+                enabled = len(settings_fields) <= index or settings_fields[index] == "1"
+            if enabled:
+                flags |= 1 << bit
+        return flags
 
     def _mutator_marker(self, info):
-        sections = ",".join(
-            "{}:{:.6f}:{:.6f}".format(section.get("role", 1), section.get("start", 0.0), section.get("length", 0.0))
-            for section in info.get("sections", [])
-        )
-        return "[TapMut:v1|ol={:.6f}|pr={}|sl={:.6f}|seed={}|set={}|sec={}]".format(
+        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|fl={}]".format(
             info.get("original_loop_length", 0.0001),
             info.get("preset", 1),
+            info.get("settings_preset", info.get("preset", 1)),
+            1 if info.get("pending_settings_update", False) else 0,
             info.get("structure_length", info.get("original_loop_length", 0.0001)),
-            info.get("seed", 1),
-            info.get("settings", ""),
-            sections,
+            int(info.get("algorithm_code", self._mutator_algorithm_code(info.get("algorithm", "mutator")))) & 0x7F,
+            max(0, min(100, int(round(float(info.get("depth", 0.5)) * 100.0)))),
+            int(info.get("regenerate_mode", 0)) & 0x7F,
+            int(info.get("source_mode", 2)) & 0x7F,
+            int(info.get("scale_index", 2)) & 0x7F,
+            int(info.get("root", 0)) & 0x7F,
+            int(info.get("flags", 127)) & 0x7F,
         )
 
     def _save_mutator_info_to_name(self, clip, info):
@@ -6365,6 +6538,8 @@ class Tap(ControlSurface):
                 self._unfold_mutator_clip()
             else:
                 self._end_mutator_clip()
+        if len(message) >= 2 and message[1] == 57:
+            self._update_mutator_clip_settings(message)
             
 
 
@@ -6410,6 +6585,51 @@ class Tap(ControlSurface):
             "settings_payload": payload.replace("|", "~")[:80],
         }
 
+    def _mutator_info_from_settings(self, settings, previous_info, clip, commit_structure=False):
+        scale_index = self._mutator_scale_index_from_name(settings.get("scale", "Minor"))
+        preset = settings.get("preset", previous_info.get("preset", 1))
+        info = {
+            "original_loop_length": previous_info.get("original_loop_length", 0.0001),
+            "structure_length": previous_info.get("structure_length", previous_info.get("original_loop_length", 0.0001)),
+            "preset": preset if commit_structure else previous_info.get("preset", preset),
+            "settings_preset": preset,
+            "seed": previous_info.get("seed", settings.get("seed", 1)),
+            "algorithm": settings.get("algorithm", previous_info.get("algorithm", "mutator")),
+            "algorithm_code": self._mutator_algorithm_code(settings.get("algorithm", previous_info.get("algorithm", "mutator"))),
+            "depth": settings.get("depth", previous_info.get("depth", 0.5)),
+            "regenerate_mode": settings.get("regenerate_mode", previous_info.get("regenerate_mode", 0)),
+            "source_mode": settings.get("source_mode", previous_info.get("source_mode", 2)),
+            "root": settings.get("root", previous_info.get("root", 0)),
+            "scale_index": scale_index if scale_index is not None else previous_info.get("scale_index", 2),
+            "flags": self._mutator_settings_flags(settings),
+            "sections": previous_info.get("sections", []),
+        }
+        if commit_structure:
+            info["pending_settings_update"] = False
+        else:
+            info["pending_settings_update"] = (
+                bool(previous_info.get("pending_settings_update", False)) or
+                self._mutator_generation_settings_changed(info, previous_info)
+            )
+        return info
+
+    def _mutator_generation_settings_changed(self, info, previous_info):
+        comparisons = (
+            ("settings_preset", int(info.get("settings_preset", info.get("preset", 1))), int(previous_info.get("settings_preset", previous_info.get("preset", 1)))),
+            ("algorithm_code", int(info.get("algorithm_code", 0)), int(previous_info.get("algorithm_code", self._mutator_algorithm_code(previous_info.get("algorithm", "mutator"))))),
+            ("source_mode", int(info.get("source_mode", 2)), int(previous_info.get("source_mode", 2))),
+            ("root", int(info.get("root", 0)), int(previous_info.get("root", 0))),
+            ("scale_index", int(info.get("scale_index", 2)), int(previous_info.get("scale_index", 2))),
+            ("flags", int(info.get("flags", 127)), int(previous_info.get("flags", 127))),
+        )
+        for _, current, previous in comparisons:
+            if current != previous:
+                return True
+        try:
+            return abs(float(info.get("depth", 0.5)) - float(previous_info.get("depth", 0.5))) > 0.005
+        except Exception:
+            return False
+
     def _mutator_pattern_roles(self, preset):
         patterns = {
             0: [0, 0, 0, 0, 5, 5, 5, 5],
@@ -6427,11 +6647,12 @@ class Tap(ControlSurface):
             12: [0, 5, 8, 5, 6, 5],
             13: [0, 1, 2, 5, 6, 8],
             14: [0, 1, 2, 7, 5, 13, 14, 6, 15, 8],
+            15: [0, 0, 5, 6, 9, 10],
         }
         return patterns.get(int(preset), patterns[1])
 
     def _mutator_preset_is_chain(self, preset):
-        return int(preset) in (2, 6, 7, 8)
+        return int(preset) in (2, 6, 7, 8, 15)
 
     def _mutator_role_depth(self, role, global_depth):
         ranges = {
@@ -6979,19 +7200,37 @@ class Tap(ControlSurface):
             clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
             clip.loop_end = source_start + structure_length
             clip.end_marker = source_start + structure_length
-            info = {
+            info = self._mutator_info_from_settings(settings, {
                 "original_loop_length": original_loop_length,
                 "structure_length": structure_length,
-                "preset": settings.get("preset", 1),
                 "seed": settings.get("seed", 1),
-                "settings": settings.get("settings_payload", ""),
                 "sections": sections,
-            }
+            }, clip, commit_structure=True)
             self._save_mutator_info_to_name(clip, info)
             self.send_selected_clip_metadata()
             self.send_selected_clip_notes()
         except Exception as e:
             self._debug_log("Error setting mutator clip: {}".format(str(e)))
+
+    def _update_mutator_clip_settings(self, message):
+        try:
+            settings = self._mutator_settings_from_message(message)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            if not getattr(clip, "is_midi_clip", False):
+                return
+
+            previous_info = self._mutator_info(clip)
+            if not previous_info:
+                return
+
+            info = self._mutator_info_from_settings(settings, previous_info, clip)
+            self._save_mutator_info_to_name(clip, info)
+            self.send_selected_clip_metadata()
+        except Exception as e:
+            self._debug_log("Error updating mutator clip settings: {}".format(str(e)))
 
     def _end_mutator_clip(self):
         try:
@@ -8843,6 +9082,18 @@ class Tap(ControlSurface):
                                 *self._to_3_7bit_bytes(int(section.get("start", 0.0) * 1000)),
                                 *self._to_3_7bit_bytes(int(section.get("length", 0.0) * 1000)),
                             ])
+                        note_data.extend([
+                            1,
+                            int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
+                            int(mutator_info.get("regenerate_mode", 0)) & 0x7F,
+                            int(mutator_info.get("source_mode", 2)) & 0x7F,
+                            max(0, min(100, int(round(float(mutator_info.get("depth", 0.5)) * 100.0)))),
+                            int(mutator_info.get("root", 0)) & 0x7F,
+                            int(mutator_info.get("scale_index", 2)) & 0x7F,
+                            int(mutator_info.get("flags", 127)) & 0x7F,
+                            int(mutator_info.get("settings_preset", mutator_info.get("preset", 1))) & 0x7F,
+                            1 if mutator_info.get("pending_settings_update", False) else 0,
+                        ])
                     else:
                         note_data.append(0)
                     
