@@ -6575,10 +6575,61 @@ class Tap(ControlSurface):
                 self._end_mutator_clip()
         if len(message) >= 2 and message[1] == 57:
             self._update_mutator_clip_settings(message)
+        if len(message) >= 2 and message[1] == 58:
+            self._replace_rhythm_generator_lane(message)
             
 
 
 
+
+    def _replace_rhythm_generator_lane(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
+            fields = payload.split("|")
+            if len(fields) < 3:
+                return
+
+            pitch = max(0, min(127, int(fields[0])))
+            replace_start = max(0.0, int(fields[1]) / 1000.0)
+            replace_end = max(replace_start, int(fields[2]) / 1000.0)
+            replace_length = max(0.0001, replace_end - replace_start)
+            note_payload = fields[3] if len(fields) > 3 else ""
+
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            if not getattr(clip, "is_midi_clip", False):
+                return
+
+            if hasattr(clip, "remove_notes_extended"):
+                clip.remove_notes_extended(pitch, 1, replace_start, replace_length)
+
+            specs = []
+            for item in note_payload.split(";"):
+                if not item:
+                    continue
+                parts = item.split(",")
+                if len(parts) < 3:
+                    continue
+                start_time = max(0.0, int(parts[0]) / 1000.0)
+                duration = max(0.0001, int(parts[1]) / 1000.0)
+                velocity = max(1, min(127, int(parts[2])))
+                specs.append(MidiNoteSpecification(
+                    pitch=pitch,
+                    start_time=start_time,
+                    duration=duration,
+                    velocity=velocity,
+                    mute=False,
+                    probability=1.0
+                ))
+
+            if specs:
+                clip.add_new_notes(tuple(specs))
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error replacing rhythm generator lane: {}".format(str(e)))
 
     def _mutator_settings_from_message(self, message):
         payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
