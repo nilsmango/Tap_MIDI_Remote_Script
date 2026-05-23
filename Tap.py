@@ -219,6 +219,9 @@ class Tap(ControlSurface):
         "nocturne_line",
         "modal_drift",
         "circle_resolve",
+        "backbeat_engine",
+        "broken_garage",
+        "four_floor_bloom",
     )
     MUTATOR_SCALE_NAMES = (
         "Chromatic",
@@ -3585,6 +3588,10 @@ class Tap(ControlSurface):
             else:
                 pending_settings_update = settings_preset != preset
 
+            companion_mode = self._mutator_companion_mode_from_code(int(fields.get("cm", "0"))) if fields.get("cm", "").isdigit() else "melody"
+            rhythm_flags = int(fields.get("rf", "3")) if fields.get("rf", "").isdigit() else 3
+            target_pitches = self._mutator_target_pitches_from_value(fields.get("tg", ""))
+
             return {
                 "original_loop_length": max(0.0001, float(fields.get("ol", "0.0001"))),
                 "structure_length": max(0.0001, float(fields.get("sl", fields.get("ol", "0.0001")))),
@@ -3599,6 +3606,10 @@ class Tap(ControlSurface):
                 "root": max(0, min(11, int(fields.get("rt", settings_fields[10] if len(settings_fields) > 10 else "0")))),
                 "scale_index": scale_index,
                 "flags": flags,
+                "companion_mode": companion_mode,
+                "companion_mode_code": self._mutator_companion_mode_code(companion_mode),
+                "rhythm_flags": rhythm_flags,
+                "target_pitches": target_pitches,
                 "pending_settings_update": pending_settings_update,
                 "settings": fields.get("set", ""),
                 "sections": sections,
@@ -3639,6 +3650,12 @@ class Tap(ControlSurface):
         except Exception:
             return "mutator"
 
+    def _mutator_companion_mode_code(self, mode):
+        return 1 if str(mode or "melody") == "rhythm" else 0
+
+    def _mutator_companion_mode_from_code(self, code):
+        return "rhythm" if int(code) == 1 else "melody"
+
     def _mutator_scale_index_from_name(self, scale_name):
         try:
             return self.MUTATOR_SCALE_NAMES.index(str(scale_name))
@@ -3663,6 +3680,27 @@ class Tap(ControlSurface):
             flags |= 1 << 6
         return flags
 
+    def _mutator_rhythm_flags(self, settings):
+        flags = 0
+        if settings.get("allow_velocity_changes", True):
+            flags |= 1 << 0
+        if settings.get("allow_gate_changes", True):
+            flags |= 1 << 1
+        return flags
+
+    def _mutator_target_pitches_from_value(self, value):
+        pitches = []
+        try:
+            for part in str(value or "").split(","):
+                if part == "":
+                    continue
+                pitch = max(0, min(127, int(part)))
+                if pitch not in pitches:
+                    pitches.append(pitch)
+        except Exception:
+            return []
+        return pitches[:16]
+
     def _mutator_settings_flags_from_values(self, compact_flags, settings_fields, has_pitch_shift_field):
         try:
             if compact_flags is not None:
@@ -3681,7 +3719,8 @@ class Tap(ControlSurface):
         return flags
 
     def _mutator_marker(self, info):
-        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|fl={}]".format(
+        target_pitches = ",".join(str(max(0, min(127, int(pitch)))) for pitch in info.get("target_pitches", [])[:16])
+        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|fl={}|cm={}|rf={}|tg={}]".format(
             info.get("original_loop_length", 0.0001),
             info.get("preset", 1),
             info.get("settings_preset", info.get("preset", 1)),
@@ -3694,6 +3733,9 @@ class Tap(ControlSurface):
             int(info.get("scale_index", 2)) & 0x7F,
             int(info.get("root", 0)) & 0x7F,
             int(info.get("flags", 127)) & 0x7F,
+            int(info.get("companion_mode_code", self._mutator_companion_mode_code(info.get("companion_mode", "melody")))) & 0x7F,
+            int(info.get("rhythm_flags", 3)) & 0x7F,
+            target_pitches,
         )
 
     def _save_mutator_info_to_name(self, clip, info):
@@ -6647,6 +6689,11 @@ class Tap(ControlSurface):
         has_pitch_shift_field = len(fields) > 19
         seed_index = 18 if has_pitch_shift_field else 17
         algorithm_index = 19 if has_pitch_shift_field else 18
+        companion_mode_index = algorithm_index + 1
+        target_pitches_index = algorithm_index + 2
+        velocity_changes_index = algorithm_index + 3
+        gate_changes_index = algorithm_index + 4
+        target_pitches = self._mutator_target_pitches_from_value(fields[target_pitches_index] if len(fields) > target_pitches_index else "")
         return {
             "preset": int_field(0, 1),
             "mutations_per_pass": max(1, min(3, int_field(1, 1))),
@@ -6668,6 +6715,10 @@ class Tap(ControlSurface):
             "allow_pitch_shifts": int_field(17, 1) == 1 if has_pitch_shift_field else True,
             "seed": int_field(seed_index, random.randint(1, 2000000000)),
             "algorithm": self._unescape_sysex_string(fields[algorithm_index]) if len(fields) > algorithm_index else "mutator",
+            "companion_mode": "rhythm" if int_field(companion_mode_index, 0) == 1 else "melody",
+            "target_pitches": target_pitches,
+            "allow_velocity_changes": int_field(velocity_changes_index, 1) == 1,
+            "allow_gate_changes": int_field(gate_changes_index, 1) == 1,
             "settings_payload": payload.replace("|", "~")[:80],
         }
 
@@ -6688,6 +6739,10 @@ class Tap(ControlSurface):
             "root": settings.get("root", previous_info.get("root", 0)),
             "scale_index": scale_index if scale_index is not None else previous_info.get("scale_index", 2),
             "flags": self._mutator_settings_flags(settings),
+            "companion_mode": settings.get("companion_mode", previous_info.get("companion_mode", "melody")),
+            "companion_mode_code": self._mutator_companion_mode_code(settings.get("companion_mode", previous_info.get("companion_mode", "melody"))),
+            "rhythm_flags": self._mutator_rhythm_flags(settings),
+            "target_pitches": settings.get("target_pitches", previous_info.get("target_pitches", [])),
             "sections": previous_info.get("sections", []),
         }
         if commit_structure:
@@ -6707,10 +6762,14 @@ class Tap(ControlSurface):
             ("root", int(info.get("root", 0)), int(previous_info.get("root", 0))),
             ("scale_index", int(info.get("scale_index", 2)), int(previous_info.get("scale_index", 2))),
             ("flags", int(info.get("flags", 127)), int(previous_info.get("flags", 127))),
+            ("companion_mode_code", int(info.get("companion_mode_code", 0)), int(previous_info.get("companion_mode_code", self._mutator_companion_mode_code(previous_info.get("companion_mode", "melody"))))),
+            ("rhythm_flags", int(info.get("rhythm_flags", 3)), int(previous_info.get("rhythm_flags", 3))),
         )
         for _, current, previous in comparisons:
             if current != previous:
                 return True
+        if tuple(info.get("target_pitches", [])) != tuple(previous_info.get("target_pitches", [])):
+            return True
         try:
             return abs(float(info.get("depth", 0.5)) - float(previous_info.get("depth", 0.5))) > 0.005
         except Exception:
@@ -7031,7 +7090,189 @@ class Tap(ControlSurface):
             )))
         return specs
 
+    def _mutator_relative_section_values(self, source_values, source_start, loop_length):
+        result = []
+        for value in tuple(source_values or ()):
+            relative_start = max(0.0, min(float(loop_length) - 0.0001, float(value.get("start", 0.0)) - float(source_start)))
+            result.append(dict(
+                value,
+                start=relative_start,
+                duration=min(float(value.get("duration", 0.0001)), float(loop_length) - relative_start)
+            ))
+        return result
+
+    def _mutator_rhythm_target_pitches(self, settings, source_values):
+        targets = [int(pitch) for pitch in settings.get("target_pitches", []) if 0 <= int(pitch) <= 127]
+        if targets:
+            return targets[:16]
+        pitches = []
+        for value in tuple(source_values or ()):
+            pitch = int(value.get("pitch", 0))
+            if pitch not in pitches:
+                pitches.append(pitch)
+        return pitches[:16]
+
+    def _mutator_rhythm_named_values(self, role, loop_length, settings, rnd):
+        algorithm = settings.get("algorithm", "mutator")
+        if algorithm not in ("backbeat_engine", "broken_garage", "four_floor_bloom"):
+            return None
+        targets = self._mutator_rhythm_target_pitches(settings, [])
+        if not targets:
+            return []
+
+        try:
+            bar_beats = float(max(1, int(self.song().signature_numerator)))
+        except Exception:
+            bar_beats = 4.0
+        bar_beats = min(max(1.0, bar_beats), max(1.0, float(loop_length)))
+        total_bars = max(1, int(math.ceil(float(loop_length) / bar_beats)))
+        kick = targets[0]
+        snare = targets[min(1, len(targets) - 1)]
+        hat = targets[min(2, len(targets) - 1)]
+        open_hat = targets[min(3, len(targets) - 1)]
+        result = []
+        depth = max(0.0, min(1.0, float(settings.get("depth", 0.5))))
+
+        for bar in range(total_bars):
+            offset = bar * bar_beats
+            if algorithm == "four_floor_bloom":
+                kick_beats = [0.0, 1.0, 2.0, 3.0]
+                snare_beats = [1.0, 3.0] if len(targets) > 1 else []
+                hat_beats = [0.5, 1.5, 2.5, 3.5] if len(targets) > 2 else []
+            elif algorithm == "broken_garage":
+                kick_beats = [0.0, 1.5, 2.75]
+                snare_beats = [1.0, 3.0] if len(targets) > 1 else []
+                hat_beats = [0.0, 0.75, 1.5, 2.25, 3.25] if len(targets) > 2 else []
+            else:
+                kick_beats = [0.0, 2.0, 2.75 if (bar + role) % 2 else 3.0]
+                snare_beats = [1.0, 3.0] if len(targets) > 1 else []
+                hat_beats = [i * 0.5 for i in range(int(bar_beats * 2))] if len(targets) > 2 else []
+
+            if role in (1, 2, 4, 13) and depth > 0.2:
+                kick_beats = kick_beats + ([3.5] if bar % 2 == 1 else [])
+            if role in (7, 14, 15):
+                kick_beats = [beat for beat in kick_beats if beat < max(0.0, bar_beats - 1.0)]
+                snare_beats = [beat for beat in snare_beats if beat < max(0.0, bar_beats - 1.0)]
+                hat_beats = [beat for beat in hat_beats if beat < max(0.0, bar_beats - 1.0)]
+
+            for beat in kick_beats:
+                if beat < bar_beats:
+                    result.append(dict(pitch=kick, start=offset + beat, duration=0.125, velocity=104, mute=False, probability=1.0))
+            for beat in snare_beats:
+                if beat < bar_beats:
+                    result.append(dict(pitch=snare, start=offset + beat, duration=0.125, velocity=98, mute=False, probability=1.0))
+            for beat in hat_beats:
+                if beat < bar_beats:
+                    pitch = open_hat if len(targets) > 3 and beat % 1.0 == 0.5 and algorithm == "four_floor_bloom" else hat
+                    result.append(dict(pitch=pitch, start=offset + beat, duration=0.0625, velocity=70 if pitch == hat else 86, mute=False, probability=1.0))
+
+        if settings.get("allow_fills", True) and role in (7, 14, 15) and targets:
+            fill_start = max(0.0, float(loop_length) - 1.0)
+            fill_pitches = list(reversed(targets))
+            for index in range(6):
+                result.append(dict(pitch=fill_pitches[index % len(fill_pitches)], start=fill_start + index * 0.166, duration=0.09, velocity=min(127, 86 + index * 5), mute=False, probability=1.0))
+
+        return self._mutator_algorithm_prune_values(result, loop_length)
+
+    def _mutator_make_rhythm_section_values(self, source_values, role, source_start, loop_length, settings, rnd):
+        if role in (0, 8):
+            return self._mutator_relative_section_values(source_values, source_start, loop_length)
+
+        named_values = self._mutator_rhythm_named_values(role, loop_length, settings, rnd)
+        if named_values is not None:
+            return named_values
+
+        depth = self._mutator_role_depth(role, settings.get("depth", 0.5))
+        values = self._mutator_relative_section_values(source_values, source_start, loop_length)
+        values.sort(key=lambda item: (item["start"], item["pitch"]))
+        if not values:
+            for pitch in self._mutator_rhythm_target_pitches(settings, source_values):
+                values.append(dict(pitch=pitch, start=0.0, duration=0.125, velocity=96, mute=False, probability=1.0))
+
+        if settings.get("allow_simplification", True) and role in (5, 6, 14):
+            keep_stride = 2 if role != 14 else 3
+            values = [value for index, value in enumerate(values) if index % keep_stride == 0] or values[:1]
+
+        if settings.get("allow_note_removals", True) and role not in (7, 15):
+            remove_chance = min(0.40, depth * (0.35 if role != 5 else 0.50))
+            values = [value for value in values if rnd.random() > remove_chance] or values[:1]
+
+        result = []
+        for index, value in enumerate(values):
+            start = float(value.get("start", 0.0))
+            duration = float(value.get("duration", 0.125))
+            velocity = int(value.get("velocity", 96))
+
+            if settings.get("allow_rhythmic_shifts", True) and role not in (6,) and rnd.random() < depth:
+                grid = 0.125
+                choices = [-2 * grid, -grid, grid, 2 * grid, 3 * grid]
+                start += rnd.choice(choices)
+
+            if settings.get("allow_gate_changes", True) and rnd.random() < depth * 0.65:
+                duration *= rnd.choice([0.5, 0.75, 1.25, 1.5])
+
+            if settings.get("allow_velocity_changes", True):
+                lift = 0
+                if role in (5, 6, 15):
+                    lift = 10
+                elif role in (4, 7, 13):
+                    lift = 6
+                velocity += lift + rnd.randint(-10, 12)
+
+            if role == 6:
+                start = round(start / 0.5) * 0.5
+            if role == 14:
+                velocity -= 18
+                duration *= 1.25
+            if role == 15:
+                start = round(start / 0.25) * 0.25
+                velocity += 18
+
+            start = max(0.0, min(float(loop_length) - 0.0001, start))
+            result.append(dict(
+                value,
+                start=start,
+                duration=max(0.03125, min(duration, float(loop_length) - start)),
+                velocity=max(1, min(127, velocity)),
+            ))
+
+        if settings.get("allow_note_additions", True) and role not in (0, 8, 14) and values:
+            additions = int(round(depth * settings.get("mutations_per_pass", 1) * (2 if role != 7 else 3)))
+            if depth >= 0.18 and role in (1, 2, 4, 5, 6, 7, 9, 10, 13, 15):
+                additions = max(1, additions)
+            for add_index in range(additions):
+                base = dict(values[add_index % len(values)])
+                if role == 7:
+                    start = float(loop_length) * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
+                    duration = min(0.18, float(loop_length) - start)
+                else:
+                    start = (float(base.get("start", 0.0)) + rnd.choice([0.25, 0.5, 0.75])) % float(loop_length)
+                    duration = min(float(base.get("duration", 0.125)), float(loop_length) - start)
+                result.append(dict(
+                    base,
+                    start=start,
+                    duration=max(0.03125, duration),
+                    velocity=min(127, int(base.get("velocity", 96)) + 10),
+                ))
+
+        if settings.get("allow_fills", True) and role in (7, 15) and values:
+            fill_start = max(0.0, float(loop_length) - 1.0)
+            fill_values = sorted(values, key=lambda item: int(item.get("velocity", 96)), reverse=True)
+            for fill_index in range(min(6, max(2, len(fill_values)))):
+                base = dict(fill_values[fill_index % len(fill_values)])
+                result.append(dict(
+                    base,
+                    start=fill_start + fill_index * 0.166,
+                    duration=0.08,
+                    velocity=min(127, int(base.get("velocity", 96)) + 8 + fill_index * 3),
+                ))
+
+        return self._mutator_algorithm_prune_values(result, loop_length)
+
     def _mutator_make_section_values(self, source_values, role, source_start, loop_length, settings, rnd):
+        if settings.get("companion_mode", "melody") == "rhythm":
+            return self._mutator_make_rhythm_section_values(source_values, role, source_start, loop_length, settings, rnd)
+
         if role in (0, 8):
             return [
                 dict(
@@ -7169,8 +7410,19 @@ class Tap(ControlSurface):
             source_end = source_start + original_loop_length
             source_notes = clip.get_notes_extended(0, 128, source_start, original_loop_length)
             source_values = [self._mutator_note_values(note) for note in source_notes if note.start_time >= source_start - 0.000001 and note.start_time < source_end - 0.000001]
-            if not source_values:
+            rhythm_mode = settings.get("companion_mode", "melody") == "rhythm"
+            target_pitches = set(self._mutator_rhythm_target_pitches(settings, source_values)) if rhythm_mode else set()
+            if not source_values and not target_pitches:
                 return
+            generation_source_values = source_values
+            passthrough_section_values = []
+            if rhythm_mode:
+                generation_source_values = [value for value in source_values if int(value.get("pitch", 0)) in target_pitches]
+                passthrough_source_values = [value for value in source_values if int(value.get("pitch", 0)) not in target_pitches]
+                passthrough_section_values = self._mutator_relative_section_values(passthrough_source_values, source_start, original_loop_length)
+
+            def section_payload(values):
+                return list(values or []) + list(passthrough_section_values)
 
             roles = self._mutator_pattern_roles(settings.get("preset", 1))
             sections = []
@@ -7178,7 +7430,7 @@ class Tap(ControlSurface):
             generated_section_cache = {}
             chain_preset = self._mutator_preset_is_chain(settings.get("preset", 1))
             original_section_values = self._mutator_make_section_values(
-                source_values,
+                generation_source_values,
                 0,
                 source_start,
                 original_loop_length,
@@ -7209,21 +7461,21 @@ class Tap(ControlSurface):
                         )
                         generated_section_cache[role] = tuple(dict(value) for value in section_values)
                         previous_chain_values = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                     continue
 
                 if role in (0, 8):
                     section_values = self._mutator_make_section_values(
-                        source_values,
+                        generation_source_values,
                         role,
                         source_start,
                         original_loop_length,
                         settings,
                         rnd
                     )
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                 elif role in generated_section_cache:
-                    specs.extend(self._mutator_place_section_values(generated_section_cache[role], section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(generated_section_cache[role]), section_start, original_loop_length))
                 elif role == 2 and 1 in generated_section_cache:
                     section_values = self._mutator_make_section_values(
                         generated_section_cache[1],
@@ -7234,7 +7486,7 @@ class Tap(ControlSurface):
                         rnd
                     )
                     generated_section_cache[role] = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                 elif role == 13 and 5 in generated_section_cache:
                     section_values = self._mutator_make_section_values(
                         generated_section_cache[5],
@@ -7245,7 +7497,7 @@ class Tap(ControlSurface):
                         rnd
                     )
                     generated_section_cache[role] = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                 elif role == 15 and 6 in generated_section_cache:
                     section_values = self._mutator_make_section_values(
                         generated_section_cache[6],
@@ -7256,10 +7508,10 @@ class Tap(ControlSurface):
                         rnd
                     )
                     generated_section_cache[role] = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                 else:
                     section_values = self._mutator_make_section_values(
-                        source_values,
+                        generation_source_values,
                         role,
                         source_start,
                         original_loop_length,
@@ -7267,7 +7519,7 @@ class Tap(ControlSurface):
                         rnd
                     )
                     generated_section_cache[role] = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_values, section_start, original_loop_length))
+                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
 
             structure_length = original_loop_length * len(roles)
             remove_start = source_start
@@ -9156,8 +9408,9 @@ class Tap(ControlSurface):
                                 *self._to_3_7bit_bytes(int(section.get("start", 0.0) * 1000)),
                                 *self._to_3_7bit_bytes(int(section.get("length", 0.0) * 1000)),
                             ])
+                        target_pitches = [max(0, min(127, int(pitch))) for pitch in mutator_info.get("target_pitches", [])[:16]]
                         note_data.extend([
-                            1,
+                            2,
                             int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
                             int(mutator_info.get("regenerate_mode", 0)) & 0x7F,
                             int(mutator_info.get("source_mode", 2)) & 0x7F,
@@ -9166,8 +9419,12 @@ class Tap(ControlSurface):
                             int(mutator_info.get("scale_index", 2)) & 0x7F,
                             int(mutator_info.get("flags", 127)) & 0x7F,
                             int(mutator_info.get("settings_preset", mutator_info.get("preset", 1))) & 0x7F,
-                            1 if mutator_info.get("pending_settings_update", False) else 0,
+                            int(mutator_info.get("companion_mode_code", self._mutator_companion_mode_code(mutator_info.get("companion_mode", "melody")))) & 0x7F,
+                            int(mutator_info.get("rhythm_flags", 3)) & 0x7F,
+                            len(target_pitches),
                         ])
+                        note_data.extend(target_pitches)
+                        note_data.append(1 if mutator_info.get("pending_settings_update", False) else 0)
                     else:
                         note_data.append(0)
                     
