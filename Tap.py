@@ -3589,6 +3589,8 @@ class Tap(ControlSurface):
                 pending_settings_update = settings_preset != preset
 
             companion_mode = self._mutator_companion_mode_from_code(int(fields.get("cm", "0"))) if fields.get("cm", "").isdigit() else "melody"
+            if companion_mode == "rhythm":
+                flags &= ~((1 << 2) | (1 << 6))
             rhythm_flags = int(fields.get("rf", "3")) if fields.get("rf", "").isdigit() else 3
             target_pitches = self._mutator_target_pitches_from_value(fields.get("tg", ""))
 
@@ -6693,7 +6695,13 @@ class Tap(ControlSurface):
         target_pitches_index = algorithm_index + 2
         velocity_changes_index = algorithm_index + 3
         gate_changes_index = algorithm_index + 4
+        companion_mode = "rhythm" if int_field(companion_mode_index, 0) == 1 else "melody"
         target_pitches = self._mutator_target_pitches_from_value(fields[target_pitches_index] if len(fields) > target_pitches_index else "")
+        allow_octave_shifts = int_field(13, 1) == 1
+        allow_pitch_shifts = int_field(17, 1) == 1 if has_pitch_shift_field else True
+        if companion_mode == "rhythm":
+            allow_octave_shifts = False
+            allow_pitch_shifts = False
         return {
             "preset": int_field(0, 1),
             "mutations_per_pass": max(1, min(3, int_field(1, 1))),
@@ -6708,14 +6716,14 @@ class Tap(ControlSurface):
             "root": max(0, min(11, int_field(10, 0))),
             "allow_fills": int_field(11, 1) == 1,
             "allow_simplification": int_field(12, 1) == 1,
-            "allow_octave_shifts": int_field(13, 1) == 1,
+            "allow_octave_shifts": allow_octave_shifts,
             "allow_rhythmic_shifts": int_field(14, 1) == 1,
             "allow_note_additions": int_field(15, 1) == 1,
             "allow_note_removals": int_field(16, 1) == 1,
-            "allow_pitch_shifts": int_field(17, 1) == 1 if has_pitch_shift_field else True,
+            "allow_pitch_shifts": allow_pitch_shifts,
             "seed": int_field(seed_index, random.randint(1, 2000000000)),
             "algorithm": self._unescape_sysex_string(fields[algorithm_index]) if len(fields) > algorithm_index else "mutator",
-            "companion_mode": "rhythm" if int_field(companion_mode_index, 0) == 1 else "melody",
+            "companion_mode": companion_mode,
             "target_pitches": target_pitches,
             "allow_velocity_changes": int_field(velocity_changes_index, 1) == 1,
             "allow_gate_changes": int_field(gate_changes_index, 1) == 1,
@@ -7103,14 +7111,93 @@ class Tap(ControlSurface):
 
     def _mutator_rhythm_target_pitches(self, settings, source_values):
         targets = [int(pitch) for pitch in settings.get("target_pitches", []) if 0 <= int(pitch) <= 127]
-        if targets:
-            return targets[:16]
-        pitches = []
+        return targets[:16]
+
+    def _mutator_split_rhythm_source_values(self, settings, source_values, source_start, loop_length):
+        target_pitches = set(self._mutator_rhythm_target_pitches(settings, source_values))
+        selected_values = []
+        passthrough_values = []
         for value in tuple(source_values or ()):
             pitch = int(value.get("pitch", 0))
-            if pitch not in pitches:
-                pitches.append(pitch)
-        return pitches[:16]
+            if pitch in target_pitches:
+                selected_values.append(value)
+            else:
+                passthrough_values.append(value)
+        passthrough_section_values = self._mutator_relative_section_values(
+            passthrough_values,
+            source_start,
+            loop_length
+        )
+        return selected_values, passthrough_section_values
+
+    def _mutator_rhythm_occupied_steps(self, values, loop_length=None, grid=0.125):
+        occupied = set()
+        step_count = max(1, int(round(float(loop_length) / float(grid)))) if loop_length else None
+        for value in tuple(values or ()):
+            try:
+                pitch = int(value.get("pitch", 0))
+                step = int(round(float(value.get("start", 0.0)) / float(grid)))
+                if step_count:
+                    step = step % step_count
+                occupied.add((pitch, step))
+            except Exception:
+                pass
+        return occupied
+
+    def _mutator_rhythm_free_start(self, pitch, start, loop_length, occupied, grid=0.125):
+        steps = max(1, int(round(float(loop_length) / float(grid))))
+        step = int(round(float(start) / float(grid))) % steps
+        for offset in range(steps):
+            candidate_step = (step + offset) % steps
+            key = (int(pitch), candidate_step)
+            if key not in occupied:
+                occupied.add(key)
+                return min(float(loop_length) - 0.0001, candidate_step * float(grid))
+        return None
+
+    def _mutator_velocity_delta(self, rnd, depth, role, rhythm=False):
+        amount = max(0.0, min(1.0, float(depth)))
+        spread = int(round((14 if rhythm else 10) + amount * (34 if rhythm else 24)))
+        return rnd.randint(-spread, spread)
+
+    def _mutator_add_fill_values(self, result, values, role, loop_length, settings, rnd, target_pitches=None, rhythm=False):
+        if not settings.get("allow_fills", True) or role not in (4, 5, 6, 7, 13, 14, 15):
+            return
+        pool = [dict(value) for value in tuple(values or ())]
+        if target_pitches:
+            targets = [int(pitch) for pitch in target_pitches if 0 <= int(pitch) <= 127]
+            pool = [value for value in pool if int(value.get("pitch", 0)) in targets] or [
+                dict(pitch=pitch, start=0.0, duration=0.125, velocity=96, mute=False, probability=1.0)
+                for pitch in targets
+            ]
+        else:
+            targets = sorted(set(int(value.get("pitch", 0)) for value in pool))
+        if not pool or not targets:
+            return
+
+        fill_depth = max(0.0, min(1.0, float(settings.get("depth", 0.5))))
+        hit_count = max(2, int(math.ceil(2 + fill_depth * (6 if rhythm else 5))))
+        fill_start = max(0.0, float(loop_length) - min(float(loop_length), 1.0))
+        step = min(0.25, max(0.0625, (float(loop_length) - fill_start) / float(hit_count)))
+        occupied = self._mutator_rhythm_occupied_steps(result, loop_length, grid=0.0625)
+
+        for fill_index in range(hit_count):
+            base = dict(pool[fill_index % len(pool)])
+            pitch = targets[(fill_index + (len(targets) - 1 if role in (7, 15) else 0)) % len(targets)]
+            start = fill_start + (fill_index * step)
+            start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied, grid=0.0625)
+            if start is None:
+                continue
+            velocity = int(base.get("velocity", 96))
+            if settings.get("allow_velocity_changes", True):
+                velocity += self._mutator_velocity_delta(rnd, fill_depth, role, rhythm=rhythm)
+            result.append(dict(
+                base,
+                pitch=pitch,
+                start=start,
+                duration=max(0.03125, min(0.125 if rhythm else 0.16, float(loop_length) - start)),
+                velocity=max(1, min(127, velocity)),
+            ))
 
     def _mutator_rhythm_named_values(self, role, loop_length, settings, rnd):
         algorithm = settings.get("algorithm", "mutator")
@@ -7166,11 +7253,7 @@ class Tap(ControlSurface):
                     pitch = open_hat if len(targets) > 3 and beat % 1.0 == 0.5 and algorithm == "four_floor_bloom" else hat
                     result.append(dict(pitch=pitch, start=offset + beat, duration=0.0625, velocity=70 if pitch == hat else 86, mute=False, probability=1.0))
 
-        if settings.get("allow_fills", True) and role in (7, 14, 15) and targets:
-            fill_start = max(0.0, float(loop_length) - 1.0)
-            fill_pitches = list(reversed(targets))
-            for index in range(6):
-                result.append(dict(pitch=fill_pitches[index % len(fill_pitches)], start=fill_start + index * 0.166, duration=0.09, velocity=min(127, 86 + index * 5), mute=False, probability=1.0))
+        self._mutator_add_fill_values(result, result, role, loop_length, settings, rnd, target_pitches=targets, rhythm=True)
 
         return self._mutator_algorithm_prune_values(result, loop_length)
 
@@ -7212,12 +7295,7 @@ class Tap(ControlSurface):
                 duration *= rnd.choice([0.5, 0.75, 1.25, 1.5])
 
             if settings.get("allow_velocity_changes", True):
-                lift = 0
-                if role in (5, 6, 15):
-                    lift = 10
-                elif role in (4, 7, 13):
-                    lift = 6
-                velocity += lift + rnd.randint(-10, 12)
+                velocity += self._mutator_velocity_delta(rnd, settings.get("depth", depth), role, rhythm=True)
 
             if role == 6:
                 start = round(start / 0.5) * 0.5
@@ -7237,35 +7315,50 @@ class Tap(ControlSurface):
             ))
 
         if settings.get("allow_note_additions", True) and role not in (0, 8, 14) and values:
-            additions = int(round(depth * settings.get("mutations_per_pass", 1) * (2 if role != 7 else 3)))
-            if depth >= 0.18 and role in (1, 2, 4, 5, 6, 7, 9, 10, 13, 15):
-                additions = max(1, additions)
-            for add_index in range(additions):
-                base = dict(values[add_index % len(values)])
-                if role == 7:
-                    start = float(loop_length) * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
-                    duration = min(0.18, float(loop_length) - start)
-                else:
-                    start = (float(base.get("start", 0.0)) + rnd.choice([0.25, 0.5, 0.75])) % float(loop_length)
-                    duration = min(float(base.get("duration", 0.125)), float(loop_length) - start)
-                result.append(dict(
-                    base,
-                    start=start,
-                    duration=max(0.03125, duration),
-                    velocity=min(127, int(base.get("velocity", 96)) + 10),
-                ))
+            target_pitches = self._mutator_rhythm_target_pitches(settings, source_values)
+            target_pitches = target_pitches[:16]
+            if target_pitches:
+                addition_pool = [value for value in values if int(value.get("pitch", 0)) in target_pitches] or values
+                addition_depth = max(0.0, min(1.0, float(settings.get("depth", depth))))
+                additions = int(math.ceil(addition_depth * settings.get("mutations_per_pass", 1) * (4 if role != 7 else 6)))
+                if addition_depth >= 0.18 and role in (1, 2, 4, 5, 6, 7, 9, 10, 13, 15):
+                    additions = max(1, additions)
+                if addition_depth >= 0.45:
+                    additions = max(additions, min(len(target_pitches), 6))
+                if addition_depth >= 0.75:
+                    additions = max(additions, min(len(target_pitches) * 2, 12))
 
-        if settings.get("allow_fills", True) and role in (7, 15) and values:
-            fill_start = max(0.0, float(loop_length) - 1.0)
-            fill_values = sorted(values, key=lambda item: int(item.get("velocity", 96)), reverse=True)
-            for fill_index in range(min(6, max(2, len(fill_values)))):
-                base = dict(fill_values[fill_index % len(fill_values)])
-                result.append(dict(
-                    base,
-                    start=fill_start + fill_index * 0.166,
-                    duration=0.08,
-                    velocity=min(127, int(base.get("velocity", 96)) + 8 + fill_index * 3),
-                ))
+                occupied = self._mutator_rhythm_occupied_steps(result, loop_length)
+                for add_index in range(additions):
+                    base = dict(addition_pool[(add_index + rnd.randrange(len(addition_pool))) % len(addition_pool)])
+                    pitch = target_pitches[(add_index + rnd.randrange(len(target_pitches))) % len(target_pitches)]
+                    if role == 7:
+                        start = float(loop_length) * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
+                        duration = min(0.18, float(loop_length) - start)
+                    else:
+                        start = (float(base.get("start", 0.0)) + rnd.choice([0.125, 0.25, 0.375, 0.5, 0.75, 1.0])) % float(loop_length)
+                        duration = min(float(base.get("duration", 0.125)), float(loop_length) - start)
+                    start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied)
+                    if start is None:
+                        continue
+                    result.append(dict(
+                        base,
+                        pitch=pitch,
+                        start=start,
+                        duration=max(0.03125, duration),
+                        velocity=min(127, int(base.get("velocity", 96)) + 10),
+                    ))
+
+        self._mutator_add_fill_values(
+            result,
+            values,
+            role,
+            loop_length,
+            settings,
+            rnd,
+            target_pitches=self._mutator_rhythm_target_pitches(settings, source_values),
+            rhythm=True
+        )
 
         return self._mutator_algorithm_prune_values(result, loop_length)
 
@@ -7357,20 +7450,28 @@ class Tap(ControlSurface):
 
             relative_start = max(0.0, min(loop_length - 0.0001, relative_start))
             pitch = self._mutator_quantize_pitch(pitch, settings)
+            if settings.get("allow_velocity_changes", True):
+                velocity += self._mutator_velocity_delta(rnd, settings.get("depth", depth), role, rhythm=False)
             section_values.append(dict(
                 value,
                 pitch=pitch,
                 start=relative_start,
                 duration=min(duration, loop_length - relative_start),
-                velocity=max(1, min(127, velocity + rnd.randint(-8, 10))),
+                velocity=max(1, min(127, velocity)),
             ))
 
         if settings.get("allow_note_additions", True) and role not in (0, 8, 14):
-            additions = int(round(depth * settings.get("mutations_per_pass", 1) * (3 if role in (4, 7) else 2)))
-            if depth >= 0.18 and role in (1, 2, 3, 4, 5, 6, 9, 10, 11, 12):
+            addition_depth = max(0.0, min(1.0, float(settings.get("depth", depth))))
+            additions = int(math.ceil(addition_depth * settings.get("mutations_per_pass", 1) * (4 if role in (4, 7) else 3)))
+            if addition_depth >= 0.18 and role in (1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 15):
                 additions = max(1, additions)
+            if addition_depth >= 0.55:
+                additions = max(additions, min(len(set(value["pitch"] for value in source_values)) + 1, 6))
+            if addition_depth >= 0.80:
+                additions = max(additions, min(len(set(value["pitch"] for value in source_values)) * 2, 12))
             motif = list(source_values)
             motif.sort(key=lambda item: item["velocity"], reverse=True)
+            occupied = self._mutator_rhythm_occupied_steps(section_values, loop_length)
             for add_index in range(additions):
                 if not motif:
                     break
@@ -7379,16 +7480,24 @@ class Tap(ControlSurface):
                     relative_start = loop_length * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
                     duration = min(0.25, loop_length - relative_start)
                 else:
-                    relative_start = (base["start"] - source_start + rnd.choice([0.25, 0.5, 0.75])) % loop_length
+                    relative_start = (base["start"] - source_start + rnd.choice([0.125, 0.25, 0.375, 0.5, 0.75, 1.0])) % loop_length
                     duration = min(base["duration"], loop_length - relative_start)
-                pitch = base["pitch"] + (12 if role == 6 and add_index % 2 == 0 else rnd.choice([-2, 2, 5, 7]))
+                pitch = int(base["pitch"])
+                relative_start = self._mutator_rhythm_free_start(pitch, relative_start, loop_length, occupied)
+                if relative_start is None:
+                    continue
+                velocity = int(base["velocity"])
+                if settings.get("allow_velocity_changes", True):
+                    velocity += self._mutator_velocity_delta(rnd, addition_depth, role, rhythm=False)
                 section_values.append(dict(
                     base,
-                    pitch=self._mutator_quantize_pitch(pitch, settings),
+                    pitch=pitch,
                     start=relative_start,
                     duration=max(0.0625, duration),
-                    velocity=min(127, base["velocity"] + 12),
+                    velocity=max(1, min(127, velocity)),
                 ))
+
+        self._mutator_add_fill_values(section_values, source_values, role, loop_length, settings, rnd, rhythm=False)
 
         return section_values
 
@@ -7417,12 +7526,15 @@ class Tap(ControlSurface):
             generation_source_values = source_values
             passthrough_section_values = []
             if rhythm_mode:
-                generation_source_values = [value for value in source_values if int(value.get("pitch", 0)) in target_pitches]
-                passthrough_source_values = [value for value in source_values if int(value.get("pitch", 0)) not in target_pitches]
-                passthrough_section_values = self._mutator_relative_section_values(passthrough_source_values, source_start, original_loop_length)
+                generation_source_values, passthrough_section_values = self._mutator_split_rhythm_source_values(
+                    settings,
+                    source_values,
+                    source_start,
+                    original_loop_length
+                )
 
             def section_payload(values):
-                return list(values or []) + list(passthrough_section_values)
+                return [dict(value) for value in tuple(values or ())] + [dict(value) for value in passthrough_section_values]
 
             roles = self._mutator_pattern_roles(settings.get("preset", 1))
             sections = []
