@@ -378,6 +378,10 @@ class Tap(ControlSurface):
             self._follow_action_clip_has_clip_listeners = {}
             self._follow_action_clip_timing_listeners = {}
             self._follow_action_song_listener_subject = None
+            self._mutator_regeneration_states = {}
+            self._mutator_generation_in_progress = set()
+            self._mutator_generation_scheduled = set()
+            self._last_mutator_generation_times = {}
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -2761,6 +2765,7 @@ class Tap(ControlSurface):
         self._sync_follow_action_runtime_listeners()
         self._sync_follow_actions_to_transport()
         self._evaluate_follow_actions()
+        self._evaluate_mutator_regeneration()
         if not self.was_initialized:
             return
         self._send_group_fold_states_if_changed()
@@ -3599,6 +3604,7 @@ class Tap(ControlSurface):
                 "structure_length": max(0.0001, float(fields.get("sl", fields.get("ol", "0.0001")))),
                 "preset": preset,
                 "settings_preset": settings_preset,
+                "mutations_per_pass": max(1, min(3, int(fields.get("mp", settings_fields[1] if len(settings_fields) > 1 else "1")))),
                 "seed": int(fields.get("seed", fields.get("sd", settings_fields[seed_index] if len(settings_fields) > seed_index else "1"))),
                 "algorithm": algorithm or "mutator",
                 "algorithm_code": self._mutator_algorithm_code(algorithm or "mutator"),
@@ -3722,10 +3728,11 @@ class Tap(ControlSurface):
 
     def _mutator_marker(self, info):
         target_pitches = ",".join(str(max(0, min(127, int(pitch)))) for pitch in info.get("target_pitches", [])[:16])
-        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|fl={}|cm={}|rf={}|tg={}]".format(
+        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|mp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|fl={}|cm={}|rf={}|tg={}]".format(
             info.get("original_loop_length", 0.0001),
             info.get("preset", 1),
             info.get("settings_preset", info.get("preset", 1)),
+            int(info.get("mutations_per_pass", 1)) & 0x7F,
             1 if info.get("pending_settings_update", False) else 0,
             info.get("structure_length", info.get("original_loop_length", 0.0001)),
             int(info.get("algorithm_code", self._mutator_algorithm_code(info.get("algorithm", "mutator")))) & 0x7F,
@@ -5780,9 +5787,11 @@ class Tap(ControlSurface):
             if track_index is not None:
                 self._update_clip_slots(track_index)
                 self._activate_follow_actions_for_playing_clips(track_index)
+                self._evaluate_mutator_regeneration(track_index)
                 return
         self._update_clip_slots()
         self._activate_follow_actions_for_playing_clips()
+        self._evaluate_mutator_regeneration()
 
     def _activate_follow_actions_for_playing_clips(self, only_track_index=None):
         self._clear_finished_follow_action_launches()
@@ -6738,9 +6747,10 @@ class Tap(ControlSurface):
             "structure_length": previous_info.get("structure_length", previous_info.get("original_loop_length", 0.0001)),
             "preset": preset if commit_structure else previous_info.get("preset", preset),
             "settings_preset": preset,
-            "seed": previous_info.get("seed", settings.get("seed", 1)),
+            "seed": settings.get("seed", previous_info.get("seed", 1)) if commit_structure else previous_info.get("seed", settings.get("seed", 1)),
             "algorithm": settings.get("algorithm", previous_info.get("algorithm", "mutator")),
             "algorithm_code": self._mutator_algorithm_code(settings.get("algorithm", previous_info.get("algorithm", "mutator"))),
+            "mutations_per_pass": settings.get("mutations_per_pass", previous_info.get("mutations_per_pass", 1)),
             "depth": settings.get("depth", previous_info.get("depth", 0.5)),
             "regenerate_mode": settings.get("regenerate_mode", previous_info.get("regenerate_mode", 0)),
             "source_mode": settings.get("source_mode", previous_info.get("source_mode", 2)),
@@ -6766,6 +6776,7 @@ class Tap(ControlSurface):
         comparisons = (
             ("settings_preset", int(info.get("settings_preset", info.get("preset", 1))), int(previous_info.get("settings_preset", previous_info.get("preset", 1)))),
             ("algorithm_code", int(info.get("algorithm_code", 0)), int(previous_info.get("algorithm_code", self._mutator_algorithm_code(previous_info.get("algorithm", "mutator"))))),
+            ("mutations_per_pass", int(info.get("mutations_per_pass", 1)), int(previous_info.get("mutations_per_pass", 1))),
             ("source_mode", int(info.get("source_mode", 2)), int(previous_info.get("source_mode", 2))),
             ("root", int(info.get("root", 0)), int(previous_info.get("root", 0))),
             ("scale_index", int(info.get("scale_index", 2)), int(previous_info.get("scale_index", 2))),
@@ -7501,28 +7512,84 @@ class Tap(ControlSurface):
 
         return section_values
 
-    def _set_mutator_clip(self, message):
+    def _mutator_scale_name_from_index(self, scale_index):
         try:
-            settings = self._mutator_settings_from_message(message)
-            clip_slot = self.song().view.highlighted_clip_slot
-            if clip_slot is None or not clip_slot.has_clip:
-                return
-            clip = clip_slot.clip
-            if not getattr(clip, "is_midi_clip", False):
-                return
+            index = max(0, min(len(self.MUTATOR_SCALE_NAMES) - 1, int(scale_index)))
+            return self.MUTATOR_SCALE_NAMES[index]
+        except Exception:
+            return "Minor"
 
-            previous_info = self._mutator_info(clip)
+    def _mutator_settings_from_info(self, info, seed=None):
+        flags = int(info.get("flags", 127))
+        rhythm_flags = int(info.get("rhythm_flags", 3))
+        companion_mode = info.get("companion_mode", "melody")
+        if companion_mode == "rhythm":
+            flags &= ~((1 << 2) | (1 << 6))
+
+        def flag_enabled(mask, bit):
+            return (int(mask) & (1 << bit)) != 0
+
+        return {
+            "preset": int(info.get("settings_preset", info.get("preset", 1))),
+            "mutations_per_pass": max(1, min(3, int(info.get("mutations_per_pass", 1)))),
+            "regenerate_mode": int(info.get("regenerate_mode", 0)),
+            "source_mode": int(info.get("source_mode", 2)),
+            "depth": max(0.0, min(1.0, float(info.get("depth", 0.5)))),
+            "scale": self._mutator_scale_name_from_index(info.get("scale_index", 2)),
+            "root": max(0, min(11, int(info.get("root", 0)))),
+            "allow_fills": flag_enabled(flags, 0),
+            "allow_simplification": flag_enabled(flags, 1),
+            "allow_octave_shifts": flag_enabled(flags, 2),
+            "allow_rhythmic_shifts": flag_enabled(flags, 3),
+            "allow_note_additions": flag_enabled(flags, 4),
+            "allow_note_removals": flag_enabled(flags, 5),
+            "allow_pitch_shifts": flag_enabled(flags, 6),
+            "seed": int(seed if seed is not None else info.get("seed", random.randint(1, 2000000000))),
+            "algorithm": info.get("algorithm", "mutator"),
+            "companion_mode": companion_mode,
+            "target_pitches": info.get("target_pitches", []),
+            "allow_velocity_changes": flag_enabled(rhythm_flags, 0),
+            "allow_gate_changes": flag_enabled(rhythm_flags, 1),
+        }
+
+    def _refresh_visible_mutator_clip(self, clip):
+        try:
+            highlighted_clip_slot = self.song().view.highlighted_clip_slot
+            if (
+                highlighted_clip_slot is not None
+                and highlighted_clip_slot.has_clip
+                and self._live_object_identity(highlighted_clip_slot.clip) == self._live_object_identity(clip)
+            ):
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
+        except Exception:
+            pass
+
+    def _generate_mutator_clip(self, clip, settings, previous_info=None, send_updates=True, automatic=False):
+        generation_key = self._live_object_identity(clip)
+        if generation_key in self._mutator_generation_in_progress:
+            return False
+        now = time.time()
+        if automatic and now - self._last_mutator_generation_times.get(generation_key, 0.0) < 0.75:
+            return False
+        self._mutator_generation_in_progress.add(generation_key)
+        try:
+            if clip is None or not getattr(clip, "is_midi_clip", False):
+                return False
+
+            previous_info = previous_info or self._mutator_info(clip)
             source_start = float(getattr(clip, "loop_start", 0.0))
             original_loop_length = previous_info.get("original_loop_length") if previous_info else None
             if original_loop_length is None:
                 original_loop_length = max(0.0001, float(getattr(clip, "loop_end", source_start + 4.0)) - source_start)
+            original_loop_length = max(0.0001, float(original_loop_length))
             source_end = source_start + original_loop_length
             source_notes = clip.get_notes_extended(0, 128, source_start, original_loop_length)
             source_values = [self._mutator_note_values(note) for note in source_notes if note.start_time >= source_start - 0.000001 and note.start_time < source_end - 0.000001]
             rhythm_mode = settings.get("companion_mode", "melody") == "rhythm"
             target_pitches = set(self._mutator_rhythm_target_pitches(settings, source_values)) if rhythm_mode else set()
             if not source_values and not target_pitches:
-                return
+                return False
             generation_source_values = source_values
             passthrough_section_values = []
             if rhythm_mode:
@@ -7657,8 +7724,121 @@ class Tap(ControlSurface):
                 "sections": sections,
             }, clip, commit_structure=True)
             self._save_mutator_info_to_name(clip, info)
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            if send_updates:
+                self._refresh_visible_mutator_clip(clip)
+            self._last_mutator_generation_times[generation_key] = time.time()
+            return True
+        except Exception as e:
+            self._debug_log("Error generating mutator clip: {}".format(str(e)))
+            return False
+        finally:
+            self._mutator_generation_in_progress.discard(generation_key)
+
+    def _schedule_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True):
+        if key in self._mutator_generation_scheduled or key in self._mutator_generation_in_progress:
+            return False
+        if time.time() - self._last_mutator_generation_times.get(key, 0.0) < 0.75:
+            return False
+
+        self._mutator_generation_scheduled.add(key)
+
+        def generate_later():
+            self._mutator_generation_scheduled.discard(key)
+            self._generate_mutator_clip(
+                clip,
+                settings,
+                previous_info=previous_info,
+                send_updates=send_updates,
+                automatic=True
+            )
+
+        try:
+            self.schedule_message(1, generate_later)
+            return True
+        except Exception:
+            self._mutator_generation_scheduled.discard(key)
+            return False
+
+    def _should_regenerate_mutator_clip(self, key, clip, info, raw_position):
+        state = self._mutator_regeneration_states.setdefault(key, {
+            "last_position": None,
+            "completed_pass_count": 0,
+            "regenerated_for_current_cycle": False,
+        })
+
+        cycle_start = float(getattr(clip, "loop_start", 0.0))
+        cycle_end = cycle_start + max(0.0001, float(info.get("structure_length", 0.0001)))
+        previous = state.get("last_position")
+        wrapped_to_start = previous is not None and previous > raw_position + 0.25
+        if wrapped_to_start:
+            state["regenerated_for_current_cycle"] = False
+        if wrapped_to_start:
+            state["completed_pass_count"] = int(state.get("completed_pass_count", 0)) + 1
+
+        regenerate_mode = int(info.get("regenerate_mode", 0))
+        should_regenerate = False
+        if regenerate_mode == 1:
+            should_regenerate = wrapped_to_start
+        elif regenerate_mode == 2:
+            should_regenerate = raw_position >= cycle_end - 0.5 and raw_position < cycle_end + 0.25
+        elif regenerate_mode == 3:
+            should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 2 == 0
+        elif regenerate_mode == 4:
+            should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 4 == 0
+        elif regenerate_mode == 5:
+            should_regenerate = wrapped_to_start and random.random() < 0.10
+        elif regenerate_mode == 6:
+            should_regenerate = wrapped_to_start and random.random() < 0.25
+        elif regenerate_mode == 7:
+            should_regenerate = wrapped_to_start and random.random() < 0.50
+        elif regenerate_mode == 8:
+            should_regenerate = wrapped_to_start and random.random() < 0.75
+
+        state["last_position"] = raw_position
+        if should_regenerate and not state.get("regenerated_for_current_cycle", False):
+            state["regenerated_for_current_cycle"] = True
+            return True
+        return False
+
+    def _evaluate_mutator_regeneration(self, only_track_index=None):
+        try:
+            if not self._song_is_playing():
+                self._mutator_regeneration_states.clear()
+                return
+
+            active_keys = set()
+            for track_index, track in enumerate(self.song().tracks):
+                if only_track_index is not None and track_index != only_track_index:
+                    continue
+                for scene_index, clip_slot in enumerate(track.clip_slots):
+                    if not clip_slot.has_clip or not clip_slot.is_playing:
+                        continue
+                    clip = clip_slot.clip
+                    info = self._mutator_info(clip)
+                    if not info or int(info.get("regenerate_mode", 0)) == 0:
+                        continue
+                    key = self._live_object_identity(clip)
+                    active_keys.add(key)
+                    raw_position = float(getattr(clip, "playing_position", 0.0))
+                    if self._should_regenerate_mutator_clip(key, clip, info, raw_position):
+                        settings = self._mutator_settings_from_info(info, seed=random.randint(1, 2000000000))
+                        self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=True)
+
+            if only_track_index is None:
+                for key in list(self._mutator_regeneration_states.keys()):
+                    if key not in active_keys:
+                        self._mutator_regeneration_states.pop(key, None)
+        except Exception as e:
+            self._debug_log("Error evaluating mutator regeneration: {}".format(str(e)))
+
+    def _set_mutator_clip(self, message):
+        try:
+            settings = self._mutator_settings_from_message(message)
+            clip_slot = self.song().view.highlighted_clip_slot
+            if clip_slot is None or not clip_slot.has_clip:
+                return
+            clip = clip_slot.clip
+            self._generate_mutator_clip(clip, settings, previous_info=self._mutator_info(clip), send_updates=True)
         except Exception as e:
             self._debug_log("Error setting mutator clip: {}".format(str(e)))
 
@@ -10064,6 +10244,10 @@ class Tap(ControlSurface):
         self._remove_follow_action_runtime_listeners()
         self._remove_follow_action_name_listeners()
         self._remove_follow_action_song_listeners()
+        self._mutator_regeneration_states.clear()
+        self._mutator_generation_in_progress.clear()
+        self._mutator_generation_scheduled.clear()
+        self._last_mutator_generation_times.clear()
         
         # Stop periodic execution
         self.periodic_timer = 0
