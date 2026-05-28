@@ -371,6 +371,7 @@ class Tap(ControlSurface):
             self._follow_action_missing_clip_counts = {}
             self._last_follow_action_state = None
             self._last_song_is_playing = False
+            self._last_sent_transport_state = None
             self._follow_action_scene_triggered_listeners = {}
             self._follow_action_clip_slot_runtime_listeners = {}
             self._follow_action_scene_name_listeners = {}
@@ -2790,7 +2791,12 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
         self._ensure_song_listener(song, "metronome", self._update_metronome)
-        self._ensure_song_listener(song, "is_playing", self._on_song_is_playing_changed)
+        try:
+            if (not hasattr(song, "is_playing_has_listener")
+                    or not song.is_playing_has_listener(self._on_song_is_playing_changed)):
+                song.add_is_playing_listener(self._on_song_is_playing_changed)
+        except Exception:
+            pass
         self._ensure_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
 
     def _remove_song_listener(self, song, listener_name, listener):
@@ -2855,6 +2861,7 @@ class Tap(ControlSurface):
 
     def _send_current_project_state(self):
         self.old_clips_array = []
+        self._send_transport_state(force=True)
         self._update_tempo()
         self._update_metronome()
         self._send_re_enable_automation_enabled()
@@ -3339,6 +3346,14 @@ class Tap(ControlSurface):
         except Exception:
             return False
 
+    def _send_transport_state(self, force=False):
+        is_playing = self._song_is_playing()
+        value = 127 if is_playing else 0
+        if not force and self._last_sent_transport_state == value:
+            return
+        self._last_sent_transport_state = value
+        self.send_cc(118, 0, value)
+
     def _clear_follow_action_launch_state(self):
         changed = bool(self._active_follow_actions or self._handled_follow_action_launches)
         self._active_follow_actions = {}
@@ -3358,6 +3373,7 @@ class Tap(ControlSurface):
             return
 
     def _on_song_is_playing_changed(self):
+        self._send_transport_state()
         self._sync_follow_actions_to_transport()
 
     def _normalize_follow_action(self, action_name):
