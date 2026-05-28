@@ -270,6 +270,7 @@ class Tap(ControlSurface):
     AUTOMATION_ENVELOPE_MAX_SAMPLES = 1024
     AUTOMATION_ENVELOPE_LINEAR_EPSILON = 0.0015
     AUTOMATION_ENVELOPE_JUMP_THRESHOLD = 0.1
+    AUTOMATION_FOLDED_ENDPOINT_ORDER = 2147483647
     
 
     def __init__(self, c_instance):
@@ -3911,13 +3912,25 @@ class Tap(ControlSurface):
             cycle_start = info["note_start"] + (float(repeat_index) * info["automation_length"])
             for step in logical_steps:
                 time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step)
-                relative_time = self._positive_mod(time_value - info["note_start"], info["automation_length"])
+                if time_value >= info["note_start"] + info["automation_length"] - 0.000001:
+                    relative_time = info["automation_length"]
+                else:
+                    relative_time = self._positive_mod(time_value - info["note_start"], info["automation_length"])
+                if repeat_index > 0 and relative_time <= 0.000001:
+                    continue
                 expanded_time = cycle_start + relative_time
-                if expanded_time < info["physical_end"] - 0.000001:
+                if expanded_time <= info["physical_end"] + 0.000001:
                     expanded_steps.append((expanded_time, duration, normalized, curve, step_id, step_order))
             cycle_end = cycle_start + info["automation_length"]
             if cycle_end <= info["physical_end"] + 0.000001:
-                expanded_steps.append((min(cycle_end, info["physical_end"]), sample_duration, loop_start_value, 0.0, 0, 0))
+                expanded_steps.append((
+                    min(cycle_end, info["physical_end"]),
+                    sample_duration,
+                    loop_start_value,
+                    0.0,
+                    0,
+                    self.AUTOMATION_FOLDED_ENDPOINT_ORDER
+                ))
         return self._automation_sorted_steps(expanded_steps)
 
     def _neutralize_decoupled_automation_points(self, envelope, device_param, info, previous_logical_steps, normalized_value, sample_duration):
@@ -4165,7 +4178,7 @@ class Tap(ControlSurface):
             time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step, index)
             if time_value < loop_start - epsilon or time_value > loop_end + epsilon:
                 continue
-            folded_time = loop_start if time_value >= loop_end - epsilon else max(loop_start, time_value)
+            folded_time = loop_end if time_value >= loop_end - epsilon else max(loop_start, time_value)
             normalized_steps.append((folded_time, duration, normalized, curve, step_id, step_order))
 
         return self._automation_sorted_steps(normalized_steps)
