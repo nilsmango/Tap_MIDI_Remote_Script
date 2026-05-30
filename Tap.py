@@ -720,6 +720,22 @@ class Tap(ControlSurface):
 
         return False
 
+    def _neutralize_automation_span(self, envelope, device_param, start_time, end_time, normalized_value):
+        if envelope is None or device_param is None:
+            return False
+
+        minimum_duration = 0.0001
+        try:
+            start_time = max(0.0, float(start_time))
+            end_time = max(start_time + minimum_duration, float(end_time))
+            raw_value = self._parameter_target_value_from_normalized(device_param, normalized_value)
+            envelope.insert_step(start_time, max(minimum_duration, end_time - start_time), raw_value)
+            return True
+        except Exception:
+            pass
+
+        return False
+
     def _re_enable_automation_for_parameter(self, device_param):
         try:
             if hasattr(device_param, 're_enable_automation'):
@@ -804,6 +820,16 @@ class Tap(ControlSurface):
             step_id,
             step_order
         )
+
+    def _automation_payload_checksum(self, value):
+        checksum = 0
+        try:
+            data = value.encode('ascii', errors='ignore')
+        except Exception:
+            data = bytes()
+        for byte in data:
+            checksum = ((checksum * 31) + byte) & 0x7fffffff
+        return checksum
 
     def _clear_authored_automation_steps(self, clip, device_param, control_index):
         key = self._automation_envelope_key(clip, device_param, control_index)
@@ -8444,6 +8470,26 @@ class Tap(ControlSurface):
             sample_duration = max(0.0001, float(fields[3]))
             step_entries = self._split_escaped_sysex_fields(fields[4], ",") if fields[4] else []
 
+            if len(fields) >= 7:
+                try:
+                    expected_step_count = int(fields[5])
+                    expected_checksum = int(fields[6], 16)
+                    checksum_payload = "|".join(fields[:5])
+                    actual_checksum = self._automation_payload_checksum(checksum_payload)
+                    if expected_step_count != len(step_entries) or expected_checksum != actual_checksum:
+                        self._debug_log(
+                            "Rejected corrupted automation envelope payload: expected {} / {:08X}, got {} / {:08X}".format(
+                                expected_step_count,
+                                expected_checksum,
+                                len(step_entries),
+                                actual_checksum
+                            )
+                        )
+                        return
+                except Exception:
+                    self._debug_log("Rejected automation envelope payload with invalid checksum fields")
+                    return
+
             device_param = self._current_connected_parameter_for_control(control_index)
             clip_slot = self.song().view.highlighted_clip_slot
             if clip_slot is None or not clip_slot.has_clip or not device_param or not liveobj_valid(device_param):
@@ -8628,6 +8674,8 @@ class Tap(ControlSurface):
             if envelope is None and hasattr(clip, 'create_automation_envelope'):
                 try:
                     envelope = clip.create_automation_envelope(device_param)
+                    if envelope is not None:
+                        automation_should_re_enable = True
                 except Exception:
                     envelope = None
 
@@ -8672,6 +8720,16 @@ class Tap(ControlSurface):
                     previous_authored_steps,
                     all_steps[0][2],
                     sample_duration
+                )
+            elif all_steps:
+                replace_start = max(0.0, min(clip_end, page_start))
+                replace_end = max(replace_start + minimum_duration, min(clip_end, page_end))
+                self._neutralize_automation_span(
+                    envelope,
+                    device_param,
+                    replace_start,
+                    replace_end,
+                    edited_span_value(replace_start)
                 )
 
             previous_insert_time = None
