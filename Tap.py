@@ -4302,6 +4302,126 @@ class Tap(ControlSurface):
         self._remove_decoupled_automation_info_from_name(clip)
         return True
 
+    def _duplicate_loop_automation_to_loop_length(self, clip, source_start, source_length, target_length):
+        if clip is None:
+            return False
+
+        source_start = max(0.0, float(source_start))
+        source_length = max(0.0001, float(source_length))
+        target_length = max(source_length, float(target_length))
+        sample_duration = 1.0 / 128.0
+        duplicated_any = False
+
+        for control_index in range(8):
+            try:
+                device_param = self._current_connected_parameter_for_control(control_index)
+                if self._duplicate_loop_automation_for_parameter(
+                    clip,
+                    device_param,
+                    control_index,
+                    source_start,
+                    source_length,
+                    target_length,
+                    sample_duration
+                ):
+                    duplicated_any = True
+            except Exception as e:
+                self._debug_log("Error duplicating loop automation for control {}: {}".format(control_index, str(e)))
+
+        return duplicated_any
+
+    def _duplicate_loop_automation_for_parameter(self, clip, device_param, control_index, source_start, source_length, target_length, sample_duration):
+        if clip is None or device_param is None or not liveobj_valid(device_param):
+            return False
+
+        envelope = None
+        if hasattr(clip, "automation_envelope"):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+
+        authored_steps = self._authored_automation_steps(clip, device_param, control_index)
+        if authored_steps is not None:
+            logical_steps = self._automation_steps_from_step_source(
+                authored_steps,
+                source_start,
+                source_length,
+                sample_duration
+            )
+        elif envelope is not None:
+            logical_steps = self._automation_steps_from_envelope_samples(
+                envelope,
+                device_param,
+                source_start,
+                source_length,
+                sample_duration
+            )
+        else:
+            return False
+
+        if not logical_steps:
+            return False
+
+        expanded_source_length = source_length * max(1, int(math.ceil(target_length / source_length)))
+        loop_info = {
+            "note_start": source_start,
+            "note_length": source_length,
+            "note_end": source_start + source_length,
+            "automation_lengths": {},
+            "automation_length": source_length,
+            "physical_length": expanded_source_length,
+            "physical_end": source_start + expanded_source_length,
+        }
+        logical_steps = self._normalize_decoupled_logical_automation_steps(loop_info, logical_steps)
+        if not logical_steps:
+            return False
+
+        expanded_steps = self._expanded_decoupled_automation_steps(loop_info, logical_steps, sample_duration)
+        duplicated_steps = self._automation_steps_from_step_source(
+            expanded_steps,
+            source_start,
+            target_length,
+            sample_duration
+        )
+        if not duplicated_steps:
+            return False
+
+        coupled_info = {
+            "note_start": source_start,
+            "note_length": target_length,
+            "note_end": source_start + target_length,
+            "automation_lengths": {},
+            "automation_length": target_length,
+            "physical_length": target_length,
+            "physical_end": source_start + target_length,
+        }
+        write_steps = self._sampled_decoupled_automation_write_steps(coupled_info, duplicated_steps, sample_duration)
+        if not write_steps:
+            return False
+
+        if envelope is None and hasattr(clip, "create_automation_envelope"):
+            try:
+                envelope = clip.create_automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        if envelope is None:
+            return False
+
+        automation_should_re_enable = self._parameter_automation_is_enabled(device_param) or envelope is not None
+        self._neutralize_decoupled_automation_points(
+            envelope,
+            device_param,
+            coupled_info,
+            duplicated_steps,
+            write_steps[0][2],
+            sample_duration
+        )
+        self._write_automation_steps_to_envelope(envelope, device_param, coupled_info, write_steps)
+        self._store_authored_automation_steps(clip, device_param, control_index, duplicated_steps)
+        self._re_enable_after_automation_write(device_param, automation_should_re_enable)
+        return True
+
     def _merge_decoupled_automation_span(self, previous_steps, edited_steps, page_start, page_end):
         edited_steps = tuple(edited_steps or ())
         if previous_steps is None:
@@ -7755,6 +7875,7 @@ class Tap(ControlSurface):
                 return False
 
             previous_info = previous_info or self._mutator_info(clip)
+            companion_was_already_running = previous_info is not None
             decoupled_info = self._decoupled_automation_info(clip)
             source_start = decoupled_info["note_start"] if decoupled_info else float(getattr(clip, "loop_start", 0.0))
             original_loop_length = previous_info.get("original_loop_length") if previous_info else None
@@ -7882,6 +8003,12 @@ class Tap(ControlSurface):
                     specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
 
             structure_length = original_loop_length * len(roles)
+            previous_structure_length = max(0.0001, float(previous_info.get("structure_length", original_loop_length))) if previous_info else original_loop_length
+            should_duplicate_automation = (
+                not companion_was_already_running or
+                structure_length > previous_structure_length + 0.000001
+            )
+            automation_source_length = previous_structure_length if companion_was_already_running else original_loop_length
             remove_start = source_start
             remove_end = max(
                 source_start + structure_length,
@@ -7898,8 +8025,16 @@ class Tap(ControlSurface):
             clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
             clip.loop_end = source_start + structure_length
             clip.end_marker = source_start + structure_length
-            if decoupled_info:
-                self._couple_decoupled_automation_to_loop_length(clip, structure_length)
+            if should_duplicate_automation:
+                if decoupled_info:
+                    self._couple_decoupled_automation_to_loop_length(clip, structure_length)
+                else:
+                    self._duplicate_loop_automation_to_loop_length(
+                        clip,
+                        source_start,
+                        automation_source_length,
+                        structure_length
+                    )
             info = self._mutator_info_from_settings(settings, {
                 "original_loop_length": original_loop_length,
                 "structure_length": structure_length,
