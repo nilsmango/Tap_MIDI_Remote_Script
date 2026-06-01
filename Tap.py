@@ -373,6 +373,7 @@ class Tap(ControlSurface):
             self._last_follow_action_state = None
             self._last_song_is_playing = False
             self._last_sent_transport_state = None
+            self._last_sent_session_record_state = None
             self._follow_action_scene_triggered_listeners = {}
             self._follow_action_clip_slot_runtime_listeners = {}
             self._follow_action_scene_name_listeners = {}
@@ -2555,12 +2556,17 @@ class Tap(ControlSurface):
         selected_device = self._selected_device()
         for control_index, control in enumerate(self._device._parameter_controls):
             device_param = self._current_connected_parameter_for_control(control_index, selected_device)
-            if device_param:
+            if device_param and liveobj_valid(device_param):
                 listener = self._create_automation_state_listener(device_param)
                 if device_param not in self._automation_state_listeners:
-                    self._automation_state_listeners[device_param] = listener
-                    if hasattr(device_param, 'add_automation_state_listener'):
-                        device_param.add_automation_state_listener(listener)
+                    try:
+                        add_listener = getattr(device_param, 'add_automation_state_listener', None)
+                        has_listener = getattr(device_param, 'automation_state_has_listener', None)
+                        if add_listener and (not has_listener or not has_listener(listener)):
+                            add_listener(listener)
+                            self._automation_state_listeners[device_param] = listener
+                    except Exception:
+                        pass
 
     def _get_automation_signature(self):
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
@@ -2646,6 +2652,7 @@ class Tap(ControlSurface):
             metadata_changed = cached_metadata != current_metadata
             if metadata_changed:
                 self._send_sys_ex_message(current_metadata, 0x7D)
+                self._schedule_parameter_metadata_resend(selected_device, current_metadata, seq_at_schedule)
                 self._set_cached_metadata(selected_device, current_metadata)
                 self._mark_metadata_sent(selected_device)
                 self._last_automation_signature = self._get_automation_signature()
@@ -2680,6 +2687,26 @@ class Tap(ControlSurface):
             else:
                 self._automation_metadata_retry_count = 0
                 self._automation_metadata_retry_start = None
+
+    def _schedule_parameter_metadata_resend(self, selected_device, metadata, seq_at_schedule):
+        timer = threading.Timer(
+            0.1,
+            self._resend_parameter_metadata_if_current,
+            args=[selected_device, metadata, seq_at_schedule]
+        )
+        timer.start()
+
+    def _resend_parameter_metadata_if_current(self, selected_device, metadata, seq_at_schedule):
+        try:
+            if not selected_device or not liveobj_valid(selected_device):
+                return
+            if self._metadata_send_seq_by_device.get(id(selected_device), 0) != seq_at_schedule:
+                return
+            current_selected = self.song().view.selected_track.view.selected_device
+            if current_selected == selected_device:
+                self._send_sys_ex_message(metadata, 0x7D)
+        except Exception:
+            pass
 
     def _remove_disabled_parameter_listeners(self):
         for (param, control_index), listener in self._disabled_parameter_listeners.items():
@@ -2829,6 +2856,7 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
         self._ensure_song_listener(song, "metronome", self._update_metronome)
+        self._ensure_song_listener(song, "session_record", self._on_session_record_changed)
         try:
             if (not hasattr(song, "is_playing_has_listener")
                     or not song.is_playing_has_listener(self._on_song_is_playing_changed)):
@@ -2900,6 +2928,7 @@ class Tap(ControlSurface):
     def _send_current_project_state(self):
         self.old_clips_array = []
         self._send_transport_state(force=True)
+        self._send_session_record_state(force=True)
         self._update_tempo()
         self._update_metronome()
         self._send_re_enable_automation_enabled()
@@ -2908,6 +2937,7 @@ class Tap(ControlSurface):
         self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
+        self._check_clip_playing_status(force=True)
 
     def _re_enable_automation_value(self):
         try:
@@ -3391,6 +3421,22 @@ class Tap(ControlSurface):
             return
         self._last_sent_transport_state = value
         self.send_cc(118, 0, value)
+
+    def _session_record_value(self):
+        try:
+            return bool(self.song().session_record)
+        except Exception:
+            return False
+
+    def _send_session_record_state(self, force=False):
+        value = 127 if self._session_record_value() else 0
+        if not force and self._last_sent_session_record_state == value:
+            return
+        self._last_sent_session_record_state = value
+        self.send_cc(119, 0, value)
+
+    def _on_session_record_changed(self):
+        self._send_session_record_state()
 
     def _clear_follow_action_launch_state(self):
         changed = bool(self._active_follow_actions or self._handled_follow_action_launches)
@@ -4982,6 +5028,7 @@ class Tap(ControlSurface):
                 self.song().session_record = True
             else:
                 self.song().session_record = False
+            self._send_session_record_state(force=True)
             self._set_up_notes_playing("clip")
 
     def _capture_button_value(self, value):
@@ -5185,7 +5232,7 @@ class Tap(ControlSurface):
             # when no device was selected (listener won't fire).
             if device_to_select is None:
                 self._on_device_changed()
-            self._check_clip_playing_status()
+            self._check_clip_playing_status(force=True)
             if self.seq_status:
                 if self.device_status:
                     self.start_step_seq()
@@ -5214,25 +5261,26 @@ class Tap(ControlSurface):
                         self.playing_position_listeners[clip_index] = listener
                         clip_slot.clip.add_playing_position_listener(listener)
 
-    def _check_clip_playing_status(self):
-        song = self.song()
-        selected_track = song.view.selected_track
-        highlighted_clip_slot_playing = getattr(song.view.highlighted_clip_slot, 'is_playing', False)
-        
-        if highlighted_clip_slot_playing:
-            # Ensure status is 0 if the highlighted clip is playing
-            new_status = 0
-        else:
-            # Check if any other clip is playing
-            another_clip_playing = any(clip_slot.is_playing for clip_slot in selected_track.clip_slots if clip_slot.has_clip)
-            new_status = 1 if another_clip_playing else 2
+    def _check_clip_playing_status(self, force=False):
+        try:
+            song = self.song()
+            selected_track = song.view.selected_track
+            highlighted_clip_slot_playing = getattr(song.view.highlighted_clip_slot, 'is_playing', False)
+            
+            if highlighted_clip_slot_playing:
+                # Ensure status is 0 if the highlighted clip is playing
+                new_status = 0
+            else:
+                # Check if any other clip is playing
+                another_clip_playing = any(clip_slot.is_playing for clip_slot in selected_track.clip_slots if clip_slot.has_clip)
+                new_status = 1 if another_clip_playing else 2
+        except Exception:
+            return
         
         # Update status only if it has changed
-        if self.seq_clip_playing_status != new_status:
+        if force or self.seq_clip_playing_status != new_status:
             self.seq_clip_playing_status = new_status
-            velocity_map = {0: 100, 1: 200, 2: 300}
-            velocity = velocity_map[new_status] & 0x7F
-            self.send_note_on(2, 3, velocity)
+            self.send_cc(67, 11, new_status)
 
     def _clip_pos_changed(self, clip_index):
         # Only check and send things if we are in device view
@@ -9313,6 +9361,7 @@ class Tap(ControlSurface):
         scenes_list = self.song().scenes
         new_index = self._find_track_index(selected_scene, scenes_list)
         self._send_selected_clip_slot(new_index)
+        self._check_clip_playing_status(force=True)
         if self.seq_status:
             self.start_step_seq()
 
@@ -9834,7 +9883,7 @@ class Tap(ControlSurface):
     def _update_device_status(self, value):
         if value:
             self.device_status = True
-            self._check_clip_playing_status()
+            self._check_clip_playing_status(force=True)
             if not self.mixer_status:
                 self._send_selected_device_state()
         else:
@@ -9854,6 +9903,7 @@ class Tap(ControlSurface):
         selected_clip_slot = song.view.highlighted_clip_slot
         self.send_selected_clip_metadata()
         self.send_selected_clip_notes()
+        self._check_clip_playing_status(force=True)
         # self.log_message("Starting step seq")
         if self.last_selected_clip_slot is not selected_clip_slot:
             if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
@@ -10667,6 +10717,7 @@ class Tap(ControlSurface):
         song.remove_scale_name_listener(self._on_scale_changed)
         song.remove_root_note_listener(self._on_scale_changed)
         self._remove_song_listener(song, "metronome", self._update_metronome)
+        self._remove_song_listener(song, "session_record", self._on_session_record_changed)
         self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
         try:
             if hasattr(song, 'remove_is_playing_listener') and (
