@@ -271,6 +271,8 @@ class Tap(ControlSurface):
     TRACK_DEVICE_MAIN_BANK_NAME = "Main"
     TRACK_DEVICE_SEND_BANK_NAME = "Sends"
     TRACK_DEVICE_BANK_SIZE = 8
+    TRACK_DEVICE_PITCH_BEND_CENTER = 8192.0
+    TRACK_DEVICE_PITCH_BEND_MAX = 16383.0
     TRACK_DEVICE_MIDI_CONTROLS = (
         {"name": "Mod Wheel", "kind": "mod_wheel", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
         {"name": "Pressure", "kind": "pressure", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
@@ -925,6 +927,18 @@ class Tap(ControlSurface):
             raw_value = ((int(message[4]) & 0x7F) << 14) | ((int(message[5]) & 0x7F) << 7) | (int(message[6]) & 0x7F)
             raw_value = max(0, min(65535, raw_value))
 
+            if gesture_state == 4:
+                track = self.song().view.selected_track
+                kind = {0: "mod_wheel", 1: "pressure"}.get(control_index)
+                entry = self._track_midi_control_entry_for_kind(kind, track)
+                if entry:
+                    self._set_track_midi_control_normalized_value(
+                        entry,
+                        float(raw_value) / 65535.0,
+                        track
+                    )
+                return
+
             if self._track_device_is_selected():
                 entry = self._track_device_parameter_entry_for_control(control_index)
                 if entry and entry.get("kind") != "parameter":
@@ -1189,10 +1203,11 @@ class Tap(ControlSurface):
     
             mixer_device = track.mixer_device
     
+            track_has_midi_input = bool(getattr(track, "has_midi_input", False))
             midi_controls = [
                 dict(control)
                 for control in self.TRACK_DEVICE_MIDI_CONTROLS
-            ]
+            ] if track_has_midi_input else []
     
             mixer_controls = [
                 {
@@ -1310,6 +1325,20 @@ class Tap(ControlSurface):
         kind = entry.get("kind", "")
         return max(0.0, min(1.0, float(self._track_midi_control_state(track).get(kind, self._track_midi_control_default_normalized(entry)))))
 
+    def _track_midi_control_entry_for_kind(self, kind, track=None):
+        if not kind:
+            return None
+        try:
+            track = track or self.song().view.selected_track
+            if not bool(getattr(track, "has_midi_input", False)):
+                return None
+            for control in self.TRACK_DEVICE_MIDI_CONTROLS:
+                if control.get("kind") == kind:
+                    return dict(control)
+        except Exception:
+            pass
+        return None
+
     def _set_track_midi_control_normalized_value(self, entry, normalized, track=None):
         if not entry:
             return
@@ -1330,6 +1359,13 @@ class Tap(ControlSurface):
     def _track_midi_control_display_value(self, entry, normalized):
         raw_value = self._track_midi_control_raw_value(entry, normalized)
         try:
+            if entry.get("kind") == "pitch_bend":
+                offset = raw_value - self.TRACK_DEVICE_PITCH_BEND_CENTER
+                denominator = (self.TRACK_DEVICE_PITCH_BEND_MAX - self.TRACK_DEVICE_PITCH_BEND_CENTER) if offset >= 0 else self.TRACK_DEVICE_PITCH_BEND_CENTER
+                percent = int(round((offset / denominator) * 100.0)) if denominator else 0
+                if percent == 0:
+                    return "0"
+                return "+{}".format(percent) if percent > 0 else str(percent)
             if entry.get("kind") == "velocity":
                 return str(max(1, min(127, int(round(raw_value)))))
             return str(int(round(raw_value)))
@@ -1354,8 +1390,20 @@ class Tap(ControlSurface):
             0x28
         )
 
-    def _set_track_midi_control_value_for_control(self, control_index, value=None, normalized=None, track=None):
-        if not self._track_device_is_selected(track):
+    def _send_track_local_control_state(self, track=None):
+        try:
+            track = track or self.song().view.selected_track
+            has_midi_input = bool(getattr(track, "has_midi_input", False))
+            state = self._track_midi_control_state(track) if has_midi_input else {}
+            mod_wheel = max(0.0, min(1.0, float(state.get("mod_wheel", 0.0))))
+            pressure = max(0.0, min(1.0, float(state.get("pressure", 0.0))))
+            payload = "mod_wheel|{:.6f},pressure|{:.6f}".format(mod_wheel, pressure)
+            self._send_sys_ex_message(payload, 0x3B)
+        except Exception:
+            pass
+
+    def _set_track_midi_control_value_for_control(self, control_index, value=None, normalized=None, track=None, require_selected=True, send_feedback=True):
+        if require_selected and not self._track_device_is_selected(track):
             return False
 
         entry = self._track_device_parameter_entry_for_control(control_index, track)
@@ -1366,7 +1414,8 @@ class Tap(ControlSurface):
             normalized = max(0.0, min(1.0, float(value) / 127.0))
         normalized = max(0.0, min(1.0, float(normalized)))
         self._set_track_midi_control_normalized_value(entry, normalized, track)
-        self._send_track_midi_control_feedback(control_index, entry, normalized, track)
+        if send_feedback:
+            self._send_track_midi_control_feedback(control_index, entry, normalized, track)
         return True
 
     def _track_device_parameter_metadata_item(self, control_index, track=None):
@@ -5710,6 +5759,8 @@ class Tap(ControlSurface):
     def _on_selected_track_changed(self):
         if self.was_initialized:
             selected_track = self.song().view.selected_track
+            track_control_selected = self._track_device_is_selected(selected_track)
+            self._track_device_selected = track_control_selected
             track_has_midi_input = 0
             if selected_track and selected_track.has_midi_input:
                 self._set_selected_track_implicit_arm()
@@ -5725,15 +5776,19 @@ class Tap(ControlSurface):
             device_to_select = selected_track.view.selected_device
             if device_to_select is None and len(selected_track.devices) > 0:
                 device_to_select = selected_track.devices[0]
-            if self._track_device_is_selected(selected_track):
+            if track_control_selected:
+                self._last_automation_signature = None
                 self._on_device_changed()
             elif device_to_select is not None:
                 self._track_change_in_progress = True
                 self.song().view.select_device(device_to_select)
                 self._track_change_in_progress = False
                 self._device_component.set_device(device_to_select)
+                self._last_automation_signature = None
+                self._on_device_changed()
             else:
                 self._device_component.set_device(device_to_select)
+                self._last_automation_signature = None
                 self._on_device_changed()
             self._check_clip_playing_status(force=True)
             if self.seq_status:
@@ -7186,6 +7241,9 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if len(values) == 2:
                 self._duplicate_loop(values[0], values[1])
+        # request selected track local controls (ModWheel/Pressure)
+        if len(message) >= 2 and message[1] == 59:
+            self._send_track_local_control_state()
         
         # add MULTIPLE notes
         if len(message) >= 2 and message[1] == 14:
