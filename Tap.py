@@ -409,6 +409,8 @@ class Tap(ControlSurface):
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
             connection_check_button.add_value_listener(self._connection_established)
+            self.transport_toggle_button = ButtonElement(1, MIDI_CC_TYPE, 0, 116)
+            self.transport_toggle_button.add_value_listener(self._transport_toggle_value)
             # send project again button
             send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
             send_project_button.add_value_listener(self._send_project)
@@ -2194,8 +2196,6 @@ class Tap(ControlSurface):
                 self._send_midi(sys_ex_message)
 
     def _initialize_buttons(self):
-        transport.set_play_button(ButtonElement(1, MIDI_CC_TYPE, 0, 118))
-        transport.set_stop_button(ButtonElement(1, MIDI_CC_TYPE, 0, 117))
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
         session_component.set_stop_all_clips_button(ButtonElement(1, MIDI_NOTE_TYPE, 15, 96))
         self.capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
@@ -2767,6 +2767,17 @@ class Tap(ControlSurface):
             did_send_new_song = self._check_for_new_song()
             if was_initialized and not did_send_new_song:
                 self._send_current_project_state()
+
+    def _transport_toggle_value(self, value):
+        if value:
+            try:
+                if self._song_is_playing():
+                    self.song().stop_playing()
+                else:
+                    self.song().start_playing()
+                self._send_transport_state(force=True)
+            except Exception:
+                pass
 
     def _send_project(self, value):
         if value:
@@ -6927,11 +6938,6 @@ class Tap(ControlSurface):
             self._update_mutator_clip_settings(message)
         if len(message) >= 2 and message[1] == 58:
             self._replace_rhythm_generator_lane(message)
-            
-
-
-
-
     def _replace_rhythm_generator_lane(self, message):
         try:
             payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
@@ -10632,6 +10638,8 @@ class Tap(ControlSurface):
             self.redo_button.remove_value_listener(self._redo_button_value)
         if hasattr(self, 'undo_button'):
             self.undo_button.remove_value_listener(self._undo_button_value)
+        if hasattr(self, 'transport_toggle_button'):
+            self.transport_toggle_button.remove_value_listener(self._transport_toggle_value)
         # browser buttons cleanup
         if hasattr(self, 'browser_start_button'):
             self.browser_start_button.remove_value_listener(self._start_browser)
