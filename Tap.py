@@ -267,6 +267,16 @@ class Tap(ControlSurface):
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
     UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
     UNMAPPED_PARAMETER_METADATA = ",".join([UNMAPPED_PARAMETER_METADATA_ITEM] * 8)
+    TRACK_DEVICE_NAV_NAME = "line.3.horizontal"
+    TRACK_DEVICE_MAIN_BANK_NAME = "Main"
+    TRACK_DEVICE_SEND_BANK_NAME = "Sends"
+    TRACK_DEVICE_BANK_SIZE = 8
+    TRACK_DEVICE_MIDI_CONTROLS = (
+        {"name": "Mod Wheel", "kind": "mod_wheel", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
+        {"name": "Pressure", "kind": "pressure", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
+        {"name": "Pitch Bend", "kind": "pitch_bend", "min": 0.0, "max": 16383.0, "default": 8192.0, "automatable": False},
+        {"name": "Velocity", "kind": "velocity", "min": 1.0, "max": 127.0, "default": 100.0, "automatable": False},
+    )
     AUTOMATION_ENVELOPE_MAX_SAMPLES = 1024
     AUTOMATION_ENVELOPE_LINEAR_EPSILON = 0.0015
     AUTOMATION_ENVELOPE_JUMP_THRESHOLD = 0.1
@@ -406,6 +416,10 @@ class Tap(ControlSurface):
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
             self._mixer_automation_status_timers = []
+            self._track_device_selected = False
+            self._track_control_selection_by_track = {}
+            self._track_control_bank_index_by_track = {}
+            self._track_midi_control_values_by_track = {}
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -454,6 +468,11 @@ class Tap(ControlSurface):
 
     def _connect_device_controls(self):
         if hasattr(self, '_device_controls'):
+            for control in self._device_controls:
+                try:
+                    control.suppress_script_forwarding = False
+                except Exception:
+                    pass
             self._device.set_parameter_controls(self._device_controls)
         self._refresh_parameter_value_listeners_current_bank()
         self._refresh_parameter_name_listeners_current_bank()
@@ -466,6 +485,21 @@ class Tap(ControlSurface):
         self._remove_parameter_name_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
+
+    def _connect_track_device_parameter_controls(self, track=None):
+        if not hasattr(self, "_device") or not hasattr(self, "_device_controls"):
+            return
+
+        controls = []
+        for control_index, control in enumerate(self._device_controls):
+            entry = self._track_device_parameter_entry_for_control(control_index, track)
+            is_parameter = bool(entry and entry.get("kind") == "parameter")
+            try:
+                control.suppress_script_forwarding = False
+            except Exception:
+                pass
+            controls.append(control if is_parameter else None)
+        self._device.set_parameter_controls(tuple(controls))
 
     def _on_nav_button_pressed(self, value):
         if value:
@@ -870,6 +904,9 @@ class Tap(ControlSurface):
     def _on_device_control_value(self, value, control):
         try:
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
+            if control_index >= 0 and self._set_track_midi_control_value_for_control(control_index, value=value):
+                return
+
             mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
             self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
             if self._consume_remove_automation_request(mapped_parameter):
@@ -887,6 +924,21 @@ class Tap(ControlSurface):
             gesture_state = int(message[3])
             raw_value = ((int(message[4]) & 0x7F) << 14) | ((int(message[5]) & 0x7F) << 7) | (int(message[6]) & 0x7F)
             raw_value = max(0, min(65535, raw_value))
+
+            if self._track_device_is_selected():
+                entry = self._track_device_parameter_entry_for_control(control_index)
+                if entry and entry.get("kind") != "parameter":
+                    if gesture_state in (0, 1, 2):
+                        self._set_track_midi_control_value_for_control(
+                            control_index,
+                            normalized=float(raw_value) / 65535.0
+                        )
+                    elif gesture_state == 3:
+                        self._set_track_midi_control_value_for_control(
+                            control_index,
+                            normalized=self._track_midi_control_default_normalized(entry)
+                        )
+                    return
 
             mapped_parameter = self._current_connected_parameter_for_control(control_index)
             if not mapped_parameter:
@@ -939,11 +991,28 @@ class Tap(ControlSurface):
             self._debug_log("Error setting high resolution parameter: {}".format(str(e)))
 
     def _bank_select(self, value):
-        if not liveobj_valid(self._device):
-            return
-        
         offset = value - 64
         if offset == 0:
+            return
+
+        if self._track_device_is_selected():
+            all_bank_names = self._track_device_bank_names()
+            if not all_bank_names:
+                return
+
+            current_index = max(0, min(len(all_bank_names) - 1, self._track_control_bank_index()))
+            new_index = max(0, min(len(all_bank_names) - 1, current_index + offset))
+            if new_index != current_index:
+                self._set_track_control_bank_index(new_index)
+                self._connect_track_device_parameter_controls()
+                try:
+                    self.request_rebuild_midi_map()
+                except Exception:
+                    pass
+                self._on_device_changed(False)
+            return
+
+        if not liveobj_valid(self._device):
             return
         
         all_bank_names = self._device._parameter_bank_names()
@@ -1058,6 +1127,369 @@ class Tap(ControlSurface):
         
         start_idx, end_idx = macro_ranges[bank_name]
         return any(device.macros_mapped[start_idx:end_idx])
+
+    def _app_device_index_to_live_index(self, value):
+        try:
+            return int(value) - 1
+        except Exception:
+            return -1
+
+    def _track_control_key(self, track=None):
+        try:
+            track = track or self.song().view.selected_track
+            return self._live_object_identity(track) if track else None
+        except Exception:
+            return None
+
+    def _track_device_is_selected(self, track=None):
+        key = self._track_control_key(track)
+        if key is None:
+            return False
+        selections = getattr(self, "_track_control_selection_by_track", {})
+        if key in selections:
+            return bool(selections[key])
+        try:
+            track = track or self.song().view.selected_track
+            has_devices = track and hasattr(track, "devices") and len(track.devices) > 0
+            return not has_devices
+        except Exception:
+            return False
+
+    def _set_track_device_selected(self, selected, track=None):
+        key = self._track_control_key(track)
+        if key is not None:
+            self._track_control_selection_by_track[key] = bool(selected)
+        self._track_device_selected = bool(selected)
+
+    def _track_control_bank_index(self, track=None):
+        key = self._track_control_key(track)
+        if key is None:
+            return 0
+        return int(getattr(self, "_track_control_bank_index_by_track", {}).get(key, 0))
+
+    def _set_track_control_bank_index(self, index, track=None):
+        key = self._track_control_key(track)
+        if key is not None:
+            self._track_control_bank_index_by_track[key] = int(index)
+        self._track_device_bank_index = int(index)
+
+    def _send_name_for_index(self, index):
+        if index < 0:
+            return "Send"
+        if index < 26:
+            return "Send {}".format(chr(ord("A") + index))
+        return "Send {}".format(index + 1)
+
+    def _track_device_parameters(self, track=None):
+        try:
+            track = track or self.song().view.selected_track
+    
+            if track is None or not hasattr(track, "mixer_device"):
+                return []
+    
+            mixer_device = track.mixer_device
+    
+            midi_controls = [
+                dict(control)
+                for control in self.TRACK_DEVICE_MIDI_CONTROLS
+            ]
+    
+            mixer_controls = [
+                {
+                    "name": "Volume",
+                    "parameter": mixer_device.volume,
+                    "kind": "parameter",
+                    "automatable": True,
+                },
+                {
+                    "name": "Pan",
+                    "parameter": mixer_device.panning,
+                    "kind": "parameter",
+                    "automatable": True,
+                },
+            ]
+    
+            sends = [
+                {
+                    "name": self._send_name_for_index(send_index),
+                    "parameter": send,
+                    "kind": "parameter",
+                    "automatable": True,
+                }
+                for send_index, send in enumerate(mixer_device.sends)
+                if send and liveobj_valid(send)
+            ]
+    
+            entries = midi_controls[:4] + mixer_controls + sends
+    
+            return [
+                entry
+                for entry in entries
+                if entry.get("kind") != "parameter"
+                or (
+                    entry.get("parameter")
+                    and liveobj_valid(entry.get("parameter"))
+                )
+            ]
+    
+        except Exception:
+            return []
+
+    def _track_device_main_entries(self, track=None):
+        return self._track_device_parameters(track)[:self.TRACK_DEVICE_BANK_SIZE]
+
+    def _track_device_extra_send_entries(self, track=None):
+        return [
+            entry for entry in self._track_device_parameters(track)[self.TRACK_DEVICE_BANK_SIZE:]
+            if entry.get("name", "").startswith("Send ")
+        ]
+
+    def _track_device_bank_names(self, track=None):
+        extra_sends = self._track_device_extra_send_entries(track)
+        names = [self.TRACK_DEVICE_MAIN_BANK_NAME]
+        if not extra_sends:
+            return names
+
+        send_bank_count = int(math.ceil(float(len(extra_sends)) / float(self.TRACK_DEVICE_BANK_SIZE)))
+        if send_bank_count == 1:
+            names.append(self.TRACK_DEVICE_SEND_BANK_NAME)
+        else:
+            for bank_index in range(send_bank_count):
+                names.append("{} {}".format(self.TRACK_DEVICE_SEND_BANK_NAME, bank_index + 1))
+        return names
+
+    def _track_device_current_bank_index(self, track=None):
+        bank_names = self._track_device_bank_names(track)
+        if not bank_names:
+            self._set_track_control_bank_index(0, track)
+            return 0
+
+        index = max(0, min(len(bank_names) - 1, self._track_control_bank_index(track)))
+        self._set_track_control_bank_index(index, track)
+        return index
+
+    def _track_device_parameter_entry_for_control(self, control_index, track=None):
+        bank_index = self._track_device_current_bank_index(track)
+        if bank_index == 0:
+            entries = self._track_device_main_entries(track)
+        else:
+            start = (bank_index - 1) * self.TRACK_DEVICE_BANK_SIZE
+            entries = self._track_device_extra_send_entries(track)[start:start + self.TRACK_DEVICE_BANK_SIZE]
+        if control_index >= 0 and control_index < len(entries):
+            return entries[control_index]
+        return None
+
+    def _track_device_parameter_for_control(self, control_index, track=None):
+        entry = self._track_device_parameter_entry_for_control(control_index, track)
+        if entry and entry.get("kind") == "parameter":
+            return entry.get("parameter")
+        return None
+
+    def _track_midi_control_state(self, track=None):
+        key = self._track_control_key(track) or "global"
+        state_by_track = getattr(self, "_track_midi_control_values_by_track", {})
+        if key not in state_by_track:
+            state_by_track[key] = {}
+            self._track_midi_control_values_by_track = state_by_track
+        return state_by_track[key]
+
+    def _track_midi_control_default_normalized(self, entry):
+        try:
+            minimum = float(entry.get("min", 0.0))
+            maximum = float(entry.get("max", 127.0))
+            default = float(entry.get("default", minimum))
+            if maximum == minimum:
+                return 0.0
+            return max(0.0, min(1.0, (default - minimum) / (maximum - minimum)))
+        except Exception:
+            return 0.0
+
+    def _track_midi_control_normalized_value(self, entry, track=None):
+        if not entry:
+            return 0.0
+        kind = entry.get("kind", "")
+        return max(0.0, min(1.0, float(self._track_midi_control_state(track).get(kind, self._track_midi_control_default_normalized(entry)))))
+
+    def _set_track_midi_control_normalized_value(self, entry, normalized, track=None):
+        if not entry:
+            return
+        kind = entry.get("kind", "")
+        if not kind:
+            return
+        self._track_midi_control_state(track)[kind] = max(0.0, min(1.0, float(normalized)))
+
+    def _track_midi_control_raw_value(self, entry, normalized):
+        try:
+            minimum = float(entry.get("min", 0.0))
+            maximum = float(entry.get("max", 127.0))
+            normalized = max(0.0, min(1.0, float(normalized)))
+            return minimum + ((maximum - minimum) * normalized)
+        except Exception:
+            return 0.0
+
+    def _track_midi_control_display_value(self, entry, normalized):
+        raw_value = self._track_midi_control_raw_value(entry, normalized)
+        try:
+            if entry.get("kind") == "velocity":
+                return str(max(1, min(127, int(round(raw_value)))))
+            return str(int(round(raw_value)))
+        except Exception:
+            return "0"
+
+    def _send_track_midi_control_feedback(self, control_index, entry=None, normalized=None, track=None):
+        entry = entry or self._track_device_parameter_entry_for_control(control_index, track)
+        if not entry or entry.get("kind") == "parameter":
+            return
+
+        if normalized is None:
+            normalized = self._track_midi_control_normalized_value(entry, track)
+        normalized = max(0.0, min(1.0, float(normalized)))
+        cc_value = max(0, min(127, int(round(normalized * 127.0))))
+        display_value = self._track_midi_control_display_value(entry, normalized)
+
+        self.send_cc(72 + control_index, 8, cc_value)
+        self._last_sent_parameter_cc_values[control_index] = cc_value
+        self._send_sys_ex_message(
+            "{}|{}|{}".format(control_index, normalized, self._escape_sysex_string(display_value)),
+            0x28
+        )
+
+    def _set_track_midi_control_value_for_control(self, control_index, value=None, normalized=None, track=None):
+        if not self._track_device_is_selected(track):
+            return False
+
+        entry = self._track_device_parameter_entry_for_control(control_index, track)
+        if not entry or entry.get("kind") == "parameter":
+            return False
+
+        if normalized is None:
+            normalized = max(0.0, min(1.0, float(value) / 127.0))
+        normalized = max(0.0, min(1.0, float(normalized)))
+        self._set_track_midi_control_normalized_value(entry, normalized, track)
+        self._send_track_midi_control_feedback(control_index, entry, normalized, track)
+        return True
+
+    def _track_device_parameter_metadata_item(self, control_index, track=None):
+        entry = self._track_device_parameter_entry_for_control(control_index, track)
+        if not entry:
+            return self.UNMAPPED_PARAMETER_METADATA_ITEM
+
+        if entry.get("kind") != "parameter":
+            name = self._escape_sysex_string(entry.get("name", ""))
+            minimum = float(entry.get("min", 0.0))
+            maximum = float(entry.get("max", 127.0))
+            default = float(entry.get("default", minimum))
+            normalized = self._track_midi_control_normalized_value(entry, track)
+            display_value = self._track_midi_control_display_value(entry, normalized)
+            fields = [
+                name,
+                str(int(minimum)) if minimum == int(minimum) else str(minimum),
+                str(int(maximum)) if maximum == int(maximum) else str(maximum),
+                str(int(default)) if default == int(default) else str(default),
+                str(max(0.0, min(1.0, round(self._track_midi_control_default_normalized(entry), 3)))),
+                str(int(minimum + ((maximum - minimum) * 32 / 127))),
+                "",
+                display_value,
+                str(max(0.0, min(1.0, normalized))),
+                self._escape_sysex_string(entry.get("kind", "")),
+                "1" if entry.get("automatable", False) else "0",
+            ]
+            return "|".join(fields)
+
+        fallback_name = entry.get("name", "")
+        parameter = entry.get("parameter")
+        name = self._get_parameter_display_name(parameter)
+        try:
+            escaped_parameter_name = self._escape_sysex_string(getattr(parameter, "name", ""))
+            prefix = ""
+            display_name = name
+            for candidate_prefix in ("**", "*/", "*-"):
+                if display_name.startswith(candidate_prefix):
+                    prefix = candidate_prefix
+                    display_name = display_name[len(candidate_prefix):]
+                    break
+            if display_name == escaped_parameter_name:
+                name = prefix + self._escape_sysex_string(fallback_name)
+        except Exception:
+            pass
+
+        min_val_str = None
+        max_val_str = None
+        default_val_str = None
+        try:
+            if hasattr(parameter, 'str_for_value') and hasattr(parameter, 'min') and hasattr(parameter, 'max'):
+                min_val_str = parameter.str_for_value(parameter.min)
+                max_val_str = parameter.str_for_value(parameter.max)
+        except Exception:
+            pass
+
+        if min_val_str is None:
+            min_val_str = str(parameter.min) if hasattr(parameter, 'min') else "0.0"
+        if max_val_str is None:
+            max_val_str = str(parameter.max) if hasattr(parameter, 'max') else "1.0"
+
+        raw_default_value = 0.0
+        quarter_str = "0.0"
+        try:
+            raw_default_value = getattr(parameter, "default_value", parameter.min if hasattr(parameter, "min") else 0.0)
+            if hasattr(parameter, 'str_for_value'):
+                default_val_str = parameter.str_for_value(raw_default_value)
+                if hasattr(parameter, 'min') and hasattr(parameter, 'max'):
+                    quarter_value = parameter.min + (parameter.max - parameter.min) * 32 / 127
+                    quarter_str = parameter.str_for_value(quarter_value)
+            else:
+                default_val_str = str(round(raw_default_value, 2))
+            if hasattr(parameter, 'min') and hasattr(parameter, 'max') and parameter.max != parameter.min:
+                raw_default_value = round((raw_default_value - parameter.min) / (parameter.max - parameter.min), 3)
+        except Exception:
+            default_val_str = min_val_str
+
+        value_items = ''
+        if hasattr(parameter, 'is_quantized') and parameter.is_quantized and hasattr(parameter, 'value_items'):
+            value_items = ';'.join(self._escape_sysex_string(item) for item in parameter.value_items)
+
+        fields = [
+            name.strip(),
+            self._escape_sysex_string(str(min_val_str).strip()),
+            self._escape_sysex_string(str(max_val_str).strip()),
+            self._escape_sysex_string(str(default_val_str).strip()),
+            str(raw_default_value).strip(),
+            self._escape_sysex_string(str(quarter_str).strip()),
+            value_items.strip(),
+            self._escape_sysex_string(self._parameter_display_value(parameter)),
+            str(self._parameter_normalized_value(parameter)),
+            "parameter",
+            "1",
+        ]
+        return "|".join(fields)
+
+    def _build_track_device_parameter_metadata(self, track=None):
+        return ",".join(
+            self._track_device_parameter_metadata_item(index, track)
+            for index in range(8)
+        )
+
+    def _send_track_device_bank_state(self, track_has_drums):
+        bank_names = self._track_device_bank_names()
+        bank_index = self._track_device_current_bank_index()
+        current_bank_name = bank_names[bank_index] if bank_names else self.TRACK_DEVICE_MAIN_BANK_NAME
+        bank_name_drum = self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums)
+        self._send_sys_ex_message(bank_name_drum, 0x6D)
+        self._send_sys_ex_message(",".join(self._escape_sysex_string(name) for name in bank_names), 0x5D)
+        return current_bank_name, tuple(bank_names), tuple(bank_names)
+
+    def _send_track_device_parameter_metadata(self, track=None):
+        metadata = self._build_track_device_parameter_metadata(track)
+        self._send_sys_ex_message(metadata, 0x7D)
+        for control_index in range(8):
+            entry = self._track_device_parameter_entry_for_control(control_index, track)
+            parameter = entry.get("parameter") if entry and entry.get("kind") == "parameter" else None
+            if parameter and liveobj_valid(parameter):
+                self._send_parameter_feedback(control_index, parameter, send_cc=True, force_display=True)
+            elif entry:
+                self._send_track_midi_control_feedback(control_index, entry, track=track)
+            else:
+                self.send_cc(72 + control_index, 8, 0)
 
     def _send_bank_state(self, selected_device, track_has_drums):
         current_bank_name = self._device._bank_name
@@ -1195,6 +1627,10 @@ class Tap(ControlSurface):
             return None
 
     def _current_connected_parameter_for_control(self, control_index, selected_device=None):
+        if self._track_device_is_selected():
+            track_parameter = self._track_device_parameter_for_control(control_index)
+            return track_parameter if track_parameter and liveobj_valid(track_parameter) else None
+
         selected_device = selected_device or self._selected_device()
         bank_param = self._current_bank_parameter_for_control(selected_device, control_index)
         if bank_param and liveobj_valid(bank_param):
@@ -1217,6 +1653,9 @@ class Tap(ControlSurface):
         return current_param and liveobj_valid(current_param) and current_param == device_param
     
     def _build_parameter_metadata(self, selected_device):
+        if self._track_device_is_selected():
+            return self._build_track_device_parameter_metadata()
+
         if not hasattr(selected_device, 'parameters'):
             return ""
         
@@ -1591,6 +2030,56 @@ class Tap(ControlSurface):
             drum_rack_device = self._find_drum_rack_in_track(selected_track) if selected_track else None
             if drum_rack_device is not None:
                 track_has_drums = 1
+
+            if self._track_device_is_selected():
+                self._connect_track_device_parameter_controls(selected_track)
+                self._send_track_device_bank_state(track_has_drums)
+                self._remove_parameter_value_listeners()
+                self._remove_parameter_name_listeners()
+                self._remove_parameter_source_listener()
+                self._remove_automation_state_listeners()
+                self._automation_metadata_device_id = None
+                if selected_track and hasattr(selected_track, "mixer_device"):
+                    self._set_parameter_source_listener(selected_track.mixer_device)
+
+                available_devices_string = self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)
+                all_devices = []
+                chain_info = []
+                if send_device_navigation and selected_track and hasattr(selected_track, "devices"):
+                    all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+                    all_device_names = [self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)]
+                    for i, device in enumerate(all_devices):
+                        name = device.name
+                        starts = [info for info in chain_info if info['start_index'] == i]
+                        ends = [info for info in chain_info if info['end_index'] == i]
+
+                        prefix = ""
+                        for s in starts:
+                            if s['type'] == 'rack':
+                                prefix += "||"
+                            elif s['type'] == 'chain':
+                                prefix += "|*"
+
+                        suffix = ""
+                        for e in [e for e in ends if e['type'] == 'chain']:
+                            suffix += "*|"
+                        for e in [e for e in ends if e['type'] == 'rack']:
+                            suffix += "||"
+
+                        all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
+                    available_devices_string = ','.join(all_device_names)
+
+                    self._send_sys_ex_message("0", 0x4D)
+                    self._send_sys_ex_message(available_devices_string, 0x01)
+                    self._send_rack_snapshot_state(all_devices)
+
+                self._send_track_device_parameter_metadata(selected_track)
+                self._refresh_parameter_value_listeners_current_bank(send_current_values=True)
+                self._refresh_parameter_name_listeners_current_bank()
+                self._refresh_automation_state_listeners_current_bank()
+                self._last_automation_signature = self._get_automation_signature()
+                return
+
             current_bank_name, all_bank_names, connected_bank_names = self._send_bank_state(selected_device, track_has_drums)
 
             self._remove_parameter_value_listeners()
@@ -1633,11 +2122,15 @@ class Tap(ControlSurface):
                     all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
                 
                 available_devices_string = ','.join(all_device_names)
+                if all_device_names:
+                    available_devices_string = self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME) + "," + available_devices_string
+                else:
+                    available_devices_string = self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)
                 
                 # CHANGE 2: Find index of selected device in our comprehensive nested devices list
                 for index, device in enumerate(all_devices):
                     if device == selected_device:
-                        selected_device_index = str(index)
+                        selected_device_index = str(index + 1)
                         break
             
             # set up drum pad listeners after the fast bank update
@@ -1912,7 +2405,7 @@ class Tap(ControlSurface):
                 continue
             has_mapped_macros, variation_count, selected_variation_index = info
             entries.append("{}|{}|{}|{}".format(
-                index,
+                index + 1,
                 1 if has_mapped_macros else 0,
                 variation_count,
                 selected_variation_index
@@ -2586,6 +3079,12 @@ class Tap(ControlSurface):
             return
         
         selected_track = self.song().view.selected_track
+        if self._track_device_is_selected():
+            self._send_track_device_parameter_metadata(selected_track)
+            self._last_automation_signature = self._get_automation_signature()
+            self._send_re_enable_automation_enabled(force=True)
+            return
+
         selected_device = selected_track.view.selected_device
         
         if not selected_device or not hasattr(selected_device, 'parameters'):
@@ -2916,6 +3415,10 @@ class Tap(ControlSurface):
         try:
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device if selected_track else None
+            if self._track_device_is_selected():
+                self._last_automation_signature = None
+                self._on_device_changed()
+                return
             if hasattr(self, "_device") and hasattr(self._device, "set_device"):
                 self._device.set_device(selected_device)
             if selected_device:
@@ -5222,15 +5725,15 @@ class Tap(ControlSurface):
             device_to_select = selected_track.view.selected_device
             if device_to_select is None and len(selected_track.devices) > 0:
                 device_to_select = selected_track.devices[0]
-            if device_to_select is not None:
+            if self._track_device_is_selected(selected_track):
+                self._on_device_changed()
+            elif device_to_select is not None:
                 self._track_change_in_progress = True
                 self.song().view.select_device(device_to_select)
                 self._track_change_in_progress = False
-            self._device_component.set_device(device_to_select)
-            # _on_device_changed is already called by select_device above via
-            # the @subject_slot('device') listener. Only call it explicitly
-            # when no device was selected (listener won't fire).
-            if device_to_select is None:
+                self._device_component.set_device(device_to_select)
+            else:
+                self._device_component.set_device(device_to_select)
                 self._on_device_changed()
             self._check_clip_playing_status(force=True)
             if self.seq_status:
@@ -5405,9 +5908,36 @@ class Tap(ControlSurface):
 
     def _select_device_by_index(self, value):
         selected_track = self.song().view.selected_track
+        was_track_control = self._track_device_is_selected(selected_track)
+        if value == 0:
+            self._set_track_device_selected(True, selected_track)
+            self._connect_track_device_parameter_controls(selected_track)
+            try:
+                self.request_rebuild_midi_map()
+            except Exception:
+                pass
+            self._on_device_changed()
+            return
+
+        self._set_track_device_selected(False, selected_track)
+        if was_track_control:
+            self._connect_device_controls()
+            try:
+                self.request_rebuild_midi_map()
+            except Exception:
+                pass
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
-        device_to_select = all_devices[value]
+        live_index = self._app_device_index_to_live_index(value)
+        if live_index < 0 or live_index >= len(all_devices):
+            return
+        device_to_select = all_devices[live_index]
+        was_selected_device = device_to_select == selected_track.view.selected_device
         self.song().view.select_device(device_to_select)
+        if was_selected_device:
+            if hasattr(self, "_device") and hasattr(self._device, "set_device"):
+                self._device.set_device(device_to_select)
+            self._last_automation_signature = None
+            self._on_device_changed()
 
     def _select_track_by_index(self, track_index):
         # self.log_message("Getting track: {}".format(track_index))
@@ -9416,10 +9946,11 @@ class Tap(ControlSurface):
             return None
         
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
-        if device_index < 0 or device_index >= len(all_devices):
+        live_index = self._app_device_index_to_live_index(device_index)
+        if live_index < 0 or live_index >= len(all_devices):
             return None
         
-        device = all_devices[device_index]
+        device = all_devices[live_index]
         if not isinstance(device, Live.RackDevice.RackDevice):
             return None
         return device
@@ -9671,6 +10202,7 @@ class Tap(ControlSurface):
     def _load_item_after_device(self, item, target_index):
         selected_track = self.song().view.selected_track
         before_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        target_index = self._app_device_index_to_live_index(target_index)
         if target_index < 0 or target_index >= len(before_devices):
             return False
 
@@ -9709,6 +10241,8 @@ class Tap(ControlSurface):
     def _move_device_after_index(self, source_index, target_index):
         selected_track = self.song().view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        source_index = self._app_device_index_to_live_index(source_index)
+        target_index = self._app_device_index_to_live_index(target_index)
         if source_index < 0 or target_index < 0 or source_index >= len(all_devices) or target_index >= len(all_devices):
             return
 
@@ -9718,6 +10252,9 @@ class Tap(ControlSurface):
     def _delete_device(self, value):
         selected_track = self.song().view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        value = self._app_device_index_to_live_index(value)
+        if value < 0 or value >= len(all_devices):
+            return
         device_to_delete = all_devices[value]
 
         # Try to find it in top-level devices first
@@ -9756,6 +10293,7 @@ class Tap(ControlSurface):
         song = self.song()
         selected_track = song.view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        value = self._app_device_index_to_live_index(value)
         if value < 0 or value >= len(all_devices):
             return
         device_to_move = all_devices[value]
@@ -9798,6 +10336,7 @@ class Tap(ControlSurface):
         song = self.song()
         selected_track = song.view.selected_track
         all_devices = self._get_all_nested_devices(selected_track.devices)[0]
+        value = self._app_device_index_to_live_index(value)
         if value < 0 or value >= len(all_devices):
             return
         device_to_move = all_devices[value]
