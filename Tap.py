@@ -8110,6 +8110,26 @@ class Tap(ControlSurface):
         spread = int(round((14 if rhythm else 10) + amount * (34 if rhythm else 24)))
         return rnd.randint(-spread, spread)
 
+    def _mutator_rhythm_gate_duration(self, duration, remaining, depth, rnd):
+        amount = max(0.0, min(1.0, float(depth)))
+        current = max(0.0001, float(duration))
+        limit = max(0.0001, float(remaining))
+        if current <= 0.125:
+            short_targets = [0.03125, 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.5]
+            target_limit = min(limit, max(current * (1.0 + amount * 3.0), 0.0625 + amount * 0.3125))
+            candidates = [
+                value
+                for value in short_targets
+                if value <= target_limit + 0.000001 and abs(value - current) >= 0.015625
+            ]
+            if not candidates:
+                candidates = [max(0.03125, min(target_limit, current * (0.5 if current > 0.03125 else 2.0)))]
+            return max(0.03125, min(limit, rnd.choice(candidates)))
+        multiplier_choices = [0.35, 0.5, 0.75, 1.25, 1.5, 2.0]
+        if amount >= 0.75:
+            multiplier_choices += [0.25, 2.5]
+        return max(0.03125, min(limit, current * rnd.choice(multiplier_choices)))
+
     def _mutator_add_fill_values(self, result, values, role, loop_length, settings, rnd, target_pitches=None, rhythm=False):
         if not settings.get("allow_fills", True) or role not in (4, 5, 6, 7, 13, 14, 15):
             return
@@ -8205,6 +8225,17 @@ class Tap(ControlSurface):
 
         self._mutator_add_fill_values(result, result, role, loop_length, settings, rnd, target_pitches=targets, rhythm=True)
 
+        if settings.get("allow_gate_changes", True):
+            for value in result:
+                if rnd.random() < min(1.0, 0.25 + depth * 0.75):
+                    start = max(0.0, min(float(loop_length) - 0.0001, float(value.get("start", 0.0))))
+                    value["duration"] = self._mutator_rhythm_gate_duration(
+                        float(value.get("duration", 0.125)),
+                        float(loop_length) - start,
+                        depth,
+                        rnd
+                    )
+
         return self._mutator_algorithm_prune_values(result, loop_length)
 
     def _mutator_make_rhythm_section_values(self, source_values, role, source_start, loop_length, settings, rnd):
@@ -8241,8 +8272,8 @@ class Tap(ControlSurface):
                 choices = [-2 * grid, -grid, grid, 2 * grid, 3 * grid]
                 start += rnd.choice(choices)
 
-            if settings.get("allow_gate_changes", True) and rnd.random() < depth * 0.65:
-                duration *= rnd.choice([0.5, 0.75, 1.25, 1.5])
+            if settings.get("allow_gate_changes", True) and rnd.random() < min(1.0, 0.25 + depth * 0.75):
+                duration = self._mutator_rhythm_gate_duration(duration, float(loop_length) - max(0.0, start), settings.get("depth", depth), rnd)
 
             if settings.get("allow_velocity_changes", True):
                 velocity += self._mutator_velocity_delta(rnd, settings.get("depth", depth), role, rhythm=True)
