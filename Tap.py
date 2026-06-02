@@ -201,6 +201,7 @@ class TapDeviceComponent(DeviceComponent):
 class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
+    MUTATOR_GENERATION_COOLDOWN_SECONDS = 1.25
     FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v2\|([^\]]*)\]")
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
@@ -398,6 +399,8 @@ class Tap(ControlSurface):
             self._mutator_generation_scheduled = set()
             self._last_mutator_generation_times = {}
             self._last_mutator_generation_request_times = {}
+            self._last_mutator_generation_signatures = {}
+            self._mutator_generation_lock = threading.RLock()
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -4224,8 +4227,8 @@ class Tap(ControlSurface):
             except Exception:
                 depth = 0.0
 
-            preset = int(fields.get("pr", "1"))
-            settings_preset = int(fields.get("sp", fields.get("pr", "1")))
+            preset = int(fields.get("pr", "9"))
+            settings_preset = int(fields.get("sp", fields.get("pr", "9")))
             pending_settings_update = int(fields.get("pd", "0")) == 1
 
             companion_mode = self._mutator_companion_mode_from_code(int(fields.get("cm", "0"))) if fields.get("cm", "").isdigit() else "melody"
@@ -4275,7 +4278,7 @@ class Tap(ControlSurface):
         if not info.get("sections"):
             original_loop_length = max(0.0001, float(info.get("original_loop_length", 0.0001)))
             source_start = float(getattr(clip, "loop_start", 0.0))
-            roles = self._mutator_pattern_roles(info.get("preset", 1))
+            roles = self._mutator_pattern_roles(info.get("preset", 9))
             info["sections"] = [
                 {"role": role, "start": source_start + (index * original_loop_length), "length": original_loop_length}
                 for index, role in enumerate(roles)
@@ -4425,7 +4428,7 @@ class Tap(ControlSurface):
 
     def _mutator_slots_marker_value(self, info):
         parts = []
-        for slot in self._mutator_normalized_slots(info):
+        for slot in self._mutator_visible_slots(info):
             if not slot:
                 parts.append("x")
                 continue
@@ -4475,9 +4478,14 @@ class Tap(ControlSurface):
                 last_used = index + 1
         return max(4, min(10, last_used))
 
+    def _mutator_visible_slots(self, settings):
+        slots = self._mutator_normalized_slots(settings)
+        slot_count = self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), slots)
+        return slots[:slot_count]
+
     def _mutator_active_slots(self, settings):
         slots = [
-            slot for slot in self._mutator_normalized_slots(settings)
+            slot for slot in self._mutator_visible_slots(settings)
             if slot and self._mutator_depth_value(slot, "probability_depth", 0.0) > 0.0
         ]
         if slots:
@@ -4529,8 +4537,8 @@ class Tap(ControlSurface):
         target_pitches = ",".join(str(max(0, min(127, int(pitch)))) for pitch in info.get("target_pitches", [])[:16])
         return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|mp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|cm={}|tg={}|od={}|oo={}|ms={}|mc={}]".format(
             info.get("original_loop_length", 0.0001),
-            info.get("preset", 1),
-            info.get("settings_preset", info.get("preset", 1)),
+            info.get("preset", 9),
+            info.get("settings_preset", info.get("preset", 9)),
             int(info.get("mutations_per_pass", 1)) & 0x7F,
             1 if info.get("pending_settings_update", False) else 0,
             info.get("structure_length", info.get("original_loop_length", 0.0001)),
@@ -7811,7 +7819,7 @@ class Tap(ControlSurface):
             mutator_slots
         )
         return {
-            "preset": int_field(0, 1),
+            "preset": int_field(0, 9),
             "mutations_per_pass": max(1, min(3, int_field(1, 1))),
             "return_after_passes": max(1, min(4, int_field(2, 2))),
             "return_mode": int_field(3, 0),
@@ -7843,7 +7851,9 @@ class Tap(ControlSurface):
 
     def _mutator_info_from_settings(self, settings, previous_info, clip, commit_structure=False):
         scale_index = self._mutator_scale_index_from_name(settings.get("scale", "Minor"))
-        preset = settings.get("preset", previous_info.get("preset", 1))
+        preset = settings.get("preset", previous_info.get("preset", 9))
+        mutator_slots = self._mutator_visible_slots(settings)
+        mutator_slot_count = self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), self._mutator_normalized_slots(settings))
         info = {
             "original_loop_length": previous_info.get("original_loop_length", 0.0001),
             "structure_length": previous_info.get("structure_length", previous_info.get("original_loop_length", 0.0001)),
@@ -7861,9 +7871,9 @@ class Tap(ControlSurface):
             "companion_mode": settings.get("companion_mode", previous_info.get("companion_mode", "melody")),
             "companion_mode_code": self._mutator_companion_mode_code(settings.get("companion_mode", previous_info.get("companion_mode", "melody"))),
             "target_pitches": settings.get("target_pitches", previous_info.get("target_pitches", [])),
-            "operation_order": self._mutator_active_operation_order(settings),
-            "mutator_slots": self._mutator_normalized_slots(settings),
-            "mutator_slot_count": self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), self._mutator_normalized_slots(settings)),
+            "operation_order": [int(slot.get("operation", 0)) for slot in self._mutator_active_slots(settings)],
+            "mutator_slots": mutator_slots,
+            "mutator_slot_count": mutator_slot_count,
             "sections": previous_info.get("sections", []),
         }
         for key in self._mutator_operation_depth_keys():
@@ -7879,7 +7889,7 @@ class Tap(ControlSurface):
 
     def _mutator_generation_settings_changed(self, info, previous_info):
         comparisons = (
-            ("settings_preset", int(info.get("settings_preset", info.get("preset", 1))), int(previous_info.get("settings_preset", previous_info.get("preset", 1)))),
+            ("settings_preset", int(info.get("settings_preset", info.get("preset", 9))), int(previous_info.get("settings_preset", previous_info.get("preset", 9)))),
             ("algorithm_code", int(info.get("algorithm_code", 0)), int(previous_info.get("algorithm_code", self._mutator_algorithm_code(previous_info.get("algorithm", "mutator"))))),
             ("mutations_per_pass", int(info.get("mutations_per_pass", 1)), int(previous_info.get("mutations_per_pass", 1))),
             ("source_mode", int(info.get("source_mode", 2)), int(previous_info.get("source_mode", 2))),
@@ -7894,7 +7904,7 @@ class Tap(ControlSurface):
             return True
         if tuple(info.get("operation_order", [])) != tuple(previous_info.get("operation_order", [])):
             return True
-        if tuple(str(slot) for slot in self._mutator_normalized_slots(info)) != tuple(str(slot) for slot in self._mutator_normalized_slots(previous_info)):
+        if tuple(str(slot) for slot in self._mutator_visible_slots(info)) != tuple(str(slot) for slot in self._mutator_visible_slots(previous_info)):
             return True
         if int(info.get("mutator_slot_count", 4)) != int(previous_info.get("mutator_slot_count", 4)):
             return True
@@ -7928,7 +7938,7 @@ class Tap(ControlSurface):
             14: [0, 1, 2, 7, 5, 13, 14, 6, 15, 8],
             15: [0, 0, 5, 6, 9, 10],
         }
-        return patterns.get(int(preset), patterns[1])
+        return patterns.get(int(preset), patterns[9])
 
     def _mutator_preset_is_chain(self, preset):
         return int(preset) in (2, 6, 7, 8, 15)
@@ -7983,6 +7993,25 @@ class Tap(ControlSurface):
         scale_notes = self._mutator_scale_notes(settings)
         index = self._mutator_scale_index(pitch, scale_notes)
         return scale_notes[max(0, min(len(scale_notes) - 1, index + int(steps)))]
+
+    def _mutator_scale_step_span_for_octave_fraction(self, pitch, amount, settings):
+        amount = max(0.0, min(1.0, float(amount)))
+        if amount <= 0.0:
+            return 0
+        if settings.get("scale", "Minor") == "Chromatic":
+            return max(1, int(math.ceil(amount * 12.0)))
+
+        scale_notes = self._mutator_scale_notes(settings)
+        index = self._mutator_scale_index(pitch, scale_notes)
+        source_pitch = scale_notes[index]
+        semitone_span = max(1, int(math.ceil(amount * 12.0)))
+        upper = index
+        while upper + 1 < len(scale_notes) and scale_notes[upper + 1] - source_pitch <= semitone_span:
+            upper += 1
+        lower = index
+        while lower - 1 >= 0 and source_pitch - scale_notes[lower - 1] <= semitone_span:
+            lower -= 1
+        return max(1, upper - index, index - lower)
 
     def _mutator_degree_pitch(self, degree, octave, settings):
         intervals = self._mutator_scale_intervals(settings.get("scale", "Minor"))
@@ -8400,42 +8429,210 @@ class Tap(ControlSurface):
 
     def _mutator_add_values_by_depth(self, values, depth, role, loop_length, settings, rnd, rhythm=False, target_pitches=None):
         values = [dict(value) for value in tuple(values or ())]
-        additions = self._mutator_operation_count(len(values), depth, rnd)
-        if additions <= 0 or not values:
+        amount = max(0.0, min(1.0, float(depth)))
+        if amount <= 0.0 or not values:
             return values
-        targets = [int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127]
-        if not targets:
-            targets = sorted(set(int(value.get("pitch", 60)) for value in values))
-        occupied = self._mutator_rhythm_occupied_steps(values, loop_length, grid=0.0625 if role == 7 else 0.125)
+        loop_length = max(0.0001, float(loop_length))
+        grid = 0.0625 if role == 7 else 0.125
+        cell_size = 1.0
+        cell_count = max(1, int(math.ceil(loop_length / cell_size)))
         result = list(values)
-        motif = list(values)
-        motif.sort(key=lambda item: (int(item.get("velocity", 96)), -float(item.get("duration", 0.125))), reverse=True)
-        velocity_pool = [max(1, min(127, int(value.get("velocity", 96)))) for value in values]
-        duration_pool = [
-            max(0.03125 if rhythm else 0.0625, float(value.get("duration", 0.125)))
-            for value in values
-            if float(value.get("duration", 0.0)) > 0.0
+        source_pitches = sorted(set(int(value.get("pitch", 60)) for value in values if 0 <= int(value.get("pitch", 60)) <= 127))
+        target_pitch_set = set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127)
+        allowed_pitches = set(source_pitches)
+        if rhythm and target_pitch_set:
+            allowed_pitches = allowed_pitches.intersection(target_pitch_set) or allowed_pitches
+        motif = [
+            value for value in sorted(
+                values,
+                key=lambda item: (
+                    float(item.get("start", 0.0)),
+                    int(item.get("pitch", 60)),
+                    -int(item.get("velocity", 96)),
+                )
+            )
+            if int(value.get("pitch", 60)) in allowed_pitches
         ]
-        for add_index in range(additions):
-            base = dict(motif[add_index % len(motif)])
-            pitch = targets[(add_index + rnd.randrange(len(targets))) % len(targets)] if targets else int(base.get("pitch", 60))
-            sampled_duration = rnd.choice(duration_pool) if duration_pool else rnd.choice([0.0625, 0.125, 0.25, 0.5])
-            sampled_velocity = rnd.choice(velocity_pool) if velocity_pool else rnd.randint(20, 127)
-            if role == 7:
-                start = float(loop_length) * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
-            else:
-                offsets = [0.125, 0.25, 0.375, 0.5, 0.75, 1.0]
-                start = (float(base.get("start", 0.0)) + rnd.choice(offsets)) % float(loop_length)
-            start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied, grid=0.0625 if role == 7 else 0.125)
+        if not motif:
+            return values
+        additions = len(motif) if amount >= 1.0 else max(1, int(round(float(len(motif)) * amount)))
+
+        def quantized(value):
+            return max(0.0, min(loop_length - 0.0001, round(float(value) / grid) * grid))
+
+        def quantized_to(value, step):
+            step = max(0.0001, float(step))
+            return max(0.0, min(loop_length - 0.0001, round(float(value) / step) * step))
+
+        def cell_index(start):
+            return max(0, min(cell_count - 1, int(math.floor(max(0.0, float(start)) / cell_size))))
+
+        offsets_by_pitch = {}
+        cells_by_pitch = {}
+        for value in values:
+            pitch = int(value.get("pitch", 60))
+            start = quantized(float(value.get("start", 0.0)))
+            cell = cell_index(start)
+            offset = max(0.0, min(cell_size - grid, quantized(start - (cell * cell_size))))
+            offsets_by_pitch.setdefault(pitch, set()).add(offset)
+            cells_by_pitch.setdefault(pitch, set()).add(cell)
+
+        def relevant_for_overlap(value, candidate_pitch):
+            return (not rhythm) or int(value.get("pitch", 60)) == int(candidate_pitch)
+
+        def start_is_taken(candidate_start, candidate_pitch):
+            for value in result:
+                if relevant_for_overlap(value, candidate_pitch) and abs(float(value.get("start", 0.0)) - candidate_start) < 0.000001:
+                    return True
+            return False
+
+        def max_free_duration(candidate_start, candidate_pitch):
+            limit = max(0.0, loop_length - candidate_start)
+            for value in result:
+                if not relevant_for_overlap(value, candidate_pitch):
+                    continue
+                other_start = float(value.get("start", 0.0))
+                other_duration = max(0.0001, float(value.get("duration", 0.0001)))
+                other_end = other_start + other_duration
+                if other_start <= candidate_start < other_end - 0.000001:
+                    return 0.0
+                if other_start > candidate_start + 0.000001:
+                    limit = min(limit, other_start - candidate_start)
+            return max(0.0, limit)
+
+        def ordered_cells_for(base_cell):
+            base_bar = base_cell // 4
+            base_beat = base_cell % 4
+            preferred = []
+            answer_beats = ((base_beat - 1) % 4, (base_beat + 1) % 4, (base_beat + 2) % 4, base_beat, 0, 2, 1, 3)
+            for bar_delta in (1, -1, 2, -2, 3, -3):
+                for beat in answer_beats:
+                    preferred.append(((base_bar + bar_delta) * 4) + beat)
+            for beat in answer_beats:
+                preferred.append((base_bar * 4) + beat)
+            preferred.extend(range(cell_count))
+
+            seen = set()
+            cells = []
+            for cell in preferred:
+                if 0 <= cell < cell_count and cell != base_cell and cell not in seen:
+                    seen.add(cell)
+                    cells.append(cell)
+            return cells
+
+        def placement_candidates(base):
+            pitch = int(base.get("pitch", 60))
+            start = quantized(float(base.get("start", 0.0)))
+            base_cell = cell_index(start)
+            base_offset = max(0.0, min(cell_size - grid, quantized(start - (base_cell * cell_size))))
+            offsets = sorted(offsets_by_pitch.get(pitch, {base_offset}), key=lambda offset: (abs(offset - base_offset), offset))
+            pitch_cells = cells_by_pitch.get(pitch, set())
+            scored = []
+            for order_index, cell in enumerate(ordered_cells_for(base_cell)):
+                for offset in offsets:
+                    candidate_start = quantized((cell * cell_size) + offset)
+                    if candidate_start >= loop_length - 0.000001:
+                        continue
+                    score = float(order_index)
+                    if cell in pitch_cells:
+                        score -= 0.35
+                    if (cell % 4) == (base_cell % 4):
+                        score -= 0.25
+                    scored.append((score + rnd.random() * 0.01, candidate_start))
+            return [start for _, start in sorted(scored, key=lambda item: item[0])]
+
+        def fallback_gap_candidates(base):
+            pitch = int(base.get("pitch", 60))
+            base_start = quantized(float(base.get("start", 0.0)))
+            base_cell = cell_index(base_start)
+            steps = (0.25, 0.125, 0.0625, 0.03125)
+            intervals = []
+            for value in result:
+                if not relevant_for_overlap(value, pitch):
+                    continue
+                start = max(0.0, min(loop_length, float(value.get("start", 0.0))))
+                end = max(start, min(loop_length, start + max(0.0001, float(value.get("duration", 0.0001)))))
+                intervals.append((start, end))
+            intervals.sort()
+
+            free_spans = []
+            cursor = 0.0
+            for start, end in intervals:
+                if start > cursor + 0.000001:
+                    free_spans.append((cursor, start))
+                cursor = max(cursor, end)
+            if cursor < loop_length - 0.000001:
+                free_spans.append((cursor, loop_length))
+
+            scored = []
+            for span_start, span_end in free_spans:
+                if span_end - span_start < 0.03125:
+                    continue
+                span_mid = (span_start + span_end) * 0.5
+                for step_index, step in enumerate(steps):
+                    start = math.ceil((span_start + 0.000001) / step) * step
+                    while start < span_end - 0.000001:
+                        candidate_start = quantized_to(start, step)
+                        if candidate_start >= span_end - 0.000001:
+                            break
+                        candidate_cell = cell_index(candidate_start)
+                        score = (
+                            step_index * 12.0
+                            + abs(candidate_cell - base_cell)
+                            + abs(candidate_start - span_mid) * 0.1
+                        )
+                        if (candidate_cell % 4) == (base_cell % 4):
+                            score -= 0.2
+                        scored.append((score + rnd.random() * 0.01, candidate_start))
+                        start += step
+            return [start for _, start in sorted(scored, key=lambda item: item[0])]
+
+        def choose_start_and_duration(base):
+            pitch = int(base.get("pitch", 60))
+            base_duration = max(0.03125 if rhythm else 0.0625, float(base.get("duration", 0.125)))
+            minimum_duration = 0.03125 if rhythm else 0.0625
+            candidates = []
+            seen = set()
+            for candidate in list(placement_candidates(base)) + list(fallback_gap_candidates(base)):
+                key = int(round(candidate / 0.0001))
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
+            for candidate_start in candidates:
+                if start_is_taken(candidate_start, pitch):
+                    continue
+                free_duration = max_free_duration(candidate_start, pitch)
+                duration = min(base_duration, free_duration)
+                if duration >= minimum_duration - 0.000001:
+                    return candidate_start, max(minimum_duration, duration)
+            return None, None
+
+        if additions >= len(motif):
+            selected_bases = list(motif)
+        else:
+            step = float(len(motif)) / float(additions)
+            selected_bases = [motif[min(len(motif) - 1, int(math.floor((index + 0.5) * step)))] for index in range(additions)]
+
+        for base in selected_bases:
+            base = dict(base)
+            pitch = int(base.get("pitch", 60))
+            if pitch not in allowed_pitches:
+                continue
+            velocity = max(1, min(127, int(base.get("velocity", 96))))
+            start, duration = choose_start_and_duration(base)
             if start is None:
                 continue
-            duration = min(sampled_duration, float(loop_length) - start)
+            cell = cell_index(start)
+            offset = max(0.0, min(cell_size - grid, quantized(start - (cell * cell_size))))
+            offsets_by_pitch.setdefault(pitch, set()).add(offset)
+            cells_by_pitch.setdefault(pitch, set()).add(cell)
             result.append(dict(
                 base,
                 pitch=pitch,
                 start=start,
-                duration=max(0.03125 if rhythm else 0.0625, duration),
-                velocity=sampled_velocity,
+                duration=duration,
+                velocity=velocity,
             ))
         return result
 
@@ -8482,10 +8679,12 @@ class Tap(ControlSurface):
                 window = max(1, min(len(choices), int(math.ceil(1 + amount * min(5, len(choices))))))
                 values[index]["pitch"] = rnd.choice(choices[:window])
             return values
-        max_steps = max(2, min(12, int(math.ceil(2 + amount * 10))))
-        step_choices = list(range(-max_steps, -1)) + list(range(2, max_steps + 1))
         for index in self._mutator_operation_indexes(len(values), probability, rnd):
-            values[index]["pitch"] = self._mutator_transpose_scale_steps(values[index].get("pitch", 60), rnd.choice(step_choices), settings)
+            pitch = int(values[index].get("pitch", 60))
+            max_steps = self._mutator_scale_step_span_for_octave_fraction(pitch, amount, settings)
+            step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
+            if step_choices:
+                values[index]["pitch"] = self._mutator_transpose_scale_steps(pitch, rnd.choice(step_choices), settings)
         return values
 
     def _mutator_remove_by_depth(self, values, depth, rnd):
@@ -8762,7 +8961,7 @@ class Tap(ControlSurface):
         companion_mode = info.get("companion_mode", "melody")
 
         settings = {
-            "preset": int(info.get("settings_preset", info.get("preset", 1))),
+            "preset": int(info.get("settings_preset", info.get("preset", 9))),
             "mutations_per_pass": max(1, min(3, int(info.get("mutations_per_pass", 1)))),
             "regenerate_mode": int(info.get("regenerate_mode", 0)),
             "source_mode": int(info.get("source_mode", 2)),
@@ -8796,12 +8995,13 @@ class Tap(ControlSurface):
 
     def _generate_mutator_clip(self, clip, settings, previous_info=None, send_updates=True, automatic=False):
         generation_key = self._live_object_identity(clip)
-        if generation_key in self._mutator_generation_in_progress:
-            return False
         now = time.time()
-        if automatic and now - self._last_mutator_generation_times.get(generation_key, 0.0) < 0.75:
-            return False
-        self._mutator_generation_in_progress.add(generation_key)
+        with self._mutator_generation_lock:
+            if generation_key in self._mutator_generation_in_progress:
+                return False
+            if automatic and now - self._last_mutator_generation_times.get(generation_key, 0.0) < self.MUTATOR_GENERATION_COOLDOWN_SECONDS:
+                return False
+            self._mutator_generation_in_progress.add(generation_key)
         try:
             if clip is None or not getattr(clip, "is_midi_clip", False):
                 return False
@@ -8837,11 +9037,11 @@ class Tap(ControlSurface):
             def section_payload(values):
                 return [dict(value) for value in tuple(values or ())] + [dict(value) for value in passthrough_section_values]
 
-            roles = self._mutator_pattern_roles(settings.get("preset", 1))
+            roles = self._mutator_pattern_roles(settings.get("preset", 9))
             sections = []
             specs = []
             generated_section_cache = {}
-            chain_preset = self._mutator_preset_is_chain(settings.get("preset", 1))
+            chain_preset = self._mutator_preset_is_chain(settings.get("preset", 9))
             original_section_values = self._mutator_make_section_values(
                 generation_source_values,
                 0,
@@ -8993,82 +9193,100 @@ class Tap(ControlSurface):
             self._debug_log("Error generating mutator clip: {}".format(str(e)))
             return False
         finally:
-            self._mutator_generation_in_progress.discard(generation_key)
+            with self._mutator_generation_lock:
+                self._mutator_generation_in_progress.discard(generation_key)
 
     def _schedule_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True):
-        if key in self._mutator_generation_scheduled or key in self._mutator_generation_in_progress:
-            return False
-        if time.time() - self._last_mutator_generation_times.get(key, 0.0) < 0.75:
-            return False
-
-        self._mutator_generation_scheduled.add(key)
+        with self._mutator_generation_lock:
+            if key in self._mutator_generation_scheduled or key in self._mutator_generation_in_progress:
+                return False
+            if time.time() - self._last_mutator_generation_times.get(key, 0.0) < self.MUTATOR_GENERATION_COOLDOWN_SECONDS:
+                return False
+            self._mutator_generation_scheduled.add(key)
 
         def generate_later():
-            self._mutator_generation_scheduled.discard(key)
-            self._generate_mutator_clip(
-                clip,
-                settings,
-                previous_info=previous_info,
-                send_updates=send_updates,
-                automatic=True
-            )
+            try:
+                self._generate_mutator_clip(
+                    clip,
+                    settings,
+                    previous_info=previous_info,
+                    send_updates=send_updates,
+                    automatic=True
+                )
+            finally:
+                with self._mutator_generation_lock:
+                    self._mutator_generation_scheduled.discard(key)
 
         try:
             self.schedule_message(1, generate_later)
             return True
         except Exception:
-            self._mutator_generation_scheduled.discard(key)
+            with self._mutator_generation_lock:
+                self._mutator_generation_scheduled.discard(key)
             return False
 
     def _should_regenerate_mutator_clip(self, key, clip, info, raw_position):
-        state = self._mutator_regeneration_states.setdefault(key, {
-            "last_position": None,
-            "completed_pass_count": 0,
-            "regenerated_for_current_cycle": False,
-        })
-        now = time.time()
-
-        cycle_start = float(getattr(clip, "loop_start", 0.0))
-        cycle_end = cycle_start + max(0.0001, float(info.get("structure_length", 0.0001)))
-        previous = state.get("last_position")
-        wrapped_to_start = previous is not None and previous > raw_position + 0.25
-        if wrapped_to_start:
-            state["regenerated_for_current_cycle"] = False
-        if wrapped_to_start:
-            state["completed_pass_count"] = int(state.get("completed_pass_count", 0)) + 1
-
-        regenerate_mode = int(info.get("regenerate_mode", 0))
-        should_regenerate = False
-        if regenerate_mode == 1:
-            should_regenerate = wrapped_to_start
-        elif regenerate_mode == 2:
-            should_regenerate = raw_position >= cycle_end - 0.5 and raw_position < cycle_end + 0.25
-        elif regenerate_mode == 3:
-            should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 2 == 0
-        elif regenerate_mode == 4:
-            should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 4 == 0
-        elif regenerate_mode == 5:
-            should_regenerate = wrapped_to_start and random.random() < 0.10
-        elif regenerate_mode == 6:
-            should_regenerate = wrapped_to_start and random.random() < 0.25
-        elif regenerate_mode == 7:
-            should_regenerate = wrapped_to_start and random.random() < 0.50
-        elif regenerate_mode == 8:
-            should_regenerate = wrapped_to_start and random.random() < 0.75
-
-        state["last_position"] = raw_position
-        if should_regenerate and not state.get("regenerated_for_current_cycle", False):
-            if now - self._last_mutator_generation_request_times.get(key, 0.0) < 1.25:
+        with self._mutator_generation_lock:
+            if key in self._mutator_generation_scheduled or key in self._mutator_generation_in_progress:
                 return False
-            self._last_mutator_generation_request_times[key] = now
-            state["regenerated_for_current_cycle"] = True
-            return True
-        return False
+
+            state = self._mutator_regeneration_states.setdefault(key, {
+                "last_position": None,
+                "completed_pass_count": 0,
+                "regenerated_for_current_cycle": False,
+            })
+            now = time.time()
+
+            cycle_start = float(getattr(clip, "loop_start", 0.0))
+            cycle_end = cycle_start + max(0.0001, float(info.get("structure_length", 0.0001)))
+            previous = state.get("last_position")
+            wrapped_to_start = previous is not None and previous > raw_position + 0.25
+            if wrapped_to_start:
+                state["regenerated_for_current_cycle"] = False
+                state["completed_pass_count"] = int(state.get("completed_pass_count", 0)) + 1
+
+            regenerate_mode = int(info.get("regenerate_mode", 0))
+            should_regenerate = False
+            if regenerate_mode == 1:
+                should_regenerate = wrapped_to_start
+            elif regenerate_mode == 2:
+                should_regenerate = raw_position >= cycle_end - 0.5 and raw_position < cycle_end + 0.25
+            elif regenerate_mode == 3:
+                should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 2 == 0
+            elif regenerate_mode == 4:
+                should_regenerate = wrapped_to_start and int(state.get("completed_pass_count", 0)) % 4 == 0
+            elif regenerate_mode == 5:
+                should_regenerate = wrapped_to_start and random.random() < 0.10
+            elif regenerate_mode == 6:
+                should_regenerate = wrapped_to_start and random.random() < 0.25
+            elif regenerate_mode == 7:
+                should_regenerate = wrapped_to_start and random.random() < 0.50
+            elif regenerate_mode == 8:
+                should_regenerate = wrapped_to_start and random.random() < 0.75
+
+            state["last_position"] = raw_position
+            if should_regenerate and not state.get("regenerated_for_current_cycle", False):
+                generation_signature = (
+                    int(regenerate_mode),
+                    int(state.get("completed_pass_count", 0)),
+                    int(round(cycle_start * 1000.0)),
+                    int(round(cycle_end * 1000.0))
+                )
+                if self._last_mutator_generation_signatures.get(key) == generation_signature:
+                    return False
+                if now - self._last_mutator_generation_request_times.get(key, 0.0) < self.MUTATOR_GENERATION_COOLDOWN_SECONDS:
+                    return False
+                self._last_mutator_generation_request_times[key] = now
+                self._last_mutator_generation_signatures[key] = generation_signature
+                state["regenerated_for_current_cycle"] = True
+                return True
+            return False
 
     def _evaluate_mutator_regeneration(self, only_track_index=None):
         try:
             if not self._song_is_playing():
                 self._mutator_regeneration_states.clear()
+                self._last_mutator_generation_signatures.clear()
                 return
 
             active_keys = set()
@@ -9093,6 +9311,7 @@ class Tap(ControlSurface):
                 for key in list(self._mutator_regeneration_states.keys()):
                     if key not in active_keys:
                         self._mutator_regeneration_states.pop(key, None)
+                        self._last_mutator_generation_signatures.pop(key, None)
         except Exception as e:
             self._debug_log("Error evaluating mutator regeneration: {}".format(str(e)))
 
@@ -10999,7 +11218,7 @@ class Tap(ControlSurface):
                             1,
                             *self._to_3_7bit_bytes(int(mutator_info.get("original_loop_length", 0.0001) * 1000)),
                             *self._to_3_7bit_bytes(int(mutator_info.get("structure_length", 0.0001) * 1000)),
-                            int(mutator_info.get("preset", 1)) & 0x7F,
+                            int(mutator_info.get("preset", 9)) & 0x7F,
                             min(32, len(mutator_info.get("sections", []))),
                         ])
                         for section in mutator_info.get("sections", [])[:32]:
@@ -11009,9 +11228,12 @@ class Tap(ControlSurface):
                                 *self._to_3_7bit_bytes(int(section.get("length", 0.0) * 1000)),
                         ])
                         target_pitches = [max(0, min(127, int(pitch))) for pitch in mutator_info.get("target_pitches", [])[:16]]
-                        operation_order = self._mutator_active_operation_order(mutator_info)
-                        mutator_slots = self._mutator_normalized_slots(mutator_info)
-                        mutator_slot_count = self._mutator_slot_count_from_value(mutator_info.get("mutator_slot_count", ""), mutator_slots)
+                        operation_order = [int(slot.get("operation", 0)) for slot in self._mutator_active_slots(mutator_info)]
+                        mutator_slots = self._mutator_visible_slots(mutator_info)
+                        mutator_slot_count = self._mutator_slot_count_from_value(
+                            mutator_info.get("mutator_slot_count", ""),
+                            self._mutator_normalized_slots(mutator_info)
+                        )
                         note_data.extend([
                             6,
                             int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
@@ -11020,7 +11242,7 @@ class Tap(ControlSurface):
                             max(0, min(100, int(round(float(mutator_info.get("depth", 0.0)) * 100.0)))),
                             int(mutator_info.get("root", 0)) & 0x7F,
                             int(mutator_info.get("scale_index", 2)) & 0x7F,
-                            int(mutator_info.get("settings_preset", mutator_info.get("preset", 1))) & 0x7F,
+                            int(mutator_info.get("settings_preset", mutator_info.get("preset", 9))) & 0x7F,
                             int(mutator_info.get("companion_mode_code", self._mutator_companion_mode_code(mutator_info.get("companion_mode", "melody")))) & 0x7F,
                             len(target_pitches),
                         ])
@@ -11573,6 +11795,7 @@ class Tap(ControlSurface):
         self._mutator_generation_scheduled.clear()
         self._last_mutator_generation_times.clear()
         self._last_mutator_generation_request_times.clear()
+        self._last_mutator_generation_signatures.clear()
         
         # Stop periodic execution
         self.periodic_timer = 0
