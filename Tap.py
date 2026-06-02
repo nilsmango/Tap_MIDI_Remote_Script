@@ -4236,6 +4236,7 @@ class Tap(ControlSurface):
             )
             operation_order = self._mutator_operation_order_from_value(fields.get("oo", ""))
             mutator_slots = self._mutator_slots_from_value(fields.get("ms", ""))
+            mutator_slot_count = self._mutator_slot_count_from_value(fields.get("mc", ""), mutator_slots)
 
             info = {
                 "original_loop_length": max(0.0001, float(fields.get("ol", "0.0001"))),
@@ -4256,6 +4257,7 @@ class Tap(ControlSurface):
                 "target_pitches": target_pitches,
                 "operation_order": operation_order,
                 "mutator_slots": mutator_slots,
+                "mutator_slot_count": mutator_slot_count,
                 "pending_settings_update": pending_settings_update,
                 "sections": sections,
             }
@@ -4461,6 +4463,18 @@ class Tap(ControlSurface):
             result.append(None)
         return result[:10]
 
+    def _mutator_slot_count_from_value(self, value, slots=None):
+        try:
+            if str(value or "") != "":
+                return max(4, min(10, int(value)))
+        except Exception:
+            pass
+        last_used = 0
+        for index, slot in enumerate(tuple(slots or ())[:10]):
+            if slot:
+                last_used = index + 1
+        return max(4, min(10, last_used))
+
     def _mutator_active_slots(self, settings):
         slots = [
             slot for slot in self._mutator_normalized_slots(settings)
@@ -4513,7 +4527,7 @@ class Tap(ControlSurface):
 
     def _mutator_marker(self, info):
         target_pitches = ",".join(str(max(0, min(127, int(pitch)))) for pitch in info.get("target_pitches", [])[:16])
-        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|mp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|cm={}|tg={}|od={}|oo={}|ms={}]".format(
+        return "[TapComp:v1|ol={:.4f}|pr={}|sp={}|mp={}|pd={}|sl={:.4f}|ai={}|dp={}|rg={}|src={}|si={}|rt={}|cm={}|tg={}|od={}|oo={}|ms={}|mc={}]".format(
             info.get("original_loop_length", 0.0001),
             info.get("preset", 1),
             info.get("settings_preset", info.get("preset", 1)),
@@ -4531,6 +4545,7 @@ class Tap(ControlSurface):
             self._mutator_operation_depths_marker_value(info),
             self._mutator_operation_order_marker_value(info),
             self._mutator_slots_marker_value(info),
+            self._mutator_slot_count_from_value(info.get("mutator_slot_count", ""), self._mutator_normalized_slots(info)),
         )
 
     def _save_mutator_info_to_name(self, clip, info):
@@ -7777,6 +7792,7 @@ class Tap(ControlSurface):
         operation_depths_index = 15
         operation_order_index = operation_depths_index + len(self._mutator_operation_depth_keys())
         mutator_slots_index = operation_order_index + 1
+        mutator_slot_count_index = mutator_slots_index + 1
         companion_mode = "rhythm" if int_field(companion_mode_index, 0) == 1 else "melody"
         target_pitches = self._mutator_target_pitches_from_value(fields[target_pitches_index] if len(fields) > target_pitches_index else "")
         operation_depths = self._mutator_operation_depths_from_fields(
@@ -7789,6 +7805,10 @@ class Tap(ControlSurface):
         )
         mutator_slots = self._mutator_slots_from_value(
             fields[mutator_slots_index] if len(fields) > mutator_slots_index else ""
+        )
+        mutator_slot_count = self._mutator_slot_count_from_value(
+            fields[mutator_slot_count_index] if len(fields) > mutator_slot_count_index else "",
+            mutator_slots
         )
         return {
             "preset": int_field(0, 1),
@@ -7817,6 +7837,7 @@ class Tap(ControlSurface):
             "gate_change_depth": operation_depths.get("gate_change_depth", 0.0),
             "operation_order": operation_order,
             "mutator_slots": mutator_slots,
+            "mutator_slot_count": mutator_slot_count,
             "settings_payload": payload.replace("|", "~")[:80],
         }
 
@@ -7842,6 +7863,7 @@ class Tap(ControlSurface):
             "target_pitches": settings.get("target_pitches", previous_info.get("target_pitches", [])),
             "operation_order": self._mutator_active_operation_order(settings),
             "mutator_slots": self._mutator_normalized_slots(settings),
+            "mutator_slot_count": self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), self._mutator_normalized_slots(settings)),
             "sections": previous_info.get("sections", []),
         }
         for key in self._mutator_operation_depth_keys():
@@ -7873,6 +7895,8 @@ class Tap(ControlSurface):
         if tuple(info.get("operation_order", [])) != tuple(previous_info.get("operation_order", [])):
             return True
         if tuple(str(slot) for slot in self._mutator_normalized_slots(info)) != tuple(str(slot) for slot in self._mutator_normalized_slots(previous_info)):
+            return True
+        if int(info.get("mutator_slot_count", 4)) != int(previous_info.get("mutator_slot_count", 4)):
             return True
         for key in self._mutator_operation_depth_keys():
             try:
@@ -8751,6 +8775,7 @@ class Tap(ControlSurface):
             "target_pitches": info.get("target_pitches", []),
             "operation_order": info.get("operation_order", []),
             "mutator_slots": self._mutator_normalized_slots(info),
+            "mutator_slot_count": self._mutator_slot_count_from_value(info.get("mutator_slot_count", ""), self._mutator_normalized_slots(info)),
         }
         for key in self._mutator_operation_depth_keys():
             settings[key] = self._mutator_depth_value(info, key, 0.0)
@@ -10986,6 +11011,7 @@ class Tap(ControlSurface):
                         target_pitches = [max(0, min(127, int(pitch))) for pitch in mutator_info.get("target_pitches", [])[:16]]
                         operation_order = self._mutator_active_operation_order(mutator_info)
                         mutator_slots = self._mutator_normalized_slots(mutator_info)
+                        mutator_slot_count = self._mutator_slot_count_from_value(mutator_info.get("mutator_slot_count", ""), mutator_slots)
                         note_data.extend([
                             6,
                             int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
@@ -11013,6 +11039,7 @@ class Tap(ControlSurface):
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "probability_depth", 0.0) * 100.0)))),
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "range_depth", 0.5) * 100.0)))),
                                 ])
+                        note_data.append(mutator_slot_count)
                         note_data.append(1 if mutator_info.get("pending_settings_update", False) else 0)
                     else:
                         note_data.append(0)
