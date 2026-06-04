@@ -538,13 +538,31 @@ class Tap(ControlSurface):
     def _parameter_display_value(self, device_param):
         try:
             if device_param and hasattr(device_param, 'str_for_value') and hasattr(device_param, 'value'):
-                return device_param.str_for_value(device_param.value).replace('∞', 'Inf')
+                return self._format_display_value_numbers(device_param.str_for_value(device_param.value).replace('∞', 'Inf'))
         except Exception:
             pass
         try:
-            return str(device_param.value).replace('∞', 'Inf')
+            return self._format_display_value_numbers(str(device_param.value).replace('∞', 'Inf'))
         except Exception:
             return ""
+
+    def _format_display_value_numbers(self, display_value):
+        def format_match(match):
+            integer_part = match.group(1)
+            fractional_part = match.group(2)
+            decimals = 1 if len(integer_part.lstrip('+-')) > 1 else 2
+            if len(fractional_part) <= decimals:
+                return match.group(0)
+            try:
+                value = float("{}.{}".format(integer_part, fractional_part))
+                return "{:.{}f}".format(value, decimals)
+            except Exception:
+                return match.group(0)
+
+        try:
+            return re.sub(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])', format_match, str(display_value))
+        except Exception:
+            return display_value
 
     def _parameter_target_value_from_normalized(self, device_param, normalized):
         min_val = device_param.min
