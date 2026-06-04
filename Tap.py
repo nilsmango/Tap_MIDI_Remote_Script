@@ -6326,6 +6326,18 @@ class Tap(ControlSurface):
         return tuple(hidden_states)
     
     # Updating names and number of tracks
+    def _format_track_name_for_display(self, name):
+        name = str(name)
+        dash_index = name.find("-")
+        if dash_index <= 0:
+            return name
+
+        prefix = name[:dash_index]
+        if not (prefix.isdigit() or (dash_index == 1 and prefix.isalpha())):
+            return name
+
+        return "{} {}".format(prefix, name[dash_index + 1:].lstrip())
+
     def _update_mixer_and_tracks(self):
         tracks = list(self.song().tracks)
         return_tracks = list(self.song().return_tracks)
@@ -6379,9 +6391,7 @@ class Tap(ControlSurface):
             track_colors = []
             
             for index, track in enumerate(tracks):
-                name = track.name
-                if len(name) >= 2 and name[0].isalnum() and name[1] == '-':
-                    name = name[0] + ' ' + name[2:]
+                name = self._format_track_name_for_display(track.name)
                 track_names.append(name)
                 if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
                     track_is_audio.append("2")
@@ -6404,9 +6414,7 @@ class Tap(ControlSurface):
             return_track_names = []
             return_track_colors = []
             for index, return_track in enumerate(return_tracks):
-                name = return_track.name
-                if len(name) >= 2 and name[0].isalnum() and name[1] == '-':
-                    name = name[0] + ' ' + name[2:]
+                name = self._format_track_name_for_display(return_track.name)
                 return_track_names.append(name)
                 return_track_colors.append(self._make_color_string(return_track.color))
 
