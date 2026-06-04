@@ -264,6 +264,7 @@ class Tap(ControlSurface):
     )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
+    DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
     UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
@@ -560,7 +561,7 @@ class Tap(ControlSurface):
                 return match.group(0)
 
         try:
-            return re.sub(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])', format_match, str(display_value))
+            return self.DISPLAY_VALUE_NUMBER_PATTERN.sub(format_match, str(display_value))
         except Exception:
             return display_value
 
