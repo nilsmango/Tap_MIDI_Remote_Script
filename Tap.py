@@ -207,6 +207,17 @@ class Tap(ControlSurface):
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
     MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v1\|([^\]]*)\]")
     MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v[0-9]+\|([^\]]*)\]")
+    SYSEX_TEXT_SYMBOL_REPLACEMENTS = (
+        ('♭', 'b'),
+        ('♯', '#'),
+        ('♮', 'nat'),
+        ('𝄫', 'bb'),
+        ('𝄪', '##'),
+    )
+    SYSEX_ROUND_BRACKET_TEXT_RE = re.compile(r'\(([^()]*)\)')
+    SYSEX_SQUARE_BRACKET_TEXT_RE = re.compile(r'\[([^\[\]]*)\]')
+    SYSEX_CURLY_BRACKET_TEXT_RE = re.compile(r'\{([^{}]*)\}')
+    SYSEX_MULTI_SPACE_RE = re.compile(r'\s{2,}')
     MUTATOR_ALGORITHMS = (
         "mutator",
         "verse_weaver",
@@ -320,6 +331,7 @@ class Tap(ControlSurface):
             self._track_level_listeners = {}
             self._return_level_listeners = {}
             self._master_level_listeners = {}
+            self._mixer_meter_targets = {}
             self._disabled_parameter_listeners = {}
             self._disabled_parameters = []
             self._current_disabled_controls = []
@@ -1588,14 +1600,7 @@ class Tap(ControlSurface):
 
     def _sanitize_sysex_text(self, value):
         sanitized_value = str(value)
-        symbol_replacements = {
-            '♭': 'b',
-            '♯': '#',
-            '♮': 'nat',
-            '𝄫': 'bb',
-            '𝄪': '##'
-        }
-        for symbol, replacement in symbol_replacements.items():
+        for symbol, replacement in self.SYSEX_TEXT_SYMBOL_REPLACEMENTS:
             sanitized_value = sanitized_value.replace(symbol, replacement)
 
         def remove_ascii_empty_bracket_group(match):
@@ -1605,11 +1610,11 @@ class Tap(ControlSurface):
                 return ''
             return match.group(0)
 
-        sanitized_value = re.sub(r'\(([^()]*)\)', remove_ascii_empty_bracket_group, sanitized_value)
-        sanitized_value = re.sub(r'\[([^\[\]]*)\]', remove_ascii_empty_bracket_group, sanitized_value)
-        sanitized_value = re.sub(r'\{([^{}]*)\}', remove_ascii_empty_bracket_group, sanitized_value)
+        sanitized_value = self.SYSEX_ROUND_BRACKET_TEXT_RE.sub(remove_ascii_empty_bracket_group, sanitized_value)
+        sanitized_value = self.SYSEX_SQUARE_BRACKET_TEXT_RE.sub(remove_ascii_empty_bracket_group, sanitized_value)
+        sanitized_value = self.SYSEX_CURLY_BRACKET_TEXT_RE.sub(remove_ascii_empty_bracket_group, sanitized_value)
         sanitized_value = sanitized_value.encode('ascii', errors='ignore').decode('ascii')
-        sanitized_value = re.sub(r'\s{2,}', ' ', sanitized_value)
+        sanitized_value = self.SYSEX_MULTI_SPACE_RE.sub(' ', sanitized_value)
         return sanitized_value.strip()
 
     def _escape_sysex_string(self, value):
@@ -2120,10 +2125,15 @@ class Tap(ControlSurface):
                 if send_device_navigation and selected_track and hasattr(selected_track, "devices"):
                     all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
                     all_device_names = [self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)]
+                    starts_by_index = {}
+                    ends_by_index = {}
+                    for info in chain_info:
+                        starts_by_index.setdefault(info.get('start_index'), []).append(info)
+                        ends_by_index.setdefault(info.get('end_index'), []).append(info)
                     for i, device in enumerate(all_devices):
                         name = device.name
-                        starts = [info for info in chain_info if info['start_index'] == i]
-                        ends = [info for info in chain_info if info['end_index'] == i]
+                        starts = starts_by_index.get(i, ())
+                        ends = ends_by_index.get(i, ())
 
                         prefix = ""
                         for s in starts:
@@ -2133,10 +2143,12 @@ class Tap(ControlSurface):
                                 prefix += "|*"
 
                         suffix = ""
-                        for e in [e for e in ends if e['type'] == 'chain']:
-                            suffix += "*|"
-                        for e in [e for e in ends if e['type'] == 'rack']:
-                            suffix += "||"
+                        for e in ends:
+                            if e['type'] == 'chain':
+                                suffix += "*|"
+                        for e in ends:
+                            if e['type'] == 'rack':
+                                suffix += "||"
 
                         all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
                     available_devices_string = ','.join(all_device_names)
@@ -2166,6 +2178,11 @@ class Tap(ControlSurface):
             if send_device_navigation:
                 # Get all available devices of the selected track, including nested devices
                 all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+                starts_by_index = {}
+                ends_by_index = {}
+                for info in chain_info:
+                    starts_by_index.setdefault(info.get('start_index'), []).append(info)
+                    ends_by_index.setdefault(info.get('end_index'), []).append(info)
                 
                 # Convert device objects to names for display, adding chain markers
                 all_device_names = []
@@ -2173,8 +2190,8 @@ class Tap(ControlSurface):
                     name = device.name
                     
                     # collect all starts/ends for this index
-                    starts = [info for info in chain_info if info['start_index'] == i]
-                    ends   = [info for info in chain_info if info['end_index'] == i]
+                    starts = starts_by_index.get(i, ())
+                    ends = ends_by_index.get(i, ())
                     
                     # there should never be more than one rack or chain at the same index
                     prefix = ""
@@ -2186,10 +2203,12 @@ class Tap(ControlSurface):
                 
                     # make sure chains come first, racks after
                     suffix = ""
-                    for e in [e for e in ends if e['type'] == 'chain']:
-                        suffix += "*|"
-                    for e in [e for e in ends if e['type'] == 'rack']:
-                        suffix += "||"
+                    for e in ends:
+                        if e['type'] == 'chain':
+                            suffix += "*|"
+                    for e in ends:
+                        if e['type'] == 'rack':
+                            suffix += "||"
                 
                     all_device_names.append(prefix + self._escape_sysex_string(name) + suffix)
                 
@@ -6626,11 +6645,23 @@ class Tap(ControlSurface):
         last_visible_channel = self.visible_channels[1]
         master_track_index = len(tracks) + len(return_tracks)
         master_track_visible = first_visible_channel <= master_track_index <= last_visible_channel
+        meter_targets = {}
+        if self.mixer_status:
+            for index, track in enumerate(tracks):
+                if index in visible_track_indexes and index >= first_visible_channel and index <= last_visible_channel:
+                    meter_targets[index] = track
+            for index, return_track in enumerate(return_tracks):
+                combined_index = len(tracks) + index
+                if combined_index >= first_visible_channel and combined_index <= last_visible_channel:
+                    meter_targets[combined_index] = return_track
+            if master_track_visible:
+                meter_targets[127] = song.master_track
+        self._mixer_meter_targets = meter_targets
         
         # Channels
         for index, track in enumerate(tracks):
 
-            if self.mixer_status and index in visible_track_indexes and index >= first_visible_channel and index <= last_visible_channel:
+            if index in meter_targets:
                 self._create_mixer_automation_control("slider", 2, index, "track", index, "volume")
                 self._create_mixer_automation_control("encoder", 3, index, "track", index, "send", 0)
                 self._create_mixer_automation_control("encoder", 4, index, "track", index, "send", 1)
@@ -6645,7 +6676,7 @@ class Tap(ControlSurface):
             # strip.set_shift_button(...)
 
         # Master / channel 7 cc 127
-        if self.mixer_status and master_track_visible:
+        if 127 in meter_targets:
             self._create_mixer_automation_control("slider", 0, 127, "master", 0, "volume")
             self._create_mixer_automation_control("encoder", 0, 126, "master", 0, "cue_volume")
             self._create_mixer_automation_control("encoder", 0, 125, "master", 0, "panning")
@@ -6655,7 +6686,7 @@ class Tap(ControlSurface):
         # Return Tracks
         for index, returnTrack in enumerate(return_tracks):
             combined_index = len(tracks) + index
-            if self.mixer_status and combined_index >= first_visible_channel and combined_index <= last_visible_channel:
+            if combined_index in meter_targets:
                 self._create_mixer_automation_control("slider", 8, index, "return", index, "volume")
                 self._create_mixer_toggle_control(8, index + 12, "return", index, "mute")
                 self._create_mixer_toggle_control(8, index + 24, "return", index, "solo")
@@ -6671,39 +6702,8 @@ class Tap(ControlSurface):
         if self.mixer_status:
             if not self.mixer_reset:
                 self.mixer_reset = True
-            song = self.song()
-            tracks = song.tracks
-            return_tracks = song.return_tracks
-            hidden_track_states = self._group_hidden_state_codes(tracks)
-            visible_track_indexes = set(
-                track_index for track_index, hidden in enumerate(hidden_track_states)
-                if hidden != "1"
-            )
-            first_visible_channel = self.visible_channels[0]
-            last_visible_channel = self.visible_channels[1]
-            master_track_index = len(tracks) + len(return_tracks)
-            is_visible_track = (
-                index < len(tracks)
-                and index in visible_track_indexes
-                and index >= first_visible_channel
-                and index <= last_visible_channel
-            )
-            is_visible_return = (
-                index >= len(tracks)
-                and index < master_track_index
-                and index >= first_visible_channel
-                and index <= last_visible_channel
-            )
-            is_visible_master = index == 127 and first_visible_channel <= master_track_index <= last_visible_channel
-            
-            if is_visible_track or is_visible_return or is_visible_master:
-                if index < len(tracks):
-                    track = tracks[index]
-                elif index - len(tracks) < len(return_tracks):
-                    track = return_tracks[index - len(tracks)]
-                else:
-                    track = song.master_track
-    
+            track = self._mixer_meter_targets.get(index)
+            if track and liveobj_valid(track):
                 if track.has_audio_output:
                     left_channel = track.output_meter_left
                     right_channel = track.output_meter_right
@@ -11066,6 +11066,8 @@ class Tap(ControlSurface):
 
             group_track.fold_state = not bool(group_track.fold_state)
             self._send_group_fold_states_if_changed(tracks, force=True)
+            if self.mixer_status:
+                self._set_up_mixer_controls()
         except Exception:
             pass
 
