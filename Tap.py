@@ -4372,6 +4372,9 @@ class Tap(ControlSurface):
             "shift_depth",
         )
 
+    def _mutator_add_shift_operation_index(self):
+        return len(self._mutator_operation_depth_keys())
+
     def _mutator_default_operation_depths(self):
         return dict((key, 0.0) for key in self._mutator_operation_depth_keys())
 
@@ -4444,6 +4447,7 @@ class Tap(ControlSurface):
 
     def _mutator_slots_from_value(self, value):
         result = []
+        add_shift_index = self._mutator_add_shift_operation_index()
         for part in str(value or "").split(";"):
             if len(result) >= 10:
                 break
@@ -4453,12 +4457,16 @@ class Tap(ControlSurface):
             fields = part.split(",")
             try:
                 operation = int(fields[0])
-                if operation < 0 or operation >= len(self._mutator_operation_depth_keys()):
+                if operation < 0 or operation > add_shift_index:
                     result.append(None)
                     continue
                 probability = max(0.0, min(1.0, float(fields[1]) / 100.0 if len(fields) > 1 else 0.0))
                 strength = max(0.0, min(1.0, float(fields[2]) / 100.0 if len(fields) > 2 else 0.5))
-                result.append(dict(operation=operation, probability_depth=probability, range_depth=strength))
+                result.append(dict(
+                    operation=operation,
+                    probability_depth=probability,
+                    range_depth=strength,
+                ))
             except Exception:
                 result.append(None)
         while len(result) < 10:
@@ -4471,8 +4479,9 @@ class Tap(ControlSurface):
             if not slot:
                 parts.append("x")
                 continue
+            operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
             parts.append("{},{},{}".format(
-                max(0, min(len(self._mutator_operation_depth_keys()) - 1, int(slot.get("operation", 0)))),
+                operation,
                 max(0, min(100, int(round(self._mutator_depth_value(slot, "probability_depth", 0.0) * 100.0)))),
                 max(0, min(100, int(round(self._mutator_depth_value(slot, "range_depth", 0.5) * 100.0)))),
             ))
@@ -4484,6 +4493,7 @@ class Tap(ControlSurface):
     def _mutator_normalized_slots(self, settings):
         slots = settings.get("mutator_slots", [])
         result = []
+        add_shift_index = self._mutator_add_shift_operation_index()
         if isinstance(slots, (list, tuple)):
             for slot in slots[:10]:
                 if not slot:
@@ -4491,7 +4501,7 @@ class Tap(ControlSurface):
                     continue
                 try:
                     operation = int(slot.get("operation", 0))
-                    if operation < 0 or operation >= len(self._mutator_operation_depth_keys()):
+                    if operation < 0 or operation > add_shift_index:
                         result.append(None)
                         continue
                     result.append(dict(
@@ -4523,21 +4533,20 @@ class Tap(ControlSurface):
         return slots[:slot_count]
 
     def _mutator_active_slots(self, settings):
-        slots = [
-            slot for slot in self._mutator_visible_slots(settings)
-            if slot and self._mutator_depth_value(slot, "probability_depth", 0.0) > 0.0
-        ]
-        if slots:
-            return slots
-        keys = self._mutator_operation_depth_keys()
-        return [
-            dict(
-                operation=index,
-                probability_depth=self._mutator_depth_value(settings, keys[index], 0.0),
-                range_depth=1.0 if keys[index] in ("note_addition_depth", "note_removal_depth") else 0.5
-            )
-            for index in self._mutator_active_operation_order(settings)
-        ]
+        active = []
+        add_shift_index = self._mutator_add_shift_operation_index()
+        for slot in self._mutator_visible_slots(settings):
+            if not slot:
+                continue
+            probability = self._mutator_depth_value(slot, "probability_depth", 0.0)
+            if probability <= 0.0:
+                continue
+            operation = int(slot.get("operation", 0))
+            if operation == add_shift_index:
+                active.append(dict(operation=operation, probability_depth=probability, range_depth=probability))
+            else:
+                active.append(slot)
+        return active
 
     def _mutator_role_operation_depth(self, role, operation_depth):
         amount = max(0.0, min(1.0, float(operation_depth)))
@@ -8509,6 +8518,7 @@ class Tap(ControlSurface):
         add_chance = max(0.0, min(1.0, float(strength)))
         if amount <= 0.0 or add_chance <= 0.0 or not values:
             return values
+        rnd = random.Random((rnd.randint(0, 2147483647) << 1) ^ rnd.randint(0, 2147483647))
         loop_length = max(0.0001, float(loop_length))
         grid = 0.0625 if role == 7 else 0.125
         cell_size = 1.0
@@ -8532,7 +8542,15 @@ class Tap(ControlSurface):
         ]
         if not motif:
             return values
-        additions = len(motif) if amount >= 1.0 else max(1, int(round(float(len(motif)) * amount)))
+        minimum_duration = 0.03125 if rhythm else 0.0625
+        source_durations = sorted(set(
+            max(minimum_duration, min(loop_length, quantized_duration))
+            for quantized_duration in (
+                round(max(minimum_duration, float(value.get("duration", 0.125))) / 0.03125) * 0.03125
+                for value in values
+            )
+            if quantized_duration > 0.0
+        ))
 
         def quantized(value):
             return max(0.0, min(loop_length - 0.0001, round(float(value) / grid) * grid))
@@ -8555,7 +8573,7 @@ class Tap(ControlSurface):
             cells_by_pitch.setdefault(pitch, set()).add(cell)
 
         def relevant_for_overlap(value, candidate_pitch):
-            return (not rhythm) or int(value.get("pitch", 60)) == int(candidate_pitch)
+            return int(value.get("pitch", 60)) == int(candidate_pitch)
 
         def start_is_taken(candidate_start, candidate_pitch):
             for value in result:
@@ -8666,8 +8684,7 @@ class Tap(ControlSurface):
 
         def choose_start_and_duration(base):
             pitch = int(base.get("pitch", 60))
-            base_duration = max(0.03125 if rhythm else 0.0625, float(base.get("duration", 0.125)))
-            minimum_duration = 0.03125 if rhythm else 0.0625
+            base_duration = max(minimum_duration, float(base.get("duration", 0.125)))
             candidates = []
             seen = set()
             for candidate in list(placement_candidates(base)) + list(fallback_gap_candidates(base)):
@@ -8676,13 +8693,24 @@ class Tap(ControlSurface):
                     continue
                 seen.add(key)
                 candidates.append(candidate)
+            viable = []
             for candidate_start in candidates:
                 if start_is_taken(candidate_start, pitch):
                     continue
                 free_duration = max_free_duration(candidate_start, pitch)
-                duration = min(base_duration, free_duration)
-                if duration >= minimum_duration - 0.000001:
-                    return candidate_start, max(minimum_duration, duration)
+                if free_duration >= minimum_duration - 0.000001:
+                    viable.append((candidate_start, free_duration))
+                if len(viable) >= 16:
+                    break
+            if viable:
+                window = max(1, min(len(viable), 2 + int(round(amount * 8.0))))
+                candidate_start, free_duration = rnd.choice(viable[:window])
+                duration_pool = [duration for duration in source_durations if duration <= free_duration + 0.000001]
+                if duration_pool and rnd.random() < 0.82:
+                    duration = rnd.choice(duration_pool)
+                else:
+                    duration = base_duration * rnd.choice([0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+                return candidate_start, max(minimum_duration, min(free_duration, duration))
             return None, None
 
         motif_by_pitch = {}
@@ -8690,17 +8718,17 @@ class Tap(ControlSurface):
             motif_by_pitch.setdefault(int(value.get("pitch", 60)), []).append(value)
 
         selected_bases = []
-        for pitch in sorted(motif_by_pitch.keys()):
+        pitches = sorted(motif_by_pitch.keys())
+        rnd.shuffle(pitches)
+        for pitch in pitches:
             pitch_motif = motif_by_pitch[pitch]
+            rnd.shuffle(pitch_motif)
             pitch_additions = len(pitch_motif) if amount >= 1.0 else max(1, int(round(float(len(pitch_motif)) * amount)))
             if pitch_additions >= len(pitch_motif):
                 selected_bases.extend(pitch_motif)
             else:
-                step = float(len(pitch_motif)) / float(pitch_additions)
-                selected_bases.extend(
-                    pitch_motif[min(len(pitch_motif) - 1, int(math.floor((index + 0.5) * step)))]
-                    for index in range(pitch_additions)
-                )
+                selected_bases.extend(rnd.sample(pitch_motif, pitch_additions))
+        rnd.shuffle(selected_bases)
 
         for base in selected_bases:
             if rnd.random() > add_chance:
@@ -8837,8 +8865,80 @@ class Tap(ControlSurface):
                     value["pitch"] = max(0, min(127, int(value.get("pitch", 60)) + 12))
         return result
 
-    def _mutator_apply_depth_pipeline(self, values, role, loop_length, settings, rnd, rhythm=False, target_pitches=None):
+    def _mutator_apply_add_shift_by_depth(self, values, source_values, role, loop_length, settings, rnd, depth, rhythm=False, target_pitches=None):
+        depth = max(0.0, min(1.0, float(depth)))
         result = [dict(value) for value in tuple(values or ())]
+        source = [dict(value) for value in tuple(source_values or ())]
+        if depth <= 0.0 or not result:
+            return result
+
+        if rhythm:
+            targets = sorted(set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127))
+            if targets:
+                for index in self._mutator_operation_indexes(len(result), depth, rnd):
+                    pitch = int(result[index].get("pitch", 60))
+                    choices = [target for target in targets if target != pitch]
+                    if choices:
+                        choices.sort(key=lambda target: abs(target - pitch))
+                        window = max(1, min(len(choices), int(math.ceil(1 + depth * min(5, len(choices))))))
+                        result[index]["pitch"] = rnd.choice(choices[:window])
+        else:
+            for value in result:
+                if rnd.random() < depth:
+                    max_steps = max(1, min(4, int(math.ceil(depth * 4))))
+                    step_choices = list(range(-max_steps, 0)) + list(range(1, max_steps + 1))
+                    value["pitch"] = self._mutator_transpose_scale_steps(
+                        int(value.get("pitch", 60)),
+                        rnd.choice(step_choices),
+                        settings
+                    )
+
+        if role in (0, 8, 14) or not source:
+            return result
+
+        additions = int(math.ceil(depth * int(settings.get("mutations_per_pass", 1)) * (4 if role in (4, 7) else 3)))
+        if depth >= 0.18 and role in (1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 15):
+            additions = max(1, additions)
+        if depth >= 0.55:
+            additions = max(additions, min(len(set(value.get("pitch", 60) for value in source)) + 1, 6))
+        if depth >= 0.80:
+            additions = max(additions, min(len(set(value.get("pitch", 60) for value in source)) * 2, 12))
+        if additions <= 0:
+            return result
+
+        allowed_pitches = set(int(value.get("pitch", 60)) for value in source)
+        if rhythm and target_pitches:
+            targets = set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127)
+            allowed_pitches = allowed_pitches.intersection(targets) or allowed_pitches
+        motif = [value for value in source if int(value.get("pitch", 60)) in allowed_pitches]
+        motif.sort(key=lambda item: int(item.get("velocity", 96)), reverse=True)
+        occupied = self._mutator_rhythm_occupied_steps(result, loop_length)
+        for add_index in range(additions):
+            if not motif:
+                break
+            base = dict(motif[add_index % len(motif)])
+            if role == 7:
+                start = float(loop_length) * rnd.choice([0.75, 0.8125, 0.875, 0.9375])
+                duration = min(0.25, float(loop_length) - start)
+            else:
+                start = (float(base.get("start", 0.0)) + rnd.choice([0.125, 0.25, 0.375, 0.5, 0.75, 1.0])) % float(loop_length)
+                duration = min(float(base.get("duration", 0.125)), float(loop_length) - start)
+            pitch = int(base.get("pitch", 60))
+            start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied)
+            if start is None:
+                continue
+            result.append(dict(
+                base,
+                pitch=pitch,
+                start=start,
+                duration=max(0.03125 if rhythm else 0.0625, duration),
+                velocity=max(1, min(127, int(base.get("velocity", 96)))),
+            ))
+        return result
+
+    def _mutator_apply_depth_pipeline(self, values, role, loop_length, settings, rnd, rhythm=False, target_pitches=None):
+        source_values = [dict(value) for value in tuple(values or ())]
+        result = [dict(value) for value in source_values]
         if role == 14:
             return self._mutator_apply_break_role(result, loop_length, rhythm=rhythm)
 
@@ -8846,11 +8946,14 @@ class Tap(ControlSurface):
         keys = self._mutator_operation_depth_keys()
         for slot in self._mutator_active_slots(settings):
             operation_index = int(slot.get("operation", 0))
-            key = keys[operation_index]
             probability = self._mutator_role_operation_depth(role, self._mutator_depth_value(slot, "probability_depth", 0.0))
             strength = self._mutator_depth_value(slot, "range_depth", 0.5)
             if probability <= 0.0:
                 continue
+            if operation_index == self._mutator_add_shift_operation_index():
+                result = self._mutator_apply_add_shift_by_depth(result, source_values, role, loop_length, settings, rnd, probability, rhythm=rhythm, target_pitches=target_pitches)
+                continue
+            key = keys[operation_index]
             if key == "fill_depth":
                 self._mutator_add_fill_values(result, result, role, loop_length, settings, rnd, target_pitches=target_pitches, rhythm=rhythm, fill_depth=probability)
             elif key == "simplification_depth":
@@ -11337,7 +11440,7 @@ class Tap(ControlSurface):
                             self._mutator_normalized_slots(mutator_info)
                         )
                         note_data.extend([
-                            7,
+                            8,
                             int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
                             int(mutator_info.get("regenerate_mode", 0)) & 0x7F,
                             int(mutator_info.get("source_mode", 2)) & 0x7F,
@@ -11358,8 +11461,9 @@ class Tap(ControlSurface):
                             if not slot:
                                 note_data.extend([127, 0, 0])
                             else:
+                                operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
                                 note_data.extend([
-                                    max(0, min(len(self._mutator_operation_depth_keys()) - 1, int(slot.get("operation", 0)))),
+                                    operation,
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "probability_depth", 0.0) * 100.0)))),
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "range_depth", 0.5) * 100.0)))),
                                 ])
