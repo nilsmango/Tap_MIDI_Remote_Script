@@ -4375,6 +4375,30 @@ class Tap(ControlSurface):
     def _mutator_add_shift_operation_index(self):
         return len(self._mutator_operation_depth_keys())
 
+    def _mutator_loop_shift_operation_index(self):
+        return 11
+
+    def _mutator_reverse_operation_index(self):
+        return 12
+
+    def _mutator_invert_operation_index(self):
+        return 13
+
+    def _mutator_pitch_add_operation_index(self):
+        return 14
+
+    def _mutator_duplicate_operation_index(self):
+        return 15
+
+    def _mutator_phrase_shift_operation_index(self):
+        return 16
+
+    def _mutator_preserver_operation_index(self):
+        return 17
+
+    def _mutator_max_operation_index(self):
+        return self._mutator_preserver_operation_index()
+
     def _mutator_default_operation_depths(self):
         return dict((key, 0.0) for key in self._mutator_operation_depth_keys())
 
@@ -4447,7 +4471,7 @@ class Tap(ControlSurface):
 
     def _mutator_slots_from_value(self, value):
         result = []
-        add_shift_index = self._mutator_add_shift_operation_index()
+        max_operation_index = self._mutator_max_operation_index()
         for part in str(value or "").split(";"):
             if len(result) >= 10:
                 break
@@ -4457,7 +4481,7 @@ class Tap(ControlSurface):
             fields = part.split(",")
             try:
                 operation = int(fields[0])
-                if operation < 0 or operation > add_shift_index:
+                if operation < 0 or operation > max_operation_index:
                     result.append(None)
                     continue
                 activation = max(0.0, min(1.0, float(fields[1]) / 100.0 if len(fields) > 1 else 1.0))
@@ -4481,7 +4505,7 @@ class Tap(ControlSurface):
             if not slot:
                 parts.append("x")
                 continue
-            operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
+            operation = max(0, min(self._mutator_max_operation_index(), int(slot.get("operation", 0))))
             parts.append("{},{},{},{}".format(
                 operation,
                 max(0, min(100, int(round(self._mutator_depth_value(slot, "activation_probability", 1.0) * 100.0)))),
@@ -4491,12 +4515,12 @@ class Tap(ControlSurface):
         return ";".join(parts)
 
     def _mutator_operation_uses_range_depth(self, operation):
-        return int(operation) in (3, 4, 5, 6, 7, 8, 9)
+        return int(operation) in (3, 6, 7, 8, 9, self._mutator_pitch_add_operation_index(), self._mutator_phrase_shift_operation_index())
 
     def _mutator_normalized_slots(self, settings):
         slots = settings.get("mutator_slots", [])
         result = []
-        add_shift_index = self._mutator_add_shift_operation_index()
+        max_operation_index = self._mutator_max_operation_index()
         if isinstance(slots, (list, tuple)):
             for slot in slots[:10]:
                 if not slot:
@@ -4504,7 +4528,7 @@ class Tap(ControlSurface):
                     continue
                 try:
                     operation = int(slot.get("operation", 0))
-                    if operation < 0 or operation > add_shift_index:
+                    if operation < 0 or operation > max_operation_index:
                         result.append(None)
                         continue
                     result.append(dict(
@@ -8447,6 +8471,242 @@ class Tap(ControlSurface):
             return list(range(int(count)))
         return [index for index in range(int(count)) if rnd.random() < amount]
 
+    def _mutator_deterministic_count(self, count, amount, minimum_when_positive=True):
+        amount = max(0.0, min(1.0, float(amount)))
+        count = max(0, int(count))
+        if count <= 0 or amount <= 0.0:
+            return 0
+        result = max(0, min(count, int(round(float(count) * amount))))
+        if minimum_when_positive:
+            result = max(1, result)
+        return result
+
+    def _mutator_deterministic_indexes(self, count, amount, rnd, minimum_when_positive=True):
+        target_count = self._mutator_deterministic_count(count, amount, minimum_when_positive=minimum_when_positive)
+        if target_count <= 0:
+            return []
+        indexes = list(range(int(count)))
+        rnd.shuffle(indexes)
+        return sorted(indexes[:target_count])
+
+    def _mutator_has_sub_sixteenth_notes(self, values):
+        for value in tuple(values or ()):
+            try:
+                start = float(value.get("start", 0.0))
+                if abs((start / 0.125) - round(start / 0.125)) <= 0.00001 and abs((start / 0.25) - round(start / 0.25)) > 0.00001:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _mutator_timing_grid(self, values):
+        return 0.125 if self._mutator_has_sub_sixteenth_notes(values) else 0.25
+
+    def _mutator_addition_grid(self, values):
+        has_sixteenth = False
+        for value in tuple(values or ()):
+            try:
+                start = float(value.get("start", 0.0))
+                if abs((start / 0.125) - round(start / 0.125)) <= 0.00001 and abs((start / 0.25) - round(start / 0.25)) > 0.00001:
+                    return 0.125
+                if abs((start / 0.25) - round(start / 0.25)) <= 0.00001 and abs((start / 0.5) - round(start / 0.5)) > 0.00001:
+                    has_sixteenth = True
+            except Exception:
+                pass
+        return 0.25 if has_sixteenth else 0.5
+
+    def _mutator_quantized_time(self, start, loop_length, grid):
+        grid = max(0.0001, float(grid))
+        loop_length = max(0.0001, float(loop_length))
+        return max(0.0, min(loop_length - 0.0001, round(float(start) / grid) * grid))
+
+    def _mutator_pack_grid(self, values):
+        pack = [dict(value) for value in tuple(values or ())]
+        if not pack:
+            return 0.25
+        starts = []
+        for value in pack:
+            starts.append(max(0.0, float(value.get("start", 0.0))))
+        for grid in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125):
+            tolerance = min(0.026, grid * 0.22)
+            if all(abs(start - (round(start / grid) * grid)) <= tolerance for start in starts):
+                return grid
+        if len(starts) > 2:
+            required_matches = len(starts) - 1
+            for grid in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125):
+                tolerance = min(0.026, grid * 0.22)
+                matches = sum(1 for start in starts if abs(start - (round(start / grid) * grid)) <= tolerance)
+                if matches >= required_matches:
+                    return grid
+        return 0.03125
+
+    def _mutator_note_start_grid(self, start):
+        start = max(0.0, float(start))
+        for grid in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125):
+            tolerance = min(0.026, grid * 0.22)
+            if abs(start - (round(start / grid) * grid)) <= tolerance:
+                return grid
+        return 0.125
+
+    def _mutator_notes_overlap(self, left, right):
+        if int(left.get("pitch", 60)) != int(right.get("pitch", 60)):
+            return False
+        left_start = float(left.get("start", 0.0))
+        right_start = float(right.get("start", 0.0))
+        left_end = left_start + max(0.0001, float(left.get("duration", 0.0001)))
+        right_end = right_start + max(0.0001, float(right.get("duration", 0.0001)))
+        return left_start < right_end - 0.000001 and right_start < left_end - 0.000001
+
+    def _mutator_sample_note_traits(self, pool, rnd, fallback=None, minimum_duration=0.03125, maximum_duration=None):
+        pool = [dict(value) for value in tuple(pool or ()) if value]
+        fallback = dict(fallback or (pool[0] if pool else {}))
+        durations = [max(minimum_duration, float(value.get("duration", fallback.get("duration", 0.125)))) for value in pool]
+        velocities = [max(1, min(127, int(value.get("velocity", fallback.get("velocity", 96))))) for value in pool]
+        mutes = [bool(value.get("mute", fallback.get("mute", False))) for value in pool]
+        probabilities = [max(0.0, min(1.0, float(value.get("probability", fallback.get("probability", 1.0))))) for value in pool]
+        duration = rnd.choice(durations) if durations else max(minimum_duration, float(fallback.get("duration", 0.125)))
+        if maximum_duration is not None:
+            duration = min(duration, max(minimum_duration, float(maximum_duration)))
+        return {
+            "duration": max(minimum_duration, duration),
+            "velocity": rnd.choice(velocities) if velocities else max(1, min(127, int(fallback.get("velocity", 96)))),
+            "mute": rnd.choice(mutes) if mutes else bool(fallback.get("mute", False)),
+            "probability": rnd.choice(probabilities) if probabilities else max(0.0, min(1.0, float(fallback.get("probability", 1.0)))),
+        }
+
+    def _mutator_phrase_start_candidates(self, source_values, result_values, base, pitch, loop_length, rnd, grid, prefer_global_open=False):
+        loop_length = max(0.0001, float(loop_length))
+        grid = max(0.03125, float(grid))
+        step_count = max(1, int(round(loop_length / grid)))
+        pitch = int(pitch)
+
+        def quantized(start):
+            return max(0.0, min(loop_length - 0.0001, round(float(start) / grid) * grid))
+
+        def start_key(start):
+            return int(round(quantized(start) * 960.0))
+
+        occupied_starts = set()
+        occupied_pitch_starts = set()
+        for value in tuple(result_values or ()):
+            try:
+                value_pitch = int(value.get("pitch", 60))
+                key = start_key(float(value.get("start", 0.0)))
+                occupied_starts.add(key)
+                occupied_pitch_starts.add((value_pitch, key))
+            except Exception:
+                pass
+
+        source = [
+            dict(value)
+            for value in tuple(source_values or ())
+            if 0.0 <= float(value.get("start", 0.0)) < loop_length
+        ]
+        if not source:
+            source = [dict(base)]
+        source.sort(key=lambda item: (float(item.get("start", 0.0)), int(item.get("pitch", 60))))
+        same_pitch = [value for value in source if int(value.get("pitch", 60)) == pitch] or source
+        base_start = quantized(float(base.get("start", 0.0)))
+
+        def unique_starts(values):
+            seen = set()
+            starts = []
+            for value in values:
+                start = quantized(float(value.get("start", 0.0)))
+                key = start_key(start)
+                if key in seen:
+                    continue
+                seen.add(key)
+                starts.append(start)
+            return sorted(starts)
+
+        starts = unique_starts(source)
+        pitch_starts = unique_starts(same_pitch)
+
+        def intervals_from(starts_to_scan):
+            counts = {}
+            if len(starts_to_scan) < 2:
+                return []
+            ordered = sorted(starts_to_scan)
+            pairs = list(zip(ordered[:-1], ordered[1:]))
+            pairs.append((ordered[-1], ordered[0] + loop_length))
+            for left, right in pairs:
+                interval = quantized(right - left)
+                if interval < grid - 0.000001 or interval > 2.0 + 0.000001:
+                    continue
+                key = int(round(interval / grid))
+                counts[key] = counts.get(key, 0) + 1
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            return [key * grid for key, _ in ranked[:5]]
+
+        intervals = intervals_from(pitch_starts) + intervals_from(starts)
+        if not intervals:
+            intervals = [grid, grid * 2.0, grid * 3.0, grid * 4.0]
+
+        phrase_last = max(starts) if starts else base_start
+        phrase_first = min(starts) if starts else base_start
+        pitch_last = max(pitch_starts) if pitch_starts else phrase_last
+        pitch_first = min(pitch_starts) if pitch_starts else phrase_first
+        offsets = sorted(set(quantized(start % 1.0) for start in pitch_starts), key=lambda offset: abs(offset - (base_start % 1.0)))
+        if not offsets:
+            offsets = [base_start % 1.0]
+
+        candidates = []
+
+        def add_candidate(start, mode_score, local_score=0.0):
+            start = quantized(start % loop_length)
+            key = start_key(start)
+            score = float(mode_score) + float(local_score)
+            if (pitch, key) in occupied_pitch_starts:
+                score += 1000.0
+            if key in occupied_starts:
+                score += 7.5 if prefer_global_open else 1.35
+            else:
+                score -= 0.55 if prefer_global_open else 0.25
+            score += rnd.random() * 0.025
+            candidates.append((score, start))
+
+        for order, interval in enumerate(intervals[:4]):
+            add_candidate(base_start + interval, 0.0, order * 0.08)
+            add_candidate(pitch_last + interval, 0.12, order * 0.08)
+            add_candidate(phrase_last + interval, 0.35, order * 0.08)
+            add_candidate(base_start - interval, 1.3, order * 0.08)
+
+        for order, interval in enumerate(intervals[:4]):
+            pickup = loop_length - interval
+            if pitch_first <= interval + grid:
+                pickup = max(0.0, loop_length - max(grid, interval - pitch_first))
+            add_candidate(pickup, 0.55, order * 0.12)
+            add_candidate(loop_length - max(grid, interval * 0.5), 0.75, order * 0.12)
+
+        beat = math.floor(base_start)
+        answer_offsets = (0.5, 0.75, 1.0, 1.5, -0.5)
+        for order, offset in enumerate(answer_offsets):
+            add_candidate(base_start + offset, 0.9, order * 0.06)
+            add_candidate(beat + offset, 1.05, order * 0.06)
+
+        for cell_delta in (1, 2, 3, 4, -1, -2, 6, -4, 8, -6):
+            cell_start = quantized(base_start + (cell_delta * grid))
+            for order, offset in enumerate(offsets[:4]):
+                add_candidate(math.floor(cell_start) + offset, 1.6, abs(cell_delta) * 0.02 + order * 0.06)
+
+        for step in range(step_count):
+            start = step * grid
+            key = start_key(start)
+            if key not in occupied_starts:
+                distance = min((step - int(round(base_start / grid))) % step_count, (int(round(base_start / grid)) - step) % step_count)
+                add_candidate(start, 2.15, distance * 0.015)
+
+        seen = set()
+        ordered = []
+        for _, start in sorted(candidates, key=lambda item: item[0]):
+            key = start_key(start)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(start)
+        return ordered
+
     def _mutator_apply_break_role(self, values, loop_length, rhythm=False):
         values = [dict(value) for value in tuple(values or ())]
         if not values:
@@ -8487,12 +8747,12 @@ class Tap(ControlSurface):
         indexes = self._mutator_operation_indexes(len(values), probability, rnd)
         if not indexes:
             return values
-        grid = 0.125
-        max_steps = max(1, min(8 if rhythm else 6, int(math.ceil(max(0.0, min(1.0, strength)) * (8 if rhythm else 6)))))
+        grid = self._mutator_timing_grid(values)
+        max_steps = max(1, min(4 if rhythm else 3, int(math.ceil(max(0.0, min(1.0, strength)) * (4 if rhythm else 3)))))
         choices = [step * grid for step in range(-max_steps, max_steps + 1) if step != 0]
         for index in indexes:
             start = float(values[index].get("start", 0.0)) + rnd.choice(choices)
-            values[index]["start"] = max(0.0, min(float(loop_length) - 0.0001, start))
+            values[index]["start"] = self._mutator_quantized_time(start, loop_length, grid)
         return values
 
     def _mutator_shift_pitch_groups_by_depth(self, values, probability, strength, loop_length, rnd, rhythm=False, target_pitches=None):
@@ -8512,16 +8772,16 @@ class Tap(ControlSurface):
         if not pitches:
             return values
 
-        max_offset = loop_length * shift_range
+        grid = self._mutator_timing_grid(values)
+        max_steps = max(1, min(8, int(math.ceil((loop_length / grid) * shift_range))))
         offsets_by_pitch = {}
         for pitch in pitches:
             pitch_rnd = random.Random(rnd.randint(0, 2147483647))
             if pitch_rnd.random() > amount:
                 continue
-            offset = pitch_rnd.uniform(-max_offset, max_offset)
-            if abs(offset) < 0.000001:
-                continue
-            offsets_by_pitch[pitch] = offset
+            step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
+            if step_choices:
+                offsets_by_pitch[pitch] = pitch_rnd.choice(step_choices) * grid
         if not offsets_by_pitch:
             return values
 
@@ -8530,18 +8790,33 @@ class Tap(ControlSurface):
             if pitch not in offsets_by_pitch:
                 continue
             start = (float(value.get("start", 0.0)) + offsets_by_pitch[pitch]) % loop_length
-            value["start"] = max(0.0, min(loop_length - 0.0001, start))
+            value["start"] = self._mutator_quantized_time(start, loop_length, grid)
+        return values
+
+    def _mutator_loop_shift_by_depth(self, values, probability, loop_length, rnd):
+        values = [dict(value) for value in tuple(values or ())]
+        amount = max(0.0, min(1.0, float(probability)))
+        if amount <= 0.0 or not values:
+            return values
+        grid = self._mutator_timing_grid(values)
+        max_steps = max(1, min(16, int(math.ceil((float(loop_length) / grid) * amount))))
+        step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
+        if not step_choices:
+            return values
+        offset = rnd.choice(step_choices) * grid
+        loop_length = max(0.0001, float(loop_length))
+        for value in values:
+            value["start"] = self._mutator_quantized_time((float(value.get("start", 0.0)) + offset) % loop_length, loop_length, grid)
         return values
 
     def _mutator_add_values_by_depth(self, values, depth, strength, role, loop_length, settings, rnd, rhythm=False, target_pitches=None):
         values = [dict(value) for value in tuple(values or ())]
         amount = max(0.0, min(1.0, float(depth)))
-        add_chance = max(0.0, min(1.0, float(strength)))
-        if amount <= 0.0 or add_chance <= 0.0 or not values:
+        if amount <= 0.0 or not values:
             return values
         rnd = random.Random((rnd.randint(0, 2147483647) << 1) ^ rnd.randint(0, 2147483647))
         loop_length = max(0.0001, float(loop_length))
-        grid = 0.0625 if role == 7 else 0.125
+        grid = self._mutator_addition_grid(values)
         cell_size = 1.0
         cell_count = max(1, int(math.ceil(loop_length / cell_size)))
         result = list(values)
@@ -8585,9 +8860,11 @@ class Tap(ControlSurface):
 
         offsets_by_pitch = {}
         cells_by_pitch = {}
+        occupied_starts = set()
         for value in values:
             pitch = int(value.get("pitch", 60))
             start = quantized(float(value.get("start", 0.0)))
+            occupied_starts.add(int(round(start * 960.0)))
             cell = cell_index(start)
             offset = max(0.0, min(cell_size - grid, quantized(start - (cell * cell_size))))
             offsets_by_pitch.setdefault(pitch, set()).add(offset)
@@ -8601,6 +8878,9 @@ class Tap(ControlSurface):
                 if relevant_for_overlap(value, candidate_pitch) and abs(float(value.get("start", 0.0)) - candidate_start) < 0.000001:
                     return True
             return False
+
+        def global_start_is_taken(candidate_start):
+            return int(round(float(candidate_start) * 960.0)) in occupied_starts
 
         def max_free_duration(candidate_start, candidate_pitch):
             limit = max(0.0, loop_length - candidate_start)
@@ -8650,6 +8930,8 @@ class Tap(ControlSurface):
                     if candidate_start >= loop_length - 0.000001:
                         continue
                     score = float(order_index)
+                    if global_start_is_taken(candidate_start):
+                        score += 2.5
                     if cell in pitch_cells:
                         score -= 0.35
                     if (cell % 4) == (base_cell % 4):
@@ -8661,7 +8943,7 @@ class Tap(ControlSurface):
             pitch = int(base.get("pitch", 60))
             base_start = quantized(float(base.get("start", 0.0)))
             base_cell = cell_index(base_start)
-            steps = (0.25, 0.125, 0.0625, 0.03125)
+            steps = tuple(sorted(set([grid, max(grid, 0.5), max(grid, 1.0)])))
             intervals = []
             for value in result:
                 if not relevant_for_overlap(value, pitch):
@@ -8708,24 +8990,42 @@ class Tap(ControlSurface):
             base_duration = max(minimum_duration, float(base.get("duration", 0.125)))
             candidates = []
             seen = set()
-            for candidate in list(placement_candidates(base)) + list(fallback_gap_candidates(base)):
+            smart_candidates = self._mutator_phrase_start_candidates(
+                motif,
+                result,
+                base,
+                pitch,
+                loop_length,
+                rnd,
+                grid,
+                prefer_global_open=False
+            )
+            for candidate in list(smart_candidates) + list(placement_candidates(base)) + list(fallback_gap_candidates(base)):
                 key = int(round(candidate / 0.0001))
                 if key in seen:
                     continue
                 seen.add(key)
                 candidates.append(candidate)
             viable = []
+            globally_free = []
             for candidate_start in candidates:
                 if start_is_taken(candidate_start, pitch):
                     continue
                 free_duration = max_free_duration(candidate_start, pitch)
                 if free_duration >= minimum_duration - 0.000001:
-                    viable.append((candidate_start, free_duration))
+                    candidate = (candidate_start, free_duration)
+                    if not global_start_is_taken(candidate_start):
+                        globally_free.append(candidate)
+                    viable.append(candidate)
                 if len(viable) >= 16:
                     break
-            if viable:
+            preferred = globally_free or viable
+            if preferred:
+                if globally_free and viable and rnd.random() >= 0.92:
+                    preferred = viable
                 window = max(1, min(len(viable), 2 + int(round(amount * 8.0))))
-                candidate_start, free_duration = rnd.choice(viable[:window])
+                window = max(1, min(len(preferred), window))
+                candidate_start, free_duration = rnd.choice(preferred[:window])
                 duration_pool = [duration for duration in source_durations if duration <= free_duration + 0.000001]
                 if duration_pool and rnd.random() < 0.82:
                     duration = rnd.choice(duration_pool)
@@ -8738,40 +9038,33 @@ class Tap(ControlSurface):
         for value in motif:
             motif_by_pitch.setdefault(int(value.get("pitch", 60)), []).append(value)
 
-        selected_bases = []
-        pitches = sorted(motif_by_pitch.keys())
-        rnd.shuffle(pitches)
-        for pitch in pitches:
-            pitch_motif = motif_by_pitch[pitch]
-            rnd.shuffle(pitch_motif)
-            pitch_additions = len(pitch_motif) if amount >= 1.0 else max(1, int(round(float(len(pitch_motif)) * amount)))
-            if pitch_additions >= len(pitch_motif):
-                selected_bases.extend(pitch_motif)
-            else:
-                selected_bases.extend(rnd.sample(pitch_motif, pitch_additions))
+        add_count = self._mutator_deterministic_count(len(motif), amount)
+        selected_bases = list(motif)
         rnd.shuffle(selected_bases)
+        selected_bases = selected_bases[:add_count]
 
         for base in selected_bases:
-            if rnd.random() > add_chance:
-                continue
             base = dict(base)
             pitch = int(base.get("pitch", 60))
             if pitch not in allowed_pitches:
                 continue
-            velocity = max(1, min(127, int(base.get("velocity", 96))))
             start, duration = choose_start_and_duration(base)
             if start is None:
                 continue
+            traits = self._mutator_sample_note_traits(motif_by_pitch.get(pitch, motif), rnd, fallback=base, minimum_duration=minimum_duration, maximum_duration=duration)
             cell = cell_index(start)
             offset = max(0.0, min(cell_size - grid, quantized(start - (cell * cell_size))))
             offsets_by_pitch.setdefault(pitch, set()).add(offset)
             cells_by_pitch.setdefault(pitch, set()).add(cell)
+            occupied_starts.add(int(round(start * 960.0)))
             result.append(dict(
                 base,
                 pitch=pitch,
                 start=start,
-                duration=duration,
-                velocity=velocity,
+                duration=traits["duration"],
+                velocity=traits["velocity"],
+                mute=traits["mute"],
+                probability=traits["probability"],
             ))
         return result
 
@@ -8809,7 +9102,7 @@ class Tap(ControlSurface):
         amount = max(0.0, min(1.0, float(strength)))
         if rhythm:
             targets = sorted(set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127))
-            for index in self._mutator_operation_indexes(len(values), probability, rnd):
+            for index in self._mutator_deterministic_indexes(len(values), probability, rnd):
                 pitch = int(values[index].get("pitch", 60))
                 choices = [target for target in targets if target != pitch]
                 if not choices:
@@ -8818,7 +9111,7 @@ class Tap(ControlSurface):
                 window = max(1, min(len(choices), int(math.ceil(1 + amount * min(5, len(choices))))))
                 values[index]["pitch"] = rnd.choice(choices[:window])
             return values
-        for index in self._mutator_operation_indexes(len(values), probability, rnd):
+        for index in self._mutator_deterministic_indexes(len(values), probability, rnd):
             pitch = int(values[index].get("pitch", 60))
             max_steps = self._mutator_scale_step_span_for_octave_fraction(pitch, amount, settings)
             step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
@@ -8826,15 +9119,324 @@ class Tap(ControlSurface):
                 values[index]["pitch"] = self._mutator_transpose_scale_steps(pitch, rnd.choice(step_choices), settings)
         return values
 
+    def _mutator_apply_pitch_add_by_depth(self, values, probability, strength, loop_length, settings, rnd, rhythm=False, target_pitches=None):
+        values = [dict(value) for value in tuple(values or ())]
+        if not values:
+            return values
+        add_count = self._mutator_deterministic_count(len(values), probability)
+        if add_count <= 0:
+            return values
+
+        amount = max(0.0, min(1.0, float(strength)))
+        selected = list(values)
+        rnd.shuffle(selected)
+        selected = selected[:add_count]
+        result = list(values)
+        loop_length = max(0.0001, float(loop_length))
+        grid = self._mutator_timing_grid(values)
+        occupied = set(
+            (
+                int(value.get("pitch", 60)),
+                int(round(float(value.get("start", 0.0)) * 960.0))
+            )
+            for value in result
+        )
+        occupied_starts = set(int(round(float(value.get("start", 0.0)) * 960.0)) for value in result)
+        targets = sorted(set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127))
+
+        def quantized_start(value):
+            return self._mutator_quantized_time(value, loop_length, grid)
+
+        def global_start_is_taken(start):
+            return int(round(float(start) * 960.0)) in occupied_starts
+
+        def pitch_start_is_taken(pitch, start):
+            return (int(pitch), int(round(float(start) * 960.0))) in occupied
+
+        for base in selected:
+            base_start = max(0.0, min(loop_length - 0.0001, float(base.get("start", 0.0))))
+            source_pitch = int(base.get("pitch", 60))
+            pitch = None
+            if rhythm and targets:
+                choices = [target for target in targets if target != source_pitch]
+                choices.sort(key=lambda target: abs(target - source_pitch))
+                window = max(1, min(len(choices), int(math.ceil(1 + amount * min(6, len(choices)))))) if choices else 0
+                if window:
+                    pitch = rnd.choice(choices[:window])
+            else:
+                max_steps = self._mutator_scale_step_span_for_octave_fraction(source_pitch, amount, settings)
+                step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
+                rnd.shuffle(step_choices)
+                for step in step_choices:
+                    candidate = self._mutator_transpose_scale_steps(source_pitch, step, settings)
+                    if candidate != source_pitch:
+                        pitch = candidate
+                        break
+            if pitch is None:
+                continue
+
+            start = None
+            candidate_starts = self._mutator_phrase_start_candidates(
+                values,
+                result,
+                base,
+                pitch,
+                loop_length,
+                rnd,
+                grid,
+                prefer_global_open=True
+            )
+            for candidate_start in candidate_starts:
+                if not pitch_start_is_taken(pitch, candidate_start):
+                    start = candidate_start
+                    if not global_start_is_taken(candidate_start):
+                        break
+            if start is not None and global_start_is_taken(start):
+                for candidate_start in candidate_starts:
+                    if not global_start_is_taken(candidate_start) and not pitch_start_is_taken(pitch, candidate_start):
+                        start = candidate_start
+                        break
+            if start is None:
+                steps = max(1, int(round(loop_length / grid)))
+                base_step = int(round(quantized_start(base_start) / grid)) % steps
+                for offset in (1, 2, 3, 4, -1, -2, 6, -4, 8, -6, 12, -8):
+                    candidate_start = quantized_start(((base_step + offset) % steps) * grid)
+                    if not global_start_is_taken(candidate_start) and not pitch_start_is_taken(pitch, candidate_start):
+                        start = candidate_start
+                        break
+            if start is None:
+                fallback_start = quantized_start(base_start)
+                if not pitch_start_is_taken(pitch, fallback_start):
+                    start = fallback_start
+            if start is None:
+                continue
+            occupied.add((int(pitch), int(round(start * 960.0))))
+            occupied_starts.add(int(round(start * 960.0)))
+            traits = self._mutator_sample_note_traits(values, rnd, fallback=base, minimum_duration=0.03125 if rhythm else 0.0625, maximum_duration=loop_length - start)
+            result.append(dict(
+                base,
+                pitch=max(0, min(127, int(pitch))),
+                start=start,
+                duration=traits["duration"],
+                velocity=traits["velocity"],
+                mute=traits["mute"],
+                probability=traits["probability"],
+            ))
+        return result
+
+    def _mutator_duplicate_by_depth(self, values, probability, loop_length, rnd):
+        values = [dict(value) for value in tuple(values or ())]
+        indexes = self._mutator_deterministic_indexes(len(values), probability, rnd)
+        if not indexes:
+            return values
+        selected = [dict(values[index]) for index in indexes]
+        loop_length = max(0.0001, float(loop_length))
+        grid = self._mutator_pack_grid(selected)
+        ticks_per_beat = 960
+        loop_ticks = max(1, int(round(loop_length * ticks_per_beat)))
+        grid_ticks = max(1, int(round(grid * ticks_per_beat)))
+
+        def snap_tick(start):
+            tick = int(round(float(start) * ticks_per_beat))
+            return int(round(float(tick) / float(grid_ticks))) * grid_ticks
+
+        snapped_starts = [max(0, min(loop_ticks - 1, snap_tick(value.get("start", 0.0)))) for value in selected]
+        range_start_tick = (min(snapped_starts) // grid_ticks) * grid_ticks
+        range_end_tick = (((max(snapped_starts) + grid_ticks) + grid_ticks - 1) // grid_ticks) * grid_ticks
+        range_start_tick = max(0, min(loop_ticks - 1, range_start_tick))
+        range_end_tick = max(range_start_tick + grid_ticks, min(loop_ticks, range_end_tick))
+        range_length_ticks = max(grid_ticks, range_end_tick - range_start_tick)
+        max_steps = max(1, min(32, int(math.ceil(float(loop_ticks) / float(range_length_ticks)))))
+        copy_count = 1
+        result = list(values)
+
+        def shifted_note(value, step):
+            relative_tick = snap_tick(value.get("start", 0.0)) - range_start_tick
+            start_tick = (range_start_tick + relative_tick + (step * range_length_ticks)) % loop_ticks
+            start = max(0.0, min(loop_length - 0.0001, float(start_tick) / float(ticks_per_beat)))
+            return dict(
+                value,
+                start=start,
+                duration=max(0.03125, min(float(value.get("duration", 0.03125)), loop_length - start))
+            )
+
+        logical_steps = [
+            step
+            for step in range(1, max_steps + 1)
+            if (step * range_length_ticks) % loop_ticks != 0
+        ]
+        if len(logical_steps) < copy_count:
+            logical_steps.extend(
+                -step
+                for step in range(1, max_steps + 1)
+                if (-step * range_length_ticks) % loop_ticks != 0
+            )
+
+        used_steps = []
+        for step in logical_steps:
+            if step in used_steps:
+                continue
+            used_steps.append(step)
+            for candidate in [shifted_note(value, step) for value in selected]:
+                result.append(candidate)
+            if len(used_steps) >= copy_count:
+                break
+
+        if used_steps:
+            return result
+
+        offsets = [1, 2, 3, 4, 6, 8, 12, 16, -1, -2, -3, -4, -6, -8, -12, -16]
+        rnd.shuffle(offsets)
+        offsets.sort(key=lambda step: (abs(step), 0 if step > 0 else 1))
+        for repeat_index in range(copy_count):
+            offset = offsets[repeat_index % len(offsets)] * grid_ticks
+            for value in selected:
+                start_tick = (snap_tick(value.get("start", 0.0)) + offset) % loop_ticks
+                start = max(0.0, min(loop_length - 0.0001, float(start_tick) / float(ticks_per_beat)))
+                result.append(dict(
+                    value,
+                    start=start,
+                    duration=max(0.03125, min(float(value.get("duration", 0.03125)), loop_length - start))
+                ))
+        return result
+
+    def _mutator_phrase_shift_by_depth(self, values, probability, strength, settings, rnd, rhythm=False, target_pitches=None):
+        values = [dict(value) for value in tuple(values or ())]
+        indexes = self._mutator_deterministic_indexes(len(values), probability, rnd)
+        if not indexes:
+            return values
+        amount = max(0.0, min(1.0, float(strength)))
+        if rhythm:
+            targets = sorted(set(int(pitch) for pitch in tuple(target_pitches or ()) if 0 <= int(pitch) <= 127))
+            if len(targets) < 2:
+                return values
+            selected_positions = [
+                targets.index(int(values[index].get("pitch", 60)))
+                for index in indexes
+                if int(values[index].get("pitch", 60)) in targets
+            ]
+            if not selected_positions:
+                return values
+            min_position = min(selected_positions)
+            max_position = max(selected_positions)
+            max_down = min_position
+            max_up = len(targets) - 1 - max_position
+            max_span = max(max_down, max_up)
+            if max_span <= 0:
+                return values
+            max_steps = max(1, min(max_span, int(math.ceil(max_span * max(0.125, amount)))))
+            step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0 and -max_down <= step <= max_up]
+            if not step_choices:
+                return values
+            offset = rnd.choice(step_choices)
+            for index in indexes:
+                pitch = int(values[index].get("pitch", 60))
+                if pitch not in targets:
+                    continue
+                values[index]["pitch"] = targets[targets.index(pitch) + offset]
+            return values
+
+        selected_pitches = [int(values[index].get("pitch", 60)) for index in indexes]
+        if not selected_pitches:
+            return values
+        max_steps = min(
+            self._mutator_scale_step_span_for_octave_fraction(min(selected_pitches), amount, settings),
+            self._mutator_scale_step_span_for_octave_fraction(max(selected_pitches), amount, settings)
+        )
+        step_choices = [step for step in range(-max_steps, max_steps + 1) if step != 0]
+        if not step_choices:
+            return values
+        offset = rnd.choice(step_choices)
+        for index in indexes:
+            values[index]["pitch"] = self._mutator_transpose_scale_steps(int(values[index].get("pitch", 60)), offset, settings)
+        return values
+
+    def _mutator_preserve_original_by_depth(self, values, source_values, probability, loop_length, rnd):
+        values = [dict(value) for value in tuple(values or ())]
+        source = [dict(value) for value in tuple(source_values or ())]
+        indexes = self._mutator_deterministic_indexes(len(source), probability, rnd)
+        if not indexes:
+            return values
+        loop_length = max(0.0001, float(loop_length))
+        preserved = []
+        for index in indexes:
+            note = dict(source[index])
+            start = max(0.0, min(loop_length - 0.0001, float(note.get("start", 0.0))))
+            note["start"] = start
+            note["duration"] = max(0.03125, min(float(note.get("duration", 0.03125)), loop_length - start))
+            preserved.append(note)
+        result = []
+        for value in values:
+            if any(self._mutator_notes_overlap(value, note) for note in preserved):
+                continue
+            result.append(value)
+        result.extend(preserved)
+        return result
+
+    def _mutator_reverse_timing_by_depth(self, values, probability, loop_length, rnd):
+        values = [dict(value) for value in tuple(values or ())]
+        indexes = self._mutator_deterministic_indexes(len(values), probability, rnd)
+        if len(indexes) < 2:
+            return values
+        selected = [values[index] for index in indexes]
+        range_start = min(float(value.get("start", 0.0)) for value in selected)
+        range_end = max(float(value.get("start", 0.0)) + max(0.0001, float(value.get("duration", 0.0001))) for value in selected)
+        range_end = min(max(range_start + 0.0001, range_end), float(loop_length))
+        for index in indexes:
+            duration = max(0.0001, float(values[index].get("duration", 0.0001)))
+            original_end = float(values[index].get("start", 0.0)) + duration
+            values[index]["start"] = max(0.0, min(float(loop_length) - 0.0001, range_start + (range_end - original_end)))
+        return values
+
+    def _mutator_invert_pitch_by_depth(self, values, probability, settings, rnd, rhythm=False, target_pitches=None):
+        values = [dict(value) for value in tuple(values or ())]
+        indexes = self._mutator_deterministic_indexes(len(values), probability, rnd)
+        if len(indexes) < 2:
+            return values
+        selected_pitches = [int(values[index].get("pitch", 60)) for index in indexes]
+        min_pitch = min(selected_pitches)
+        max_pitch = max(selected_pitches)
+        if rhythm:
+            allowed = sorted(set(int(pitch) for pitch in tuple(target_pitches or selected_pitches) if 0 <= int(pitch) <= 127))
+            if len(allowed) < 2:
+                return values
+            selected_indexes = [allowed.index(pitch) for pitch in selected_pitches if pitch in allowed]
+            if len(selected_indexes) < 2:
+                return values
+            min_index = min(selected_indexes)
+            max_index = max(selected_indexes)
+            for index in indexes:
+                pitch = int(values[index].get("pitch", 60))
+                if pitch not in allowed:
+                    continue
+                mirrored_index = max_index - max(0, allowed.index(pitch) - min_index)
+                if 0 <= mirrored_index < len(allowed):
+                    values[index]["pitch"] = allowed[mirrored_index]
+            return values
+        if settings.get("scale", "Minor") == "Chromatic":
+            for index in indexes:
+                pitch = int(values[index].get("pitch", 60))
+                values[index]["pitch"] = max(0, min(127, min_pitch + (max_pitch - pitch)))
+            return values
+
+        allowed = self._mutator_scale_notes(settings)
+        try:
+            min_index = self._mutator_scale_index(min_pitch, allowed)
+            max_index = self._mutator_scale_index(max_pitch, allowed)
+        except Exception:
+            return values
+        for index in indexes:
+            pitch_index = self._mutator_scale_index(int(values[index].get("pitch", 60)), allowed)
+            mirrored_index = max_index - max(0, pitch_index - min_index)
+            if 0 <= mirrored_index < len(allowed):
+                values[index]["pitch"] = allowed[mirrored_index]
+        return values
+
     def _mutator_remove_by_depth(self, values, depth, strength, rnd):
         values = [dict(value) for value in tuple(values or ())]
-        remove_chance = max(0.0, min(1.0, float(strength)))
-        if remove_chance <= 0.0:
+        if max(0.0, min(1.0, float(depth))) <= 0.0:
             return values
-        remove_indexes = set(
-            index for index in self._mutator_operation_indexes(len(values), depth, rnd)
-            if rnd.random() <= remove_chance
-        )
+        remove_indexes = set(self._mutator_deterministic_indexes(len(values), depth, rnd))
         if not remove_indexes:
             return values
         return [value for index, value in enumerate(values) if index not in remove_indexes]
@@ -8933,7 +9535,8 @@ class Tap(ControlSurface):
             allowed_pitches = allowed_pitches.intersection(targets) or allowed_pitches
         motif = [value for value in source if int(value.get("pitch", 60)) in allowed_pitches]
         motif.sort(key=lambda item: int(item.get("velocity", 96)), reverse=True)
-        occupied = self._mutator_rhythm_occupied_steps(result, loop_length)
+        grid = 0.0625 if role == 7 else self._mutator_timing_grid(source or result)
+        occupied = self._mutator_rhythm_occupied_steps(result, loop_length, grid=grid)
         for add_index in range(additions):
             if not motif:
                 break
@@ -8945,15 +9548,41 @@ class Tap(ControlSurface):
                 start = (float(base.get("start", 0.0)) + rnd.choice([0.125, 0.25, 0.375, 0.5, 0.75, 1.0])) % float(loop_length)
                 duration = min(float(base.get("duration", 0.125)), float(loop_length) - start)
             pitch = int(base.get("pitch", 60))
-            start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied)
+            start_candidates = self._mutator_phrase_start_candidates(
+                motif,
+                result,
+                base,
+                pitch,
+                loop_length,
+                rnd,
+                grid,
+                prefer_global_open=False
+            )
+            if role == 7:
+                start_candidates = [
+                    candidate
+                    for candidate in start_candidates
+                    if candidate >= max(0.0, float(loop_length) - 1.0)
+                ] or start_candidates
+            start_candidates.append(start)
+            placed_start = None
+            for candidate in start_candidates[:18]:
+                placed_start = self._mutator_rhythm_free_start(pitch, candidate, loop_length, occupied, grid=grid)
+                if placed_start is not None:
+                    break
+            start = placed_start
             if start is None:
                 continue
+            duration_limit = min(duration, max(0.03125, float(loop_length) - start))
+            traits = self._mutator_sample_note_traits(motif, rnd, fallback=base, minimum_duration=0.03125 if rhythm else 0.0625, maximum_duration=duration_limit)
             result.append(dict(
                 base,
                 pitch=pitch,
                 start=start,
-                duration=max(0.03125 if rhythm else 0.0625, duration),
-                velocity=max(1, min(127, int(base.get("velocity", 96)))),
+                duration=traits["duration"],
+                velocity=traits["velocity"],
+                mute=traits["mute"],
+                probability=traits["probability"],
             ))
         return result
 
@@ -8973,6 +9602,29 @@ class Tap(ControlSurface):
                 continue
             if operation_index == self._mutator_add_shift_operation_index():
                 result = self._mutator_apply_add_shift_by_depth(result, source_values, role, loop_length, settings, rnd, probability, rhythm=rhythm, target_pitches=target_pitches)
+                continue
+            if operation_index == self._mutator_loop_shift_operation_index():
+                result = self._mutator_loop_shift_by_depth(result, probability, loop_length, rnd)
+                continue
+            if operation_index == self._mutator_reverse_operation_index():
+                result = self._mutator_reverse_timing_by_depth(result, probability, loop_length, rnd)
+                continue
+            if operation_index == self._mutator_invert_operation_index():
+                result = self._mutator_invert_pitch_by_depth(result, probability, settings, rnd, rhythm=rhythm, target_pitches=target_pitches)
+                continue
+            if operation_index == self._mutator_pitch_add_operation_index():
+                result = self._mutator_apply_pitch_add_by_depth(result, probability, strength, loop_length, settings, rnd, rhythm=rhythm, target_pitches=target_pitches)
+                continue
+            if operation_index == self._mutator_duplicate_operation_index():
+                result = self._mutator_duplicate_by_depth(result, probability, loop_length, rnd)
+                continue
+            if operation_index == self._mutator_phrase_shift_operation_index():
+                result = self._mutator_phrase_shift_by_depth(result, probability, strength, settings, rnd, rhythm=rhythm, target_pitches=target_pitches)
+                continue
+            if operation_index == self._mutator_preserver_operation_index():
+                result = self._mutator_preserve_original_by_depth(result, source_values, probability, loop_length, rnd)
+                continue
+            if operation_index < 0 or operation_index >= len(keys):
                 continue
             key = keys[operation_index]
             if key == "fill_depth":
@@ -9020,19 +9672,43 @@ class Tap(ControlSurface):
             fill_depth = max(0.0, min(1.0, float(settings.get("depth", 0.0))))
         if fill_depth <= 0.0:
             return
-        hit_count = max(1, int(math.ceil(fill_depth * (8 if rhythm else 7))))
-        fill_start = max(0.0, float(loop_length) - min(float(loop_length), 1.0))
-        step = min(0.25, max(0.0625, (float(loop_length) - fill_start) / float(hit_count)))
+        hit_count = max(1, min(8, int(math.ceil(fill_depth * (8 if rhythm else 7)))))
+        if hit_count <= 2:
+            fill_window = min(float(loop_length), 2.0)
+        elif hit_count <= 4:
+            fill_window = min(float(loop_length), 1.5)
+        else:
+            fill_window = min(float(loop_length), 1.0)
+        fill_start = max(0.0, float(loop_length) - fill_window)
+        fill_patterns = {
+            1: ((0.5,), (1.0,), (1.5,)),
+            2: ((0.0, 1.0), (0.5, 1.5), (0.5, 1.0), (1.0, 1.5)),
+            3: ((0.0, 0.75, 1.25), (0.25, 0.75, 1.25), (0.5, 1.0, 1.25)),
+            4: ((0.0, 0.5, 1.0, 1.25), (0.25, 0.75, 1.0, 1.25), (0.0, 0.5, 0.75, 1.25)),
+            5: ((0.25, 0.5, 0.625, 0.75, 0.875), (0.375, 0.5, 0.625, 0.75, 0.875)),
+            6: ((0.25, 0.375, 0.5, 0.625, 0.75, 0.875), (0.125, 0.375, 0.5, 0.625, 0.75, 0.875)),
+            7: ((0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875),),
+            8: ((0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875),),
+        }
+        offsets = list(rnd.choice(fill_patterns.get(hit_count, fill_patterns[8])))
         occupied = self._mutator_rhythm_occupied_steps(result, loop_length, grid=0.0625)
+        contour_targets = list(targets)
+        rnd.shuffle(contour_targets)
 
-        for fill_index in range(hit_count):
-            base = dict(pool[fill_index % len(pool)])
-            pitch = targets[(fill_index + (len(targets) - 1 if role in (7, 15) else 0)) % len(targets)]
-            start = fill_start + (fill_index * step)
+        for fill_index, offset in enumerate(offsets):
+            base = dict(rnd.choice(pool))
+            if rhythm:
+                pitch = rnd.choice(targets)
+            elif contour_targets:
+                pitch = contour_targets[fill_index % len(contour_targets)]
+            else:
+                pitch = int(base.get("pitch", 60))
+            start = fill_start + min(fill_window - 0.0625, offset)
             start = self._mutator_rhythm_free_start(pitch, start, loop_length, occupied, grid=0.0625)
             if start is None:
                 continue
-            velocity = int(base.get("velocity", 96))
+            traits = self._mutator_sample_note_traits(pool, rnd, fallback=base, minimum_duration=0.03125, maximum_duration=float(loop_length) - start)
+            velocity = int(traits.get("velocity", base.get("velocity", 96)))
             velocity_depth = fill_depth
             if settings.get("algorithm", "mutator") == "mutator":
                 velocity_depth = self._mutator_role_operation_depth(role, self._mutator_depth_value(settings, "velocity_change_depth", 0.0))
@@ -9042,8 +9718,10 @@ class Tap(ControlSurface):
                 base,
                 pitch=pitch,
                 start=start,
-                duration=max(0.03125, min(0.125 if rhythm else 0.16, float(loop_length) - start)),
+                duration=max(0.03125, min(traits["duration"], 0.125 if rhythm else 0.16, float(loop_length) - start)),
                 velocity=max(1, min(127, velocity)),
+                mute=traits["mute"],
+                probability=traits["probability"],
             ))
 
     def _mutator_rhythm_named_values(self, role, loop_length, settings, rnd):
@@ -11477,13 +12155,13 @@ class Tap(ControlSurface):
                         for key in self._mutator_operation_depth_keys():
                             note_data.append(max(0, min(100, int(round(self._mutator_depth_value(mutator_info, key, 0.0) * 100.0)))))
                         note_data.append(len(operation_order))
-                        note_data.extend(max(0, min(len(self._mutator_operation_depth_keys()) - 1, int(index))) for index in operation_order)
+                        note_data.extend(max(0, min(self._mutator_max_operation_index(), int(index))) for index in operation_order)
                         note_data.append(len(mutator_slots))
                         for slot in mutator_slots:
                             if not slot:
                                 note_data.extend([127, 0, 0, 0])
                             else:
-                                operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
+                                operation = max(0, min(self._mutator_max_operation_index(), int(slot.get("operation", 0))))
                                 note_data.extend([
                                     operation,
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "activation_probability", 1.0) * 100.0)))),
