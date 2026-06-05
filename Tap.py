@@ -4460,10 +4460,12 @@ class Tap(ControlSurface):
                 if operation < 0 or operation > add_shift_index:
                     result.append(None)
                     continue
-                probability = max(0.0, min(1.0, float(fields[1]) / 100.0 if len(fields) > 1 else 0.0))
-                strength = max(0.0, min(1.0, float(fields[2]) / 100.0 if len(fields) > 2 else 0.5))
+                activation = max(0.0, min(1.0, float(fields[1]) / 100.0 if len(fields) > 1 else 1.0))
+                probability = max(0.0, min(1.0, float(fields[2]) / 100.0 if len(fields) > 2 else 0.0))
+                strength = max(0.0, min(1.0, float(fields[3]) / 100.0 if len(fields) > 3 else 0.5))
                 result.append(dict(
                     operation=operation,
+                    activation_probability=activation,
                     probability_depth=probability,
                     range_depth=strength,
                 ))
@@ -4480,8 +4482,9 @@ class Tap(ControlSurface):
                 parts.append("x")
                 continue
             operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
-            parts.append("{},{},{}".format(
+            parts.append("{},{},{},{}".format(
                 operation,
+                max(0, min(100, int(round(self._mutator_depth_value(slot, "activation_probability", 1.0) * 100.0)))),
                 max(0, min(100, int(round(self._mutator_depth_value(slot, "probability_depth", 0.0) * 100.0)))),
                 max(0, min(100, int(round(self._mutator_depth_value(slot, "range_depth", 0.5) * 100.0)))),
             ))
@@ -4506,6 +4509,7 @@ class Tap(ControlSurface):
                         continue
                     result.append(dict(
                         operation=operation,
+                        activation_probability=self._mutator_depth_value(slot, "activation_probability", 1.0),
                         probability_depth=self._mutator_depth_value(slot, "probability_depth", 0.0),
                         range_depth=self._mutator_depth_value(slot, "range_depth", 0.5),
                     ))
@@ -4532,10 +4536,27 @@ class Tap(ControlSurface):
         slot_count = self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), slots)
         return slots[:slot_count]
 
+    def _mutator_resolve_slot_activation(self, settings):
+        resolved = dict(settings or {})
+        rnd = random.Random(int(resolved.get("seed", 1)) ^ 0x5A175EED)
+        active_slots = []
+        for slot in self._mutator_visible_slots(resolved):
+            if not slot:
+                continue
+            activation = self._mutator_depth_value(slot, "activation_probability", 1.0)
+            if activation <= 0.0:
+                continue
+            if activation < 1.0 and rnd.random() > activation:
+                continue
+            active_slots.append(slot)
+        resolved["_active_mutator_slots"] = active_slots
+        return resolved
+
     def _mutator_active_slots(self, settings):
         active = []
         add_shift_index = self._mutator_add_shift_operation_index()
-        for slot in self._mutator_visible_slots(settings):
+        source_slots = settings.get("_active_mutator_slots", self._mutator_visible_slots(settings))
+        for slot in source_slots:
             if not slot:
                 continue
             probability = self._mutator_depth_value(slot, "probability_depth", 0.0)
@@ -9226,6 +9247,7 @@ class Tap(ControlSurface):
             target_pitches = set(self._mutator_rhythm_target_pitches(settings, source_values)) if rhythm_mode else set()
             if not source_values and not target_pitches:
                 return False
+            settings = self._mutator_resolve_slot_activation(settings)
             generation_source_values = source_values
             passthrough_section_values = []
             if rhythm_mode:
@@ -11440,7 +11462,7 @@ class Tap(ControlSurface):
                             self._mutator_normalized_slots(mutator_info)
                         )
                         note_data.extend([
-                            8,
+                            9,
                             int(mutator_info.get("algorithm_code", self._mutator_algorithm_code(mutator_info.get("algorithm", "mutator")))) & 0x7F,
                             int(mutator_info.get("regenerate_mode", 0)) & 0x7F,
                             int(mutator_info.get("source_mode", 2)) & 0x7F,
@@ -11459,11 +11481,12 @@ class Tap(ControlSurface):
                         note_data.append(len(mutator_slots))
                         for slot in mutator_slots:
                             if not slot:
-                                note_data.extend([127, 0, 0])
+                                note_data.extend([127, 0, 0, 0])
                             else:
                                 operation = max(0, min(self._mutator_add_shift_operation_index(), int(slot.get("operation", 0))))
                                 note_data.extend([
                                     operation,
+                                    max(0, min(100, int(round(self._mutator_depth_value(slot, "activation_probability", 1.0) * 100.0)))),
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "probability_depth", 0.0) * 100.0)))),
                                     max(0, min(100, int(round(self._mutator_depth_value(slot, "range_depth", 0.5) * 100.0)))),
                                 ])
