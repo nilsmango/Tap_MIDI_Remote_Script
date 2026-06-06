@@ -275,6 +275,7 @@ class Tap(ControlSurface):
     )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58)
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
@@ -410,10 +411,14 @@ class Tap(ControlSurface):
             self._mutator_regeneration_states = {}
             self._mutator_generation_in_progress = set()
             self._mutator_generation_scheduled = set()
+            self._queued_mutator_work = {}
             self._last_mutator_generation_times = {}
             self._last_mutator_generation_request_times = {}
             self._last_mutator_generation_signatures = {}
             self._mutator_generation_lock = threading.RLock()
+            self._selected_clip_update_suppression_depth = 0
+            self._selected_clip_update_pending_metadata = False
+            self._selected_clip_update_pending_notes = False
             self._clip_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
@@ -7412,7 +7417,7 @@ class Tap(ControlSurface):
         """
         Handles incoming SysEx messages, including multi-part (chunked) ones.
         Chunks start with '$' (more coming) or '_' (final chunk).
-        Only for manufacturer ID 16, 15, 14 (Modify Notes).
+        Only for message ids that can be chunked by the app.
         """
         # Ensure we have a buffer for assembling chunks
         if not hasattr(self, "_sysex_buffer"):
@@ -7428,7 +7433,7 @@ class Tap(ControlSurface):
     
         # Check if this message is chunked. Existing Tap app -> script chunks
         # always use the prefix directly after the manufacturer id.
-        if manufacturer_id in (14, 15, 16, 50, 51, 55):
+        if manufacturer_id in self.CHUNKED_INCOMING_SYSEX_IDS:
             if prefix == 36:
                 # Intermediate chunk
                 self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
@@ -9881,7 +9886,109 @@ class Tap(ControlSurface):
             settings[key] = self._mutator_depth_value(info, key, 0.0)
         return settings
 
-    def _refresh_visible_mutator_clip(self, clip):
+    def _mutator_generation_is_busy(self, key):
+        with self._mutator_generation_lock:
+            return key in self._mutator_generation_in_progress or key in self._mutator_generation_scheduled
+
+    def _queue_mutator_work(self, key, work):
+        if not work:
+            return False
+        with self._mutator_generation_lock:
+            self._queued_mutator_work[key] = work
+        return True
+
+    def _queue_mutator_settings_update(self, key, clip, settings, send_updates=True):
+        return self._queue_mutator_work(key, {
+            "type": "settings",
+            "clip": clip,
+            "settings": dict(settings or {}),
+            "send_updates": bool(send_updates),
+        })
+
+    def _queue_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True):
+        return self._queue_mutator_work(key, {
+            "type": "generate",
+            "clip": clip,
+            "settings": dict(settings or {}),
+            "previous_info": dict(previous_info or {}) if previous_info else None,
+            "send_updates": bool(send_updates),
+        })
+
+    def _pop_queued_mutator_work(self, key):
+        with self._mutator_generation_lock:
+            return self._queued_mutator_work.pop(key, None)
+
+    def _flush_queued_mutator_work(self, key):
+        with self._mutator_generation_lock:
+            if key in self._mutator_generation_in_progress or key in self._mutator_generation_scheduled:
+                return False
+        work = self._pop_queued_mutator_work(key)
+
+        if not work:
+            return False
+
+        def run_queued_work():
+            work_type = work.get("type")
+            clip = work.get("clip")
+            settings = work.get("settings", {})
+            send_updates = bool(work.get("send_updates", True))
+            if work_type == "generate":
+                previous_info = self._mutator_info(clip) or work.get("previous_info")
+                self._generate_mutator_clip(
+                    clip,
+                    settings,
+                    previous_info=previous_info,
+                    send_updates=send_updates,
+                    automatic=False
+                )
+            elif work_type == "settings":
+                self._apply_mutator_clip_settings(clip, settings, send_updates=send_updates)
+
+        try:
+            self.schedule_message(1, run_queued_work)
+            return True
+        except Exception:
+            try:
+                run_queued_work()
+                return True
+            except Exception as e:
+                self._debug_log("Error flushing queued mutator work: {}".format(str(e)))
+                return False
+
+    def _begin_selected_clip_update_batch(self):
+        self._selected_clip_update_suppression_depth += 1
+
+    def _end_selected_clip_update_batch(self):
+        self._selected_clip_update_suppression_depth = max(0, self._selected_clip_update_suppression_depth - 1)
+        if self._selected_clip_update_suppression_depth == 0:
+            self._selected_clip_update_pending_metadata = False
+            self._selected_clip_update_pending_notes = False
+
+    def _selected_clip_updates_are_suppressed(self):
+        return self._selected_clip_update_suppression_depth > 0
+
+    def _begin_undo_step(self):
+        try:
+            song = self.song()
+            begin_undo_step = getattr(song, "begin_undo_step", None)
+            if begin_undo_step:
+                begin_undo_step()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _end_undo_step(self, undo_step_started):
+        if not undo_step_started:
+            return
+        try:
+            end_undo_step = getattr(self.song(), "end_undo_step", None)
+            if end_undo_step:
+                end_undo_step()
+        except Exception:
+            pass
+
+    def _refresh_visible_mutator_clip(self, clip, send_notes=True):
         try:
             highlighted_clip_slot = self.song().view.highlighted_clip_slot
             if (
@@ -9890,7 +9997,8 @@ class Tap(ControlSurface):
                 and self._live_object_identity(highlighted_clip_slot.clip) == self._live_object_identity(clip)
             ):
                 self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                if send_notes:
+                    self.send_selected_clip_notes()
         except Exception:
             pass
 
@@ -10062,32 +10170,38 @@ class Tap(ControlSurface):
                 float(getattr(clip, "end_marker", 0.0)),
                 float(getattr(clip, "length", 0.0))
             )
-            if hasattr(clip, "remove_notes_extended"):
-                clip.remove_notes_extended(0, 128, remove_start, max(0.0001, remove_end - remove_start))
-            if specs:
-                clip.add_new_notes(tuple(specs))
+            self._begin_selected_clip_update_batch()
+            undo_step_started = self._begin_undo_step()
+            try:
+                if hasattr(clip, "remove_notes_extended"):
+                    clip.remove_notes_extended(0, 128, remove_start, max(0.0001, remove_end - remove_start))
+                if specs:
+                    clip.add_new_notes(tuple(specs))
 
-            clip.loop_start = source_start
-            clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
-            clip.loop_end = source_start + structure_length
-            clip.end_marker = source_start + structure_length
-            if should_duplicate_automation:
-                if decoupled_info:
-                    self._couple_decoupled_automation_to_loop_length(clip, structure_length)
-                else:
-                    self._duplicate_loop_automation_to_loop_length(
-                        clip,
-                        source_start,
-                        automation_source_length,
-                        structure_length
-                    )
-            info = self._mutator_info_from_settings(settings, {
-                "original_loop_length": original_loop_length,
-                "structure_length": structure_length,
-                "seed": settings.get("seed", 1),
-                "sections": sections,
-            }, clip, commit_structure=True)
-            self._save_mutator_info_to_name(clip, info)
+                clip.loop_start = source_start
+                clip.start_marker = min(float(getattr(clip, "start_marker", source_start)), source_start)
+                clip.loop_end = source_start + structure_length
+                clip.end_marker = source_start + structure_length
+                if should_duplicate_automation:
+                    if decoupled_info:
+                        self._couple_decoupled_automation_to_loop_length(clip, structure_length)
+                    else:
+                        self._duplicate_loop_automation_to_loop_length(
+                            clip,
+                            source_start,
+                            automation_source_length,
+                            structure_length
+                        )
+                info = self._mutator_info_from_settings(settings, {
+                    "original_loop_length": original_loop_length,
+                    "structure_length": structure_length,
+                    "seed": settings.get("seed", 1),
+                    "sections": sections,
+                }, clip, commit_structure=True)
+                self._save_mutator_info_to_name(clip, info)
+            finally:
+                self._end_undo_step(undo_step_started)
+                self._end_selected_clip_update_batch()
             if send_updates:
                 self._refresh_visible_mutator_clip(clip)
             self._last_mutator_generation_times[generation_key] = time.time()
@@ -10098,6 +10212,7 @@ class Tap(ControlSurface):
         finally:
             with self._mutator_generation_lock:
                 self._mutator_generation_in_progress.discard(generation_key)
+            self._flush_queued_mutator_work(generation_key)
 
     def _schedule_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True):
         with self._mutator_generation_lock:
@@ -10109,16 +10224,50 @@ class Tap(ControlSurface):
 
         def generate_later():
             try:
-                self._generate_mutator_clip(
-                    clip,
-                    settings,
-                    previous_info=previous_info,
-                    send_updates=send_updates,
-                    automatic=True
+                queued_work = self._pop_queued_mutator_work(key)
+                generation_clip = clip
+                generation_settings = settings
+                generation_previous_info = previous_info
+                generation_send_updates = send_updates
+                generation_automatic = True
+                apply_settings_if_generation_fails = None
+
+                if queued_work:
+                    work_type = queued_work.get("type")
+                    if work_type == "generate":
+                        generation_clip = queued_work.get("clip")
+                        generation_settings = queued_work.get("settings", {})
+                        generation_previous_info = self._mutator_info(generation_clip) or queued_work.get("previous_info")
+                        generation_send_updates = bool(queued_work.get("send_updates", True))
+                        generation_automatic = False
+                    elif work_type == "settings":
+                        generation_clip = queued_work.get("clip")
+                        generation_settings = queued_work.get("settings", {})
+                        generation_previous_info = self._mutator_info(generation_clip) or previous_info
+                        generation_send_updates = bool(queued_work.get("send_updates", True))
+                        generation_automatic = False
+                        apply_settings_if_generation_fails = queued_work
+
+                generation_succeeded = self._generate_mutator_clip(
+                    generation_clip,
+                    generation_settings,
+                    previous_info=generation_previous_info,
+                    send_updates=generation_send_updates,
+                    automatic=generation_automatic
                 )
+                if apply_settings_if_generation_fails and not generation_succeeded:
+                    self._apply_mutator_clip_settings(
+                        apply_settings_if_generation_fails.get("clip"),
+                        apply_settings_if_generation_fails.get("settings", {}),
+                        send_updates=bool(apply_settings_if_generation_fails.get("send_updates", True)),
+                        request_generation=False
+                    )
+                if not generation_succeeded:
+                    self._mark_mutator_generation_unscheduled(key)
             finally:
                 with self._mutator_generation_lock:
                     self._mutator_generation_scheduled.discard(key)
+                self._flush_queued_mutator_work(key)
 
         try:
             self.schedule_message(1, generate_later)
@@ -10127,6 +10276,32 @@ class Tap(ControlSurface):
             with self._mutator_generation_lock:
                 self._mutator_generation_scheduled.discard(key)
             return False
+
+    def _mark_mutator_generation_unscheduled(self, key):
+        with self._mutator_generation_lock:
+            state = self._mutator_regeneration_states.get(key)
+            if state:
+                state["regenerated_for_current_cycle"] = False
+            self._last_mutator_generation_signatures.pop(key, None)
+
+    def _request_mutator_generation_after_settings_update(self, key, clip, info, previous_info, send_updates=True):
+        try:
+            if not self._song_is_playing():
+                return False
+            if int(info.get("regenerate_mode", 0)) == 0:
+                return False
+            if not self._mutator_generation_settings_changed(info, previous_info):
+                return False
+            self._mark_mutator_generation_unscheduled(key)
+            settings = self._mutator_settings_from_info(info, seed=random.randint(1, 2000000000))
+            if self._mutator_generation_is_busy(key):
+                return self._queue_mutator_generation(key, clip, settings, previous_info=info, send_updates=send_updates)
+            if self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=send_updates):
+                return True
+            self._mark_mutator_generation_unscheduled(key)
+        except Exception as e:
+            self._debug_log("Error requesting mutator generation after settings update: {}".format(str(e)))
+        return False
 
     def _should_regenerate_mutator_clip(self, key, clip, info, raw_position):
         with self._mutator_generation_lock:
@@ -10208,7 +10383,8 @@ class Tap(ControlSurface):
                     raw_position = float(getattr(clip, "playing_position", 0.0))
                     if self._should_regenerate_mutator_clip(key, clip, info, raw_position):
                         settings = self._mutator_settings_from_info(info, seed=random.randint(1, 2000000000))
-                        self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=True)
+                        if not self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=True):
+                            self._mark_mutator_generation_unscheduled(key)
 
             if only_track_index is None:
                 for key in list(self._mutator_regeneration_states.keys()):
@@ -10225,9 +10401,36 @@ class Tap(ControlSurface):
             if clip_slot is None or not clip_slot.has_clip:
                 return
             clip = clip_slot.clip
-            self._generate_mutator_clip(clip, settings, previous_info=self._mutator_info(clip), send_updates=True)
+            key = self._live_object_identity(clip)
+            previous_info = self._mutator_info(clip)
+            if self._mutator_generation_is_busy(key):
+                self._queue_mutator_generation(key, clip, settings, previous_info=previous_info, send_updates=True)
+                return
+            self._generate_mutator_clip(clip, settings, previous_info=previous_info, send_updates=True)
         except Exception as e:
             self._debug_log("Error setting mutator clip: {}".format(str(e)))
+
+    def _apply_mutator_clip_settings(self, clip, settings, send_updates=True, request_generation=True):
+        if clip is None or not getattr(clip, "is_midi_clip", False):
+            return False
+
+        key = self._live_object_identity(clip)
+        previous_info = self._mutator_info(clip)
+        if not previous_info:
+            return False
+
+        info = self._mutator_info_from_settings(settings, previous_info, clip)
+        info["pending_settings_update"] = False
+        self._begin_selected_clip_update_batch()
+        try:
+            self._save_mutator_info_to_name(clip, info)
+        finally:
+            self._end_selected_clip_update_batch()
+        if send_updates:
+            self._refresh_visible_mutator_clip(clip, send_notes=False)
+        if request_generation:
+            self._request_mutator_generation_after_settings_update(key, clip, info, previous_info, send_updates=send_updates)
+        return True
 
     def _update_mutator_clip_settings(self, message):
         try:
@@ -10238,14 +10441,11 @@ class Tap(ControlSurface):
             clip = clip_slot.clip
             if not getattr(clip, "is_midi_clip", False):
                 return
-
-            previous_info = self._mutator_info(clip)
-            if not previous_info:
+            key = self._live_object_identity(clip)
+            if self._mutator_generation_is_busy(key):
+                self._queue_mutator_settings_update(key, clip, settings, send_updates=True)
                 return
-
-            info = self._mutator_info_from_settings(settings, previous_info, clip)
-            self._save_mutator_info_to_name(clip, info)
-            self.send_selected_clip_metadata()
+            self._apply_mutator_clip_settings(clip, settings, send_updates=True)
         except Exception as e:
             self._debug_log("Error updating mutator clip settings: {}".format(str(e)))
 
@@ -12065,6 +12265,9 @@ class Tap(ControlSurface):
         """
         Encode clip metadata into a compact SysEx message and send it out.
         """
+        if self._selected_clip_updates_are_suppressed():
+            self._selected_clip_update_pending_metadata = True
+            return
         if self.seq_status:
             # self.log_message("sending clip metadata")
             status_byte = 0xF0
@@ -12181,6 +12384,9 @@ class Tap(ControlSurface):
         """
         Encode a full clip with all notes into a compact SysEx message and send it out.
         """
+        if self._selected_clip_updates_are_suppressed():
+            self._selected_clip_update_pending_notes = True
+            return
         if self.seq_status:
             status_byte = 0xF0
             end_byte = 0xF7
@@ -12700,6 +12906,7 @@ class Tap(ControlSurface):
         self._mutator_regeneration_states.clear()
         self._mutator_generation_in_progress.clear()
         self._mutator_generation_scheduled.clear()
+        self._queued_mutator_work.clear()
         self._last_mutator_generation_times.clear()
         self._last_mutator_generation_request_times.clear()
         self._last_mutator_generation_signatures.clear()
