@@ -37,7 +37,7 @@ Note: If you have a Mac, **MIDI over USB is the best way to connect your iPhone 
 4. Find your iOS device in the sidebar and click the `Enable` button.
 
 ### Over WiFi
-1. Connect your device to the same WiFi as your computer (best would be an ad hoc WiFi network, even better a **USB C to Ethernet Adapter**).
+1. Connect your device to the same WiFi as your computer (best would be an ad hoc WiFi network, even better a **USB-C to Ethernet Adapter**).
 2. Configure RTP-MIDI:
 
    **Windows**
