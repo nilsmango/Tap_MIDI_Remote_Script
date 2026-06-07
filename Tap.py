@@ -415,6 +415,8 @@ class Tap(ControlSurface):
             self._last_mutator_generation_times = {}
             self._last_mutator_generation_request_times = {}
             self._last_mutator_generation_signatures = {}
+            self._mutator_playing_clip_keys = set()
+            self._mutator_triggered_clip_keys = set()
             self._mutator_generation_lock = threading.RLock()
             self._last_mutator_scale_root_signature = None
             self._mutator_scale_root_sync_scheduled = False
@@ -3424,8 +3426,9 @@ class Tap(ControlSurface):
         else:
             self._check_for_follow_action_song_change()
         self._sync_follow_actions_to_track_topology()
-        self._reconcile_follow_action_rules()
-        self._sync_follow_action_runtime_listeners()
+        if self._has_follow_action_runtime_work():
+            self._reconcile_follow_action_rules()
+            self._sync_follow_action_runtime_listeners()
         self._sync_follow_actions_to_transport()
         self._evaluate_follow_actions()
         self._evaluate_mutator_regeneration()
@@ -3437,6 +3440,16 @@ class Tap(ControlSurface):
         # meaning not in the device view
         if self.device_status is False:
             self._update_clip_slots()
+
+    def _has_follow_action_runtime_work(self):
+        return bool(
+            self._follow_action_rules
+            or self._active_follow_actions
+            or self._handled_follow_action_launches
+            or self._follow_action_missing_clip_counts
+            or self._follow_action_scene_triggered_listeners
+            or self._follow_action_clip_slot_runtime_listeners
+        )
 
     def _ensure_song_listener(self, song, listener_name, listener):
         try:
@@ -10345,11 +10358,11 @@ class Tap(ControlSurface):
                 self._mutator_generation_in_progress.discard(generation_key)
             self._flush_queued_mutator_work(generation_key)
 
-    def _schedule_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True):
+    def _schedule_mutator_generation(self, key, clip, settings, previous_info=None, send_updates=True, respect_cooldown=True, automatic=True):
         with self._mutator_generation_lock:
             if key in self._mutator_generation_scheduled or key in self._mutator_generation_in_progress:
                 return False
-            if time.time() - self._last_mutator_generation_times.get(key, 0.0) < self.MUTATOR_GENERATION_COOLDOWN_SECONDS:
+            if respect_cooldown and time.time() - self._last_mutator_generation_times.get(key, 0.0) < self.MUTATOR_GENERATION_COOLDOWN_SECONDS:
                 return False
             self._mutator_generation_scheduled.add(key)
 
@@ -10360,7 +10373,7 @@ class Tap(ControlSurface):
                 generation_settings = settings
                 generation_previous_info = previous_info
                 generation_send_updates = send_updates
-                generation_automatic = True
+                generation_automatic = bool(automatic)
                 apply_settings_if_generation_fails = None
 
                 if queued_work:
@@ -10491,37 +10504,152 @@ class Tap(ControlSurface):
                 return True
             return False
 
+    def _should_regenerate_mutator_clip_on_launch(self, key, clip, info, raw_position):
+        with self._mutator_generation_lock:
+            state = self._mutator_regeneration_states.setdefault(key, {
+                "last_position": None,
+                "completed_pass_count": 0,
+                "regenerated_for_current_cycle": False,
+            })
+
+            cycle_start = float(getattr(clip, "loop_start", 0.0))
+            cycle_end = cycle_start + max(0.0001, float(info.get("structure_length", 0.0001)))
+            play_count = int(state.get("completed_pass_count", 0)) + 1
+            state["completed_pass_count"] = play_count
+            state["last_position"] = raw_position
+            state["regenerated_for_current_cycle"] = False
+
+            regenerate_mode = int(info.get("regenerate_mode", 0))
+            should_regenerate = False
+            if regenerate_mode in (1, 2):
+                should_regenerate = True
+            elif regenerate_mode == 3:
+                should_regenerate = play_count % 2 == 0
+            elif regenerate_mode == 4:
+                should_regenerate = play_count % 4 == 0
+            elif regenerate_mode == 5:
+                should_regenerate = random.random() < 0.10
+            elif regenerate_mode == 6:
+                should_regenerate = random.random() < 0.25
+            elif regenerate_mode == 7:
+                should_regenerate = random.random() < 0.50
+            elif regenerate_mode == 8:
+                should_regenerate = random.random() < 0.75
+
+            if should_regenerate:
+                generation_signature = (
+                    "launch",
+                    int(regenerate_mode),
+                    int(play_count),
+                    int(round(cycle_start * 1000.0)),
+                    int(round(cycle_end * 1000.0))
+                )
+                if self._last_mutator_generation_signatures.get(key) == generation_signature:
+                    return False
+                self._last_mutator_generation_request_times[key] = time.time()
+                self._last_mutator_generation_signatures[key] = generation_signature
+                state["regenerated_for_current_cycle"] = True
+                return True
+            return False
+
+    def _request_mutator_generation_for_launch(self, key, clip, info, raw_position):
+        try:
+            if not info or int(info.get("regenerate_mode", 0)) == 0:
+                return False
+            if not self._should_regenerate_mutator_clip_on_launch(key, clip, info, raw_position):
+                return False
+            settings = self._mutator_settings_from_info(info, seed=random.randint(1, 2000000000))
+            if self._mutator_generation_is_busy(key):
+                return self._queue_mutator_generation(key, clip, settings, previous_info=info, send_updates=True)
+            if self._schedule_mutator_generation(
+                key,
+                clip,
+                settings,
+                previous_info=info,
+                send_updates=True,
+                respect_cooldown=False,
+                automatic=False
+            ):
+                return True
+            self._mark_mutator_generation_unscheduled(key)
+        except Exception as e:
+            self._debug_log("Error requesting mutator generation for launch: {}".format(str(e)))
+        return False
+
     def _evaluate_mutator_regeneration(self, only_track_index=None):
         try:
             if not self._song_is_playing():
                 self._mutator_regeneration_states.clear()
                 self._last_mutator_generation_signatures.clear()
+                self._mutator_playing_clip_keys.clear()
+                self._mutator_triggered_clip_keys.clear()
                 return
 
             active_keys = set()
+            known_keys = set()
+            scoped_keys = set()
             for track_index, track in enumerate(self.song().tracks):
                 if only_track_index is not None and track_index != only_track_index:
                     continue
                 for scene_index, clip_slot in enumerate(track.clip_slots):
-                    if not clip_slot.has_clip or not clip_slot.is_playing:
+                    if not clip_slot.has_clip:
                         continue
                     clip = clip_slot.clip
+                    is_playing = bool(clip_slot.is_playing)
+                    is_triggered = self._clip_slot_is_triggered(clip_slot)
+
+                    if not is_playing and not is_triggered:
+                        if not self._mutator_playing_clip_keys and not self._mutator_triggered_clip_keys:
+                            continue
+                        key = self._live_object_identity(clip)
+                        if key not in self._mutator_playing_clip_keys and key not in self._mutator_triggered_clip_keys:
+                            continue
+                    else:
+                        key = self._live_object_identity(clip)
+
+                    known_keys.add(key)
+                    scoped_keys.add(key)
                     info = self._mutator_info(clip)
                     if not info or int(info.get("regenerate_mode", 0)) == 0:
+                        self._mutator_playing_clip_keys.discard(key)
+                        self._mutator_triggered_clip_keys.discard(key)
                         continue
-                    key = self._live_object_identity(clip)
-                    active_keys.add(key)
+
                     raw_position = float(getattr(clip, "playing_position", 0.0))
+
+                    if is_triggered:
+                        self._mutator_triggered_clip_keys.add(key)
+
+                    if is_playing:
+                        active_keys.add(key)
+                        was_already_playing = key in self._mutator_playing_clip_keys
+                        trigger_resolved = key in self._mutator_triggered_clip_keys and not is_triggered
+                        if not was_already_playing or trigger_resolved:
+                            self._request_mutator_generation_for_launch(key, clip, info, raw_position)
+                            self._mutator_triggered_clip_keys.discard(key)
+                        self._mutator_playing_clip_keys.add(key)
+                    else:
+                        self._mutator_playing_clip_keys.discard(key)
+                        if not is_triggered:
+                            self._mutator_triggered_clip_keys.discard(key)
+                        continue
+
                     if self._should_regenerate_mutator_clip(key, clip, info, raw_position):
                         settings = self._mutator_settings_from_info(info, seed=random.randint(1, 2000000000))
                         if not self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=True):
                             self._mark_mutator_generation_unscheduled(key)
 
             if only_track_index is None:
+                self._mutator_playing_clip_keys.intersection_update(active_keys)
+                self._mutator_triggered_clip_keys.intersection_update(known_keys | active_keys)
                 for key in list(self._mutator_regeneration_states.keys()):
                     if key not in active_keys:
                         self._mutator_regeneration_states.pop(key, None)
                         self._last_mutator_generation_signatures.pop(key, None)
+            else:
+                for key in list(self._mutator_playing_clip_keys):
+                    if key in scoped_keys and key not in active_keys:
+                        self._mutator_playing_clip_keys.discard(key)
         except Exception as e:
             self._debug_log("Error evaluating mutator regeneration: {}".format(str(e)))
 
