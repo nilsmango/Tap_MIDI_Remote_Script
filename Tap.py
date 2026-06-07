@@ -416,6 +416,8 @@ class Tap(ControlSurface):
             self._last_mutator_generation_request_times = {}
             self._last_mutator_generation_signatures = {}
             self._mutator_generation_lock = threading.RLock()
+            self._last_mutator_scale_root_signature = None
+            self._mutator_scale_root_sync_scheduled = False
             self._selected_clip_update_suppression_depth = 0
             self._selected_clip_update_pending_metadata = False
             self._selected_clip_update_pending_notes = False
@@ -4229,7 +4231,7 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
-    def _mutator_info_from_name(self, name):
+    def _mutator_info_from_name(self, name, resolve_scale_root=True):
         try:
             matches = self.MUTATOR_NAME_MARKER_RE.findall(str(name or ""))
             if not matches:
@@ -4308,6 +4310,13 @@ class Tap(ControlSurface):
                 "sections": sections,
             }
             info.update(operation_depths)
+            if resolve_scale_root:
+                live_scale_index, live_root = self._current_mutator_scale_root(
+                    info.get("scale_index", 2),
+                    info.get("root", 0)
+                )
+                info["scale_index"] = live_scale_index
+                info["root"] = live_root
             return info
         except Exception:
             return None
@@ -4356,6 +4365,109 @@ class Tap(ControlSurface):
             return self.MUTATOR_SCALE_NAMES.index(str(scale_name))
         except Exception:
             return None
+
+    def _current_mutator_scale_root(self, fallback_scale_index=2, fallback_root=0):
+        scale_index = fallback_scale_index
+        root = fallback_root
+        try:
+            song = self.song()
+            live_scale_index = self._mutator_scale_index_from_name(getattr(song, "scale_name", ""))
+            if live_scale_index is not None:
+                scale_index = live_scale_index
+            root = max(0, min(11, int(getattr(song, "root_note", fallback_root))))
+        except Exception:
+            pass
+        return scale_index, root
+
+    def _current_mutator_scale_root_signature(self):
+        return self._current_mutator_scale_root(2, 0)
+
+    def _mutator_operation_is_scale_sensitive(self, operation):
+        try:
+            return int(operation) in (
+                6,
+                self._mutator_add_shift_operation_index(),
+                self._mutator_invert_operation_index(),
+                self._mutator_pitch_add_operation_index(),
+                self._mutator_phrase_shift_operation_index(),
+            )
+        except Exception:
+            return False
+
+    def _mutator_info_is_scale_sensitive(self, info):
+        if not info or info.get("companion_mode", "melody") == "rhythm":
+            return False
+        if self._mutator_algorithm_kind(info.get("algorithm", "mutator")) is not None:
+            return True
+        if self._mutator_depth_value(info, "pitch_shift_depth", 0.0) > 0.0:
+            return True
+        for slot in self._mutator_visible_slots(info):
+            if (
+                slot
+                and self._mutator_operation_is_scale_sensitive(slot.get("operation", 0))
+                and self._mutator_depth_value(slot, "probability_depth", 0.0) > 0.0
+            ):
+                return True
+        return False
+
+    def _mutator_clip_slots(self):
+        try:
+            for track_index, track in enumerate(self.song().tracks):
+                if track is None or not hasattr(track, "clip_slots"):
+                    continue
+                for scene_index, clip_slot in enumerate(track.clip_slots):
+                    if clip_slot is not None and clip_slot.has_clip:
+                        yield track_index, scene_index, clip_slot
+        except Exception:
+            return
+
+    def _sync_mutator_scale_root_to_companion_clips(self):
+        self._mutator_scale_root_sync_scheduled = False
+        try:
+            scale_index, root = self._current_mutator_scale_root_signature()
+            signature = (scale_index, root)
+            previous_signature = self._last_mutator_scale_root_signature
+            self._last_mutator_scale_root_signature = signature
+            if previous_signature is None or previous_signature == signature:
+                return
+
+            for _, _, clip_slot in self._mutator_clip_slots():
+                clip = clip_slot.clip
+                raw_info = self._mutator_info_from_name(clip.name, resolve_scale_root=False)
+                if not raw_info:
+                    continue
+                info = dict(raw_info)
+                scale_root_changed = (
+                    int(info.get("scale_index", 2)) != scale_index
+                    or int(info.get("root", 0)) != root
+                )
+                info["scale_index"] = scale_index
+                info["root"] = root
+                if scale_root_changed:
+                    self._save_mutator_info_to_name(clip, info)
+                if not self._mutator_info_is_scale_sensitive(info):
+                    continue
+
+                key = self._live_object_identity(clip)
+                settings = self._mutator_settings_from_info(
+                    info,
+                    seed=random.randint(1, 2000000000)
+                )
+                if self._mutator_generation_is_busy(key):
+                    self._queue_mutator_generation(key, clip, settings, previous_info=info, send_updates=True)
+                elif not self._schedule_mutator_generation(key, clip, settings, previous_info=info, send_updates=True):
+                    self._generate_mutator_clip(clip, settings, previous_info=info, send_updates=True)
+        except Exception as e:
+            self._debug_log("Error syncing mutator scale/root: {}".format(str(e)))
+
+    def _schedule_mutator_scale_root_sync(self):
+        if self._mutator_scale_root_sync_scheduled:
+            return
+        self._mutator_scale_root_sync_scheduled = True
+        try:
+            self.schedule_message(1, self._sync_mutator_scale_root_to_companion_clips)
+        except Exception:
+            self._sync_mutator_scale_root_to_companion_clips()
 
     def _mutator_depth_value(self, settings, key, fallback=0.0):
         try:
@@ -7412,6 +7524,11 @@ class Tap(ControlSurface):
         root = song.root_note
         scale_string = "{};{}".format(self._escape_sysex_string(scale), root)
         self._send_sys_ex_message(scale_string, 0x0A)
+        self._schedule_mutator_scale_root_sync()
+        try:
+            self.send_selected_clip_metadata()
+        except Exception:
+            pass
 
     def handle_sysex(self, message):
         """
@@ -7910,6 +8027,14 @@ class Tap(ControlSurface):
             fields[mutator_slot_count_index] if len(fields) > mutator_slot_count_index else "",
             mutator_slots
         )
+        message_scale = self._unescape_sysex_string(fields[9]) if len(fields) > 9 else "Minor"
+        message_scale_index = self._mutator_scale_index_from_name(message_scale)
+        if message_scale_index is None:
+            message_scale_index = 2
+        live_scale_index, live_root = self._current_mutator_scale_root(
+            message_scale_index,
+            max(0, min(11, int_field(10, 0)))
+        )
         return {
             "preset": int_field(0, 9),
             "mutations_per_pass": max(1, min(3, int_field(1, 1))),
@@ -7920,8 +8045,8 @@ class Tap(ControlSurface):
             "regenerate_mode": int_field(6, 0),
             "source_mode": int_field(7, 2),
             "depth": max(0.0, min(1.0, float_field(8, 0.0))),
-            "scale": self._unescape_sysex_string(fields[9]) if len(fields) > 9 else "Minor",
-            "root": max(0, min(11, int_field(10, 0))),
+            "scale": self._mutator_scale_name_from_index(live_scale_index),
+            "root": live_root,
             "seed": int_field(seed_index, random.randint(1, 2000000000)),
             "algorithm": self._unescape_sysex_string(fields[algorithm_index]) if len(fields) > algorithm_index else "mutator",
             "companion_mode": companion_mode,
@@ -7943,7 +8068,13 @@ class Tap(ControlSurface):
         }
 
     def _mutator_info_from_settings(self, settings, previous_info, clip, commit_structure=False):
-        scale_index = self._mutator_scale_index_from_name(settings.get("scale", "Minor"))
+        settings_scale_index = self._mutator_scale_index_from_name(settings.get("scale", "Minor"))
+        if settings_scale_index is None:
+            settings_scale_index = previous_info.get("scale_index", 2)
+        scale_index, root = self._current_mutator_scale_root(
+            settings_scale_index,
+            settings.get("root", previous_info.get("root", 0))
+        )
         preset = settings.get("preset", previous_info.get("preset", 9))
         mutator_slots = self._mutator_visible_slots(settings)
         mutator_slot_count = self._mutator_slot_count_from_value(settings.get("mutator_slot_count", ""), self._mutator_normalized_slots(settings))
@@ -7959,8 +8090,8 @@ class Tap(ControlSurface):
             "depth": settings.get("depth", previous_info.get("depth", 0.0)),
             "regenerate_mode": settings.get("regenerate_mode", previous_info.get("regenerate_mode", 0)),
             "source_mode": settings.get("source_mode", previous_info.get("source_mode", 2)),
-            "root": settings.get("root", previous_info.get("root", 0)),
-            "scale_index": scale_index if scale_index is not None else previous_info.get("scale_index", 2),
+            "root": root,
+            "scale_index": scale_index,
             "companion_mode": settings.get("companion_mode", previous_info.get("companion_mode", "melody")),
             "companion_mode_code": self._mutator_companion_mode_code(settings.get("companion_mode", previous_info.get("companion_mode", "melody"))),
             "target_pitches": settings.get("target_pitches", previous_info.get("target_pitches", [])),
