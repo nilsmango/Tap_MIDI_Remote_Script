@@ -11976,7 +11976,7 @@ class Tap(ControlSurface):
             elif action == 1:
                 device.recall_last_used_variation()
             elif action == 2:
-                device.randomize_macros()
+                self._randomize_rack_macros(device)
             elif action == 3 and len(message) >= 5:
                 variation_index = message[4]
                 if hasattr(device, 'selected_variation_index'):
@@ -12016,7 +12016,13 @@ class Tap(ControlSurface):
         self.schedule_message(1, self._send_rack_snapshot_state)
         self.schedule_message(3, self._send_rack_snapshot_state)
 
-    def _macro_parameters_for_rack(self, device):
+    def _is_macro_randomize_protected_parameter(self, parameter):
+        try:
+            return str(parameter.name).strip().lower() == "volume"
+        except Exception:
+            return False
+
+    def _macro_parameters_for_rack(self, device, protected_only=False):
         if not liveobj_valid(device) or not hasattr(device, 'parameters'):
             return []
         
@@ -12043,10 +12049,27 @@ class Tap(ControlSurface):
                 continue
             if getattr(parameter, 'max', 0) == getattr(parameter, 'min', 0):
                 continue
+            is_protected = self._is_macro_randomize_protected_parameter(parameter)
+            if protected_only != is_protected:
+                continue
             
             macro_parameters.append(parameter)
         
         return macro_parameters
+
+    def _randomize_rack_macros(self, device):
+        protected_values = [
+            (parameter, parameter.value)
+            for parameter in self._macro_parameters_for_rack(device, protected_only=True)
+        ]
+        device.randomize_macros()
+        for parameter, value in protected_values:
+            if not liveobj_valid(parameter):
+                continue
+            try:
+                parameter.value = max(parameter.min, min(parameter.max, value))
+            except Exception:
+                pass
 
     def _randomize_rack_macros_smoothly(self, device, duration):
         parameters = self._macro_parameters_for_rack(device)
@@ -12058,7 +12081,7 @@ class Tap(ControlSurface):
         
         starts = [parameter.value for parameter in parameters]
         try:
-            device.randomize_macros()
+            self._randomize_rack_macros(device)
         except Exception as e:
             self._debug_log("Smooth macro randomize target failed: {}".format(str(e)))
             return
