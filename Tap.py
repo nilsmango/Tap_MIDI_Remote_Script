@@ -4354,6 +4354,25 @@ class Tap(ControlSurface):
             )
         return info
 
+    def _mutator_source_note_range(self, clip):
+        info = self._mutator_info(clip)
+        if not info:
+            return None
+        decoupled_info = self._decoupled_automation_info(clip)
+        source_start = decoupled_info["note_start"] if decoupled_info else float(getattr(clip, "loop_start", 0.0))
+        original_loop_length = max(
+            0.0001,
+            float(info.get("original_loop_length", float(getattr(clip, "loop_end", source_start)) - source_start))
+        )
+        return source_start, source_start + original_loop_length
+
+    def _mutator_allows_source_note_time(self, clip, start_time):
+        source_range = self._mutator_source_note_range(clip)
+        if not source_range:
+            return True
+        source_start, source_end = source_range
+        return float(start_time) >= source_start - 0.000001 and float(start_time) < source_end - 0.000001
+
     def _mutator_algorithm_code(self, algorithm):
         try:
             return self.MUTATOR_ALGORITHMS.index(str(algorithm or "mutator"))
@@ -7687,6 +7706,16 @@ class Tap(ControlSurface):
             clip_slot = song.view.highlighted_clip_slot
             if clip_slot is not None and clip_slot.has_clip and len(new_notes) > 0:
                 clip = clip_slot.clip
+                filtered_notes = []
+                filtered_note_values = []
+                for note_spec, note_values in zip(new_notes, new_note_values):
+                    if self._mutator_allows_source_note_time(clip, note_values[1]):
+                        filtered_notes.append(note_spec)
+                        filtered_note_values.append(note_values)
+                new_notes = filtered_notes
+                new_note_values = filtered_note_values
+                if not new_notes:
+                    return
                 decoupled_info = self._decoupled_automation_info(clip)
                 if decoupled_info:
                     repeated_notes = []
@@ -7722,6 +7751,12 @@ class Tap(ControlSurface):
                 decoupled_info = self._decoupled_automation_info(clip)
                 if decoupled_info:
                     notes = clip.get_notes_extended(0, 128, decoupled_info["note_start"], decoupled_info["physical_length"])
+                    note_ids = [
+                        note_id for note_id in note_ids
+                        if any(note.note_id == note_id and self._mutator_allows_source_note_time(clip, note.start_time) for note in notes)
+                    ]
+                    if not note_ids:
+                        return
                     remove_ids = set(note_ids)
                     targets = []
                     for note in notes:
@@ -7736,6 +7771,15 @@ class Tap(ControlSurface):
                     if matching_ids:
                         clip.remove_notes_by_id(tuple(matching_ids))
                 else:
+                    clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+                    clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
+                    notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
+                    note_ids = [
+                        note_id for note_id in note_ids
+                        if any(note.note_id == note_id and self._mutator_allows_source_note_time(clip, note.start_time) for note in notes)
+                    ]
+                    if not note_ids:
+                        return
                     # Remove the note by ID
                     clip.remove_notes_by_id(note_ids)
         
@@ -7754,6 +7798,7 @@ class Tap(ControlSurface):
                 clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
                 clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
                 notes = clip.get_notes_extended(0, 128, clip_start, clip_length)
+                did_modify_notes = False
         
                 # Modify the matching notes
                 while index < (len(message) - 1):
@@ -7784,6 +7829,10 @@ class Tap(ControlSurface):
                                 break
                         if target_note is None:
                             continue
+                        if not self._mutator_allows_source_note_time(clip, target_note.start_time):
+                            continue
+                        if not self._mutator_allows_source_note_time(clip, start_time):
+                            continue
 
                         old_pitch = int(target_note.pitch)
                         old_folded_time = self._folded_note_time(target_note.start_time, decoupled_info)
@@ -7798,19 +7847,26 @@ class Tap(ControlSurface):
                                 note.velocity = velocity
                                 note.mute = mute
                                 note.probability = probability
+                                did_modify_notes = True
                     else:
                         for note in notes:
                             if note.note_id == note_id:
+                                if not self._mutator_allows_source_note_time(clip, note.start_time):
+                                    break
+                                if not self._mutator_allows_source_note_time(clip, start_time):
+                                    break
                                 note.pitch = pitch
                                 note.start_time = start_time
                                 note.duration = duration
                                 note.velocity = velocity
                                 note.mute = mute
                                 note.probability = probability
+                                did_modify_notes = True
                                 break
         
                 # Apply the modified notes back to the clip
-                clip.apply_note_modifications(notes)
+                if did_modify_notes:
+                    clip.apply_note_modifications(notes)
         
         # markers
         if len(message) >= 2 and message[1] == 17:
@@ -10209,6 +10265,7 @@ class Tap(ControlSurface):
             for index, role in enumerate(roles):
                 section_start = source_start + (index * original_loop_length)
                 sections.append({"role": role, "start": section_start, "length": original_loop_length})
+                preserve_source_section = index == 0
 
                 if chain_preset:
                     if role == 0:
@@ -10228,7 +10285,8 @@ class Tap(ControlSurface):
                         )
                         generated_section_cache[role] = tuple(dict(value) for value in section_values)
                         previous_chain_values = tuple(dict(value) for value in section_values)
-                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
+                    if not preserve_source_section:
+                        specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                     continue
 
                 if role in (0, 8):
@@ -10240,7 +10298,8 @@ class Tap(ControlSurface):
                         settings,
                         rnd
                     )
-                    specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
+                    if not preserve_source_section:
+                        specs.extend(self._mutator_place_section_values(section_payload(section_values), section_start, original_loop_length))
                 elif role in generated_section_cache:
                     specs.extend(self._mutator_place_section_values(section_payload(generated_section_cache[role]), section_start, original_loop_length))
                 elif role == 2 and 1 in generated_section_cache:
@@ -10307,7 +10366,7 @@ class Tap(ControlSurface):
                 structure_length > previous_structure_length + 0.000001
             )
             automation_source_length = previous_structure_length if companion_was_already_running else original_loop_length
-            remove_start = source_start
+            remove_start = source_end
             remove_end = max(
                 source_start + structure_length,
                 float(getattr(clip, "loop_end", 0.0)),
