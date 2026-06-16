@@ -5203,11 +5203,7 @@ class Tap(ControlSurface):
             if previous_insert_time is not None and time_value <= previous_insert_time:
                 time_value = previous_insert_time + minimum_duration
 
-            next_time = None
-            for next_step in write_steps[index + 1:]:
-                if next_step[0] > time_value:
-                    next_time = next_step[0]
-                    break
+            next_time = write_steps[index + 1][0] if index + 1 < len(write_steps) and write_steps[index + 1][0] > time_value else None
             if next_time is not None:
                 duration = max(minimum_duration, next_time - time_value)
             else:
@@ -11224,6 +11220,8 @@ class Tap(ControlSurface):
             page_end = max(page_start, float(fields[2]))
             sample_duration = max(0.0001, float(fields[3]))
             step_entries = self._split_escaped_sysex_fields(fields[4], ",") if fields[4] else []
+            write_token = fields[7] if len(fields) >= 8 else ""
+            response_token_fields = [write_token] if write_token else []
 
             if len(fields) >= 7:
                 try:
@@ -11420,7 +11418,7 @@ class Tap(ControlSurface):
                     current_normalized,
                     "",
                     "",
-                    "|".join(self._automation_response_decoupled_fields(clip, device_param))
+                    "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
                 )
                 self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
@@ -11441,7 +11439,7 @@ class Tap(ControlSurface):
                     current_normalized,
                     "",
                     "",
-                    "|".join(self._automation_response_decoupled_fields(clip, device_param))
+                    "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
                 )
                 self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
@@ -11494,11 +11492,7 @@ class Tap(ControlSurface):
                 if previous_insert_time is not None and time_value <= previous_insert_time:
                     time_value = previous_insert_time + minimum_duration
 
-                next_time = None
-                for next_step in all_steps[index + 1:]:
-                    if next_step[0] > time_value:
-                        next_time = next_step[0]
-                        break
+                next_time = all_steps[index + 1][0] if index + 1 < len(all_steps) and all_steps[index + 1][0] > time_value else None
 
                 if next_time is not None:
                     duration = max(minimum_duration, next_time - time_value)
@@ -11544,7 +11538,7 @@ class Tap(ControlSurface):
                 current_normalized,
                 ",".join(point_entries),
                 ",".join(render_entries),
-                "|".join(self._automation_response_decoupled_fields(clip, device_param))
+                "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
             )
             self._send_sys_ex_message(response, 0x31)
             self._re_enable_after_automation_write(device_param, automation_should_re_enable)
