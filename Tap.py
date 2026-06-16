@@ -383,6 +383,7 @@ class Tap(ControlSurface):
             self._active_follow_actions = {}
             self._handled_follow_action_launches = set()
             self._active_high_resolution_gestures = set()
+            self._active_high_resolution_undo_steps = set()
             self._parameter_value_listeners = {}
             self._parameter_name_listeners = {}
             self._parameter_name_update_timer = None
@@ -961,6 +962,28 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error selecting touched parameter: {}".format(str(e)))
 
+    def _begin_high_resolution_undo_step(self, control_index):
+        if control_index in self._active_high_resolution_undo_steps:
+            return
+        try:
+            song = self.song()
+            if hasattr(song, 'begin_undo_step'):
+                song.begin_undo_step()
+                self._active_high_resolution_undo_steps.add(control_index)
+        except Exception as e:
+            self._debug_log("Error beginning high resolution undo step: {}".format(str(e)))
+
+    def _end_high_resolution_undo_step(self, control_index):
+        if control_index not in self._active_high_resolution_undo_steps:
+            return
+        try:
+            song = self.song()
+            if hasattr(song, 'end_undo_step'):
+                song.end_undo_step()
+        except Exception as e:
+            self._debug_log("Error ending high resolution undo step: {}".format(str(e)))
+        self._active_high_resolution_undo_steps.discard(control_index)
+
     def _set_device_control_high_resolution(self, message):
         try:
             if len(message) < 7:
@@ -1000,11 +1023,16 @@ class Tap(ControlSurface):
 
             mapped_parameter = self._current_connected_parameter_for_control(control_index)
             if not mapped_parameter:
+                if gesture_state == 2:
+                    self._end_high_resolution_undo_step(control_index)
+                    self._active_high_resolution_gestures.discard(control_index)
                 return
 
             if control_index in self._automation_removal_suppressed_controls:
                 if gesture_state == 2:
                     self._automation_removal_suppressed_controls.discard(control_index)
+                    self._end_high_resolution_undo_step(control_index)
+                    self._active_high_resolution_gestures.discard(control_index)
                 return
 
             if self._consume_remove_automation_request(mapped_parameter):
@@ -1012,6 +1040,9 @@ class Tap(ControlSurface):
                 return
 
             if hasattr(mapped_parameter, 'is_enabled') and not mapped_parameter.is_enabled:
+                if gesture_state == 2:
+                    self._end_high_resolution_undo_step(control_index)
+                    self._active_high_resolution_gestures.discard(control_index)
                 return
 
             self._select_parameter_if_possible(mapped_parameter)
@@ -1028,6 +1059,7 @@ class Tap(ControlSurface):
                 self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
                 
                 if control_index not in self._active_high_resolution_gestures:
+                    self._begin_high_resolution_undo_step(control_index)
                     if hasattr(mapped_parameter, 'begin_gesture'):
                         mapped_parameter.begin_gesture()
                     self._active_high_resolution_gestures.add(control_index)
@@ -1044,6 +1076,7 @@ class Tap(ControlSurface):
                 if hasattr(mapped_parameter, 'end_gesture'):
                     mapped_parameter.end_gesture()
                 self._active_high_resolution_gestures.discard(control_index)
+                self._end_high_resolution_undo_step(control_index)
                 self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, force_display=True)
         except Exception as e:
             self._debug_log("Error setting high resolution parameter: {}".format(str(e)))
@@ -13266,6 +13299,8 @@ class Tap(ControlSurface):
                 except Exception:
                     pass
         self._active_high_resolution_gestures.clear()
+        for control_index in list(getattr(self, '_active_high_resolution_undo_steps', set())):
+            self._end_high_resolution_undo_step(control_index)
         
         self._remove_parameter_value_listeners()
         self._remove_parameter_name_listeners()
