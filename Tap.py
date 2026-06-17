@@ -11773,8 +11773,56 @@ class Tap(ControlSurface):
     def _duplicate_loop(self, track_index, clip_index):
         track = self.song().tracks[track_index]
         clip_slot = track.clip_slots[clip_index]
-        if clip_slot.has_clip:
-            clip_slot.clip.duplicate_loop()
+        if not clip_slot.has_clip:
+            return
+
+        clip = clip_slot.clip
+        decoupled_info = self._decoupled_automation_info(clip)
+
+        self._begin_selected_clip_update_batch()
+        undo_step_started = self._begin_undo_step()
+
+        try:
+            if decoupled_info:
+                folded_start = float(decoupled_info.get("note_start", 0.0))
+                folded_length = max(0.0001, float(decoupled_info.get("note_length", 1.0)))
+                auto_lengths = decoupled_info.get("automation_lengths", {})
+                epsilon = 0.0001
+
+                all_auto_fit = True
+                if auto_lengths:
+                    for auto_len in auto_lengths.values():
+                        ratio = folded_length / auto_len
+                        if ratio < 1.0 - epsilon or abs(ratio - round(ratio)) > epsilon:
+                            all_auto_fit = False
+                            break
+
+                if all_auto_fit:
+                    clip.loop_start = folded_start
+                    clip.start_marker = min(float(getattr(clip, "start_marker", folded_start)), folded_start)
+                    clip.loop_end = folded_start + folded_length
+                    clip.end_marker = folded_start + folded_length
+                    clip.duplicate_loop()
+                else:
+                    clip.loop_start = folded_start
+                    clip.start_marker = min(float(getattr(clip, "start_marker", folded_start)), folded_start)
+                    clip.loop_end = folded_start + (folded_length * 2.0)
+                    clip.end_marker = folded_start + (folded_length * 2.0)
+
+                self._remove_decoupled_automation_info_from_name(clip)
+            else:
+                clip.duplicate_loop()
+
+        except Exception as e:
+            self._debug_log("Error in _duplicate_loop: {}".format(str(e)))
+            raise
+        finally:
+            self._end_undo_step(undo_step_started)
+            self._end_selected_clip_update_batch()
+
+        if decoupled_info:
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
 
     def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
         tracks = self.song().tracks
