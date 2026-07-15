@@ -31,6 +31,12 @@ swing_amount_value = 0.0
 
 class TapDeviceComponent(DeviceComponent):
     SAFE_PARAMETER_BANK_SIZE = 8
+    OPERATOR_WAVES_BANK_NAME = "Waveforms"
+    OPERATOR_FILTER_PLUS_BANK_NAME = "Filter +"
+    OPERATOR_LFO_PLUS_BANK_NAME = "LFO +"
+    WAVETABLE_OSC_BANK_NAME = "Waves"
+    WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
+    WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -75,22 +81,20 @@ class TapDeviceComponent(DeviceComponent):
                 return '', tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
 
     def _parameter_banks(self):
+        base_names = self._base_parameter_bank_names()
         if self._use_safe_parameter_banks:
-            return self._safe_parameter_banks()
-        try:
-            return DeviceComponent._parameter_banks(self)
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            return self._safe_parameter_banks()
+            banks = self._safe_parameter_banks()
+        else:
+            try:
+                banks = DeviceComponent._parameter_banks(self)
+            except IndexError:
+                self._use_safe_parameter_banks = True
+                base_names = self._safe_parameter_bank_names_base()
+                banks = self._safe_parameter_banks()
+        return self._add_tap_custom_banks(banks, base_names)
 
     def _parameter_bank_names(self):
-        if self._use_safe_parameter_banks:
-            return self._safe_parameter_bank_names()
-        try:
-            return DeviceComponent._parameter_bank_names(self)
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            return self._safe_parameter_bank_names()
+        return self._add_tap_custom_bank_names(self._base_parameter_bank_names())
 
     def _best_of_parameter_bank(self):
         if self._use_safe_parameter_banks:
@@ -102,17 +106,367 @@ class TapDeviceComponent(DeviceComponent):
             return []
 
     def _number_of_parameter_banks(self):
+        return len(self._parameter_banks())
+
+    def _base_parameter_bank_names(self):
         if self._use_safe_parameter_banks:
-            return len(self._safe_parameter_banks())
+            return self._safe_parameter_bank_names_base()
         try:
-            return DeviceComponent._number_of_parameter_banks(self)
+            return tuple(DeviceComponent._parameter_bank_names(self))
         except IndexError:
             self._use_safe_parameter_banks = True
-            return len(self._safe_parameter_banks())
+            return self._safe_parameter_bank_names_base()
+
+    def _safe_parameter_bank_names_base(self):
+        bank_count = len(self._safe_parameter_banks())
+        device = getattr(self, '_device', None)
+        names = []
+        for index in range(bank_count):
+            name = None
+            if device and hasattr(device, 'get_bank_name'):
+                try:
+                    name = device.get_bank_name(index)
+                except Exception:
+                    pass
+            if name:
+                name = ''.join(char for char in str(name) if ord(char) < 128)
+            names.append(name or "Bank {}".format(index + 1))
+        return tuple(names)
+
+    def _device_class_name(self):
+        try:
+            return str(self._device.class_name)
+        except Exception:
+            return ""
+
+    def _is_operator(self):
+        return self._device_class_name() == 'Operator'
+
+    def _is_wavetable(self):
+        device = getattr(self, '_device', None)
+        try:
+            return (
+                self._device_class_name() in ('Wavetable', 'InstrumentVector') or
+                str(device.class_display_name) == 'Wavetable' or
+                hasattr(device, 'oscillator_1_wavetables')
+            )
+        except Exception:
+            return False
+
+    def _custom_bank_insert_index(self, bank_names, anchor_name):
+        anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
+        for index, name in enumerate(bank_names):
+            normalized_name = re.sub(r'[^a-z0-9]+', '', str(name).lower())
+            if anchor_name in normalized_name:
+                return index + 1
+        return len(bank_names)
+
+    def _operator_waves_insert_index(self, bank_names):
+        for index, name in enumerate(bank_names):
+            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
+            if normalized in ('oscd', 'oscillatord') or normalized.endswith('oscillatord'):
+                return index + 1
+        return len(bank_names)
+
+    def _add_tap_custom_bank_names(self, bank_names):
+        names = list(bank_names)
+        if self._is_operator():
+            index = self._operator_waves_insert_index(names)
+            names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
+            filter_index = self._operator_filter_bank_insert_index(names)
+            names.insert(filter_index, self.OPERATOR_FILTER_PLUS_BANK_NAME)
+            lfo_index = self._operator_lfo_bank_insert_index(names)
+            names.insert(lfo_index, self.OPERATOR_LFO_PLUS_BANK_NAME)
+        elif self._is_wavetable():
+            self._replace_wavetable_envelope_bank_names(names)
+            index = self._wavetable_waves_insert_index(names)
+            names.insert(index, self.WAVETABLE_OSC_BANK_NAME)
+        return tuple(names)
+
+    def _add_tap_custom_banks(self, banks, base_names):
+        banks = list(banks)
+        names = list(base_names)
+        if self._is_operator():
+            self._replace_operator_lfo_bank(banks, names)
+            waves = self._operator_wave_parameters(banks)
+            index = self._operator_waves_insert_index(names)
+            banks.insert(index, tuple(waves + [None] * (self.SAFE_PARAMETER_BANK_SIZE - len(waves))))
+            names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
+            filter_index = self._operator_filter_bank_insert_index(names)
+            banks.insert(filter_index, self._operator_filter_plus_parameters())
+            names.insert(filter_index, self.OPERATOR_FILTER_PLUS_BANK_NAME)
+            lfo_index = self._operator_lfo_bank_insert_index(names)
+            banks.insert(lfo_index, self._operator_lfo_plus_parameters())
+        elif self._is_wavetable():
+            self._replace_wavetable_envelope_banks(banks, names)
+            # These are Live.WavetableDevice properties, not DeviceParameters.
+            # Tap handles their MIDI mapping and feedback directly.
+            index = self._wavetable_waves_insert_index(names)
+            banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+        return banks
+
+    def _parameter_by_names(self, *names):
+        wanted = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
+        fallback = None
+        for parameter in getattr(self._device, 'parameters', ()):
+            parameter_names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
+            if any(re.sub(r'[^a-z0-9]+', '', name.lower()) in wanted for name in parameter_names):
+                if self._operator_parameter_is_active(parameter):
+                    return parameter
+                if fallback is None:
+                    fallback = parameter
+        return fallback
+
+    def _operator_filter_bank_insert_index(self, bank_names):
+        for index, name in enumerate(bank_names):
+            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) == 'filter':
+                return index + 1
+        return self._custom_bank_insert_index(bank_names, 'filter')
+
+    def _operator_lfo_bank_insert_index(self, bank_names):
+        for index, name in enumerate(bank_names):
+            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) == 'lfo':
+                return index + 1
+        return len(bank_names)
+
+    def _operator_filter_plus_parameters(self):
+        filter_type = self._parameter_by_names('Filter Type', 'Filter Type (Legacy)')
+        circuit_candidates = (
+            self._parameter_by_names('Filter Circuit - LP/HP'),
+            self._parameter_by_names('Filter Circuit - BP/NO/Morph'),
+        )
+        filter_type_display = self._operator_filter_type_display(filter_type)
+        preferred_circuit_index = 0 if any(name in filter_type_display for name in ('lowpass', 'highpass')) else 1
+        circuit = circuit_candidates[preferred_circuit_index]
+        if not circuit:
+            circuit = next((parameter for parameter in circuit_candidates if parameter and self._operator_parameter_is_active(parameter)), None)
+        circuit = circuit or next((parameter for parameter in circuit_candidates if parameter), None)
+        slope = self._parameter_by_names('Filter Slope')
+        filter_morph = self._parameter_by_names('Filter Morph') if self._operator_filter_is_morph(filter_type) else None
+        return (
+            filter_type,
+            circuit,
+            slope,
+            self._parameter_by_names('Filter Drive'),
+            self._parameter_by_names('LFO Retrigger'),
+            self._parameter_by_names('Filter On'),
+            filter_morph,
+            self._parameter_by_names('Fe Amount'),
+        )
+
+    def _operator_filter_is_morph(self, filter_type):
+        return 'morph' in self._operator_filter_type_display(filter_type)
+
+    def _operator_filter_type_display(self, filter_type):
+        try:
+            return str(filter_type.str_for_value(filter_type.value)).strip().lower()
+        except Exception:
+            return ''
+
+    def _operator_lfo_plus_parameters(self):
+        return tuple(self._parameter_by_names(name) for name in (
+            'Osc-A < LFO',
+            'Osc-B < LFO',
+            'Osc-C < LFO',
+            'Osc-D < LFO',
+            'Filt < LFO',
+            'LFO Dst B',
+            'LFO Amt B',
+            'LFO On',
+        ))
+
+    def _wavetable_waves_insert_index(self, bank_names):
+        for index, name in enumerate(bank_names):
+            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
+            if normalized in ('osc2', 'oscillator2') or normalized.endswith('oscillator2'):
+                return index + 1
+        return min(2, len(bank_names))
+
+    def _wavetable_envelope_bank_index(self, bank_names):
+        for index, name in enumerate(bank_names):
+            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
+            if normalized in ('env23', 'envelope23', 'envelopes23'):
+                return index
+        return None
+
+    def _replace_wavetable_envelope_bank_names(self, bank_names):
+        index = self._wavetable_envelope_bank_index(bank_names)
+        if index is not None:
+            bank_names[index] = self.WAVETABLE_ENV_2_BANK_NAME
+            bank_names.insert(index + 1, self.WAVETABLE_ENV_3_BANK_NAME)
+
+    def _wavetable_envelope_parameters(self, envelope_number):
+        prefix = 'Env {}'.format(envelope_number)
+        return tuple(self._parameter_by_names(name) for name in (
+            '{} Attack'.format(prefix),
+            '{} Decay'.format(prefix),
+            '{} Sustain'.format(prefix),
+            '{} Release'.format(prefix),
+            '{} Peak'.format(prefix),
+            '{} Loop Mode'.format(prefix),
+            '{} A Slope'.format(prefix),
+            'LFO {} Retrigger'.format(envelope_number - 1),
+        ))
+
+    def _replace_wavetable_envelope_banks(self, banks, bank_names):
+        index = self._wavetable_envelope_bank_index(bank_names)
+        if index is not None and index < len(banks):
+            banks[index] = self._wavetable_envelope_parameters(2)
+            banks.insert(index + 1, self._wavetable_envelope_parameters(3))
+            bank_names[index] = self.WAVETABLE_ENV_2_BANK_NAME
+            bank_names.insert(index + 1, self.WAVETABLE_ENV_3_BANK_NAME)
+
+    def _operator_lfo_is_synced(self, range_parameter):
+        try:
+            return str(range_parameter.str_for_value(range_parameter.value)).strip().lower() == 'sync'
+        except Exception:
+            return False
+
+    def _replace_operator_lfo_bank(self, banks, bank_names):
+        if banks is None:
+            return
+        for index, name in enumerate(bank_names):
+            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) != 'lfo' or index >= len(banks):
+                continue
+            bank = list(banks[index])
+            bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
+            lfo_range = self._parameter_by_names('LFO Range')
+            lfo_rate = self._parameter_by_names('LFO Sync' if self._operator_lfo_is_synced(lfo_range) else 'LFO Rate')
+            bank[4] = lfo_rate
+            bank[7] = lfo_range
+            banks[index] = tuple(bank[:self.SAFE_PARAMETER_BANK_SIZE])
+            return
+
+    def _operator_source_parameters(self, raw_banks=None):
+        parameters = list(getattr(self._device, 'parameters', ()))
+        identities = set(id(parameter) for parameter in parameters)
+        for bank in raw_banks or ():
+            for parameter in bank or ():
+                if parameter is not None and id(parameter) not in identities:
+                    identities.add(id(parameter))
+                    parameters.append(parameter)
+        return parameters
+
+    def _operator_wave_parameters(self, raw_banks=None):
+        try:
+            by_name = {}
+            parameters = self._operator_source_parameters(raw_banks)
+            for parameter in parameters:
+                by_name[parameter.name] = parameter
+                try:
+                    by_name[parameter.original_name] = parameter
+                except Exception:
+                    pass
+            feedback_by_oscillator = self._operator_feedback_parameters(parameters, by_name)
+            parameters = []
+            for oscillator in ('A', 'B', 'C', 'D'):
+                wave = by_name.get('Osc-{} Wave'.format(oscillator))
+                feedback = feedback_by_oscillator.get(oscillator)
+                parameters.extend((wave, feedback))
+            return parameters
+        except Exception:
+            return []
+
+    def _operator_feedback_parameters(self, parameters=None, by_name=None):
+        parameters = list(parameters if parameters is not None else self._operator_source_parameters())
+        by_name = by_name or {}
+        if not by_name:
+            for parameter in parameters:
+                by_name[parameter.name] = parameter
+                try:
+                    by_name[parameter.original_name] = parameter
+                except Exception:
+                    pass
+
+        result = {}
+        feedback_parameters = []
+        for index, parameter in enumerate(parameters):
+            names = [str(getattr(parameter, 'name', ''))]
+            try:
+                names.append(str(parameter.original_name))
+            except Exception:
+                pass
+            normalized_names = [re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names]
+            if any(
+                    'feedback' in name or 'feedb' in name or 'fdbk' in name or 'feedbk' in name or
+                    name.endswith('fb') for name in normalized_names):
+                feedback_parameters.append((index, parameter, normalized_names))
+
+        for oscillator in ('A', 'B', 'C', 'D'):
+            key = oscillator.lower()
+            for _, parameter, normalized_names in feedback_parameters:
+                if any(name in (
+                        '{}feedback'.format(key), 'osc{}feedback'.format(key),
+                        'oscillator{}feedback'.format(key),
+                        '{}feedb'.format(key), 'osc{}feedb'.format(key),
+                        'oscillator{}feedb'.format(key),
+                        '{}fdbk'.format(key), 'osc{}fdbk'.format(key),
+                        'oscillator{}fdbk'.format(key),
+                        '{}feedbk'.format(key), 'osc{}feedbk'.format(key),
+                        'oscillator{}feedbk'.format(key),
+                        '{}fb'.format(key), 'osc{}fb'.format(key),
+                        'oscillator{}fb'.format(key),
+                        'feedback{}'.format(key), 'fdbk{}'.format(key),
+                        'feedbk{}'.format(key), 'fb{}'.format(key),
+                ) for name in normalized_names):
+                    result[oscillator] = parameter
+                    break
+
+        wave_positions = {}
+        for index, parameter in enumerate(parameters):
+            names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
+            for oscillator in ('A', 'B', 'C', 'D'):
+                normalized_wave_name = 'osc{}wave'.format(oscillator.lower())
+                if any(re.sub(r'[^a-z0-9]+', '', name.lower()) == normalized_wave_name for name in names):
+                    wave_positions[oscillator] = index
+
+        unassigned = [(index, parameter) for index, parameter, _ in feedback_parameters if parameter not in result.values()]
+        for oscillator_index, oscillator in enumerate(('A', 'B', 'C', 'D')):
+            if oscillator in result or oscillator not in wave_positions:
+                continue
+            start = wave_positions[oscillator]
+            next_positions = [wave_positions[name] for name in ('A', 'B', 'C', 'D')[oscillator_index + 1:] if name in wave_positions]
+            end = min(next_positions) if next_positions else len(parameters)
+            for parameter_index, parameter in unassigned:
+                if start <= parameter_index < end:
+                    result[oscillator] = parameter
+                    unassigned.remove((parameter_index, parameter))
+                    break
+
+        unresolved = [oscillator for oscillator in ('A', 'B', 'C', 'D') if oscillator not in result]
+        if len(unassigned) == len(unresolved):
+            for oscillator, (_, parameter) in zip(unresolved, unassigned):
+                result[oscillator] = parameter
+        return result
+
+    def _operator_parameter_is_active(self, parameter):
+        try:
+            if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
+                return False
+            if hasattr(parameter, 'state'):
+                return parameter.state == Live.DeviceParameter.ParameterState.enabled
+        except Exception:
+            return False
+        return True
+
+    def tap_custom_bank_kind(self):
+        names = self._parameter_bank_names()
+        try:
+            name = names[self._bank_index]
+        except Exception:
+            return None
+        if name == self.WAVETABLE_OSC_BANK_NAME:
+            return 'wavetable_osc'
+        if name == self.OPERATOR_WAVES_BANK_NAME:
+            return 'operator_waves'
+        if name == self.OPERATOR_FILTER_PLUS_BANK_NAME:
+            return 'operator_filter_plus'
+        if name == self.OPERATOR_LFO_PLUS_BANK_NAME:
+            return 'operator_lfo_plus'
+        return None
 
     def _clamp_bank_index_to_safe_banks(self):
-        safe_banks = self._safe_parameter_banks()
-        bank_count = len(safe_banks)
+        bank_count = len(self._parameter_banks())
         if bank_count == 0:
             self._bank_index = 0
         else:
@@ -179,23 +533,7 @@ class TapDeviceComponent(DeviceComponent):
         return banks
 
     def _safe_parameter_bank_names(self):
-        bank_count = len(self._safe_parameter_banks())
-        if bank_count == 0:
-            return []
-
-        device = getattr(self, '_device', None)
-        names = []
-        for index in range(bank_count):
-            name = None
-            if device and hasattr(device, 'get_bank_name'):
-                try:
-                    name = device.get_bank_name(index)
-                except Exception:
-                    name = None
-            if name:
-                name = ''.join(char for char in str(name) if ord(char) < 128)
-            names.append(name or "Bank {}".format(index + 1))
-        return tuple(names)
+        return self._safe_parameter_bank_names_base()
 
 
 class Tap(ControlSurface):
@@ -387,11 +725,15 @@ class Tap(ControlSurface):
             self._parameter_value_listeners = {}
             self._parameter_name_listeners = {}
             self._parameter_name_update_timer = None
+            self._active_bank_parameter_refresh_pending = False
             self._bank_metadata_refresh_timers = []
             self._parameter_source_device = None
             self._parameter_source_listener = None
             self._bank_parameter_source_device = None
             self._bank_parameter_source_listener = None
+            self._wavetable_virtual_property_listeners = []
+            self._operator_virtual_bank_listeners = []
+            self._operator_virtual_bank_refresh_pending = False
             self._last_sent_parameter_displays = {}
             self._last_sent_parameter_normalized_values = {}
             self._last_sent_parameter_cc_values = {}
@@ -544,6 +886,308 @@ class Tap(ControlSurface):
             return mapped_parameter if mapped_parameter and liveobj_valid(mapped_parameter) else None
         except Exception:
             return None
+
+    def _tap_device_kind(self, device):
+        try:
+            class_name = str(device.class_name)
+            display_name = str(device.class_display_name)
+            if class_name == 'Operator' or display_name == 'Operator':
+                return 'operator_waves'
+            if (class_name in ('Wavetable', 'InstrumentVector') or display_name == 'Wavetable' or
+                    hasattr(device, 'oscillator_1_wavetables')):
+                return 'wavetable_osc'
+        except Exception:
+            pass
+        return None
+
+    def _tap_visible_bank_info(self, device):
+        device = device or getattr(self._device, '_device', None)
+        names = list(self._device._parameter_bank_names())
+        kind = self._tap_device_kind(device)
+        if kind == 'operator_waves':
+            name = self._device.OPERATOR_WAVES_BANK_NAME
+        elif kind == 'wavetable_osc':
+            name = self._device.WAVETABLE_OSC_BANK_NAME
+        else:
+            return names, None, None, None
+        try:
+            insert_index = names.index(name)
+        except ValueError:
+            return names, None, None, None
+        return names, kind, insert_index, name
+
+    def _tap_active_custom_kind(self, device=None):
+        try:
+            component_device = getattr(self._device, '_device', None)
+            device = device or component_device
+            if (device and component_device and
+                    self._live_object_identity(device) == self._live_object_identity(component_device)):
+                return self._device.tap_custom_bank_kind()
+        except Exception:
+            pass
+        return None
+
+    def _active_wavetable_virtual_specs(self):
+        """The Wavetable chooser properties are intentionally outside device.parameters."""
+        try:
+            device = self._device._device
+            active_kind = self._tap_active_custom_kind(device)
+            if not device or not liveobj_valid(device) or active_kind != 'wavetable_osc':
+                return []
+        except Exception:
+            return []
+
+        if not self._device._is_wavetable():
+            return []
+
+        sub_tone = None
+        try:
+            for parameter in device.parameters:
+                if (parameter.name in ('Sub Tone', 'Sub Tone ', 'Tone') or
+                        parameter.original_name in ('Sub Tone', 'Tone')):
+                    sub_tone = parameter
+                    break
+        except Exception:
+            pass
+
+        return [
+            {'name': 'Osc 1 Category', 'values': 'oscillator_wavetable_categories', 'index': 'oscillator_1_wavetable_category'},
+            {'name': 'Osc 1 Table', 'values': 'oscillator_1_wavetables', 'index': 'oscillator_1_wavetable_index'},
+            {'name': 'Osc 2 Category', 'values': 'oscillator_wavetable_categories', 'index': 'oscillator_2_wavetable_category'},
+            {'name': 'Osc 2 Table', 'values': 'oscillator_2_wavetables', 'index': 'oscillator_2_wavetable_index'},
+            {'name': 'Osc 1 Effect', 'items': ('None', 'FM', 'Sync & PW', 'Warp & Fold'), 'index': 'oscillator_1_effect_mode'},
+            {'name': 'Osc 2 Effect', 'items': ('None', 'FM', 'Sync & PW', 'Warp & Fold'), 'index': 'oscillator_2_effect_mode'},
+            {'name': 'Sub Tone', 'parameter': sub_tone},
+            {'name': 'Unison', 'items': ('None', 'Classic', 'Slow Shimmer', 'Fast Shimmer', 'Phase Sync', 'Position Spread', 'Random Note'), 'index': 'unison_mode'},
+        ]
+
+    def _wavetable_virtual_spec(self, control_index):
+        specs = self._active_wavetable_virtual_specs()
+        return specs[control_index] if 0 <= control_index < len(specs) else None
+
+    def _wavetable_virtual_items(self, spec):
+        if not spec:
+            return ()
+        if spec.get('parameter'):
+            parameter = spec['parameter']
+            try:
+                return tuple(parameter.value_items) if parameter.is_quantized else ()
+            except Exception:
+                return ()
+        try:
+            device = self._device._device
+            return tuple(spec.get('items') or getattr(device, spec['values']))
+        except Exception:
+            return tuple(spec.get('items') or ())
+
+    def _wavetable_virtual_index(self, spec):
+        if spec.get('parameter'):
+            return self._parameter_current_value_item_index(spec['parameter'], len(self._wavetable_virtual_items(spec)))
+        try:
+            return int(getattr(self._device._device, spec['index']))
+        except Exception:
+            return 0
+
+    def _set_wavetable_virtual_normalized(self, control_index, normalized):
+        spec = self._wavetable_virtual_spec(control_index)
+        if not spec:
+            return False
+        items = self._wavetable_virtual_items(spec)
+        parameter = spec.get('parameter')
+        if parameter and not items:
+            try:
+                parameter.value = self._parameter_target_value_from_normalized(parameter, normalized)
+                self._send_wavetable_virtual_feedback(control_index)
+                return True
+            except Exception:
+                return False
+        if not items:
+            return False
+        index = max(0, min(len(items) - 1, int(math.floor(float(normalized) * (len(items) - 1) + 0.5))))
+        try:
+            if spec.get('parameter'):
+                parameter = spec['parameter']
+                parameter.value = self._parameter_target_value_from_normalized(parameter, float(index) / max(1, len(items) - 1))
+            else:
+                setattr(self._device._device, spec['index'], index)
+            self._send_wavetable_virtual_feedback(control_index)
+            return True
+        except Exception as error:
+            self._debug_log('Error setting Wavetable {}: {}'.format(spec['name'], error))
+            return False
+
+    def _send_wavetable_virtual_feedback(self, control_index):
+        spec = self._wavetable_virtual_spec(control_index)
+        if not spec:
+            return
+        items = self._wavetable_virtual_items(spec)
+        parameter = spec.get('parameter')
+        if parameter and not items:
+            normalized = self._parameter_normalized_value(parameter)
+            self.send_cc(72 + control_index, 8, int(round(normalized * 127)))
+            self._send_sys_ex_message('{}|{}|{}'.format(control_index, normalized, self._escape_sysex_string(self._parameter_display_value(parameter))), 0x28)
+            return
+        if not items:
+            return
+        index = max(0, min(len(items) - 1, self._wavetable_virtual_index(spec)))
+        normalized = float(index) / float(max(1, len(items) - 1))
+        display = self._escape_sysex_string(str(items[index]))
+        cc_value = int(round(normalized * 127))
+        self.send_cc(72 + control_index, 8, cc_value)
+        self._send_sys_ex_message('{}|{}|{}'.format(control_index, normalized, display), 0x28)
+
+    def _send_wavetable_virtual_feedback_all(self):
+        for control_index in range(len(self._active_wavetable_virtual_specs())):
+            self._send_wavetable_virtual_feedback(control_index)
+
+    def _remove_wavetable_virtual_property_listeners(self):
+        for device, property_name, listener in list(getattr(self, '_wavetable_virtual_property_listeners', [])):
+            remove_listener = getattr(device, 'remove_{}_listener'.format(property_name), None)
+            if remove_listener and liveobj_valid(device):
+                try:
+                    remove_listener(listener)
+                except Exception:
+                    pass
+        self._wavetable_virtual_property_listeners = []
+
+    def _on_wavetable_virtual_property_changed(self):
+        if not self._active_wavetable_virtual_specs():
+            return
+        self._send_sys_ex_message(self._wavetable_virtual_metadata(), 0x7D)
+        self._send_wavetable_virtual_feedback_all()
+
+    def _setup_wavetable_virtual_property_listeners(self):
+        self._remove_wavetable_virtual_property_listeners()
+        if not self._active_wavetable_virtual_specs():
+            return
+
+        device = self._device._device
+        property_names = (
+            'oscillator_1_wavetable_category',
+            'oscillator_1_wavetable_index',
+            'oscillator_1_wavetables',
+            'oscillator_2_wavetable_category',
+            'oscillator_2_wavetable_index',
+            'oscillator_2_wavetables',
+            'oscillator_1_effect_mode',
+            'oscillator_2_effect_mode',
+            'unison_mode',
+        )
+        for property_name in property_names:
+            add_listener = getattr(device, 'add_{}_listener'.format(property_name), None)
+            if not add_listener:
+                continue
+            listener = lambda: self._on_wavetable_virtual_property_changed()
+            try:
+                add_listener(listener)
+                self._wavetable_virtual_property_listeners.append((device, property_name, listener))
+            except Exception:
+                pass
+
+    def _remove_operator_virtual_bank_listeners(self):
+        for parameter, listener_type, listener in list(getattr(self, '_operator_virtual_bank_listeners', [])):
+            remove_listener = getattr(parameter, 'remove_{}_listener'.format(listener_type), None)
+            has_listener = getattr(parameter, '{}_has_listener'.format(listener_type), None)
+            if remove_listener and liveobj_valid(parameter):
+                try:
+                    if not has_listener or has_listener(listener):
+                        remove_listener(listener)
+                except Exception:
+                    pass
+        self._operator_virtual_bank_listeners = []
+
+    def _schedule_operator_virtual_bank_refresh(self):
+        if self._operator_virtual_bank_refresh_pending:
+            return
+        self._operator_virtual_bank_refresh_pending = True
+        self.schedule_message(1, self._refresh_operator_virtual_bank)
+
+    def _refresh_operator_virtual_bank(self):
+        self._operator_virtual_bank_refresh_pending = False
+        if not self._device._is_operator():
+            return
+        self._connect_device_controls()
+        try:
+            self.request_rebuild_midi_map()
+        except Exception:
+            pass
+        self._on_device_changed(False)
+
+    def _setup_operator_virtual_bank_listeners(self):
+        self._remove_operator_virtual_bank_listeners()
+        device = getattr(self._device, '_device', None)
+        if not self._device._is_operator() or not device or not liveobj_valid(device):
+            return
+
+        try:
+            bank_name = self._device._parameter_bank_names()[self._device._bank_index]
+        except Exception:
+            return
+
+        def add_parameter_listener(parameter, listener_type):
+            add_listener = getattr(parameter, 'add_{}_listener'.format(listener_type), None) if parameter else None
+            if not add_listener:
+                return
+            listener = lambda: self._schedule_operator_virtual_bank_refresh()
+            try:
+                add_listener(listener)
+                self._operator_virtual_bank_listeners.append((parameter, listener_type, listener))
+            except Exception:
+                pass
+
+        if bank_name == self._device.OPERATOR_WAVES_BANK_NAME:
+            for parameter in self._device._operator_feedback_parameters().values():
+                add_parameter_listener(parameter, 'state')
+            add_parameter_listener(self._device._parameter_by_names('Algorithm'), 'value')
+        elif bank_name == self._device.OPERATOR_FILTER_PLUS_BANK_NAME:
+            add_parameter_listener(self._device._parameter_by_names('Filter Type', 'Filter Type (Legacy)'), 'value')
+            add_parameter_listener(self._device._parameter_by_names('Filter Circuit - LP/HP'), 'state')
+            add_parameter_listener(self._device._parameter_by_names('Filter Circuit - BP/NO/Morph'), 'state')
+        elif re.sub(r'[^a-z0-9]+', '', str(bank_name).lower()) == 'lfo':
+            add_parameter_listener(self._device._parameter_by_names('LFO Range'), 'value')
+
+    def _wavetable_virtual_metadata(self):
+        metadata = []
+        for spec in self._active_wavetable_virtual_specs():
+            items = self._wavetable_virtual_items(spec)
+            parameter = spec.get('parameter')
+            if parameter and not items:
+                try:
+                    min_value = parameter.str_for_value(parameter.min)
+                    max_value = parameter.str_for_value(parameter.max)
+                    default_value = getattr(parameter, 'default_value', parameter.min)
+                    default_display = parameter.str_for_value(default_value)
+                    value_range = parameter.max - parameter.min
+                    default_normalized = ((default_value - parameter.min) / value_range) if value_range else 0.0
+                    quarter_display = parameter.str_for_value(parameter.min + (parameter.max - parameter.min) * 32.0 / 127.0)
+                    metadata.append('{}|{}|{}|{}|{}|{}||{}|{}|parameter|1'.format(
+                        self._escape_sysex_string(spec['name']),
+                        self._escape_sysex_string(min_value), self._escape_sysex_string(max_value),
+                        self._escape_sysex_string(default_display),
+                        default_normalized, self._escape_sysex_string(quarter_display),
+                        self._escape_sysex_string(self._parameter_display_value(parameter)),
+                        self._parameter_normalized_value(parameter)))
+                    continue
+                except Exception:
+                    metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
+                    continue
+            if not items:
+                metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
+                continue
+            index = max(0, min(len(items) - 1, self._wavetable_virtual_index(spec)))
+            normalized = float(index) / float(max(1, len(items) - 1))
+            metadata.append('{}|{}|{}|{}|0.0|{}|{}|{}|{}|parameter|0'.format(
+                self._escape_sysex_string(spec['name']),
+                self._escape_sysex_string(str(items[0])),
+                self._escape_sysex_string(str(items[-1])),
+                self._escape_sysex_string(str(items[0])),
+                self._escape_sysex_string(str(items[min(len(items) - 1, int(round((len(items) - 1) * 32 / 127.0)))])),
+                ';'.join(self._escape_sysex_string(str(item)) for item in items),
+                self._escape_sysex_string(str(items[index])),
+                normalized,
+            ))
+        metadata.extend([self.UNMAPPED_PARAMETER_METADATA_ITEM] * (8 - len(metadata)))
+        return ','.join(metadata[:8])
 
     def _parameter_normalized_value(self, device_param):
         try:
@@ -953,6 +1597,8 @@ class Tap(ControlSurface):
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
             if control_index >= 0 and self._set_track_midi_control_value_for_control(control_index, value=value):
                 return
+            if control_index >= 0 and self._set_wavetable_virtual_normalized(control_index, float(value) / 127.0):
+                return
 
             mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
             self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
@@ -1021,6 +1667,19 @@ class Tap(ControlSurface):
                         )
                     return
 
+            virtual_spec = self._wavetable_virtual_spec(control_index)
+            if virtual_spec:
+                if gesture_state == 0:
+                    self._set_wavetable_virtual_normalized(control_index, float(raw_value) / 65535.0)
+                elif gesture_state == 3:
+                    items = self._wavetable_virtual_items(virtual_spec)
+                    if items:
+                        current = self._wavetable_virtual_index(virtual_spec)
+                        self._set_wavetable_virtual_normalized(control_index, float((current + 1) % len(items)) / max(1, len(items) - 1))
+                elif gesture_state in (1, 2):
+                    self._send_wavetable_virtual_feedback(control_index)
+                return
+
             mapped_parameter = self._current_connected_parameter_for_control(control_index)
             if not mapped_parameter:
                 if gesture_state == 2:
@@ -1039,7 +1698,7 @@ class Tap(ControlSurface):
                 self._automation_removal_suppressed_controls.add(control_index)
                 return
 
-            if hasattr(mapped_parameter, 'is_enabled') and not mapped_parameter.is_enabled:
+            if not self._parameter_is_control_available(mapped_parameter):
                 if gesture_state == 2:
                     self._end_high_resolution_undo_step(control_index)
                     self._active_high_resolution_gestures.discard(control_index)
@@ -1106,16 +1765,23 @@ class Tap(ControlSurface):
         if not liveobj_valid(self._device):
             return
         
-        all_bank_names = self._device._parameter_bank_names()
+        selected_track = self.song().view.selected_track
+        selected_device = selected_track.view.selected_device if selected_track else None
+        selected_device = selected_device or getattr(self._device, '_device', None)
+        all_bank_names, _, _, _ = self._tap_visible_bank_info(selected_device)
         if not all_bank_names:
             return
-        
+
         current_index = self._device._bank_index
         new_index = max(0, min(len(all_bank_names) - 1, current_index + offset))
-        
         if new_index != current_index:
             self._device._bank_index = new_index
+            self._connect_device_controls()
             self._device.update()
+            try:
+                self.request_rebuild_midi_map()
+            except Exception:
+                pass
             self._on_device_changed(False)
             self._schedule_bank_metadata_refreshes()
 
@@ -1618,8 +2284,9 @@ class Tap(ControlSurface):
                 self.send_cc(72 + control_index, 8, 0)
 
     def _send_bank_state(self, selected_device, track_has_drums):
-        current_bank_name = self._device._bank_name
-        all_bank_names = self._device._parameter_bank_names()
+        all_bank_names, _, _, _ = self._tap_visible_bank_info(selected_device)
+        bank_index = self._device._bank_index
+        current_bank_name = all_bank_names[bank_index] if 0 <= bank_index < len(all_bank_names) else ''
         connected_bank_names = [name for name in all_bank_names if self._is_bank_connected(selected_device, name)]
 
         # Handle case where current bank was filtered out
@@ -1710,16 +2377,27 @@ class Tap(ControlSurface):
     def _get_parameter_display_name(self, device_param):
         raw_name = self._escape_sysex_string(device_param.name)
         if hasattr(device_param, 'is_enabled'):
+            if not self._parameter_is_control_available(device_param):
+                return f"*-{raw_name}"
             if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
                 if device_param.automation_state == 1:
                     return f"**{raw_name}"
                 elif device_param.automation_state == 2:
                     return f"*/{raw_name}"
-            elif device_param.is_enabled:
-                return raw_name
-            else:
-                return f"*-{raw_name}"
+            return raw_name
         return raw_name
+
+    def _parameter_is_control_available(self, parameter):
+        try:
+            if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
+                return False
+            if self._device._is_operator():
+                normalized_name = re.sub(r'[^a-z0-9]+', '', str(getattr(parameter, 'name', '')).lower())
+                if normalized_name.startswith(('osca', 'oscb', 'oscc', 'oscd')) and 'feedb' in normalized_name:
+                    return self._device._operator_parameter_is_active(parameter)
+        except Exception:
+            pass
+        return True
 
     def _current_bank_parameter_for_control(self, selected_device, control_index):
         try:
@@ -1772,6 +2450,9 @@ class Tap(ControlSurface):
         return current_param and liveobj_valid(current_param) and current_param == device_param
     
     def _build_parameter_metadata(self, selected_device):
+        virtual_metadata = self._wavetable_virtual_metadata()
+        if self._active_wavetable_virtual_specs():
+            return virtual_metadata
         if self._track_device_is_selected():
             return self._build_track_device_parameter_metadata()
 
@@ -2139,10 +2820,13 @@ class Tap(ControlSurface):
     
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
+        self._remove_wavetable_virtual_property_listeners()
+        self._remove_operator_virtual_bank_listeners()
         if liveobj_valid(self._device):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
             selected_device = selected_track.view.selected_device if selected_track else None
+            selected_device = selected_device or getattr(self._device, '_device', None)
 
             # Send the light bank update before listener and metadata work.
             track_has_drums = 0
@@ -2207,6 +2891,18 @@ class Tap(ControlSurface):
                 return
 
             current_bank_name, all_bank_names, connected_bank_names = self._send_bank_state(selected_device, track_has_drums)
+            if self._active_wavetable_virtual_specs():
+                self._remove_parameter_value_listeners()
+                self._remove_parameter_name_listeners()
+                self._remove_parameter_source_listener()
+                self._remove_automation_state_listeners()
+                self._setup_wavetable_virtual_property_listeners()
+                self._send_sys_ex_message(self._wavetable_virtual_metadata(), 0x7D)
+                self._send_wavetable_virtual_feedback_all()
+                return
+
+            if self._device._is_operator():
+                self._setup_operator_virtual_bank_listeners()
 
             self._remove_parameter_value_listeners()
             self._remove_parameter_name_listeners()
@@ -2301,15 +2997,7 @@ class Tap(ControlSurface):
                             device_param = mapped_param
                             
                             if device_param and hasattr(device_param, 'is_enabled'):
-                                if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
-                                    if device_param.automation_state == 1:
-                                        names.append(f"**{self._escape_sysex_string(device_param.name)}")
-                                    elif device_param.automation_state == 2:
-                                        names.append(f"*/{self._escape_sysex_string(device_param.name)}")
-                                elif device_param.is_enabled:
-                                    names.append(self._escape_sysex_string(device_param.name))
-                                else:
-                                    names.append(f"*-{self._escape_sysex_string(device_param.name)}")
+                                names.append(self._get_parameter_display_name(device_param))
                             else:
                                 # Fallback to mapped parameter name if DeviceParameter not found
                                 names.append(self._escape_sysex_string(mapped_param.name))
@@ -2374,7 +3062,7 @@ class Tap(ControlSurface):
                         
                         device_param = mapped_param
                         
-                        if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
+                        if device_param and not self._parameter_is_control_available(device_param):
                             listener = self._create_disabled_param_listener(device_param, control_index)
                             if not device_param.value_has_listener(listener):
                                 device_param.add_value_listener(listener)
@@ -3004,7 +3692,7 @@ class Tap(ControlSurface):
         def listener():
             if not self._is_current_parameter_for_control(control_index, device_param):
                 return
-            self._send_parameter_feedback(control_index, device_param)
+            self._send_parameter_feedback(control_index, device_param, throttle_display=True)
         return listener
 
     def _create_parameter_name_listener(self, device_param, control_index):
@@ -3027,22 +3715,26 @@ class Tap(ControlSurface):
     def _schedule_active_bank_parameter_refresh(self):
         if not liveobj_valid(self._device):
             return
-
-        if self._parameter_name_update_timer:
-            self._parameter_name_update_timer.cancel()
-
-        self._parameter_name_update_timer = threading.Timer(0.05, self._refresh_active_bank_parameters)
-        self._parameter_name_update_timer.start()
+        if self._active_bank_parameter_refresh_pending:
+            return
+        self._active_bank_parameter_refresh_pending = True
+        self.schedule_message(1, self._refresh_active_bank_parameters)
 
     def _refresh_active_bank_parameters(self):
         self._parameter_name_update_timer = None
+        self._active_bank_parameter_refresh_pending = False
         if not liveobj_valid(self._device):
             return
 
         try:
             if hasattr(self._device, 'update'):
                 self._device.update()
-            self._on_device_changed()
+            self._connect_device_controls()
+            try:
+                self.request_rebuild_midi_map()
+            except Exception:
+                pass
+            self._force_send_current_bank_metadata()
         except Exception as e:
             self._debug_log("Error refreshing active bank after parameter metadata change: {}".format(str(e)))
 
@@ -3374,7 +4066,7 @@ class Tap(ControlSurface):
             for control_index, control in enumerate(self._device._parameter_controls):
                 device_param = self._current_connected_parameter_for_control(control_index, selected_device)
 
-                if device_param and hasattr(device_param, 'is_enabled') and not device_param.is_enabled:
+                if device_param and not self._parameter_is_control_available(device_param):
                     if (device_param, control_index) not in self._disabled_parameter_listeners:
                         listener = self._create_disabled_param_listener(device_param, control_index)
                         if not device_param.value_has_listener(listener):
@@ -13347,6 +14039,8 @@ class Tap(ControlSurface):
         self._remove_parameter_value_listeners()
         self._remove_parameter_name_listeners()
         self._remove_parameter_source_listener()
+        self._remove_wavetable_virtual_property_listeners()
+        self._remove_operator_virtual_bank_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
         self._remove_mixer_automation_state_listeners()
