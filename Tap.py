@@ -35,7 +35,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 12
+secret_version_number = 13
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -52,6 +52,8 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
+    SIMPLER_AMP_BANK_NAME = "Amp Env"
+    SIMPLER_AMP_BANK_INDEX = 3
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -169,10 +171,7 @@ class TapDeviceComponent(DeviceComponent):
             return False
 
     def _is_simpler(self):
-        try:
-            return self._device_class_name() == 'OriginalSimpler' and liveobj_valid(self._device.sample)
-        except Exception:
-            return False
+        return self._device_class_name() == 'OriginalSimpler'
 
     def _custom_bank_insert_index(self, bank_names, anchor_name):
         anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
@@ -206,6 +205,8 @@ class TapDeviceComponent(DeviceComponent):
             # Keep Live's native bank count and indices intact.  Tap's Push-like
             # page replaces bank zero in place instead of inserting a bank.
             names[0] = self.SIMPLER_MAIN_BANK_NAME
+            if len(names) > self.SIMPLER_AMP_BANK_INDEX:
+                names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
         return tuple(names)
 
     def _add_tap_custom_banks(self, banks, base_names):
@@ -230,7 +231,16 @@ class TapDeviceComponent(DeviceComponent):
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler() and banks:
             banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
+            if len(banks) > self.SIMPLER_AMP_BANK_INDEX:
+                banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
         return banks
+
+    def _simpler_amp_parameters(self):
+        names = (
+            'Ve Attack', 'Ve Decay', 'Ve Sustain', 'Ve Release',
+            'Glide Time', 'Spread', 'Pan', 'Volume',
+        )
+        return tuple(self._parameter_by_names(name) for name in names)
 
     def _parameter_by_names(self, *names):
         wanted = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
@@ -728,7 +738,8 @@ class Tap(ControlSurface):
                 8: 'plugins',
                 9: 'sounds',
                 10: 'user_folders',
-                11: 'user_library'
+                11: 'user_library',
+                12: 'samples'
             }
             self._metadata_recheck_timer = None
             self._last_sent_metadata = None
@@ -2894,6 +2905,8 @@ class Tap(ControlSurface):
     def _add_simpler_listener(self, subject, property_name, callback):
         if not liveobj_valid(subject):
             return
+        if (subject, property_name, callback) in self._simpler_listener_bindings:
+            return
         add_listener = getattr(subject, 'add_{}_listener'.format(property_name), None)
         if not callable(add_listener):
             return
@@ -2940,7 +2953,13 @@ class Tap(ControlSurface):
             self._debug_log('Could not create Simpler parameter decorator: {}'.format(str(error)))
 
     def _connect_simpler_parameter_listeners(self):
-        for parameter_name in ('S Loop On', 'Trigger Mode', 'Snap'):
+        parameter_names = (
+            'S Loop On', 'Trigger Mode', 'Snap', 'Start', 'End', 'Fade In', 'Fade Out',
+            'Transpose', 'Gain', 'Nudge', 'Playback', 'Slice by', 'Division', 'Regions',
+            'Pad Slicing', 'Sensitivity', 'S Start', 'S Length', 'S Loop Length',
+            'Detune', 'S Loop Fade',
+        )
+        for parameter_name in parameter_names:
             parameter = self._simpler_parameter(parameter_name)
             if parameter:
                 self._add_simpler_listener(parameter, 'value', self._on_simpler_state_changed)
@@ -2997,6 +3016,9 @@ class Tap(ControlSurface):
                 'sample_end',
                 'sample_loop_start',
                 'sample_loop_end',
+                'sample_env_fade_in',
+                'sample_env_fade_out',
+                'sample_loop_fade',
                 'selected_slice',
             ):
                 self._add_simpler_listener(view, property_name, self._on_simpler_state_changed)
@@ -3112,8 +3134,17 @@ class Tap(ControlSurface):
                     self._escape_sysex_string(item)
                     for item in self._simpler_value_items(name, parameter)
                 )
-            return '{}|{}|{}|{}|{}|{}|{}|{}|{}|parameter|0'.format(
-                self._escape_sysex_string(name),
+            display_name = name
+            if not self._parameter_is_control_available(parameter):
+                display_name = '*-' + display_name
+            elif hasattr(parameter, 'automation_state'):
+                if parameter.automation_state == 1:
+                    display_name = '**' + display_name
+                elif parameter.automation_state == 2:
+                    display_name = '*/' + display_name
+            automatable = 1 if hasattr(parameter, 'automation_state') else 0
+            return '{}|{}|{}|{}|{}|{}|{}|{}|{}|parameter|{}'.format(
+                self._escape_sysex_string(display_name),
                 self._escape_sysex_string(min_value),
                 self._escape_sysex_string(max_value),
                 self._escape_sysex_string(default_display),
@@ -3122,6 +3153,7 @@ class Tap(ControlSurface):
                 value_items,
                 self._escape_sysex_string(self._simpler_display_value(name, parameter)),
                 self._parameter_normalized_value(parameter),
+                automatable,
             )
         except Exception:
             return self.UNMAPPED_PARAMETER_METADATA_ITEM
@@ -3223,7 +3255,7 @@ class Tap(ControlSurface):
         device = self._simpler_device
         sample = self._simpler_sample
         if not liveobj_valid(device) or not liveobj_valid(sample):
-            self._send_sys_ex_message('1|0|1|0|1|', 0x42)
+            self._send_sys_ex_message('1|0|1|0|1||0|0|0|0|0|0|0|0|0|0|0|0', 0x42)
             return
 
         try:
@@ -3276,7 +3308,16 @@ class Tap(ControlSurface):
         warp_enabled = 1 if bool(getattr(sample, 'warping', False)) else 0
         snap_parameter = self._simpler_parameter('Snap')
         snap_enabled = 1 if snap_parameter and self._parameter_normalized_value(snap_parameter) >= 0.5 else 0
-        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}'.format(
+        try:
+            warp_mode = int(sample.warp_mode)
+        except Exception:
+            warp_mode = 0
+        active_length = max(1.0, (sample_end - sample_start) * length)
+        loop_length = max(1.0, (loop_end - loop_start) * length)
+        fade_in = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_in', 0.0)) / active_length))
+        fade_out = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_out', 0.0)) / active_length))
+        loop_fade = max(0.0, min(0.5, float(getattr(view, 'sample_loop_fade', 0.0)) / loop_length))
+        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}'.format(
             sample_start,
             sample_end,
             loop_start,
@@ -3289,6 +3330,10 @@ class Tap(ControlSurface):
             loop_or_trigger_enabled,
             warp_enabled,
             snap_enabled,
+            warp_mode,
+            fade_in,
+            fade_out,
+            loop_fade,
         )
         self._send_sys_ex_message(payload, 0x42)
 
@@ -3341,6 +3386,18 @@ class Tap(ControlSurface):
                 parameter = self._simpler_parameter('Snap')
                 if parameter:
                     parameter.value = parameter.min if parameter.value > parameter.min else parameter.max
+            elif action_index == 8 and bool(sample.warping):
+                warp_modes = (
+                    Live.Clip.WarpMode.beats,
+                    Live.Clip.WarpMode.tones,
+                    Live.Clip.WarpMode.texture,
+                    Live.Clip.WarpMode.repitch,
+                    Live.Clip.WarpMode.complex,
+                    Live.Clip.WarpMode.complex_pro,
+                )
+                current_mode = int(sample.warp_mode)
+                current_index = next((index for index, warp_mode in enumerate(warp_modes) if int(warp_mode) == current_mode), -1)
+                sample.warp_mode = warp_modes[(current_index + 1) % len(warp_modes)]
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
             self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
@@ -3660,7 +3717,8 @@ class Tap(ControlSurface):
                 self._remove_parameter_value_listeners()
                 self._remove_parameter_name_listeners()
                 self._remove_parameter_source_listener()
-                self._remove_automation_state_listeners()
+                self._refresh_automation_state_listeners_current_bank()
+                self._last_automation_signature = self._get_automation_signature()
                 self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
                 self._send_simpler_virtual_feedback_all()
                 return
@@ -4636,6 +4694,21 @@ class Tap(ControlSurface):
         self._remove_automation_state_listeners()
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return
+        if self._simpler_main_active():
+            for control_index in range(8):
+                spec = self._simpler_virtual_spec(control_index)
+                device_param = spec.get('parameter') if spec and spec.get('kind') == 'parameter' else None
+                if device_param and liveobj_valid(device_param) and device_param not in self._automation_state_listeners:
+                    listener = self._create_automation_state_listener(device_param)
+                    try:
+                        add_listener = getattr(device_param, 'add_automation_state_listener', None)
+                        has_listener = getattr(device_param, 'automation_state_has_listener', None)
+                        if add_listener and (not has_listener or not has_listener(listener)):
+                            add_listener(listener)
+                            self._automation_state_listeners[device_param] = listener
+                    except Exception:
+                        pass
+            return
         selected_device = self._selected_device()
         for control_index, control in enumerate(self._device._parameter_controls):
             device_param = self._current_connected_parameter_for_control(control_index, selected_device)
@@ -4655,6 +4728,12 @@ class Tap(ControlSurface):
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return None
         signature = []
+        if self._simpler_main_active():
+            for control_index in range(8):
+                spec = self._simpler_virtual_spec(control_index)
+                parameter = spec.get('parameter') if spec and spec.get('kind') == 'parameter' else None
+                signature.append(parameter.automation_state if parameter and hasattr(parameter, 'automation_state') else None)
+            return tuple(signature)
         selected_device = self._selected_device()
         for control_index, control in enumerate(self._device._parameter_controls):
             mapped_param = self._current_connected_parameter_for_control(control_index, selected_device)
