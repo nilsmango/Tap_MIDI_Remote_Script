@@ -16,6 +16,10 @@ try:
     from ableton.v2.control_surface import SimplerDeviceDecorator
 except ImportError:
     SimplerDeviceDecorator = None
+try:
+    from ableton.v2.control_surface.simpler_slice_nudging import SimplerSliceNudging
+except ImportError:
+    SimplerSliceNudging = None
 from Live.Clip import MidiNoteSpecification
 
 import threading
@@ -35,7 +39,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 13
+secret_version_number = 16
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -52,8 +56,14 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
-    SIMPLER_AMP_BANK_NAME = "Amp Env"
+    SIMPLER_AMP_BANK_NAME = "Volume"
+    SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
+    DRUMCELL_SAMPLE_BANK_NAME = "Sample"
+    DRUMCELL_FX_FILTER_BANK_NAME = "FX & Filter"
+    DRUMCELL_REST_BANK_NAME = "Rest"
+    DRUMCELL_FX_2_BANK_NAME = "FX 2"
+    DRUMCELL_FX_3_BANK_NAME = "FX 3"
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -173,6 +183,21 @@ class TapDeviceComponent(DeviceComponent):
     def _is_simpler(self):
         return self._device_class_name() == 'OriginalSimpler'
 
+    def _is_drumcell(self):
+        return self._device_class_name() == 'DrumCell'
+
+    def _simpler_is_classic(self):
+        try:
+            return self._is_simpler() and int(self._device.playback_mode) == 0
+        except Exception:
+            return False
+
+    def _simpler_is_slice(self):
+        try:
+            return self._is_simpler() and int(self._device.playback_mode) == 2
+        except Exception:
+            return False
+
     def _custom_bank_insert_index(self, bank_names, anchor_name):
         anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
         for index, name in enumerate(bank_names):
@@ -205,8 +230,23 @@ class TapDeviceComponent(DeviceComponent):
             # Keep Live's native bank count and indices intact.  Tap's Push-like
             # page replaces bank zero in place instead of inserting a bank.
             names[0] = self.SIMPLER_MAIN_BANK_NAME
-            if len(names) > self.SIMPLER_AMP_BANK_INDEX:
+            if self._simpler_is_classic() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
+            elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
+                names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
+        elif self._is_drumcell():
+            custom_names = (
+                self.DRUMCELL_SAMPLE_BANK_NAME,
+                self.DRUMCELL_FX_FILTER_BANK_NAME,
+                self.DRUMCELL_REST_BANK_NAME,
+            )
+            while len(names) < len(custom_names):
+                names.append('Bank {}'.format(len(names) + 1))
+            names[:len(custom_names)] = custom_names
+            if len(names) > 3:
+                names[3] = self.DRUMCELL_FX_2_BANK_NAME
+            if len(names) > 4:
+                names[4] = self.DRUMCELL_FX_3_BANK_NAME
         return tuple(names)
 
     def _add_tap_custom_banks(self, banks, base_names):
@@ -231,8 +271,19 @@ class TapDeviceComponent(DeviceComponent):
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler() and banks:
             banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-            if len(banks) > self.SIMPLER_AMP_BANK_INDEX:
+            if self._simpler_is_classic() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
+            elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
+                banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
+        elif self._is_drumcell():
+            custom_banks = (
+                self._drumcell_sample_parameters(),
+                self._drumcell_fx_filter_parameters(),
+                self._drumcell_rest_parameters(),
+            )
+            while len(banks) < len(custom_banks):
+                banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+            banks[:len(custom_banks)] = custom_banks
         return banks
 
     def _simpler_amp_parameters(self):
@@ -241,6 +292,82 @@ class TapDeviceComponent(DeviceComponent):
             'Glide Time', 'Spread', 'Pan', 'Volume',
         )
         return tuple(self._parameter_by_names(name) for name in names)
+
+    def _simpler_slice_detail_parameters(self):
+        names = ('Transpose', 'Detune', 'Fade In', 'Fade Out')
+        parameters = [self._parameter_by_names(name) for name in names]
+        return tuple(parameters + [None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
+
+    def _parameter_display(self, parameter):
+        if not parameter:
+            return ''
+        try:
+            return str(parameter.str_for_value(parameter.value)).strip()
+        except Exception:
+            return str(getattr(parameter, 'value', '')).strip()
+
+    def _drumcell_sample_parameters(self):
+        env_mode = self._parameter_by_names('Env Mode')
+        hold = self._parameter_by_names('Hold') if 'trigger' in self._parameter_display(env_mode).lower() else None
+        return (
+            self._parameter_by_names('Start'),
+            self._parameter_by_names('Length'),
+            self._parameter_by_names('Attack'),
+            hold,
+            self._parameter_by_names('Decay'),
+            self._parameter_by_names('Transpose'),
+            self._parameter_by_names('Detune'),
+            env_mode,
+        )
+
+    def _drumcell_effect_parameter_names(self):
+        fx_type = self._parameter_display(self._parameter_by_names('FX Type')).lower()
+        if 'pitch' in fx_type:
+            return 'Pitch Env Amt', 'Pitch Env Decay'
+        if 'sub' in fx_type:
+            return 'Sub Amt', 'Sub Freq'
+        if 'noise' in fx_type:
+            return 'Noise Amt', 'Noise Color'
+        if 'loop' in fx_type:
+            return 'Loop Offset', 'Loop Length'
+        if 'stretch' in fx_type:
+            return 'Stretch Factor', 'Grain Size'
+        if 'punch' in fx_type:
+            return 'Punch Amt', 'Punch Release'
+        if '8-bit' in fx_type or '8 bit' in fx_type:
+            return '8-Bit Rate', '8-Bit Flt Decay'
+        if fx_type == 'fm' or 'frequency mod' in fx_type:
+            return 'FM Amt', 'FM Freq'
+        return 'RM Amt', 'RM Freq'
+
+    def _drumcell_filter_gain_or_resonance(self):
+        filter_type = self._parameter_display(self._parameter_by_names('Filter Type')).lower()
+        return self._parameter_by_names('Filter Gain') if 'peak' in filter_type else self._parameter_by_names('Filter Res')
+
+    def _drumcell_fx_filter_parameters(self):
+        effect_one, effect_two = self._drumcell_effect_parameter_names()
+        return (
+            self._parameter_by_names('FX On'),
+            self._parameter_by_names('FX Type'),
+            self._parameter_by_names(effect_one),
+            self._parameter_by_names(effect_two),
+            self._parameter_by_names('Filter On'),
+            self._parameter_by_names('Filter Type'),
+            self._parameter_by_names('Filter Freq'),
+            self._drumcell_filter_gain_or_resonance(),
+        )
+
+    def _drumcell_rest_parameters(self):
+        return (
+            self._parameter_by_names('Volume'),
+            self._parameter_by_names('Pan'),
+            self._parameter_by_names('Vel > Vol'),
+            self._parameter_by_names('Mod Src', 'Mod Source', 'Modulation Source'),
+            self._parameter_by_names('Mod Dest'),
+            self._parameter_by_names('Mod Amt'),
+            None,
+            None,
+        )
 
     def _parameter_by_names(self, *names):
         wanted = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
@@ -502,6 +629,13 @@ class TapDeviceComponent(DeviceComponent):
             return 'operator_lfo_plus'
         if name == self.SIMPLER_MAIN_BANK_NAME and self._is_simpler():
             return 'simpler_main'
+        if self._is_drumcell():
+            if name == self.DRUMCELL_SAMPLE_BANK_NAME:
+                return 'drumcell_sample'
+            if name == self.DRUMCELL_FX_FILTER_BANK_NAME:
+                return 'drumcell_fx_filter'
+            if name == self.DRUMCELL_REST_BANK_NAME:
+                return 'drumcell_rest'
         return None
 
     def _clamp_bank_index_to_safe_banks(self):
@@ -834,7 +968,9 @@ class Tap(ControlSurface):
             self._simpler_device = None
             self._simpler_sample = None
             self._simpler_decorator = None
+            self._simpler_slice_nudging = None
             self._simpler_zoom = 0.0
+            self._simpler_waveform_center = 0.5
             self._simpler_listener_bindings = []
             self._simpler_waveform_generation = 0
             self._simpler_waveform_cache = {}
@@ -2500,6 +2636,13 @@ class Tap(ControlSurface):
             track_parameter = self._track_device_parameter_for_control(control_index)
             return track_parameter if track_parameter and liveobj_valid(track_parameter) else None
 
+        if self._simpler_main_active():
+            simpler_spec = self._simpler_virtual_spec(control_index)
+            if simpler_spec and simpler_spec.get('kind') == 'parameter':
+                parameter = simpler_spec.get('parameter')
+                if parameter and liveobj_valid(parameter):
+                    return parameter
+
         selected_device = selected_device or self._selected_device()
         bank_param = self._current_bank_parameter_for_control(selected_device, control_index)
         if bank_param and liveobj_valid(bank_param):
@@ -2551,6 +2694,8 @@ class Tap(ControlSurface):
                 
                 if device_param:
                     name = self._get_parameter_display_name(device_param)
+                    if self._tap_active_custom_kind(selected_device) == 'drumcell_sample' and control_index == 7:
+                        name = 'Mode'
                     
                     min_val_str = None
                     max_val_str = None
@@ -2902,6 +3047,19 @@ class Tap(ControlSurface):
             pass
         return str(getattr(device, 'class_name', '')) in ('OriginalSimpler', 'Simpler')
 
+    def _is_drumcell_device(self, device):
+        return liveobj_valid(device) and str(getattr(device, 'class_name', '')) == 'DrumCell'
+
+    def _drumcell_dynamic_parameter(self, parameter):
+        if not self._is_drumcell_device(self._selected_device()):
+            return False
+        names = (
+            str(getattr(parameter, 'name', '')),
+            str(getattr(parameter, 'original_name', '')),
+        )
+        normalized = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
+        return bool(normalized.intersection(('envmode', 'fxtype', 'filtertype')))
+
     def _add_simpler_listener(self, subject, property_name, callback):
         if not liveobj_valid(subject):
             return
@@ -2932,6 +3090,12 @@ class Tap(ControlSurface):
         self._simpler_listener_bindings = []
 
     def _disconnect_simpler_decorator(self):
+        nudging = getattr(self, '_simpler_slice_nudging', None)
+        if nudging is not None:
+            try:
+                nudging.set_device(None)
+            except Exception:
+                pass
         decorator = getattr(self, '_simpler_decorator', None)
         self._simpler_decorator = None
         if decorator:
@@ -2949,6 +3113,10 @@ class Tap(ControlSurface):
                 live_object=self._simpler_device,
                 additional_properties={}
             )
+            if SimplerSliceNudging is not None:
+                if self._simpler_slice_nudging is None:
+                    self._simpler_slice_nudging = SimplerSliceNudging()
+                self._simpler_slice_nudging.set_device(self._simpler_decorator)
         except Exception as error:
             self._debug_log('Could not create Simpler parameter decorator: {}'.format(str(error)))
 
@@ -2977,6 +3145,7 @@ class Tap(ControlSurface):
         self._simpler_playhead_low = -1
         self._simpler_playhead_enabled = None
         self._simpler_zoom = 0.0
+        self._simpler_waveform_center = 0.5
         self._send_simpler_waveform_clear()
 
         if not self._simpler_device:
@@ -3026,6 +3195,7 @@ class Tap(ControlSurface):
         self._send_simpler_state()
         self._send_simpler_playhead(force=True)
         self._request_simpler_waveform()
+        self.schedule_message(1, self._sync_simpler_pad_slicing)
 
     def _on_simpler_sample_changed(self):
         device = self._simpler_device
@@ -3053,10 +3223,30 @@ class Tap(ControlSurface):
         self._send_simpler_virtual_feedback_all()
 
     def _on_simpler_configuration_changed(self):
+        self.schedule_message(1, self._sync_simpler_pad_slicing)
         self._send_simpler_state()
+        try:
+            selected_track = self.song().view.selected_track
+            track_has_drums = 1 if self._find_drum_rack_in_track(selected_track) is not None else 0
+            self._send_bank_state(self._simpler_device, track_has_drums)
+        except Exception:
+            pass
         if self._simpler_main_active():
             self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
             self._send_simpler_virtual_feedback_all()
+
+    def _sync_simpler_pad_slicing(self):
+        device = self._simpler_device
+        sample = self._simpler_sample
+        if not liveobj_valid(device) or not liveobj_valid(sample):
+            return
+        try:
+            manual = sample.slicing_style == Live.Sample.SlicingStyle.manual
+            target = bool(int(device.playback_mode) == 2 and manual)
+            if bool(device.pad_slicing) != target:
+                device.pad_slicing = target
+        except Exception as error:
+            self._debug_log('Could not update Simpler pad slicing: {}'.format(str(error)))
 
     def _simpler_main_active(self):
         return bool(
@@ -3159,9 +3349,13 @@ class Tap(ControlSurface):
             return self.UNMAPPED_PARAMETER_METADATA_ITEM
 
     def _simpler_value_items(self, name, parameter):
+        try:
+            mode = int(self._simpler_device.playback_mode)
+        except Exception:
+            mode = 0
         requested_items = {
             'Mode': ('Classic', '1-Shot', 'Slice'),
-            'Playback': ('Gate', 'Trigger'),
+            'Playback': ('Mono', 'Poly', 'Thru') if mode == 2 else ('Gate', 'Trigger'),
             'Slice by': ('Transient', 'Beat', 'Region', 'Manual'),
         }.get(name)
         if requested_items:
@@ -3232,6 +3426,7 @@ class Tap(ControlSurface):
         try:
             if spec['kind'] == 'zoom':
                 self._simpler_zoom = normalized
+                self._clamp_simpler_waveform_center()
                 self._send_simpler_state()
             else:
                 parameter = spec['parameter']
@@ -3241,6 +3436,26 @@ class Tap(ControlSurface):
         except Exception as error:
             self._debug_log('Error setting Simpler {}: {}'.format(spec['name'], str(error)))
             return False
+
+    def _clamp_simpler_waveform_center(self):
+        zoom = max(0.0, min(1.0, self._simpler_zoom))
+        visible_width = max(0.04, math.pow(1.0 - zoom, 2.0))
+        half_width = visible_width * 0.5
+        self._simpler_waveform_center = max(
+            half_width,
+            min(1.0 - half_width, self._simpler_waveform_center),
+        )
+
+    def _set_simpler_viewport(self, values):
+        if not self._simpler_main_active() or len(values) < 4:
+            return
+        zoom_raw = (int(values[0]) << 7) | int(values[1])
+        center_raw = (int(values[2]) << 7) | int(values[3])
+        self._simpler_zoom = max(0.0, min(1.0, float(zoom_raw) / 16383.0))
+        self._simpler_waveform_center = max(0.0, min(1.0, float(center_raw) / 16383.0))
+        self._clamp_simpler_waveform_center()
+        self._send_simpler_state()
+        self._send_simpler_virtual_feedback(0)
 
     def _on_simpler_playhead_changed(self):
         self._send_simpler_playhead()
@@ -3255,7 +3470,7 @@ class Tap(ControlSurface):
         device = self._simpler_device
         sample = self._simpler_sample
         if not liveobj_valid(device) or not liveobj_valid(sample):
-            self._send_sys_ex_message('1|0|1|0|1||0|0|0|0|0|0|0|0|0|0|0|0', 0x42)
+            self._send_sys_ex_message('1|0|1|0|1||0|0|0|0|0|0|0|0|0|0|0|0|0.5', 0x42)
             return
 
         try:
@@ -3316,8 +3531,12 @@ class Tap(ControlSurface):
         loop_length = max(1.0, (loop_end - loop_start) * length)
         fade_in = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_in', 0.0)) / active_length))
         fade_out = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_out', 0.0)) / active_length))
-        loop_fade = max(0.0, min(0.5, float(getattr(view, 'sample_loop_fade', 0.0)) / loop_length))
-        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}'.format(
+        loop_fade = self._normalized_simpler_position(
+            getattr(view, 'sample_loop_fade', loop_start * length),
+            length,
+            loop_start,
+        )
+        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}|{:.6f}'.format(
             sample_start,
             sample_end,
             loop_start,
@@ -3334,6 +3553,7 @@ class Tap(ControlSurface):
             fade_in,
             fade_out,
             loop_fade,
+            self._simpler_waveform_center,
         )
         self._send_sys_ex_message(payload, 0x42)
 
@@ -3382,7 +3602,7 @@ class Tap(ControlSurface):
                     device.crop()
             elif action_index == 6:
                 device.reverse()
-            elif action_index == 7 and mode == 1:
+            elif action_index == 7 and mode in (0, 1):
                 parameter = self._simpler_parameter('Snap')
                 if parameter:
                     parameter.value = parameter.min if parameter.value > parameter.min else parameter.max
@@ -3398,6 +3618,17 @@ class Tap(ControlSurface):
                 current_mode = int(sample.warp_mode)
                 current_index = next((index for index, warp_mode in enumerate(warp_modes) if int(warp_mode) == current_mode), -1)
                 sample.warp_mode = warp_modes[(current_index + 1) % len(warp_modes)]
+            elif action_index == 9:
+                self._simpler_zoom = min(1.0, self._simpler_zoom + 0.12)
+                self._clamp_simpler_waveform_center()
+            elif action_index == 10:
+                self._simpler_zoom = max(0.0, self._simpler_zoom - 0.12)
+                self._clamp_simpler_waveform_center()
+            elif action_index in (11, 12):
+                visible_width = max(0.04, math.pow(1.0 - self._simpler_zoom, 2.0))
+                direction = -1.0 if action_index == 11 else 1.0
+                self._simpler_waveform_center += direction * visible_width * 0.25
+                self._clamp_simpler_waveform_center()
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
             self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
@@ -3511,11 +3742,6 @@ class Tap(ControlSurface):
             if generation != self._simpler_waveform_generation:
                 self._simpler_waveform_pending.discard(pending_key)
                 return
-            peaks = self._simpler_waveform_from_asd(file_path)
-            if peaks:
-                self._cache_simpler_waveform(file_path, peaks)
-                self._simpler_waveform_pending.discard(pending_key)
-                return
             temp_directory = tempfile.mkdtemp(prefix='tap-simpler-')
             converted_path = os.path.join(temp_directory, 'waveform.wav')
             peaks = []
@@ -3525,7 +3751,7 @@ class Tap(ControlSurface):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=True,
-                    timeout=45,
+                    timeout=120,
                 )
                 with wave.open(converted_path, 'rb') as audio_file:
                     frame_count = audio_file.getnframes()
@@ -3627,6 +3853,31 @@ class Tap(ControlSurface):
             self._debug_log('Simpler ASD waveform decode failed for {}: {}'.format(analysis_path, str(error)))
             return []
 
+    def _send_custom_device_navigation_state(self, selected_track, selected_device):
+        if not selected_track:
+            return
+        all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+        starts_by_index = {}
+        ends_by_index = {}
+        for info in chain_info:
+            starts_by_index.setdefault(info.get('start_index'), []).append(info)
+            ends_by_index.setdefault(info.get('end_index'), []).append(info)
+
+        names = [self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)]
+        selected_index = 'not found'
+        for index, device in enumerate(all_devices):
+            prefix = ''.join('||' if item['type'] == 'rack' else '|*' for item in starts_by_index.get(index, ()))
+            endings = ends_by_index.get(index, ())
+            suffix = ''.join('*|' for item in endings if item['type'] == 'chain')
+            suffix += ''.join('||' for item in endings if item['type'] == 'rack')
+            names.append(prefix + self._escape_sysex_string(device.name) + suffix)
+            if device == selected_device:
+                selected_index = str(index + 1)
+
+        self._send_sys_ex_message(selected_index, 0x4D)
+        self._send_sys_ex_message(','.join(names), 0x01)
+        self._send_rack_snapshot_state(all_devices)
+
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
         self._remove_wavetable_virtual_property_listeners()
@@ -3703,6 +3954,9 @@ class Tap(ControlSurface):
                 return
 
             current_bank_name, all_bank_names, connected_bank_names = self._send_bank_state(selected_device, track_has_drums)
+            has_early_custom_surface = bool(self._active_wavetable_virtual_specs() or self._simpler_main_active())
+            if send_device_navigation and has_early_custom_surface:
+                self._send_custom_device_navigation_state(selected_track, selected_device)
             if self._active_wavetable_virtual_specs():
                 self._remove_parameter_value_listeners()
                 self._remove_parameter_name_listeners()
@@ -4516,6 +4770,8 @@ class Tap(ControlSurface):
             if not self._is_current_parameter_for_control(control_index, device_param):
                 return
             self._send_parameter_feedback(control_index, device_param, throttle_display=True)
+            if self._drumcell_dynamic_parameter(device_param):
+                self._schedule_active_bank_parameter_refresh()
         return listener
 
     def _create_parameter_name_listener(self, device_param, control_index):
@@ -9184,6 +9440,11 @@ class Tap(ControlSurface):
             values = self.extract_values_from_sysex_message(message)
             if values:
                 self._trigger_simpler_action(values[0])
+            return
+        # Simpler's two-axis Zoom control sends zoom and waveform center as
+        # two 14-bit normalized values.
+        if len(message) >= 7 and message[1] == 0x46:
+            self._set_simpler_viewport(self.extract_values_from_sysex_message(message))
             return
         # The app may connect after the one-time sample-change waveform send.
         if len(message) >= 4 and message[1] == 0x45:
