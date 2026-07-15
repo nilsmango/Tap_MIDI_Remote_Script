@@ -12,16 +12,30 @@ from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
 from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
+try:
+    from ableton.v2.control_surface import SimplerDeviceDecorator
+except ImportError:
+    SimplerDeviceDecorator = None
 from Live.Clip import MidiNoteSpecification
 
 import threading
 import random
 import re
 import math
+import os
+import shutil
+import struct
+import subprocess
+import tempfile
+import wave
+try:
+    import audioop
+except ImportError:
+    audioop = None
 from itertools import zip_longest
 import time
 
-secret_version_number = 8
+secret_version_number = 12
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -37,6 +51,7 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_OSC_BANK_NAME = "Waves"
     WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
+    SIMPLER_MAIN_BANK_NAME = "Main"
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -153,6 +168,12 @@ class TapDeviceComponent(DeviceComponent):
         except Exception:
             return False
 
+    def _is_simpler(self):
+        try:
+            return self._device_class_name() == 'OriginalSimpler' and liveobj_valid(self._device.sample)
+        except Exception:
+            return False
+
     def _custom_bank_insert_index(self, bank_names, anchor_name):
         anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
         for index, name in enumerate(bank_names):
@@ -181,6 +202,10 @@ class TapDeviceComponent(DeviceComponent):
             self._replace_wavetable_envelope_bank_names(names)
             index = self._wavetable_waves_insert_index(names)
             names.insert(index, self.WAVETABLE_OSC_BANK_NAME)
+        elif self._is_simpler() and names:
+            # Keep Live's native bank count and indices intact.  Tap's Push-like
+            # page replaces bank zero in place instead of inserting a bank.
+            names[0] = self.SIMPLER_MAIN_BANK_NAME
         return tuple(names)
 
     def _add_tap_custom_banks(self, banks, base_names):
@@ -203,6 +228,8 @@ class TapDeviceComponent(DeviceComponent):
             # Tap handles their MIDI mapping and feedback directly.
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+        elif self._is_simpler() and banks:
+            banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
         return banks
 
     def _parameter_by_names(self, *names):
@@ -463,6 +490,8 @@ class TapDeviceComponent(DeviceComponent):
             return 'operator_filter_plus'
         if name == self.OPERATOR_LFO_PLUS_BANK_NAME:
             return 'operator_lfo_plus'
+        if name == self.SIMPLER_MAIN_BANK_NAME and self._is_simpler():
+            return 'simpler_main'
         return None
 
     def _clamp_bank_index_to_safe_banks(self):
@@ -791,6 +820,19 @@ class Tap(ControlSurface):
             self._track_control_selection_by_track = {}
             self._track_control_bank_index_by_track = {}
             self._track_midi_control_values_by_track = {}
+            self._simpler_device = None
+            self._simpler_sample = None
+            self._simpler_decorator = None
+            self._simpler_zoom = 0.0
+            self._simpler_listener_bindings = []
+            self._simpler_waveform_generation = 0
+            self._simpler_waveform_cache = {}
+            self._simpler_waveform_cache_order = []
+            self._simpler_waveform_lock = threading.Lock()
+            self._simpler_waveform_pending = set()
+            self._simpler_playhead_high = -1
+            self._simpler_playhead_low = -1
+            self._simpler_playhead_enabled = None
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -1597,6 +1639,8 @@ class Tap(ControlSurface):
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
             if control_index >= 0 and self._set_track_midi_control_value_for_control(control_index, value=value):
                 return
+            if control_index >= 0 and self._set_simpler_virtual_normalized(control_index, float(value) / 127.0):
+                return
             if control_index >= 0 and self._set_wavetable_virtual_normalized(control_index, float(value) / 127.0):
                 return
 
@@ -1668,6 +1712,23 @@ class Tap(ControlSurface):
                     return
 
             virtual_spec = self._wavetable_virtual_spec(control_index)
+            simpler_spec = self._simpler_virtual_spec(control_index)
+            if simpler_spec:
+                if gesture_state == 0:
+                    self._set_simpler_virtual_normalized(control_index, float(raw_value) / 65535.0)
+                elif gesture_state == 3:
+                    parameter = simpler_spec.get('parameter')
+                    if parameter and getattr(parameter, 'is_quantized', False):
+                        items = tuple(getattr(parameter, 'value_items', ()))
+                        if items:
+                            current = int(round(self._parameter_normalized_value(parameter) * max(1, len(items) - 1)))
+                            self._set_simpler_virtual_normalized(control_index, float((current + 1) % len(items)) / max(1, len(items) - 1))
+                    else:
+                        self._send_simpler_virtual_feedback(control_index)
+                elif gesture_state in (1, 2):
+                    self._send_simpler_virtual_feedback(control_index)
+                return
+
             if virtual_spec:
                 if gesture_state == 0:
                     self._set_wavetable_virtual_normalized(control_index, float(raw_value) / 65535.0)
@@ -2450,6 +2511,8 @@ class Tap(ControlSurface):
         return current_param and liveobj_valid(current_param) and current_param == device_param
     
     def _build_parameter_metadata(self, selected_device):
+        if self._simpler_main_active():
+            return self._simpler_virtual_metadata()
         virtual_metadata = self._wavetable_virtual_metadata()
         if self._active_wavetable_virtual_specs():
             return virtual_metadata
@@ -2818,6 +2881,695 @@ class Tap(ControlSurface):
             self._drum_pad_change_recheck_count = 0
             self._drum_pad_recheck_start = None
     
+    def _is_simpler_device(self, device):
+        if not liveobj_valid(device):
+            return False
+        try:
+            if isinstance(device, Live.SimplerDevice.SimplerDevice):
+                return True
+        except Exception:
+            pass
+        return str(getattr(device, 'class_name', '')) in ('OriginalSimpler', 'Simpler')
+
+    def _add_simpler_listener(self, subject, property_name, callback):
+        if not liveobj_valid(subject):
+            return
+        add_listener = getattr(subject, 'add_{}_listener'.format(property_name), None)
+        if not callable(add_listener):
+            return
+        has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+        try:
+            if not callable(has_listener) or not has_listener(callback):
+                add_listener(callback)
+            self._simpler_listener_bindings.append((subject, property_name, callback))
+        except Exception:
+            pass
+
+    def _remove_simpler_listeners(self):
+        for subject, property_name, callback in list(getattr(self, '_simpler_listener_bindings', [])):
+            if not liveobj_valid(subject):
+                continue
+            remove_listener = getattr(subject, 'remove_{}_listener'.format(property_name), None)
+            has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+            try:
+                if callable(remove_listener) and (not callable(has_listener) or has_listener(callback)):
+                    remove_listener(callback)
+            except Exception:
+                pass
+        self._simpler_listener_bindings = []
+
+    def _disconnect_simpler_decorator(self):
+        decorator = getattr(self, '_simpler_decorator', None)
+        self._simpler_decorator = None
+        if decorator:
+            try:
+                decorator.disconnect()
+            except Exception:
+                pass
+
+    def _create_simpler_decorator(self):
+        self._disconnect_simpler_decorator()
+        if not self._simpler_device or SimplerDeviceDecorator is None:
+            return
+        try:
+            self._simpler_decorator = SimplerDeviceDecorator(
+                live_object=self._simpler_device,
+                additional_properties={}
+            )
+        except Exception as error:
+            self._debug_log('Could not create Simpler parameter decorator: {}'.format(str(error)))
+
+    def _connect_simpler_parameter_listeners(self):
+        for parameter_name in ('S Loop On', 'Trigger Mode', 'Snap'):
+            parameter = self._simpler_parameter(parameter_name)
+            if parameter:
+                self._add_simpler_listener(parameter, 'value', self._on_simpler_state_changed)
+
+    def _set_simpler_device(self, device):
+        if device == self._simpler_device and self._is_simpler_device(device):
+            return
+
+        self._remove_simpler_listeners()
+        self._disconnect_simpler_decorator()
+        self._simpler_waveform_generation += 1
+        self._simpler_device = device if self._is_simpler_device(device) else None
+        self._simpler_sample = None
+        self._simpler_playhead_high = -1
+        self._simpler_playhead_low = -1
+        self._simpler_playhead_enabled = None
+        self._simpler_zoom = 0.0
+        self._send_simpler_waveform_clear()
+
+        if not self._simpler_device:
+            self._send_sys_ex_message('0|0|1|0|1|', 0x42)
+            self._send_simpler_playhead(force=True, hidden=True)
+            return
+
+        self._add_simpler_listener(self._simpler_device, 'sample', self._on_simpler_sample_changed)
+        self._add_simpler_listener(self._simpler_device, 'playing_position', self._on_simpler_playhead_changed)
+        self._add_simpler_listener(self._simpler_device, 'playing_position_enabled', self._on_simpler_playhead_changed)
+        for property_name in ('playback_mode', 'slicing_playback_mode', 'pad_slicing', 'multi_sample_mode'):
+            self._add_simpler_listener(self._simpler_device, property_name, self._on_simpler_configuration_changed)
+        self._create_simpler_decorator()
+        self._connect_simpler_parameter_listeners()
+        self._connect_simpler_sample()
+
+    def _connect_simpler_sample(self):
+        device = self._simpler_device
+        sample = getattr(device, 'sample', None) if liveobj_valid(device) else None
+        self._simpler_sample = sample if liveobj_valid(sample) else None
+
+        if self._simpler_sample:
+            for property_name in (
+                'file_path', 'start_marker', 'end_marker', 'slices', 'slicing_style',
+                'slicing_sensitivity', 'slicing_beat_division', 'slicing_region_count',
+                'warping', 'warp_mode',
+            ):
+                callback = self._on_simpler_file_changed if property_name == 'file_path' else self._on_simpler_state_changed
+                if property_name in ('slicing_style', 'warping', 'warp_mode'):
+                    callback = self._on_simpler_configuration_changed
+                self._add_simpler_listener(self._simpler_sample, property_name, callback)
+
+        view = getattr(device, 'view', None) if liveobj_valid(device) else None
+        if liveobj_valid(view):
+            for property_name in (
+                'sample_start',
+                'sample_end',
+                'sample_loop_start',
+                'sample_loop_end',
+                'selected_slice',
+            ):
+                self._add_simpler_listener(view, property_name, self._on_simpler_state_changed)
+
+        self._send_simpler_state()
+        self._send_simpler_playhead(force=True)
+        self._request_simpler_waveform()
+
+    def _on_simpler_sample_changed(self):
+        device = self._simpler_device
+        self._remove_simpler_listeners()
+        if liveobj_valid(device):
+            self._add_simpler_listener(device, 'sample', self._on_simpler_sample_changed)
+            self._add_simpler_listener(device, 'playing_position', self._on_simpler_playhead_changed)
+            self._add_simpler_listener(device, 'playing_position_enabled', self._on_simpler_playhead_changed)
+            for property_name in ('playback_mode', 'slicing_playback_mode', 'pad_slicing', 'multi_sample_mode'):
+                self._add_simpler_listener(device, property_name, self._on_simpler_configuration_changed)
+        self._create_simpler_decorator()
+        self._connect_simpler_parameter_listeners()
+        self._simpler_waveform_generation += 1
+        self._send_simpler_waveform_clear()
+        self._connect_simpler_sample()
+
+    def _on_simpler_file_changed(self):
+        self._simpler_waveform_generation += 1
+        self._send_simpler_waveform_clear()
+        self._send_simpler_state()
+        self._request_simpler_waveform()
+
+    def _on_simpler_state_changed(self):
+        self._send_simpler_state()
+        self._send_simpler_virtual_feedback_all()
+
+    def _on_simpler_configuration_changed(self):
+        self._send_simpler_state()
+        if self._simpler_main_active():
+            self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
+            self._send_simpler_virtual_feedback_all()
+
+    def _simpler_main_active(self):
+        return bool(
+            self._simpler_device and
+            self._tap_active_custom_kind(self._simpler_device) == 'simpler_main'
+        )
+
+    def _simpler_parameter(self, name):
+        decorator = getattr(self, '_simpler_decorator', None)
+        candidates = []
+        try:
+            candidates.extend(decorator.parameters)
+        except Exception:
+            pass
+        try:
+            candidates.extend(self._simpler_device.parameters)
+        except Exception:
+            pass
+        wanted = re.sub(r'[^a-z0-9]+', '', name.lower())
+        for parameter in candidates:
+            try:
+                parameter_names = (str(parameter.name), str(getattr(parameter, 'original_name', '')))
+                if any(re.sub(r'[^a-z0-9]+', '', value.lower()) == wanted for value in parameter_names):
+                    return parameter
+            except Exception:
+                pass
+        return None
+
+    def _simpler_main_spec_names(self):
+        try:
+            mode = int(self._simpler_device.playback_mode)
+        except Exception:
+            mode = 0
+        if mode == 1:
+            return ('Zoom', 'Start', 'End', 'Fade In', 'Fade Out', 'Transpose', 'Gain', 'Mode')
+        if mode == 2:
+            slice_by = self._simpler_parameter('Slice by')
+            slice_by_name = self._parameter_display_value(slice_by).lower() if slice_by else ''
+            if 'beat' in slice_by_name:
+                slicing_control = 'Division'
+            elif 'region' in slice_by_name:
+                slicing_control = 'Regions'
+            elif 'manual' in slice_by_name:
+                slicing_control = 'Pad Slicing'
+            else:
+                slicing_control = 'Sensitivity'
+            return ('Zoom', 'Start', 'End', 'Nudge', 'Playback', 'Slice by', slicing_control, 'Mode')
+        warp_enabled = bool(getattr(self._simpler_sample, 'warping', False)) if liveobj_valid(self._simpler_sample) else False
+        return ('Zoom', 'Start', 'End', 'S Start', 'S Length', 'S Loop Length', 'Detune' if warp_enabled else 'S Loop Fade', 'Mode')
+
+    def _simpler_virtual_spec(self, control_index):
+        if not self._simpler_main_active() or not 0 <= control_index < 8:
+            return None
+        name = self._simpler_main_spec_names()[control_index]
+        if name == 'Zoom':
+            return {'name': name, 'kind': 'zoom'}
+        parameter = self._simpler_parameter(name)
+        return {'name': name, 'kind': 'parameter', 'parameter': parameter} if parameter else None
+
+    def _simpler_parameter_metadata_item(self, name, parameter):
+        if not parameter:
+            return self.UNMAPPED_PARAMETER_METADATA_ITEM
+        try:
+            min_value = self._simpler_display_for_value(name, parameter, parameter.min)
+            max_value = self._simpler_display_for_value(name, parameter, parameter.max)
+            default_value = getattr(parameter, 'default_value', parameter.min)
+            default_display = self._simpler_display_for_value(name, parameter, default_value)
+            value_range = float(parameter.max) - float(parameter.min)
+            default_normalized = (float(default_value) - float(parameter.min)) / value_range if value_range else 0.0
+            quarter_value = float(parameter.min) + value_range * 32.0 / 127.0
+            quarter_display = self._simpler_display_for_value(name, parameter, quarter_value)
+            value_items = ''
+            if getattr(parameter, 'is_quantized', False):
+                value_items = ';'.join(
+                    self._escape_sysex_string(item)
+                    for item in self._simpler_value_items(name, parameter)
+                )
+            return '{}|{}|{}|{}|{}|{}|{}|{}|{}|parameter|0'.format(
+                self._escape_sysex_string(name),
+                self._escape_sysex_string(min_value),
+                self._escape_sysex_string(max_value),
+                self._escape_sysex_string(default_display),
+                default_normalized,
+                self._escape_sysex_string(quarter_display),
+                value_items,
+                self._escape_sysex_string(self._simpler_display_value(name, parameter)),
+                self._parameter_normalized_value(parameter),
+            )
+        except Exception:
+            return self.UNMAPPED_PARAMETER_METADATA_ITEM
+
+    def _simpler_value_items(self, name, parameter):
+        requested_items = {
+            'Mode': ('Classic', '1-Shot', 'Slice'),
+            'Playback': ('Gate', 'Trigger'),
+            'Slice by': ('Transient', 'Beat', 'Region', 'Manual'),
+        }.get(name)
+        if requested_items:
+            return requested_items
+        if not getattr(parameter, 'is_quantized', False):
+            return ()
+        try:
+            return tuple(str(item) for item in parameter.value_items)
+        except Exception:
+            return ()
+
+    def _simpler_display_for_value(self, name, parameter, value):
+        items = self._simpler_value_items(name, parameter)
+        if items:
+            try:
+                value_range = float(parameter.max) - float(parameter.min)
+                normalized = (float(value) - float(parameter.min)) / value_range if value_range else 0.0
+                item_index = int(round(normalized * max(1, len(items) - 1)))
+                return items[max(0, min(len(items) - 1, item_index))]
+            except Exception:
+                pass
+        try:
+            display = parameter.str_for_value(value) if hasattr(parameter, 'str_for_value') else str(value)
+            return self._format_display_value_numbers(display)
+        except Exception:
+            return self._format_display_value_numbers(str(value))
+
+    def _simpler_display_value(self, name, parameter):
+        return self._simpler_display_for_value(name, parameter, parameter.value)
+
+    def _simpler_virtual_metadata(self):
+        metadata = []
+        for control_index in range(8):
+            spec = self._simpler_virtual_spec(control_index)
+            if not spec:
+                metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
+            elif spec['kind'] == 'zoom':
+                display = '{}%'.format(int(round(self._simpler_zoom * 100.0)))
+                metadata.append('Zoom|Full|Close|Full|0.0|25%||{}|{}|parameter|0'.format(display, self._simpler_zoom))
+            else:
+                metadata.append(self._simpler_parameter_metadata_item(spec['name'], spec['parameter']))
+        return ','.join(metadata)
+
+    def _send_simpler_virtual_feedback(self, control_index):
+        spec = self._simpler_virtual_spec(control_index)
+        if not spec:
+            self.send_cc(72 + control_index, 8, 0)
+            return
+        if spec['kind'] == 'zoom':
+            normalized = self._simpler_zoom
+            display = '{}%'.format(int(round(normalized * 100.0)))
+        else:
+            normalized = self._parameter_normalized_value(spec['parameter'])
+            display = self._simpler_display_value(spec['name'], spec['parameter'])
+        self.send_cc(72 + control_index, 8, int(round(max(0.0, min(1.0, normalized)) * 127.0)))
+        self._send_sys_ex_message('{}|{}|{}'.format(control_index, normalized, self._escape_sysex_string(display)), 0x28)
+
+    def _send_simpler_virtual_feedback_all(self):
+        if self._simpler_main_active():
+            for control_index in range(8):
+                self._send_simpler_virtual_feedback(control_index)
+
+    def _set_simpler_virtual_normalized(self, control_index, normalized):
+        spec = self._simpler_virtual_spec(control_index)
+        if not spec:
+            return False
+        normalized = max(0.0, min(1.0, float(normalized)))
+        try:
+            if spec['kind'] == 'zoom':
+                self._simpler_zoom = normalized
+                self._send_simpler_state()
+            else:
+                parameter = spec['parameter']
+                parameter.value = self._parameter_target_value_from_normalized(parameter, normalized)
+            self._send_simpler_virtual_feedback(control_index)
+            return True
+        except Exception as error:
+            self._debug_log('Error setting Simpler {}: {}'.format(spec['name'], str(error)))
+            return False
+
+    def _on_simpler_playhead_changed(self):
+        self._send_simpler_playhead()
+
+    def _normalized_simpler_position(self, value, length, fallback):
+        try:
+            return max(0.0, min(1.0, float(value) / max(1.0, float(length))))
+        except Exception:
+            return fallback
+
+    def _send_simpler_state(self):
+        device = self._simpler_device
+        sample = self._simpler_sample
+        if not liveobj_valid(device) or not liveobj_valid(sample):
+            self._send_sys_ex_message('1|0|1|0|1|', 0x42)
+            return
+
+        try:
+            length = max(1.0, float(sample.length))
+        except Exception:
+            length = 1.0
+        view = getattr(device, 'view', None)
+        sample_start = self._normalized_simpler_position(
+            getattr(view, 'sample_start', getattr(sample, 'start_marker', 0.0)), length, 0.0
+        )
+        sample_end = self._normalized_simpler_position(
+            getattr(view, 'sample_end', getattr(sample, 'end_marker', length)), length, 1.0
+        )
+        loop_start = self._normalized_simpler_position(
+            getattr(view, 'sample_loop_start', sample_start * length), length, sample_start
+        )
+        loop_end = self._normalized_simpler_position(
+            getattr(view, 'sample_loop_end', sample_end * length), length, sample_end
+        )
+        try:
+            slices = [
+                '{:.6f}'.format(max(0.0, min(1.0, float(value) / length)))
+                for value in list(sample.slices)[:128]
+            ]
+        except Exception:
+            slices = []
+
+        try:
+            mode = int(device.playback_mode)
+        except Exception:
+            mode = 0
+        selected_slice = self._normalized_simpler_position(
+            getattr(view, 'selected_slice', sample_start * length), length, sample_start
+        )
+        slice_by_parameter = self._simpler_parameter('Slice by')
+        manual_slicing = 1 if slice_by_parameter and 'manual' in self._parameter_display_value(slice_by_parameter).lower() else 0
+        toggle_parameter = self._simpler_parameter('S Loop On' if mode == 0 else 'Trigger Mode')
+        toggle_normalized = self._parameter_normalized_value(toggle_parameter) if toggle_parameter else 0.0
+        if mode == 0:
+            loop_or_trigger_enabled = 1 if toggle_parameter and toggle_normalized >= 0.5 else 0
+        else:
+            toggle_display = self._parameter_display_value(toggle_parameter).lower() if toggle_parameter else ''
+            if 'trigger' in toggle_display:
+                loop_or_trigger_enabled = 1
+            elif 'gate' in toggle_display:
+                loop_or_trigger_enabled = 0
+            else:
+                # Trigger Mode's raw direction is opposite to the UI label in Live 12.
+                loop_or_trigger_enabled = 1 if toggle_parameter and toggle_normalized < 0.5 else 0
+        warp_enabled = 1 if bool(getattr(sample, 'warping', False)) else 0
+        snap_parameter = self._simpler_parameter('Snap')
+        snap_enabled = 1 if snap_parameter and self._parameter_normalized_value(snap_parameter) >= 0.5 else 0
+        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}'.format(
+            sample_start,
+            sample_end,
+            loop_start,
+            loop_end,
+            ','.join(slices),
+            mode,
+            self._simpler_zoom,
+            selected_slice,
+            manual_slicing,
+            loop_or_trigger_enabled,
+            warp_enabled,
+            snap_enabled,
+        )
+        self._send_sys_ex_message(payload, 0x42)
+
+    def _trigger_simpler_action(self, action_index):
+        device = self._simpler_device
+        sample = self._simpler_sample
+        if not self._simpler_main_active() or not liveobj_valid(device) or not liveobj_valid(sample):
+            return
+        try:
+            mode = int(device.playback_mode)
+            if action_index == 0:
+                parameter = self._simpler_parameter('S Loop On' if mode == 0 else 'Trigger Mode')
+                if parameter:
+                    if getattr(parameter, 'is_quantized', False) and getattr(parameter, 'value_items', None):
+                        count = len(parameter.value_items)
+                        current = int(round(self._parameter_normalized_value(parameter) * max(1, count - 1)))
+                        parameter.value = self._parameter_target_value_from_normalized(
+                            parameter, float((current + 1) % count) / max(1, count - 1)
+                        )
+                    else:
+                        parameter.value = parameter.min if parameter.value > parameter.min else parameter.max
+            elif action_index == 1:
+                sample.warping = not bool(sample.warping)
+            elif action_index == 2 and bool(device.can_warp_half):
+                device.warp_half()
+            elif action_index == 3 and bool(device.can_warp_double):
+                device.warp_double()
+            elif action_index == 4 and mode == 2:
+                slice_by_parameter = self._simpler_parameter('Slice by')
+                if slice_by_parameter and 'manual' in self._parameter_display_value(slice_by_parameter).lower():
+                    sample.clear_slices()
+                else:
+                    sample.reset_slices()
+            elif action_index == 5:
+                if mode == 2:
+                    slices = list(sample.slices) + [sample.end_marker]
+                    selected = device.view.selected_slice
+                    if selected in slices:
+                        slice_index = slices.index(selected)
+                        if slice_index + 1 < len(slices):
+                            new_slice = int((slices[slice_index + 1] - selected) / 2.0) + selected
+                            if new_slice not in slices:
+                                sample.insert_slice(new_slice)
+                                device.view.selected_slice = new_slice
+                else:
+                    device.crop()
+            elif action_index == 6:
+                device.reverse()
+            elif action_index == 7 and mode == 1:
+                parameter = self._simpler_parameter('Snap')
+                if parameter:
+                    parameter.value = parameter.min if parameter.value > parameter.min else parameter.max
+            self._send_simpler_state()
+            self._send_sys_ex_message(str(action_index), 0x44)
+            self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
+            self._send_simpler_virtual_feedback_all()
+        except Exception as error:
+            self._debug_log('Simpler action {} failed: {}'.format(action_index, str(error)))
+
+    def _send_simpler_playhead(self, force=False, hidden=False):
+        device = self._simpler_device
+        enabled = False
+        position = 0.0
+        if not hidden and liveobj_valid(device):
+            try:
+                enabled = bool(device.playing_position_enabled)
+                position = max(0.0, min(1.0, float(device.playing_position)))
+            except Exception:
+                enabled = False
+                position = 0.0
+
+        raw_position = max(0, min(16383, int(round(position * 16383.0))))
+        high = (raw_position >> 7) & 0x7F
+        low = raw_position & 0x7F
+        enabled_value = 127 if enabled else 0
+        if force or high != self._simpler_playhead_high:
+            self.send_cc(67, 11, high)
+            self._simpler_playhead_high = high
+        if force or low != self._simpler_playhead_low:
+            self.send_cc(68, 11, low)
+            self._simpler_playhead_low = low
+        if force or enabled_value != self._simpler_playhead_enabled:
+            self.send_cc(69, 11, enabled_value)
+            self._simpler_playhead_enabled = enabled_value
+
+    def _send_simpler_waveform_clear(self):
+        generation = self._simpler_waveform_generation & 0x7F
+        self._send_sys_ex_message('{}|'.format(generation), 0x41)
+
+    def _send_simpler_waveform(self, generation, peaks):
+        if generation != self._simpler_waveform_generation:
+            return
+        peaks = list(peaks)
+        target_count = min(112, len(peaks))
+        if len(peaks) > target_count:
+            reduced = []
+            for point_index in range(target_count):
+                start = int(float(point_index) * len(peaks) / target_count)
+                end = max(start + 1, int(float(point_index + 1) * len(peaks) / target_count))
+                reduced.append(max(peaks[start:end]))
+            peaks = reduced
+        else:
+            peaks = peaks[:target_count]
+        encoded_peaks = ''.join('{:02x}'.format(max(0, min(127, int(peak)))) for peak in peaks)
+        self._debug_log('Sending Simpler waveform: {} points in one packet'.format(len(peaks)))
+        self._send_sys_ex_message('{}|{}'.format(generation & 0x7F, encoded_peaks), 0x41)
+
+    def _request_simpler_waveform(self):
+        sample = self._simpler_sample
+        if not liveobj_valid(sample):
+            return
+        try:
+            file_path = str(sample.file_path)
+        except Exception:
+            file_path = ''
+        if not file_path or not os.path.isfile(file_path):
+            return
+
+        generation = self._simpler_waveform_generation
+        cached = self._simpler_waveform_cache.get(file_path)
+        if cached:
+            self._debug_log('Using cached Simpler waveform: {} points'.format(len(cached)))
+            self._send_simpler_waveform(generation, cached)
+            return
+
+        self._poll_simpler_waveform(generation, file_path, 0)
+        pending_key = (generation, file_path)
+        if pending_key in self._simpler_waveform_pending:
+            return
+        self._simpler_waveform_pending.add(pending_key)
+
+        worker = threading.Thread(
+            target=self._build_simpler_waveform,
+            args=(generation, file_path),
+            name='TapSimplerWaveform',
+        )
+        worker.daemon = True
+        worker.start()
+
+    def _poll_simpler_waveform(self, generation, file_path, attempt):
+        if generation != self._simpler_waveform_generation:
+            return
+        cached = self._simpler_waveform_cache.get(file_path)
+        if cached:
+            self._send_simpler_waveform(generation, cached)
+            return
+        if attempt < 120:
+            self.schedule_message(5, lambda: self._poll_simpler_waveform(generation, file_path, attempt + 1))
+
+    def _cache_simpler_waveform(self, file_path, peaks):
+        self._debug_log('Cached Simpler waveform: {} points'.format(len(peaks)))
+        self._simpler_waveform_cache[file_path] = tuple(peaks)
+        if file_path in self._simpler_waveform_cache_order:
+            self._simpler_waveform_cache_order.remove(file_path)
+        self._simpler_waveform_cache_order.append(file_path)
+        while len(self._simpler_waveform_cache_order) > 8:
+            oldest = self._simpler_waveform_cache_order.pop(0)
+            self._simpler_waveform_cache.pop(oldest, None)
+
+    def _build_simpler_waveform(self, generation, file_path):
+        pending_key = (generation, file_path)
+        with self._simpler_waveform_lock:
+            if generation != self._simpler_waveform_generation:
+                self._simpler_waveform_pending.discard(pending_key)
+                return
+            peaks = self._simpler_waveform_from_asd(file_path)
+            if peaks:
+                self._cache_simpler_waveform(file_path, peaks)
+                self._simpler_waveform_pending.discard(pending_key)
+                return
+            temp_directory = tempfile.mkdtemp(prefix='tap-simpler-')
+            converted_path = os.path.join(temp_directory, 'waveform.wav')
+            peaks = []
+            try:
+                subprocess.run(
+                    ['/usr/bin/afconvert', '-f', 'WAVE', '-d', 'LEI16@4000', '-c', '1', file_path, converted_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=45,
+                )
+                with wave.open(converted_path, 'rb') as audio_file:
+                    frame_count = audio_file.getnframes()
+                    point_count = max(1, min(512, frame_count))
+                    for point_index in range(point_count):
+                        end_frame = int(round(float(point_index + 1) * frame_count / point_count))
+                        frames_to_read = max(1, end_frame - audio_file.tell())
+                        frame_data = audio_file.readframes(frames_to_read)
+                        if not frame_data:
+                            peaks.append(0)
+                        elif audioop is not None:
+                            peaks.append(audioop.max(frame_data, 2))
+                        else:
+                            maximum = 0
+                            for byte_index in range(0, len(frame_data) - 1, 2):
+                                value = int.from_bytes(frame_data[byte_index:byte_index + 2], 'little', signed=True)
+                                maximum = max(maximum, abs(value))
+                            peaks.append(maximum)
+                maximum_peak = max(peaks) if peaks else 0
+                if maximum_peak > 0:
+                    peaks = [max(0, min(127, int(round(float(value) * 127.0 / maximum_peak)))) for value in peaks]
+                else:
+                    peaks = [0 for _ in peaks]
+            except Exception as error:
+                self._debug_log('Simpler waveform decode failed for {}: {}'.format(file_path, str(error)))
+                peaks = self._simpler_waveform_from_asd(file_path)
+            finally:
+                shutil.rmtree(temp_directory, ignore_errors=True)
+
+            if not peaks or generation != self._simpler_waveform_generation:
+                self._simpler_waveform_pending.discard(pending_key)
+                return
+            self._cache_simpler_waveform(file_path, peaks)
+            self._simpler_waveform_pending.discard(pending_key)
+
+    def _simpler_waveform_from_asd(self, file_path):
+        """Read Live's cached waveform overview when pack audio is encrypted."""
+        analysis_path = file_path + '.asd'
+        if not os.path.isfile(analysis_path):
+            return []
+        try:
+            with open(analysis_path, 'rb') as analysis_file:
+                data = analysis_file.read()
+            tag = b'\x00\x13SampleOverViewLevel'
+            search_from = 0
+            candidates = []
+            while True:
+                offset = data.find(tag, search_from)
+                if offset < 0:
+                    break
+                search_from = offset + len(tag)
+                body = offset + len(tag)
+                if body + 8 > len(data):
+                    continue
+                version, value_count = struct.unpack_from('<II', data, body)
+                if value_count <= 0 or value_count > 65536:
+                    continue
+                if version == 0:
+                    value_size = 2
+                    value_format = 'e'
+                elif version == 2:
+                    value_size = 4
+                    value_format = 'f'
+                else:
+                    continue
+                values_start = body + 8
+                values_end = values_start + value_count * value_size
+                if values_end > len(data):
+                    continue
+                values = struct.unpack_from('<{}{}'.format(value_count, value_format), data, values_start)
+                if any(not math.isfinite(value) for value in values):
+                    continue
+                # Overview values are interleaved min/max pairs per channel.
+                # Four values collapse a stereo bin; on mono files this simply
+                # combines two adjacent bins and keeps the same envelope shape.
+                amplitudes = [
+                    max(abs(value) for value in values[index:index + 4])
+                    for index in range(0, len(values), 4)
+                    if values[index:index + 4]
+                ]
+                if amplitudes:
+                    candidates.append(amplitudes)
+            if not candidates:
+                return []
+
+            amplitudes = max(candidates, key=len)
+            if len(amplitudes) > 512:
+                reduced = []
+                for point_index in range(512):
+                    start = int(float(point_index) * len(amplitudes) / 512.0)
+                    end = max(start + 1, int(float(point_index + 1) * len(amplitudes) / 512.0))
+                    reduced.append(max(amplitudes[start:end]))
+                amplitudes = reduced
+            maximum = max(amplitudes)
+            if maximum <= 0.0:
+                return [0 for _ in amplitudes]
+            return [max(0, min(127, int(round(value * 127.0 / maximum)))) for value in amplitudes]
+        except Exception as error:
+            self._debug_log('Simpler ASD waveform decode failed for {}: {}'.format(analysis_path, str(error)))
+            return []
+
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
         self._remove_wavetable_virtual_property_listeners()
@@ -2825,8 +3577,11 @@ class Tap(ControlSurface):
         if liveobj_valid(self._device):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
-            selected_device = selected_track.view.selected_device if selected_track else None
-            selected_device = selected_device or getattr(self._device, '_device', None)
+            selected_device = getattr(self._device, '_device', None)
+            if not liveobj_valid(selected_device) and selected_track:
+                selected_device = selected_track.view.selected_device
+            track_device_selected = self._track_device_is_selected()
+            self._set_simpler_device(None if track_device_selected else selected_device)
 
             # Send the light bank update before listener and metadata work.
             track_has_drums = 0
@@ -2834,7 +3589,7 @@ class Tap(ControlSurface):
             if drum_rack_device is not None:
                 track_has_drums = 1
 
-            if self._track_device_is_selected():
+            if track_device_selected:
                 self._connect_track_device_parameter_controls(selected_track)
                 self._send_track_device_bank_state(track_has_drums)
                 self._remove_parameter_value_listeners()
@@ -2899,6 +3654,15 @@ class Tap(ControlSurface):
                 self._setup_wavetable_virtual_property_listeners()
                 self._send_sys_ex_message(self._wavetable_virtual_metadata(), 0x7D)
                 self._send_wavetable_virtual_feedback_all()
+                return
+
+            if self._simpler_main_active():
+                self._remove_parameter_value_listeners()
+                self._remove_parameter_name_listeners()
+                self._remove_parameter_source_listener()
+                self._remove_automation_state_listeners()
+                self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
+                self._send_simpler_virtual_feedback_all()
                 return
 
             if self._device._is_operator():
@@ -3086,6 +3850,7 @@ class Tap(ControlSurface):
                 self._mixer_disconnect_timer.start()
 
         else:
+            self._set_simpler_device(None)
             # no device
             # sending sysex of bank name, device name, bank names
             bank_name_drum = ";0"
@@ -8335,6 +9100,17 @@ class Tap(ControlSurface):
                 self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
+        # Push-style Simpler option row.
+        if len(message) >= 4 and message[1] == 0x43:
+            values = self.extract_values_from_sysex_message(message)
+            if values:
+                self._trigger_simpler_action(values[0])
+            return
+        # The app may connect after the one-time sample-change waveform send.
+        if len(message) >= 4 and message[1] == 0x45:
+            self._debug_log('Simpler waveform requested by app')
+            self._request_simpler_waveform()
+            return
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
             values = self.extract_values_from_sysex_message(message)
@@ -13994,6 +14770,11 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._simpler_waveform_generation += 1
+        self._remove_simpler_listeners()
+        self._disconnect_simpler_decorator()
+        self._simpler_device = None
+        self._simpler_sample = None
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
             self._metadata_recheck_timer = None
@@ -14077,13 +14858,13 @@ class Tap(ControlSurface):
             self.re_enable_parameter_automation_button.remove_value_listener(self._arm_re_enable_automation_from_next_encoder)
         song = self.song()
         # periodic_check_button.remove_value_listener(self._periodic_check)
-        song.remove_tracks_listener(self._on_tracks_changed)
+        self._remove_song_listener(song, "tracks", self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
         # self._unregister_clip_and_audio_listeners()
         # self.remove_midi_listener(self._midi_listener)
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
-        song.remove_scale_name_listener(self._on_scale_changed)
-        song.remove_root_note_listener(self._on_scale_changed)
+        self._remove_song_listener(song, "scale_name", self._on_scale_changed)
+        self._remove_song_listener(song, "root_note", self._on_scale_changed)
         self._remove_song_listener(song, "metronome", self._update_metronome)
         self._remove_song_listener(song, "session_record", self._on_session_record_changed)
         self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
