@@ -64,6 +64,7 @@ class TapDeviceComponent(DeviceComponent):
     DRUMCELL_REST_BANK_NAME = "Rest"
     DRUMCELL_FX_2_BANK_NAME = "FX 2"
     DRUMCELL_FX_3_BANK_NAME = "FX 3"
+    DELAY_BANK_NAMES = ("Main", "Time+Flt", "Flt+LFO", "LFO Wave")
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -186,6 +187,9 @@ class TapDeviceComponent(DeviceComponent):
     def _is_drumcell(self):
         return self._device_class_name() == 'DrumCell'
 
+    def _is_delay(self):
+        return self._device_class_name() == 'Delay'
+
     def _simpler_is_classic(self):
         try:
             return self._is_simpler() and int(self._device.playback_mode) == 0
@@ -247,6 +251,8 @@ class TapDeviceComponent(DeviceComponent):
                 names[3] = self.DRUMCELL_FX_2_BANK_NAME
             if len(names) > 4:
                 names[4] = self.DRUMCELL_FX_3_BANK_NAME
+        elif self._is_delay():
+            names = list(self.DELAY_BANK_NAMES)
         return tuple(names)
 
     def _add_tap_custom_banks(self, banks, base_names):
@@ -284,7 +290,52 @@ class TapDeviceComponent(DeviceComponent):
             while len(banks) < len(custom_banks):
                 banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks[:len(custom_banks)] = custom_banks
+        elif self._is_delay():
+            banks = list(self._delay_parameter_banks())
         return banks
+
+    def _delay_parameter_banks(self):
+        main = tuple(self._parameter_by_names(*names) for names in (
+            ('Feedback',),
+            ('Dry/Wet', 'Dry Wet'),
+            ('Smoothing', 'Delay Smoothing Mode'),
+            ('Link', 'Stereo Time Link'),
+            ('Ping Pong',),
+            ('Freeze',),
+            ('L Sync', 'L Delay Sync'),
+            ('R Sync', 'R Delay Sync'),
+        ))
+        time_bank = tuple(self._parameter_by_names(*names) for names in (
+            ('L Time', 'L Delay Time'),
+            ('R Time', 'R Delay Time'),
+            ('L 16th', 'L Delay 16th'),
+            ('R 16th', 'R Delay 16th'),
+            ('L Offset', 'L Delay Offset'),
+            ('R Offset', 'R Delay Offset'),
+            ('Filter Freq', 'Filter Frequency'),
+            ('Filter Width', 'Filter Bandwidth'),
+        ))
+
+        filter_lfo_bank = tuple(self._parameter_by_names(*names) for names in (
+            ('Filter On', 'Filter On/Off'),
+            ('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
+            ('LFO Freq', 'Mod LFO Freq', 'Modulation Frequency', 'LFO Rate'),
+            ('LFO Time', 'Mod LFO Time', 'Modulation Time'),
+            ('LFO Synced', 'LFO Sync', 'Mod LFO Synced', 'Modulation Synced Rate', 'LFO Synced Rate'),
+            ('LFO 16th', 'Mod LFO 16th', 'Modulation 16th'),
+            ('LFO > Delay', 'Delay < Modulation'),
+            ('LFO > Filter', 'Filter < Modulation'),
+        ))
+        lfo_wave_bank = (
+            self._parameter_by_names('LFO Wave', 'Mod LFO Wave', 'Modulation Waveform', 'LFO Waveform'),
+            self._parameter_by_names('LFO Morph', 'Mod LFO Morph', 'Modulation Morph'),
+        ) + tuple([None] * 6)
+        return (
+            main,
+            time_bank,
+            filter_lfo_bank,
+            lfo_wave_bank,
+        )
 
     def _simpler_amp_parameters(self):
         names = (
@@ -1293,7 +1344,7 @@ class Tap(ControlSurface):
 
     def _refresh_operator_virtual_bank(self):
         self._operator_virtual_bank_refresh_pending = False
-        if not self._device._is_operator():
+        if not (self._device._is_operator() or self._device._is_delay()):
             return
         self._connect_device_controls()
         try:
@@ -1305,7 +1356,7 @@ class Tap(ControlSurface):
     def _setup_operator_virtual_bank_listeners(self):
         self._remove_operator_virtual_bank_listeners()
         device = getattr(self._device, '_device', None)
-        if not self._device._is_operator() or not device or not liveobj_valid(device):
+        if not (self._device._is_operator() or self._device._is_delay()) or not device or not liveobj_valid(device):
             return
 
         try:
@@ -1332,8 +1383,20 @@ class Tap(ControlSurface):
             add_parameter_listener(self._device._parameter_by_names('Filter Type', 'Filter Type (Legacy)'), 'value')
             add_parameter_listener(self._device._parameter_by_names('Filter Circuit - LP/HP'), 'state')
             add_parameter_listener(self._device._parameter_by_names('Filter Circuit - BP/NO/Morph'), 'state')
-        elif re.sub(r'[^a-z0-9]+', '', str(bank_name).lower()) == 'lfo':
+        elif (self._device._is_operator() and
+              re.sub(r'[^a-z0-9]+', '', str(bank_name).lower()) == 'lfo'):
             add_parameter_listener(self._device._parameter_by_names('LFO Range'), 'value')
+        elif self._device._is_delay():
+            for parameter in (
+                    self._device._parameter_by_names('Link', 'Stereo Time Link'),
+                    self._device._parameter_by_names('L Sync', 'L Delay Sync'),
+                    self._device._parameter_by_names('R Sync', 'R Delay Sync'),
+                    self._device._parameter_by_names('Filter On', 'Filter On/Off'),
+                    self._device._parameter_by_names('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
+                    self._device._parameter_by_names('LFO Wave', 'Mod LFO Wave', 'Modulation Waveform', 'LFO Waveform')):
+                add_parameter_listener(parameter, 'value')
+            for parameter in getattr(device, 'parameters', ()):
+                add_parameter_listener(parameter, 'state')
 
     def _wavetable_virtual_metadata(self):
         metadata = []
@@ -2403,7 +2466,7 @@ class Tap(ControlSurface):
             escaped_parameter_name = self._escape_sysex_string(getattr(parameter, "name", ""))
             prefix = ""
             display_name = name
-            for candidate_prefix in ("**", "*/", "*-"):
+            for candidate_prefix in ("**", "*/", "*-", "*~"):
                 if display_name.startswith(candidate_prefix):
                     prefix = candidate_prefix
                     display_name = display_name[len(candidate_prefix):]
@@ -2585,6 +2648,8 @@ class Tap(ControlSurface):
     def _get_parameter_display_name(self, device_param):
         raw_name = self._escape_sysex_string(device_param.name)
         if hasattr(device_param, 'is_enabled'):
+            if self._parameter_is_inactive_but_controllable(device_param):
+                return f"*~{raw_name}"
             if not self._parameter_is_control_available(device_param):
                 return f"*-{raw_name}"
             if hasattr(device_param, 'automation_state') and device_param.automation_state != 0:
@@ -2597,6 +2662,8 @@ class Tap(ControlSurface):
 
     def _parameter_is_control_available(self, parameter):
         try:
+            if self._parameter_is_inactive_but_controllable(parameter):
+                return True
             if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
                 return False
             if self._device._is_operator():
@@ -2606,6 +2673,113 @@ class Tap(ControlSurface):
         except Exception:
             pass
         return True
+
+    def _parameter_normalized_names(self, parameter):
+        names = []
+        for attribute in ('name', 'original_name'):
+            try:
+                value = re.sub(r'[^a-z0-9]+', '', str(getattr(parameter, attribute, '')).lower())
+                if value:
+                    names.append(value)
+            except Exception:
+                pass
+        return tuple(names)
+
+    def _parameter_matches_names(self, parameter, *names):
+        wanted = set(re.sub(r'[^a-z0-9]+', '', str(name).lower()) for name in names)
+        return any(name in wanted for name in self._parameter_normalized_names(parameter))
+
+    def _parameter_switch_is_on(self, parameter):
+        if not parameter:
+            return False
+        try:
+            display = str(parameter.str_for_value(parameter.value)).strip().lower()
+            if display in ('on', 'yes', 'true', 'linked'):
+                return True
+            if display in ('off', 'no', 'false', 'unlinked'):
+                return False
+        except Exception:
+            pass
+        try:
+            return float(parameter.value) > (float(parameter.min) + float(parameter.max)) * 0.5
+        except Exception:
+            return bool(getattr(parameter, 'value', False))
+
+    def _delay_parameter_is_logically_active(self, parameter):
+        if not self._device._is_delay():
+            return True
+
+        link_on = self._parameter_switch_is_on(
+            self._device._parameter_by_names('Link', 'Stereo Time Link')
+        )
+        left_sync_on = self._parameter_switch_is_on(
+            self._device._parameter_by_names('L Sync', 'L Delay Sync')
+        )
+        right_sync_on = left_sync_on if link_on else self._parameter_switch_is_on(
+            self._device._parameter_by_names('R Sync', 'R Delay Sync')
+        )
+
+        if self._parameter_matches_names(parameter, 'R Sync', 'R Delay Sync'):
+            return not link_on
+        if self._parameter_matches_names(parameter, 'L Time', 'L Delay Time'):
+            return not left_sync_on
+        if self._parameter_matches_names(parameter, 'L 16th', 'L Delay 16th'):
+            return left_sync_on
+        if self._parameter_matches_names(parameter, 'R Time', 'R Delay Time'):
+            return not link_on and not right_sync_on
+        if self._parameter_matches_names(parameter, 'R 16th', 'R Delay 16th'):
+            return not link_on and right_sync_on
+
+        lfo_mode = self._device._parameter_by_names(
+            'LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'
+        )
+        try:
+            lfo_mode_name = re.sub(
+                r'[^a-z0-9]+', '',
+                str(lfo_mode.str_for_value(lfo_mode.value)).strip().lower()
+            ) if lfo_mode else ''
+        except Exception:
+            lfo_mode_name = ''
+
+        # If Live exposes an unfamiliar mode, leave these controls available
+        # and let DeviceParameter.is_enabled/state provide the fallback.
+        if lfo_mode_name:
+            if self._parameter_matches_names(
+                    parameter, 'LFO Freq', 'Mod LFO Freq', 'Modulation Frequency', 'LFO Rate'):
+                return lfo_mode_name in ('rate', 'freq', 'frequency')
+            if self._parameter_matches_names(parameter, 'LFO Time', 'Mod LFO Time', 'Modulation Time'):
+                return lfo_mode_name == 'time'
+            if self._parameter_matches_names(
+                    parameter, 'LFO Synced', 'LFO Sync', 'Mod LFO Synced',
+                    'Modulation Synced Rate', 'LFO Synced Rate'):
+                return lfo_mode_name in ('sync', 'synced', 'dotted', 'triplet')
+            if self._parameter_matches_names(parameter, 'LFO 16th', 'Mod LFO 16th', 'Modulation 16th'):
+                return lfo_mode_name in ('16th', 'sixteenth')
+        return True
+
+    def _operator_feedback_is_inactive(self, parameter):
+        if not self._device._is_operator():
+            return False
+        is_feedback = any(
+            feedback == parameter
+            for feedback in self._device._operator_feedback_parameters().values()
+        )
+        return is_feedback and not self._device._operator_parameter_is_active(parameter)
+
+    def _parameter_is_inactive_but_controllable(self, parameter):
+        try:
+            if self._operator_feedback_is_inactive(parameter):
+                return True
+            if self._device._is_delay():
+                physically_inactive = (
+                    (hasattr(parameter, 'is_enabled') and not parameter.is_enabled) or
+                    (hasattr(parameter, 'state') and
+                     parameter.state != Live.DeviceParameter.ParameterState.enabled)
+                )
+                return physically_inactive or not self._delay_parameter_is_logically_active(parameter)
+        except Exception:
+            pass
+        return False
 
     def _current_bank_parameter_for_control(self, selected_device, control_index):
         try:
@@ -3977,7 +4151,7 @@ class Tap(ControlSurface):
                 self._send_simpler_virtual_feedback_all()
                 return
 
-            if self._device._is_operator():
+            if self._device._is_operator() or self._device._is_delay():
                 self._setup_operator_virtual_bank_listeners()
 
             self._remove_parameter_value_listeners()
