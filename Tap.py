@@ -78,7 +78,7 @@ class TapDeviceComponent(DeviceComponent):
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
     SIMPLER_WARP_BANK_NAME = "Controls"
     SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
-    SIMPLER_CONTROLS_3_BANK_NAME = "Controls 3"
+    SIMPLER_CONTROLS_3_BANK_NAME = "Pitch Env"
     SIMPLER_BROWSE_BANK_NAME = "Browse Samples"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
@@ -128,10 +128,12 @@ class TapDeviceComponent(DeviceComponent):
         self._meld_decorator_device = None
         self._simpler_bank_decorator = None
         self._simpler_bank_decorator_device = None
+        self._simpler_filter_parameter_cache = tuple([None] * 4)
 
     def invalidate_parameter_bank_cache(self):
         self._operator_parameter_bank_cache = None
         self._operator_parameter_bank_cache_device = None
+        self._simpler_filter_parameter_cache = tuple([None] * 4)
 
     def set_device(self, device):
         if device != getattr(self, '_device', None):
@@ -506,6 +508,7 @@ class TapDeviceComponent(DeviceComponent):
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler():
+            self._simpler_filter_parameter_cache = self._simpler_filter_parameters_from_base_banks(banks, names)
             if not banks:
                 banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
@@ -588,16 +591,48 @@ class TapDeviceComponent(DeviceComponent):
             return ''
 
     def _simpler_filter_parameters(self):
-        filter_type = self._parameter_by_names('Filter Type', 'Filter Type (Legacy)')
-        return (
-            filter_type,
+        direct_parameters = (
+            self._parameter_by_names('Filter Type', 'Filter Type (Legacy)', 'F Type', 'Flt Type'),
             self._parameter_by_names('Filter Slope', 'Slope'),
-            self._parameter_by_names('Filter Circuit - LP/HP'),
+            self._parameter_by_names('Filter Circuit - LP/HP', 'Filter Circuit LP/HP', 'F Circuit LP/HP'),
             self._parameter_by_names('Filter Drive'),
         )
+        cached_parameters = getattr(self, '_simpler_filter_parameter_cache', ())
+        return tuple(
+            cached_parameters[index] if index < len(cached_parameters) and cached_parameters[index] else parameter
+            for index, parameter in enumerate(direct_parameters)
+        )
+
+    def _simpler_filter_parameters_from_base_banks(self, banks, bank_names):
+        filter_index = self._bank_index_named(bank_names, 'Filter')
+        if filter_index is None or filter_index >= len(banks):
+            return tuple([None] * 4)
+        bank = list(banks[filter_index])
+        bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
+        # Live's resolved Simpler Filter bank slots are Type, Circuit,
+        # Drive and Slope at 0, 3, 5 and 6 respectively.  Reading the
+        # resolved slots preserves Live's new/legacy filter selection and
+        # conditional LP/HP versus BP/NO circuit choice.
+        resolved = [bank[0], bank[6], bank[3], bank[5]]
+
+        # The Python bank descriptions intentionally hide some slots when the
+        # filter is off.  The C++ bank indices can still expose their underlying
+        # DeviceParameters, so use those to fill any conditional gaps.
+        try:
+            parameters = list(self._device.parameters)
+            live_banks = self._safe_live_parameter_banks(self._device, parameters)
+            if filter_index < len(live_banks):
+                live_bank = list(live_banks[filter_index])
+                live_bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(live_bank)))
+                for result_index, bank_slot in enumerate((0, 6, 3, 5)):
+                    if not resolved[result_index]:
+                        resolved[result_index] = live_bank[bank_slot]
+        except Exception:
+            pass
+        return tuple(resolved)
 
     def _simpler_control_parameters(self):
-        mode = self._simpler_warp_mode_name()
+        mode = self._simpler_warp_mode_name() if self._simpler_is_warped() else ''
         mode_parameters = {
             'beats': ('Preserve', 'Loop Mode', 'Envelope'),
             'tones': ('Grain Size Tones',),
@@ -639,6 +674,7 @@ class TapDeviceComponent(DeviceComponent):
             self._normalized_bank_name(self.SIMPLER_WARP_BANK_NAME),
             self._normalized_bank_name(self.SIMPLER_CONTROLS_2_BANK_NAME),
             self._normalized_bank_name(self.SIMPLER_CONTROLS_3_BANK_NAME),
+            self._normalized_bank_name('Controls 3'),
             self._normalized_bank_name('Options'),
             self._normalized_bank_name('Warp'),
         }
