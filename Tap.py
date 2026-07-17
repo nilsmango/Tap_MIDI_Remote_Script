@@ -75,6 +75,7 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
+    SIMPLER_ACTIONS_BANK_NAME = "Actions"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
@@ -402,6 +403,7 @@ class TapDeviceComponent(DeviceComponent):
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
             elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
+            names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
         elif self._is_drumcell():
             custom_names = (
                 self.DRUMCELL_SAMPLE_BANK_NAME,
@@ -449,6 +451,7 @@ class TapDeviceComponent(DeviceComponent):
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
             elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
+            banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_drumcell():
             custom_banks = (
                 self._drumcell_sample_parameters(),
@@ -1089,6 +1092,8 @@ class TapDeviceComponent(DeviceComponent):
             return 'operator_lfo_plus'
         if name == self.SIMPLER_MAIN_BANK_NAME and self._is_simpler():
             return 'simpler_main'
+        if name == self.SIMPLER_ACTIONS_BANK_NAME and self._is_simpler():
+            return 'simpler_actions'
         if self._is_drumcell():
             if name == self.DRUMCELL_SAMPLE_BANK_NAME:
                 return 'drumcell_sample'
@@ -2372,6 +2377,8 @@ class Tap(ControlSurface):
             control_index = self._device_controls.index(control) if hasattr(self, '_device_controls') and control in self._device_controls else -1
             if control_index >= 0 and self._set_track_midi_control_value_for_control(control_index, value=value):
                 return
+            if control_index >= 0 and self._set_simpler_action_normalized(control_index, float(value) / 127.0):
+                return
             if control_index >= 0 and self._set_simpler_virtual_normalized(control_index, float(value) / 127.0):
                 return
             if control_index >= 0 and self._set_wavetable_virtual_normalized(control_index, float(value) / 127.0):
@@ -2462,6 +2469,18 @@ class Tap(ControlSurface):
 
             virtual_spec = self._wavetable_virtual_spec(control_index)
             simpler_spec = self._simpler_virtual_spec(control_index)
+            simpler_action_spec = self._simpler_action_spec(control_index)
+            if simpler_action_spec:
+                if gesture_state == 0:
+                    self._set_simpler_action_normalized(control_index, float(raw_value) / 65535.0)
+                elif gesture_state == 3:
+                    if simpler_action_spec.get('enabled', True):
+                        self._trigger_simpler_action(int(simpler_action_spec['action']))
+                    else:
+                        self._send_simpler_action_feedback(control_index)
+                elif gesture_state in (1, 2):
+                    self._send_simpler_action_feedback(control_index)
+                return
             if simpler_spec:
                 if gesture_state == 0:
                     self._set_simpler_virtual_normalized(control_index, float(raw_value) / 65535.0)
@@ -3493,6 +3512,8 @@ class Tap(ControlSurface):
         return current_param and liveobj_valid(current_param) and current_param == device_param
     
     def _build_parameter_metadata(self, selected_device):
+        if self._simpler_actions_active():
+            return self._simpler_action_metadata()
         if self._simpler_main_active():
             return self._simpler_virtual_metadata()
         virtual_metadata = self._wavetable_virtual_metadata()
@@ -4293,6 +4314,9 @@ class Tap(ControlSurface):
     def _on_simpler_state_changed(self):
         self._send_simpler_state()
         self._send_simpler_virtual_feedback_all()
+        if self._simpler_actions_active():
+            self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+        self._send_simpler_action_feedback_all()
 
     def _on_simpler_configuration_changed(self):
         self.schedule_message(1, self._sync_simpler_pad_slicing)
@@ -4306,6 +4330,9 @@ class Tap(ControlSurface):
         if self._simpler_main_active():
             self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
             self._send_simpler_virtual_feedback_all()
+        elif self._simpler_actions_active():
+            self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+            self._send_simpler_action_feedback_all()
 
     def _sync_simpler_pad_slicing(self):
         device = self._simpler_device
@@ -4324,6 +4351,12 @@ class Tap(ControlSurface):
         return bool(
             self._simpler_device and
             self._tap_active_custom_kind(self._simpler_device) == 'simpler_main'
+        )
+
+    def _simpler_actions_active(self):
+        return bool(
+            self._simpler_device and
+            self._tap_active_custom_kind(self._simpler_device) == 'simpler_actions'
         )
 
     def _simpler_parameter(self, name):
@@ -4457,6 +4490,219 @@ class Tap(ControlSurface):
 
     def _simpler_display_value(self, name, parameter):
         return self._simpler_display_for_value(name, parameter, parameter.value)
+
+    def _simpler_warp_mode_items(self):
+        return ('Beats', 'Tones', 'Texture', 'Re-Pitch', 'Complex', 'Complex Pro')
+
+    def _simpler_action_specs(self):
+        if not self._simpler_actions_active() or not liveobj_valid(self._simpler_sample):
+            return tuple([None] * 8)
+        try:
+            mode = int(self._simpler_device.playback_mode)
+        except Exception:
+            mode = 0
+        warp_enabled = bool(getattr(self._simpler_sample, 'warping', False))
+
+        toggle_parameter = self._simpler_parameter('S Loop On' if mode == 0 else 'Trigger Mode')
+        if mode == 0:
+            toggle_items = self._simpler_value_items('S Loop On', toggle_parameter) if toggle_parameter else ()
+            toggle_items = toggle_items or ('Off', 'On')
+            toggle_display = self._parameter_display_value(toggle_parameter) if toggle_parameter else toggle_items[0]
+            toggle_normalized = self._parameter_normalized_value(toggle_parameter) if toggle_parameter else 0.0
+            toggle_name = 'Loop'
+        else:
+            toggle_items = ('Gate', 'Trigger')
+            toggle_display = self._parameter_display_value(toggle_parameter) if toggle_parameter else toggle_items[0]
+            is_trigger = 'trigger' in toggle_display.lower()
+            toggle_display = 'Trigger' if is_trigger else 'Gate'
+            toggle_normalized = 1.0 if is_trigger else 0.0
+            toggle_name = 'Trigger Mode'
+
+        def button(name, action, enabled=True):
+            return {
+                'name': name,
+                'action': action,
+                'kind': 'button',
+                'items': ('Ready', 'Trigger'),
+                'display': 'Ready',
+                'normalized': 0.0,
+                'enabled': enabled,
+            }
+
+        def toggle(name, action, items, display, normalized, enabled=True):
+            return {
+                'name': name,
+                'action': action,
+                'kind': 'toggle',
+                'items': tuple(items),
+                'display': display,
+                'normalized': normalized,
+                'enabled': enabled,
+            }
+
+        warp_modes = self._simpler_warp_mode_items()
+        try:
+            live_warp_modes = (
+                Live.Clip.WarpMode.beats,
+                Live.Clip.WarpMode.tones,
+                Live.Clip.WarpMode.texture,
+                Live.Clip.WarpMode.repitch,
+                Live.Clip.WarpMode.complex,
+                Live.Clip.WarpMode.complex_pro,
+            )
+            current_warp_mode = int(self._simpler_sample.warp_mode)
+            warp_mode_index = next(
+                (index for index, item in enumerate(live_warp_modes) if int(item) == current_warp_mode),
+                0,
+            )
+        except Exception:
+            warp_mode_index = 0
+        warp_mode_spec = {
+            'name': 'Warp Mode',
+            'action': 8,
+            'kind': 'warp_mode',
+            'items': warp_modes,
+            'display': warp_modes[warp_mode_index],
+            'normalized': float(warp_mode_index) / float(len(warp_modes) - 1),
+            'enabled': warp_enabled,
+        }
+
+        snap_parameter = self._simpler_parameter('Snap')
+        snap_normalized = self._parameter_normalized_value(snap_parameter) if snap_parameter else 0.0
+        snap_spec = toggle(
+            'Snap', 7, ('Off', 'On'), 'On' if snap_normalized >= 0.5 else 'Off', snap_normalized
+        )
+        try:
+            reset_name = 'Clear Slices' if int(self._simpler_sample.slicing_style) == 1 else 'Reset Slices'
+        except Exception:
+            reset_name = 'Reset Slices'
+
+        specs = [
+            toggle(toggle_name, 0, toggle_items, toggle_display, toggle_normalized),
+            toggle('Warp', 1, ('Off', 'On'), 'On' if warp_enabled else 'Off', 1.0 if warp_enabled else 0.0),
+            button('Warp ÷2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
+            button('Warp ×2', 3, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_double', False))),
+            button(reset_name, 4) if mode == 2 else warp_mode_spec,
+            button('Split' if mode == 2 else 'Crop', 5),
+            button('Reverse', 6),
+            warp_mode_spec if mode == 2 else snap_spec,
+        ]
+        return tuple(specs)
+
+    def _simpler_action_spec(self, control_index):
+        specs = self._simpler_action_specs()
+        return specs[control_index] if 0 <= control_index < len(specs) else None
+
+    def _simpler_action_metadata_item(self, spec):
+        if not spec:
+            return self.UNMAPPED_PARAMETER_METADATA_ITEM
+        items = tuple(spec.get('items') or ('Ready', 'Trigger'))
+        name = str(spec.get('name', 'Action'))
+        if not spec.get('enabled', True):
+            name = '*~' + name
+        normalized = max(0.0, min(1.0, float(spec.get('normalized', 0.0))))
+        quarter_index = int(round((len(items) - 1) * 32.0 / 127.0))
+        return '{}|{}|{}|{}|{}|{}|{}|{}|{}|action|0'.format(
+            self._escape_sysex_string(name),
+            self._escape_sysex_string(items[0]),
+            self._escape_sysex_string(items[-1]),
+            self._escape_sysex_string(items[0]),
+            0.0,
+            self._escape_sysex_string(items[quarter_index]),
+            ';'.join(self._escape_sysex_string(item) for item in items),
+            self._escape_sysex_string(spec.get('display', items[0])),
+            normalized,
+        )
+
+    def _simpler_action_metadata(self):
+        return ','.join(
+            self._simpler_action_metadata_item(spec)
+            for spec in self._simpler_action_specs()
+        )
+
+    def _send_simpler_action_feedback(self, control_index):
+        spec = self._simpler_action_spec(control_index)
+        if not spec:
+            self.send_cc(72 + control_index, 8, 0)
+            return
+        normalized = max(0.0, min(1.0, float(spec.get('normalized', 0.0))))
+        display = str(spec.get('display', 'Ready'))
+        self.send_cc(72 + control_index, 8, int(round(normalized * 127.0)))
+        self._send_sys_ex_message(
+            '{}|{}|{}'.format(control_index, normalized, self._escape_sysex_string(display)),
+            0x28,
+        )
+
+    def _send_simpler_action_feedback_all(self):
+        if self._simpler_actions_active():
+            for control_index in range(8):
+                self._send_simpler_action_feedback(control_index)
+
+    def _set_simpler_parameter_display_item(self, parameter, display_item):
+        if not parameter:
+            return False
+        wanted = str(display_item).strip().lower()
+        candidates = (parameter.min, parameter.max)
+        try:
+            value_items = tuple(parameter.value_items) if parameter.is_quantized else ()
+            if len(value_items) > 2:
+                value_range = float(parameter.max) - float(parameter.min)
+                candidates = tuple(
+                    float(parameter.min) + value_range * index / float(len(value_items) - 1)
+                    for index in range(len(value_items))
+                )
+        except Exception:
+            pass
+        for value in candidates:
+            try:
+                if wanted in str(parameter.str_for_value(value)).strip().lower():
+                    parameter.value = value
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _set_simpler_action_normalized(self, control_index, normalized):
+        spec = self._simpler_action_spec(control_index)
+        if not spec or not spec.get('enabled', True):
+            return False
+        normalized = max(0.0, min(1.0, float(normalized)))
+        action = int(spec['action'])
+        try:
+            if action == 0:
+                parameter = self._simpler_parameter(
+                    'S Loop On' if int(self._simpler_device.playback_mode) == 0 else 'Trigger Mode'
+                )
+                items = spec['items']
+                item = items[int(round(normalized * (len(items) - 1)))]
+                if not self._set_simpler_parameter_display_item(parameter, item):
+                    parameter.value = self._parameter_target_value_from_normalized(parameter, normalized)
+            elif action == 1:
+                self._simpler_sample.warping = normalized >= 0.5
+            elif action == 7:
+                parameter = self._simpler_parameter('Snap')
+                parameter.value = self._parameter_target_value_from_normalized(parameter, normalized)
+            elif action == 8:
+                warp_modes = (
+                    Live.Clip.WarpMode.beats,
+                    Live.Clip.WarpMode.tones,
+                    Live.Clip.WarpMode.texture,
+                    Live.Clip.WarpMode.repitch,
+                    Live.Clip.WarpMode.complex,
+                    Live.Clip.WarpMode.complex_pro,
+                )
+                index = int(round(normalized * (len(warp_modes) - 1)))
+                self._simpler_sample.warp_mode = warp_modes[index]
+            else:
+                self._send_simpler_action_feedback(control_index)
+                return True
+            self._send_simpler_state()
+            self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+            self._send_simpler_action_feedback_all()
+            return True
+        except Exception as error:
+            self._debug_log('Error setting Simpler action {}: {}'.format(spec.get('name'), str(error)))
+            return False
 
     def _simpler_virtual_metadata(self):
         metadata = []
@@ -4632,7 +4878,7 @@ class Tap(ControlSurface):
     def _trigger_simpler_action(self, action_index):
         device = self._simpler_device
         sample = self._simpler_sample
-        if not self._simpler_main_active() or not liveobj_valid(device) or not liveobj_valid(sample):
+        if not (self._simpler_main_active() or self._simpler_actions_active()) or not liveobj_valid(device) or not liveobj_valid(sample):
             return
         try:
             mode = int(device.playback_mode)
@@ -4703,8 +4949,12 @@ class Tap(ControlSurface):
                 self._clamp_simpler_waveform_center()
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
-            self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
-            self._send_simpler_virtual_feedback_all()
+            if self._simpler_actions_active():
+                self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+                self._send_simpler_action_feedback_all()
+            else:
+                self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
+                self._send_simpler_virtual_feedback_all()
         except Exception as error:
             self._debug_log('Simpler action {} failed: {}'.format(action_index, str(error)))
 
@@ -5035,7 +5285,11 @@ class Tap(ControlSurface):
                 return
 
             current_bank_name, all_bank_names, connected_bank_names = self._send_bank_state(selected_device, track_has_drums)
-            has_early_custom_surface = bool(self._active_wavetable_virtual_specs() or self._simpler_main_active())
+            has_early_custom_surface = bool(
+                self._active_wavetable_virtual_specs() or
+                self._simpler_main_active() or
+                self._simpler_actions_active()
+            )
             if send_device_navigation and has_early_custom_surface:
                 self._send_custom_device_navigation_state(selected_track, selected_device)
             if self._active_wavetable_virtual_specs():
@@ -5056,6 +5310,16 @@ class Tap(ControlSurface):
                 self._last_automation_signature = self._get_automation_signature()
                 self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
                 self._send_simpler_virtual_feedback_all()
+                return
+
+            if self._simpler_actions_active():
+                self._remove_parameter_value_listeners()
+                self._remove_parameter_name_listeners()
+                self._remove_parameter_source_listener()
+                self._remove_automation_state_listeners()
+                self._last_automation_signature = None
+                self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+                self._send_simpler_action_feedback_all()
                 return
 
             self._setup_dynamic_parameter_state_listeners()
@@ -9367,6 +9631,32 @@ class Tap(ControlSurface):
             self._on_output_level_changed(index)
         return handler
 
+    def _track_has_output_meter(self, track):
+        try:
+            return bool(track and liveobj_valid(track) and track.has_audio_output)
+        except Exception:
+            return False
+
+    def _remove_output_meter_listener_pair(self, track, left_listener, right_listener):
+        # Live's proxy advertises the output-meter listener methods even for a
+        # track whose routing has changed to MIDI output.  Calling any of those
+        # methods then raises RuntimeError, so capability must be checked first
+        # and every proxy call kept inside the same guard.
+        if not self._track_has_output_meter(track):
+            return
+        try:
+            if (left_listener and
+                    track.output_meter_left_has_listener(left_listener)):
+                track.remove_output_meter_left_listener(left_listener)
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            if (right_listener and
+                    track.output_meter_right_has_listener(right_listener)):
+                track.remove_output_meter_right_listener(right_listener)
+        except (AttributeError, RuntimeError):
+            pass
+
     def _foldable_group_track_for_track(self, track):
         try:
             if track and liveobj_valid(track) and getattr(track, 'is_foldable', False):
@@ -9454,6 +9744,7 @@ class Tap(ControlSurface):
                     int(track.color),
                     bool(track.is_grouped),
                     bool(track.has_audio_input),
+                    bool(track.has_audio_output),
                     any(clip_slot.is_group_slot for clip_slot in track.clip_slots),
                 )
                 for track in tracks
@@ -9466,25 +9757,16 @@ class Tap(ControlSurface):
         if tracks_changed:
             # 1. Remove all old listeners to prevent leaks
             for track, (left_listener, right_listener) in self._track_level_listeners.items():
-                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                    track.remove_output_meter_left_listener(left_listener)
-                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                    track.remove_output_meter_right_listener(right_listener)
+                self._remove_output_meter_listener_pair(track, left_listener, right_listener)
             self._track_level_listeners.clear()
 
             for track, (left_listener, right_listener) in self._return_level_listeners.items():
-                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                    track.remove_output_meter_left_listener(left_listener)
-                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                    track.remove_output_meter_right_listener(right_listener)
+                self._remove_output_meter_listener_pair(track, left_listener, right_listener)
             self._return_level_listeners.clear()
             
             if self._master_level_listeners:
                 left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
-                if left_listener and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
-                    master_track.remove_output_meter_left_listener(left_listener)
-                if right_listener and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
-                    master_track.remove_output_meter_right_listener(right_listener)
+                self._remove_output_meter_listener_pair(master_track, left_listener, right_listener)
                 self._master_level_listeners.clear()
             self._track_list_signature = track_signature
 
@@ -9530,13 +9812,18 @@ class Tap(ControlSurface):
         
         # 3. Set up level meter listeners (idempotent, safe to call every time)
         for index, track in enumerate(tracks):
-            if track.has_audio_output:
+            if self._track_has_output_meter(track):
                 if track not in self._track_level_listeners:
                     left_handler = self._create_level_change_handler(index)
                     right_handler = self._create_level_change_handler(index)
-                    track.add_output_meter_left_listener(left_handler)
-                    track.add_output_meter_right_listener(right_handler)
-                    self._track_level_listeners[track] = (left_handler, right_handler)
+                    try:
+                        track.add_output_meter_left_listener(left_handler)
+                        track.add_output_meter_right_listener(right_handler)
+                        self._track_level_listeners[track] = (left_handler, right_handler)
+                    except RuntimeError:
+                        self._remove_output_meter_listener_pair(track, left_handler, right_handler)
+            else:
+                self._track_level_listeners.pop(track, None)
 
             if not track.color_has_listener(self._on_color_name_changed):
                 track.add_color_listener(self._on_color_name_changed)
@@ -9544,23 +9831,29 @@ class Tap(ControlSurface):
                 track.add_name_listener(self._on_color_name_changed)
 
         for index, return_track in enumerate(return_tracks):
-            if hasattr(return_track, 'add_output_meter_left_listener'):
+            if self._track_has_output_meter(return_track):
                 return_index = index + len(tracks)
                 if return_track not in self._return_level_listeners:
                     left_handler = self._create_level_change_handler(return_index)
                     right_handler = self._create_level_change_handler(return_index)
-                    return_track.add_output_meter_left_listener(left_handler)
-                    return_track.add_output_meter_right_listener(right_handler)
-                    self._return_level_listeners[return_track] = (left_handler, right_handler)
+                    try:
+                        return_track.add_output_meter_left_listener(left_handler)
+                        return_track.add_output_meter_right_listener(right_handler)
+                        self._return_level_listeners[return_track] = (left_handler, right_handler)
+                    except RuntimeError:
+                        self._remove_output_meter_listener_pair(return_track, left_handler, right_handler)
 
-        if hasattr(master_track, 'add_output_meter_left_listener'):
+        if self._track_has_output_meter(master_track):
             master_index = 127
             if master_track not in self._master_level_listeners:
                 left_handler = self._create_level_change_handler(master_index)
                 right_handler = self._create_level_change_handler(master_index)
-                master_track.add_output_meter_left_listener(left_handler)
-                master_track.add_output_meter_right_listener(right_handler)
-                self._master_level_listeners[master_track] = (left_handler, right_handler)
+                try:
+                    master_track.add_output_meter_left_listener(left_handler)
+                    master_track.add_output_meter_right_listener(right_handler)
+                    self._master_level_listeners[master_track] = (left_handler, right_handler)
+                except RuntimeError:
+                    self._remove_output_meter_listener_pair(master_track, left_handler, right_handler)
 
         self._set_up_mixer_controls()
 
@@ -9982,16 +10275,10 @@ class Tap(ControlSurface):
             # output meter listeners - use stored handler references
             if track in self._track_level_listeners:
                 left_listener, right_listener = self._track_level_listeners[track]
-                if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                    track.remove_output_meter_left_listener(left_listener)
-                if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                    track.remove_output_meter_right_listener(right_listener)
+                self._remove_output_meter_listener_pair(track, left_listener, right_listener)
 
         for return_track, (left_listener, right_listener) in self._return_level_listeners.items():
-            if liveobj_valid(return_track) and hasattr(return_track, 'output_meter_left_has_listener') and return_track.output_meter_left_has_listener(left_listener):
-                return_track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(return_track) and hasattr(return_track, 'output_meter_right_has_listener') and return_track.output_meter_right_has_listener(right_listener):
-                return_track.remove_output_meter_right_listener(right_listener)
+            self._remove_output_meter_listener_pair(return_track, left_listener, right_listener)
         
         self._track_level_listeners.clear()
         self._return_level_listeners.clear()
@@ -16309,23 +16596,14 @@ class Tap(ControlSurface):
             pass
         # Clean up level listeners
         for track, (left_listener, right_listener) in self._track_level_listeners.items():
-            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                track.remove_output_meter_right_listener(right_listener)
+            self._remove_output_meter_listener_pair(track, left_listener, right_listener)
 
         for track, (left_listener, right_listener) in self._return_level_listeners.items():
-            if liveobj_valid(track) and hasattr(track, 'output_meter_left_has_listener') and track.output_meter_left_has_listener(left_listener):
-                track.remove_output_meter_left_listener(left_listener)
-            if liveobj_valid(track) and hasattr(track, 'output_meter_right_has_listener') and track.output_meter_right_has_listener(right_listener):
-                track.remove_output_meter_right_listener(right_listener)
+            self._remove_output_meter_listener_pair(track, left_listener, right_listener)
 
         if self._master_level_listeners:
             master_track = self.song().master_track
             left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
-            if left_listener and liveobj_valid(master_track) and hasattr(master_track, 'output_meter_left_has_listener') and master_track.output_meter_left_has_listener(left_listener):
-                master_track.remove_output_meter_left_listener(left_listener)
-            if right_listener and liveobj_valid(master_track) and hasattr(master_track, 'output_meter_right_has_listener') and master_track.output_meter_right_has_listener(right_listener):
-                master_track.remove_output_meter_right_listener(right_listener)
+            self._remove_output_meter_listener_pair(master_track, left_listener, right_listener)
         
         super(Tap, self).disconnect()
