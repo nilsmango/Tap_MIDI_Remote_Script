@@ -1526,7 +1526,7 @@ class Tap(ControlSurface):
     )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58)
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60)
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
@@ -1598,6 +1598,14 @@ class Tap(ControlSurface):
             self.browser_pages_count = 0
             self.browser_items_per_page = 12
             self.browser_insert_after_device_index = None
+            self.browser_current_path = []
+            self.browser_search_restore_state = None
+            self.browser_search_query = ''
+            self.browser_search_tag_indices = []
+            self.browser_search_generation = 0
+            self.browser_search_work = None
+            self.browser_search_batch_size = 200
+            self.browser_search_max_items = 50000
             # browser navigation history for back button
             self.browser_history = []
             self.browser_folder_mapping = {
@@ -1613,8 +1621,28 @@ class Tap(ControlSurface):
                 9: 'sounds',
                 10: 'user_folders',
                 11: 'user_library',
-                12: 'samples'
+                12: 'samples',
+                13: 'clips'
             }
+            self.browser_folder_labels = {
+                0: 'Audio Effects',
+                1: 'Colors',
+                2: 'Current Project',
+                3: 'Drums',
+                4: 'Instruments',
+                5: 'Max For Live',
+                6: 'MIDI Effects',
+                7: 'Packs',
+                8: 'Plug-Ins',
+                9: 'Sounds',
+                10: 'User Folders',
+                11: 'User Library',
+                12: 'Samples',
+                13: 'Clips'
+            }
+            # These are the content tags exposed by Live's control-surface Browser API.
+            # The desktop browser's arbitrary user tag database is not part of that API.
+            self.browser_searchable_tag_indices = (0, 3, 4, 5, 6, 8, 9, 12, 13)
             self._metadata_recheck_timer = None
             self._last_sent_metadata = None
             self._last_drum_pad_metadata = None
@@ -10931,6 +10959,16 @@ class Tap(ControlSurface):
             self._debug_log('Simpler waveform requested by app')
             self._request_simpler_waveform()
             return
+        # Browser name search and content-tag filtering are performed here in the
+        # Remote Script so the app only ever receives the current 12-item page.
+        if len(message) >= 3 and message[1] == 0x3C:
+            self._browser_search(message)
+            return
+        # Preview the item at the supplied one-based row index, or stop at zero.
+        if len(message) >= 3 and message[1] == 0x3D:
+            values = self.extract_values_from_sysex_message(message)
+            self._browser_preview(values[0] if values else 0)
+            return
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
             values = self.extract_values_from_sysex_message(message)
@@ -16313,7 +16351,8 @@ class Tap(ControlSurface):
         Triggered by MIDI CC on channel 1, CC 25. The value corresponds to a folder mapping:
         0 = audio_effects, 1 = colors, 2 = current_project, 3 = drums,
         4 = instruments, 5 = max_for_live, 6 = midi_effects, 7 = packs,
-        8 = plugins, 9 = sounds, 10 = user_folders, 11 = user_library
+        8 = plugins, 9 = sounds, 10 = user_folders, 11 = user_library,
+        12 = samples, 13 = clips
 
         Collects all items from the requested folder, resets pagination, and sends the first page
         via SysEx with manufacturer ID 0x13.
@@ -16331,6 +16370,12 @@ class Tap(ControlSurface):
         try:
             # Clear history when starting fresh
             self.browser_history = []
+            self.browser_search_restore_state = None
+            self.browser_search_query = ''
+            self.browser_search_tag_indices = []
+            self.browser_search_generation += 1
+            self.browser_search_work = None
+            self.browser_current_path = [self.browser_folder_labels.get(folder_index, folder_name)]
 
             # Get the browser item for the requested folder
             if folder_name in ['colors', 'user_folders']:
@@ -16352,6 +16397,8 @@ class Tap(ControlSurface):
 
         except Exception as e:
             self._debug_log(f"Error starting browser: {str(e)}")
+            self.browser_current_items = []
+            self._send_browser_page(0)
 
     def _get_browser_item_type(self, item):
         """
@@ -16393,6 +16440,12 @@ class Tap(ControlSurface):
         Args:
             page_number: The page number to send (0-indexed)
         """
+        if not self.browser_current_items:
+            self.browser_current_page = 0
+            self.browser_pages_count = 0
+            self._send_sys_ex_message("0^0^", 0x13)
+            return
+
         if page_number < 0 or page_number >= self.browser_pages_count:
             return
 
@@ -16416,6 +16469,210 @@ class Tap(ControlSurface):
 
         # Send using manufacturer ID 0x13
         self._send_sys_ex_message(message, 0x13)
+
+    def _browser_decode_search_payload(self, message):
+        try:
+            payload = bytes(self.extract_values_from_sysex_message(message)).decode('ascii', errors='ignore')
+        except Exception:
+            payload = ''
+        fields = self._split_escaped_sysex_fields(payload, '|')
+        query = self._unescape_sysex_string(fields[0]).strip() if fields else ''
+        tag_indices = []
+        if len(fields) > 1:
+            for raw_index in fields[1].split(','):
+                try:
+                    index = int(raw_index)
+                    if index in self.browser_searchable_tag_indices and index not in tag_indices:
+                        tag_indices.append(index)
+                except Exception:
+                    pass
+        return query, tag_indices
+
+    def _browser_state_snapshot(self):
+        return {
+            'items': list(self.browser_current_items),
+            'page': self.browser_current_page,
+            'pages_count': self.browser_pages_count,
+            'history': list(self.browser_history),
+            'path': list(self.browser_current_path)
+        }
+
+    def _restore_browser_state_after_search(self):
+        self.browser_search_generation += 1
+        self.browser_search_work = None
+        state = self.browser_search_restore_state
+        self.browser_search_restore_state = None
+        self.browser_search_query = ''
+        self.browser_search_tag_indices = []
+        if state is None:
+            self.browser_current_items = []
+            self.browser_current_page = 0
+            self.browser_pages_count = 0
+            self.browser_history = []
+            self.browser_current_path = []
+            self._send_browser_page(0)
+            return
+        self.browser_current_items = state['items']
+        self.browser_current_page = state['page']
+        self.browser_pages_count = state['pages_count']
+        self.browser_history = state['history']
+        self.browser_current_path = state['path']
+        self._send_browser_page(self.browser_current_page)
+
+    def _browser_items_for_category(self, category_index):
+        browser = self.application().browser
+        folder_name = self.browser_folder_mapping.get(category_index)
+        if folder_name is None:
+            return []
+        try:
+            root = getattr(browser, folder_name)
+            if folder_name in ('colors', 'user_folders'):
+                return list(root)
+            if hasattr(root, 'children'):
+                return list(root.children)
+            return [root]
+        except Exception as error:
+            self._debug_log('Browser category {} unavailable: {}'.format(folder_name, error))
+            return []
+
+    def _browser_search_roots(self, tag_indices):
+        if tag_indices:
+            roots = []
+            for category_index in tag_indices:
+                label = self.browser_folder_labels.get(category_index, '')
+                roots.extend((item, (label,)) for item in self._browser_items_for_category(category_index))
+            return roots
+
+        state = self.browser_search_restore_state
+        if state and state['items']:
+            base_path = tuple(state.get('path', ()))
+            return [(item, base_path) for item in state['items']]
+
+        roots = []
+        for category_index in self.browser_searchable_tag_indices:
+            label = self.browser_folder_labels.get(category_index, '')
+            roots.extend((item, (label,)) for item in self._browser_items_for_category(category_index))
+        return roots
+
+    def _browser_item_search_key(self, item):
+        try:
+            uri = str(item.uri)
+            if uri:
+                return uri
+        except Exception:
+            pass
+        try:
+            source = str(item.source)
+        except Exception:
+            source = ''
+        return '{}|{}'.format(source, str(getattr(item, 'name', '')))
+
+    def _browser_item_is_loadable(self, item):
+        try:
+            return bool(item.is_loadable)
+        except Exception:
+            try:
+                return not bool(item.is_folder) and not bool(list(item.children))
+            except Exception:
+                return not bool(getattr(item, 'is_folder', False))
+
+    def _continue_browser_search(self, generation):
+        work = self.browser_search_work
+        if work is None or generation != self.browser_search_generation:
+            return
+
+        processed = 0
+        while (
+            work['stack'] and
+            work['traversed'] < self.browser_search_max_items and
+            processed < self.browser_search_batch_size
+        ):
+            item, parent_path = work['stack'].pop()
+            processed += 1
+            key = self._browser_item_search_key(item)
+            if key in work['visited']:
+                continue
+            work['visited'].add(key)
+            work['traversed'] += 1
+
+            name = str(getattr(item, 'name', ''))
+            path = parent_path + ((name,) if name else tuple())
+            try:
+                source = str(item.source)
+            except Exception:
+                source = ''
+            haystack = ' '.join(path + ((source,) if source else tuple())).casefold()
+            if self._browser_item_is_loadable(item) and all(term in haystack for term in work['terms']):
+                normalized_name = name.casefold()
+                query = work['normalized_query']
+                if query and normalized_name == query:
+                    rank = 0
+                elif query and normalized_name.startswith(query):
+                    rank = 1
+                elif query and query in normalized_name:
+                    rank = 2
+                else:
+                    rank = 3
+                work['matches'].append((rank, normalized_name, item))
+
+            try:
+                children = list(item.children)
+            except Exception:
+                children = []
+            for child in reversed(children):
+                work['stack'].append((child, path))
+
+        if work['stack'] and work['traversed'] < self.browser_search_max_items:
+            self.schedule_message(1, lambda: self._continue_browser_search(generation))
+            return
+
+        work['matches'].sort(key=lambda value: (value[0], value[1]))
+        self.browser_current_items = [value[2] for value in work['matches']]
+        self.browser_current_page = 0
+        self.browser_pages_count = (
+            (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
+        )
+        self.browser_search_work = None
+        self._send_browser_page(0)
+
+    def _browser_search(self, message):
+        query, tag_indices = self._browser_decode_search_payload(message)
+        if not query and not tag_indices:
+            self._restore_browser_state_after_search()
+            return
+
+        if self.browser_search_restore_state is None:
+            self.browser_search_restore_state = self._browser_state_snapshot()
+        self.browser_search_query = query
+        self.browser_search_tag_indices = tag_indices
+        self.browser_search_generation += 1
+        generation = self.browser_search_generation
+        normalized_query = query.casefold()
+        self.browser_search_work = {
+            'stack': list(reversed(self._browser_search_roots(tag_indices))),
+            'visited': set(),
+            'matches': [],
+            'traversed': 0,
+            'terms': [term for term in normalized_query.split() if term],
+            'normalized_query': normalized_query
+        }
+        self.schedule_message(1, lambda: self._continue_browser_search(generation))
+
+    def _browser_preview(self, value):
+        browser = self.application().browser
+        if value == 0:
+            try:
+                browser.stop_preview()
+            except Exception:
+                pass
+            return
+        index = (self.browser_current_page * self.browser_items_per_page) + (value - 1)
+        if index < 0 or index >= len(self.browser_current_items):
+            return
+        try:
+            browser.preview_item(self.browser_current_items[index])
+        except Exception as error:
+            self._debug_log('Browser preview failed: {}'.format(error))
 
     def _browser_navigate(self, value):
         """
@@ -16485,9 +16742,11 @@ class Tap(ControlSurface):
                 self.browser_history.append({
                     'items': self.browser_current_items,
                     'page': self.browser_current_page,
-                    'pages_count': self.browser_pages_count
+                    'pages_count': self.browser_pages_count,
+                    'path': list(self.browser_current_path)
                 })
                 self.browser_current_items = list(item.children)
+                self.browser_current_path.append(str(getattr(item, 'name', '')))
                 self.browser_current_page = 0
                 self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
                 self._send_browser_page(self.browser_current_page)
@@ -16499,9 +16758,11 @@ class Tap(ControlSurface):
                     self.browser_history.append({
                         'items': self.browser_current_items,
                         'page': self.browser_current_page,
-                        'pages_count': self.browser_pages_count
+                        'pages_count': self.browser_pages_count,
+                        'path': list(self.browser_current_path)
                     })
                     self.browser_current_items = children
+                    self.browser_current_path.append(str(getattr(item, 'name', '')))
                     self.browser_current_page = 0
                     self.browser_pages_count = (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
                     self._send_browser_page(self.browser_current_page)
@@ -16584,6 +16845,7 @@ class Tap(ControlSurface):
         self.browser_current_items = previous_state['items']
         self.browser_current_page = previous_state['page']
         self.browser_pages_count = previous_state['pages_count']
+        self.browser_current_path = previous_state.get('path', self.browser_current_path[:-1])
 
         # Send the page we were at
         self._send_browser_page(self.browser_current_page)
