@@ -508,7 +508,7 @@ class TapDeviceComponent(DeviceComponent):
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler():
-            self._simpler_filter_parameter_cache = self._simpler_filter_parameters_from_base_banks(banks, names)
+            self._simpler_filter_parameter_cache = self._simpler_filter_parameters_from_live_bank()
             if not banks:
                 banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
@@ -603,30 +603,65 @@ class TapDeviceComponent(DeviceComponent):
             for index, parameter in enumerate(direct_parameters)
         )
 
-    def _simpler_filter_parameters_from_base_banks(self, banks, bank_names):
-        filter_index = self._bank_index_named(bank_names, 'Filter')
-        if filter_index is None or filter_index >= len(banks):
+    def _simpler_filter_parameters_from_live_bank(self):
+        device = getattr(self, '_device', None)
+        if not device or not hasattr(device, 'parameters'):
             return tuple([None] * 4)
-        bank = list(banks[filter_index])
-        bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
-        # Live's resolved Simpler Filter bank slots are Type, Circuit,
-        # Drive and Slope at 0, 3, 5 and 6 respectively.  Reading the
-        # resolved slots preserves Live's new/legacy filter selection and
-        # conditional LP/HP versus BP/NO circuit choice.
-        resolved = [bank[0], bank[6], bank[3], bank[5]]
 
-        # The Python bank descriptions intentionally hide some slots when the
-        # filter is off.  The C++ bank indices can still expose their underlying
-        # DeviceParameters, so use those to fill any conditional gaps.
+        specifications = (
+            ('Filter Type', 'Filter Type (Legacy)'),
+            ('Filter Slope',),
+            ('Filter Circuit - LP/HP',),
+            ('Filter Drive',),
+        )
+        parameters = list(device.parameters)
+
+        def native_parameter_by_names(names):
+            wanted = set(self._normalized_bank_name(name) for name in names)
+            for parameter in parameters:
+                parameter_names = (
+                    getattr(parameter, 'name', ''),
+                    getattr(parameter, 'original_name', ''),
+                )
+                if any(self._normalized_bank_name(name) in wanted for name in parameter_names):
+                    return parameter
+            return None
+
+        # Prefer the actual DeviceParameters advertised by Live (the same
+        # names shown in Macro mapping) so every selector remains available
+        # even when Live conditionally hides it from its factory bank.
+        resolved = [native_parameter_by_names(names) for names in specifications]
+
+        # OriginalSimpler is still present in _Framework's legacy four-bank
+        # dictionary.  Its bank names say "Filter" at index 1 while its bank
+        # payload at index 1 is the old filter-envelope bank.  Find the modern
+        # C++ Filter bank by get_bank_name instead of combining those two
+        # incompatible sources.  Live 12.4's Filter slots are:
+        #   1 Type, 4 Circuit, 5 Drive/Morph, 6 Slope.
         try:
-            parameters = list(self._device.parameters)
-            live_banks = self._safe_live_parameter_banks(self._device, parameters)
-            if filter_index < len(live_banks):
+            bank_count = int(device.get_bank_count())
+            filter_index = next(
+                (index for index in range(bank_count)
+                 if self._normalized_bank_name(device.get_bank_name(index)) == 'filter'),
+                None,
+            )
+            live_banks = self._safe_live_parameter_banks(device, parameters)
+            if filter_index is not None and filter_index < len(live_banks):
                 live_bank = list(live_banks[filter_index])
                 live_bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(live_bank)))
-                for result_index, bank_slot in enumerate((0, 6, 3, 5)):
-                    if not resolved[result_index]:
-                        resolved[result_index] = live_bank[bank_slot]
+                for result_index, bank_slot in enumerate((1, 6, 4, 5)):
+                    candidate = live_bank[bank_slot]
+                    if not resolved[result_index] and candidate:
+                        candidate_names = (
+                            getattr(candidate, 'name', ''),
+                            getattr(candidate, 'original_name', ''),
+                        )
+                        wanted = set(
+                            self._normalized_bank_name(name)
+                            for name in specifications[result_index]
+                        )
+                        if any(self._normalized_bank_name(name) in wanted for name in candidate_names):
+                            resolved[result_index] = candidate
         except Exception:
             pass
         return tuple(resolved)
