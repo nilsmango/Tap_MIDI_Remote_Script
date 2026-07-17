@@ -76,6 +76,7 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
+    SIMPLER_WARP_BANK_NAME = "Warp"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
@@ -104,6 +105,11 @@ class TapDeviceComponent(DeviceComponent):
         "LFO 2",
         "Global / Out",
     )
+    ANALOG_OSC_1_BANK_NAME = "OSC 1"
+    ANALOG_OSC_2_BANK_NAME = "OSC 2"
+    ANALOG_NOISE_BANK_NAME = "Noise"
+    ANALOG_OSC_PLUS_BANK_NAME = "OSC +"
+    ANALOG_FILTER_PLUS_BANK_NAME = "Filter +"
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -263,6 +269,9 @@ class TapDeviceComponent(DeviceComponent):
     def _is_delay(self):
         return self._device_class_name() == 'Delay'
 
+    def _is_analog(self):
+        return self._device_class_name() == 'UltraAnalog'
+
     def _is_drift(self):
         try:
             return self._device_class_name() == 'Drift' or str(self._device.class_display_name) == 'Drift'
@@ -404,6 +413,8 @@ class TapDeviceComponent(DeviceComponent):
             elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
             names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
+        elif self._is_analog():
+            names = self._analog_bank_names(names)
         elif self._is_drumcell():
             custom_names = (
                 self.DRUMCELL_SAMPLE_BANK_NAME,
@@ -451,7 +462,11 @@ class TapDeviceComponent(DeviceComponent):
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
             elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
+            self._replace_simpler_lfo_bank(banks, names)
+            self._replace_simpler_warp_bank(banks, names)
             banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+        elif self._is_analog():
+            banks = self._analog_parameter_banks(banks, names)
         elif self._is_drumcell():
             custom_banks = (
                 self._drumcell_sample_parameters(),
@@ -464,6 +479,123 @@ class TapDeviceComponent(DeviceComponent):
         elif self._is_delay():
             banks = list(self._delay_parameter_banks())
         return banks
+
+    def _normalized_bank_name(self, name):
+        return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+    def _bank_index_named(self, bank_names, *wanted_names):
+        wanted = set(self._normalized_bank_name(name) for name in wanted_names)
+        return next(
+            (index for index, name in enumerate(bank_names)
+             if self._normalized_bank_name(name) in wanted),
+            None,
+        )
+
+    def _replace_simpler_lfo_bank(self, banks, bank_names):
+        index = self._bank_index_named(bank_names, 'LFO')
+        if index is None or index >= len(banks):
+            return
+        bank = list(banks[index])
+        bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
+        sync = self._parameter_by_names('L Sync')
+        sync_on = False
+        if sync:
+            try:
+                display = str(sync.str_for_value(sync.value)).strip().lower()
+                sync_on = display in ('on', 'yes', 'true', 'sync', 'synced')
+                if display in ('off', 'no', 'false', 'free'):
+                    sync_on = False
+            except Exception:
+                try:
+                    sync_on = float(sync.value) > float(sync.min)
+                except Exception:
+                    pass
+        rate = self._parameter_by_names('L Sync Rate' if sync_on else 'L Rate')
+        for control_index, parameter in enumerate(bank):
+            key = self._normalized_bank_name(getattr(parameter, 'name', '')) if parameter else ''
+            original_key = self._normalized_bank_name(getattr(parameter, 'original_name', '')) if parameter else ''
+            if key == 'lrate' or original_key == 'lrate':
+                bank[control_index] = rate
+            elif key == 'lrkey' or original_key == 'lrkey':
+                bank[control_index] = sync
+        banks[index] = tuple(bank[:self.SAFE_PARAMETER_BANK_SIZE])
+
+    def _simpler_warp_mode_name(self):
+        try:
+            value = int(self._device.sample.warp_mode)
+            modes = (
+                (Live.Clip.WarpMode.beats, 'beats'),
+                (Live.Clip.WarpMode.tones, 'tones'),
+                (Live.Clip.WarpMode.texture, 'texture'),
+                (Live.Clip.WarpMode.repitch, 'repitch'),
+                (Live.Clip.WarpMode.complex, 'complex'),
+                (Live.Clip.WarpMode.complex_pro, 'complexpro'),
+            )
+            return next((name for mode, name in modes if int(mode) == value), '')
+        except Exception:
+            return ''
+
+    def _simpler_warp_parameters(self):
+        mode = self._simpler_warp_mode_name()
+        mode_parameters = {
+            'beats': ('Preserve', 'Loop Mode', 'Envelope'),
+            'tones': ('Grain Size Tones',),
+            'texture': ('Grain Size Texture', 'Flux'),
+            'complexpro': ('Formants', 'Envelope Complex Pro'),
+        }.get(mode, ())
+        return self._parameter_bank(None, 'Warp Mode', *mode_parameters)
+
+    def _replace_simpler_warp_bank(self, banks, bank_names):
+        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME)
+        if index is not None and index < len(banks):
+            banks[index] = self._simpler_warp_parameters()
+
+    def _analog_bank_names(self, bank_names):
+        names = list(bank_names)
+        oscillator_index = self._bank_index_named(names, 'Oscillators')
+        custom = [
+            self.ANALOG_OSC_1_BANK_NAME,
+            self.ANALOG_OSC_2_BANK_NAME,
+            self.ANALOG_NOISE_BANK_NAME,
+            self.ANALOG_OSC_PLUS_BANK_NAME,
+        ]
+        if oscillator_index is None:
+            names = custom + names
+        else:
+            names[oscillator_index:oscillator_index + 1] = custom
+        names.append(self.ANALOG_FILTER_PLUS_BANK_NAME)
+        return tuple(names)
+
+    def _analog_parameter_banks(self, banks, bank_names):
+        result = list(banks)
+        oscillator_index = self._bank_index_named(bank_names, 'Oscillators')
+        custom = [
+            self._parameter_bank(
+                'OSC1 Level', 'OSC1 Octave', 'OSC1 Semi', 'OSC1 Detune',
+                'OSC1 Shape', 'PEG1 Amount', 'PEG1 Time', None,
+            ),
+            self._parameter_bank(
+                'OSC2 Level', 'OSC2 Octave', 'OSC2 Semi', 'OSC2 Detune',
+                'OSC2 Shape', 'PEG2 Amount', 'PEG2 Time', None,
+            ),
+            self._parameter_bank(
+                'Noise On/Off', 'Noise Level', 'Noise Balance', 'Noise Color',
+                None, None, None, None,
+            ),
+            self._parameter_bank(
+                'OSC1 Mode', 'O1 Sub/Sync', 'OSC1 PW', 'O1 PW < LFO',
+                'OSC2 Mode', 'O2 Sub/Sync', 'OSC2 PW', 'O2 PW < LFO',
+            ),
+        ]
+        if oscillator_index is None:
+            result = custom + result
+        else:
+            result[oscillator_index:oscillator_index + 1] = custom
+        result.append(self._parameter_bank(
+            'FEG1 Loop', 'F1 Drive', 'FEG2 Loop', 'F2 Drive',
+            'F1 On/Off', 'F1 Type', 'F2 On/Off', 'F2 Type',
+        ))
+        return result
 
     def _parameter_bank(self, *specifications):
         parameters = []
@@ -1094,6 +1226,8 @@ class TapDeviceComponent(DeviceComponent):
             return 'simpler_main'
         if name == self.SIMPLER_ACTIONS_BANK_NAME and self._is_simpler():
             return 'simpler_actions'
+        if name == self.SIMPLER_WARP_BANK_NAME and self._is_simpler():
+            return 'simpler_warp'
         if self._is_drumcell():
             if name == self.DRUMCELL_SAMPLE_BANK_NAME:
                 return 'drumcell_sample'
@@ -1846,6 +1980,14 @@ class Tap(ControlSurface):
         remap_dynamic_bank = self._device._is_drift() or self._device._is_meld()
         for parameter in bank_parameters or ():
             add_parameter_listener(parameter, 'state', remap=remap_dynamic_bank)
+
+        if self._device._is_simpler():
+            normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
+            if normalized_bank_name == 'lfo':
+                add_parameter_listener(self._device._parameter_by_names('L Sync'), 'value', remap=True)
+            elif normalized_bank_name == 'warp':
+                add_parameter_listener(self._device._parameter_by_names('Warp Mode'), 'value', remap=True)
+            return
 
         if self._device._is_delay():
             # Delay does not publish relevance changes for all of its dependent
@@ -3514,6 +3656,8 @@ class Tap(ControlSurface):
     def _build_parameter_metadata(self, selected_device):
         if self._simpler_actions_active():
             return self._simpler_action_metadata()
+        if self._simpler_warp_active():
+            return self._simpler_warp_metadata()
         if self._simpler_main_active():
             return self._simpler_virtual_metadata()
         virtual_metadata = self._wavetable_virtual_metadata()
@@ -4316,6 +4460,8 @@ class Tap(ControlSurface):
         self._send_simpler_virtual_feedback_all()
         if self._simpler_actions_active():
             self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+        elif self._simpler_warp_active():
+            self._send_sys_ex_message(self._simpler_warp_metadata(), 0x7D)
         self._send_simpler_action_feedback_all()
 
     def _on_simpler_configuration_changed(self):
@@ -4332,6 +4478,9 @@ class Tap(ControlSurface):
             self._send_simpler_virtual_feedback_all()
         elif self._simpler_actions_active():
             self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+            self._send_simpler_action_feedback_all()
+        elif self._simpler_warp_active():
+            self._send_sys_ex_message(self._simpler_warp_metadata(), 0x7D)
             self._send_simpler_action_feedback_all()
 
     def _sync_simpler_pad_slicing(self):
@@ -4357,6 +4506,12 @@ class Tap(ControlSurface):
         return bool(
             self._simpler_device and
             self._tap_active_custom_kind(self._simpler_device) == 'simpler_actions'
+        )
+
+    def _simpler_warp_active(self):
+        return bool(
+            self._simpler_device and
+            self._tap_active_custom_kind(self._simpler_device) == 'simpler_warp'
         )
 
     def _simpler_parameter(self, name):
@@ -4580,7 +4735,7 @@ class Tap(ControlSurface):
         specs = [
             toggle(toggle_name, 0, toggle_items, toggle_display, toggle_normalized),
             toggle('Warp', 1, ('Off', 'On'), 'On' if warp_enabled else 'Off', 1.0 if warp_enabled else 0.0),
-            button('Warp ÷2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
+            button('Warp /2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
             button('Warp ×2', 3, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_double', False))),
             button(reset_name, 4) if mode == 2 else warp_mode_spec,
             button('Split' if mode == 2 else 'Crop', 5),
@@ -4590,12 +4745,33 @@ class Tap(ControlSurface):
         return tuple(specs)
 
     def _simpler_action_spec(self, control_index):
+        if self._simpler_warp_active():
+            if control_index != 0:
+                return None
+            enabled = bool(getattr(self._simpler_device, 'can_warp_as', False))
+            return {
+                'name': 'Warp as 2 Beats',
+                'action': 13,
+                'kind': 'button',
+                'items': (),
+                'display': '',
+                'normalized': 0.0,
+                'enabled': enabled,
+            }
         specs = self._simpler_action_specs()
         return specs[control_index] if 0 <= control_index < len(specs) else None
 
     def _simpler_action_metadata_item(self, spec):
         if not spec:
             return self.UNMAPPED_PARAMETER_METADATA_ITEM
+        if spec.get('kind') == 'button':
+            name = str(spec.get('name', 'Action'))
+            if not spec.get('enabled', True):
+                name = '*~' + name
+            return '{}||||0.0||||0.0|momentary_{}|0'.format(
+                self._escape_sysex_string(name),
+                int(spec.get('action', 0)),
+            )
         items = tuple(spec.get('items') or ('Ready', 'Trigger'))
         name = str(spec.get('name', 'Action'))
         if not spec.get('enabled', True):
@@ -4620,6 +4796,18 @@ class Tap(ControlSurface):
             for spec in self._simpler_action_specs()
         )
 
+    def _simpler_warp_metadata(self):
+        try:
+            _, parameters = self._device._current_bank_details()
+        except Exception:
+            parameters = ()
+        metadata = [self._simpler_action_metadata_item(self._simpler_action_spec(0))]
+        for control_index in range(1, 8):
+            parameter = parameters[control_index] if control_index < len(parameters) else None
+            name = str(getattr(parameter, 'name', '')) if parameter else ''
+            metadata.append(self._simpler_parameter_metadata_item(name, parameter))
+        return ','.join(metadata)
+
     def _send_simpler_action_feedback(self, control_index):
         spec = self._simpler_action_spec(control_index)
         if not spec:
@@ -4634,9 +4822,10 @@ class Tap(ControlSurface):
         )
 
     def _send_simpler_action_feedback_all(self):
-        if self._simpler_actions_active():
+        if self._simpler_actions_active() or self._simpler_warp_active():
             for control_index in range(8):
-                self._send_simpler_action_feedback(control_index)
+                if self._simpler_action_spec(control_index):
+                    self._send_simpler_action_feedback(control_index)
 
     def _set_simpler_parameter_display_item(self, parameter, display_item):
         if not parameter:
@@ -4850,9 +5039,9 @@ class Tap(ControlSurface):
         fade_in = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_in', 0.0)) / active_length))
         fade_out = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_out', 0.0)) / active_length))
         loop_fade = self._normalized_simpler_position(
-            getattr(view, 'sample_loop_fade', loop_start * length),
+            getattr(view, 'sample_loop_fade', 0.0),
             length,
-            loop_start,
+            0.0,
         )
         payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}|{:.6f}'.format(
             sample_start,
@@ -4878,7 +5067,7 @@ class Tap(ControlSurface):
     def _trigger_simpler_action(self, action_index):
         device = self._simpler_device
         sample = self._simpler_sample
-        if not (self._simpler_main_active() or self._simpler_actions_active()) or not liveobj_valid(device) or not liveobj_valid(sample):
+        if not (self._simpler_main_active() or self._simpler_actions_active() or self._simpler_warp_active()) or not liveobj_valid(device) or not liveobj_valid(sample):
             return
         try:
             mode = int(device.playback_mode)
@@ -4947,10 +5136,15 @@ class Tap(ControlSurface):
                 direction = -1.0 if action_index == 11 else 1.0
                 self._simpler_waveform_center += direction * visible_width * 0.25
                 self._clamp_simpler_waveform_center()
+            elif action_index == 13 and bool(getattr(device, 'can_warp_as', False)):
+                device.warp_as(2.0)
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
             if self._simpler_actions_active():
                 self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
+                self._send_simpler_action_feedback_all()
+            elif self._simpler_warp_active():
+                self._send_sys_ex_message(self._simpler_warp_metadata(), 0x7D)
                 self._send_simpler_action_feedback_all()
             else:
                 self._send_sys_ex_message(self._simpler_virtual_metadata(), 0x7D)
@@ -5288,7 +5482,8 @@ class Tap(ControlSurface):
             has_early_custom_surface = bool(
                 self._active_wavetable_virtual_specs() or
                 self._simpler_main_active() or
-                self._simpler_actions_active()
+                self._simpler_actions_active() or
+                self._simpler_warp_active()
             )
             if send_device_navigation and has_early_custom_surface:
                 self._send_custom_device_navigation_state(selected_track, selected_device)
