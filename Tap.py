@@ -76,7 +76,8 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
-    SIMPLER_WARP_BANK_NAME = "Options"
+    SIMPLER_WARP_BANK_NAME = "Controls"
+    SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
     SIMPLER_BROWSE_BANK_NAME = "Browse Samples"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
@@ -457,7 +458,7 @@ class TapDeviceComponent(DeviceComponent):
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
             elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
-            self._configure_simpler_warp_bank_names(names)
+            self._configure_simpler_control_bank_names(names)
             names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
             names.append(self.SIMPLER_BROWSE_BANK_NAME)
         elif self._is_analog():
@@ -512,7 +513,7 @@ class TapDeviceComponent(DeviceComponent):
             elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
             self._replace_simpler_lfo_bank(banks, names)
-            self._configure_simpler_warp_bank(banks, names)
+            self._configure_simpler_control_banks(banks, names)
             banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_analog():
@@ -585,43 +586,73 @@ class TapDeviceComponent(DeviceComponent):
         except Exception:
             return ''
 
-    def _simpler_warp_parameters(self):
+    def _simpler_filter_parameters(self):
+        filter_type = self._parameter_by_names('Filter Type', 'Filter Type (Legacy)')
+        return (
+            filter_type,
+            self._parameter_by_names('Filter Slope', 'Slope'),
+            self._parameter_by_names('Filter Circuit - LP/HP'),
+            self._parameter_by_names('Filter Drive'),
+        )
+
+    def _simpler_control_parameters(self):
         mode = self._simpler_warp_mode_name()
         mode_parameters = {
-            'beats': ('Preserve', 'Envelope'),
+            'beats': ('Preserve', 'Loop Mode', 'Envelope'),
             'tones': ('Grain Size Tones',),
             'texture': ('Grain Size Texture', 'Flux'),
             'complexpro': ('Formants', 'Envelope Complex Pro'),
         }.get(mode, ())
-        return self._parameter_bank(
-            None, 'Warp Mode', *mode_parameters,
-            'Filter Type', 'Filter Slope', 'Filter Circuit - LP/HP', 'Filter Drive',
+        parameters = [None, self._parameter_by_names('Warp Mode')]
+        parameters.extend(self._parameter_by_names(name) for name in mode_parameters)
+        parameters.extend(self._simpler_filter_parameters()[:3])
+        parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
+        return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
+
+    def _simpler_controls_2_parameters(self):
+        filter_drive = self._simpler_filter_parameters()[3]
+        return (
+            filter_drive,
+            self._parameter_by_names('Transpose'),
+            self._parameter_by_names('Detune'),
+            self._parameter_by_names('Glide Mode', 'Glide', 'Glide On'),
+            self._parameter_by_names('Glide Time'),
+            self._parameter_by_names('Pe < Env'),
+            self._parameter_by_names('L R < Key'),
+            self._parameter_by_names('L Retrig'),
         )
 
-    def _configure_simpler_warp_bank_names(self, bank_names):
-        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME, 'Warp')
-        if self._simpler_is_warped():
-            if index is None:
-                bank_names.insert(min(1, len(bank_names)), self.SIMPLER_WARP_BANK_NAME)
-            else:
-                bank_names[index] = self.SIMPLER_WARP_BANK_NAME
-        elif index is not None:
-            bank_names.pop(index)
+    def _simpler_control_bank_indices(self, bank_names):
+        wanted = {
+            self._normalized_bank_name(self.SIMPLER_WARP_BANK_NAME),
+            self._normalized_bank_name(self.SIMPLER_CONTROLS_2_BANK_NAME),
+            self._normalized_bank_name('Options'),
+            self._normalized_bank_name('Warp'),
+        }
+        return [
+            index for index, name in enumerate(bank_names)
+            if self._normalized_bank_name(name) in wanted
+        ]
 
-    def _configure_simpler_warp_bank(self, banks, bank_names):
-        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME, 'Warp')
-        if self._simpler_is_warped():
-            if index is None:
-                index = min(1, len(banks))
-                bank_names.insert(index, self.SIMPLER_WARP_BANK_NAME)
-                banks.insert(index, self._simpler_warp_parameters())
-            elif index < len(banks):
-                bank_names[index] = self.SIMPLER_WARP_BANK_NAME
-                banks[index] = self._simpler_warp_parameters()
-        elif index is not None:
+    def _configure_simpler_control_bank_names(self, bank_names):
+        indices = self._simpler_control_bank_indices(bank_names)
+        insertion_index = min(indices) if indices else min(1, len(bank_names))
+        for index in reversed(indices):
+            bank_names.pop(index)
+        bank_names.insert(insertion_index, self.SIMPLER_WARP_BANK_NAME)
+        bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
+
+    def _configure_simpler_control_banks(self, banks, bank_names):
+        indices = self._simpler_control_bank_indices(bank_names)
+        insertion_index = min(indices) if indices else min(1, len(banks))
+        for index in reversed(indices):
             bank_names.pop(index)
             if index < len(banks):
                 banks.pop(index)
+        bank_names.insert(insertion_index, self.SIMPLER_WARP_BANK_NAME)
+        banks.insert(insertion_index, self._simpler_control_parameters())
+        bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
+        banks.insert(insertion_index + 1, self._simpler_controls_2_parameters())
 
     def _analog_bank_names(self, bank_names):
         names = list(bank_names)
@@ -2100,8 +2131,13 @@ class Tap(ControlSurface):
             normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
             if normalized_bank_name == 'lfo':
                 add_parameter_listener(self._device._parameter_by_names('L Sync'), 'value', remap=True)
-            elif normalized_bank_name in ('warp', 'options'):
+            elif normalized_bank_name == 'controls':
                 add_parameter_listener(self._device._parameter_by_names('Warp Mode'), 'value', remap=True)
+                add_parameter_listener(
+                    self._device._parameter_by_names('Filter Type', 'Filter Type (Legacy)'),
+                    'value',
+                    remap=True,
+                )
             return
 
         if self._device._is_delay():
@@ -4922,13 +4958,18 @@ class Tap(ControlSurface):
 
     def _simpler_warp_metadata(self):
         try:
-            _, parameters = self._device._current_bank_details()
+            parameters = self._device._simpler_control_parameters()
         except Exception:
             parameters = ()
         metadata = [self._simpler_action_metadata_item(self._simpler_action_spec(0))]
         for control_index in range(1, 8):
             parameter = parameters[control_index] if control_index < len(parameters) else None
             name = str(getattr(parameter, 'name', '')) if parameter else ''
+            normalized_name = re.sub(r'[^a-z0-9]+', '', name.lower())
+            if normalized_name == 'loopmode':
+                name = 'Transient Loop Mode'
+            elif normalized_name == 'filtertypelegacy':
+                name = 'Filter Type'
             metadata.append(self._simpler_parameter_metadata_item(name, parameter))
         return ','.join(metadata)
 
