@@ -86,7 +86,8 @@ class TapDeviceComponent(DeviceComponent):
     DELAY_BANK_NAMES = ("Main", "Time+Flt", "Flt+LFO", "LFO Wave")
     DRIFT_BANK_NAMES = (
         "Main", "Oscillators", "Osc 2 / Noise", "Osc Mod", "Filters", "Filter Mod",
-        "Envelope 1", "Envelope 2", "Envelope 2 Cyc", "LFO", "Mod 1 & 2", "Mod 3", "Global",
+        "Envelope 1", "Envelope 2", "Envelope 2 Cyc", "LFO", "Mod 1 & 2", "Mod 3",
+        "Global", "Global / Out",
     )
     MELD_ENGINE_BANK_NAME = "A | B"
     MELD_BANK_NAMES = (
@@ -476,18 +477,19 @@ class TapDeviceComponent(DeviceComponent):
         return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
 
     def _drift_parameter_banks(self):
+        envelope_2 = self._drift_envelope_2_parameters()
         return (
             self._parameter_bank(
                 'Osc 1 Wave', 'Osc 1 Shape', 'Osc 1 Gain', 'Osc 2 Gain',
-                'LP Freq', 'LP Res', 'Env 1 Attack', 'Env 1 Release',
+                'LP Freq', 'LP Res', 'LP Mod Amt 1', 'LP Mod Amt 2',
             ),
             self._parameter_bank(
-                'Osc 1 Wave', 'Osc 1 Oct', 'Osc 1 Shape', 'Osc 1 Gain',
-                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Shape', 'Osc 2 Gain',
+                'Osc 1 Wave', 'Osc 1 Shape', 'Osc 1 Oct', 'Osc 1 Gain',
+                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Detune', 'Osc 2 Gain',
             ),
             self._parameter_bank(
-                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Shape', 'Osc 2 Detune',
-                'Osc 2 Gain', 'Noise Gain', 'Osc Retrig On', 'Noise On',
+                'Osc Retrig On', None, 'Noise Gain', 'Noise On',
+                'Noise Flt On', None, None, None,
             ),
             self._parameter_bank(
                 'Pitch Mod Src 1', 'Pitch Mod Amt 1', 'Pitch Mod Src 2', 'Pitch Mod Amt 2',
@@ -505,10 +507,7 @@ class TapDeviceComponent(DeviceComponent):
                 'Env 1 Attack', 'Env 1 Decay', 'Env 1 Sustain', 'Env 1 Release',
                 None, None, None, None,
             ),
-            self._parameter_bank(
-                'Env 2 Attack', 'Env 2 Decay', 'Env 2 Sustain', 'Env 2 Release',
-                'Env 2 Cyc On', None, None, None,
-            ),
+            envelope_2,
             self._parameter_bank(
                 'Env 2 Cyc On', ('Cyc Env Tilt', 'Cyc Tilt'), ('Cyc Env Hold', 'Cyc Hold'),
                 ('Cyc Env Time Mode', 'Cyc Mode'), ('Cyc Env Rate', 'Cyc Rate'),
@@ -528,9 +527,31 @@ class TapDeviceComponent(DeviceComponent):
                 None, None, None, None,
             ),
             self._parameter_bank(
-                'Voice Mode', self._drift_voice_mode_parameter(), 'Voice Count', 'Drift',
-                'Legato On', 'Glide Time', 'Transpose', 'Volume',
+                'Voice Mode', 'Voice Count', 'Thickness', 'Spread',
+                'Strength', 'Legato On', 'Glide Time', 'Drift',
             ),
+            self._parameter_bank(
+                'Transpose', 'Volume', 'PB Range', 'Note Pitch Bend On',
+                None, None, None, None,
+            ),
+        )
+
+    def _drift_envelope_2_parameters(self):
+        cycle_enabled = self._parameter_by_names('Env 2 Cyc On')
+        try:
+            is_cycling = cycle_enabled.value > cycle_enabled.min
+        except Exception:
+            is_cycling = 'on' in self._parameter_display(cycle_enabled).lower()
+        if is_cycling:
+            return self._parameter_bank(
+                'Env 2 Cyc On', ('Cyc Env Tilt', 'Cyc Tilt'), ('Cyc Env Hold', 'Cyc Hold'),
+                ('Cyc Env Time Mode', 'Cyc Mode'), ('Cyc Env Rate', 'Cyc Rate'),
+                ('Cyc Env Ratio', 'Cyc Ratio'), ('Cyc Env Time', 'Cyc Time'),
+                ('Cyc Env Synced', 'Cyc Synced'),
+            )
+        return self._parameter_bank(
+            'Env 2 Attack', 'Env 2 Decay', 'Env 2 Sustain', 'Env 2 Release',
+            'Env 2 Cyc On', None, None, None,
         )
 
     def _parameter_value_text(self, *names):
@@ -571,9 +592,15 @@ class TapDeviceComponent(DeviceComponent):
     def _meld_parameter_banks(self):
         engine = self._meld_engine_letter()
         sync_1 = self._parameter_by_names('LFO 1 {} Sync'.format(engine), self._meld_original_name('Lfo1_Sync'))
-        retrigger_1 = self._parameter_by_names('LFO 1 {} Retrigger'.format(engine))
+        retrigger_1 = self._meld_parameter('Lfo1_Retrigger', 'LFO 1 {} Retrigger'.format(engine))
         sync_2 = self._parameter_by_names('LFO 2 {} Sync'.format(engine), self._meld_original_name('Lfo2_Sync'))
+        retrigger_2 = self._meld_parameter('Lfo2_Retrigger', 'LFO 2 {} Retrigger'.format(engine))
         glide_mode = self._parameter_by_names('Glide {}'.format(engine))
+        mono_poly = self._parameter_by_names('Mono Poly')
+        try:
+            mono_voice_parameter = self._parameter_by_names('Legato', 'MonoLegato') if int(mono_poly.value) == 0 else self._parameter_by_names('Poly Voices')
+        except Exception:
+            mono_voice_parameter = self._parameter_by_names('Poly Voices')
         envelope_delay_aliases = ('MeldVoice_EngineBDelay',) if engine == 'B' else ()
         return (
             tuple([None] * self.SAFE_PARAMETER_BANK_SIZE),
@@ -582,10 +609,10 @@ class TapDeviceComponent(DeviceComponent):
                 (self._meld_original_name('Oscillator_Macro1'),),
                 (self._meld_original_name('Oscillator_Macro2'),),
                 (self._meld_original_name('Filter_Frequency'),),
+                (self._meld_original_name('Filter_Macro1'),),
                 (self._meld_original_name('ToneFilter'),),
                 (self._meld_original_name('Pan'),),
                 (self._meld_original_name('Volume'),),
-                None,
             ),
             self._parameter_bank(
                 (self._meld_original_name('Oscillator_OscillatorType'),),
@@ -624,7 +651,7 @@ class TapDeviceComponent(DeviceComponent):
                 (self._meld_original_name('FilterEnvelope_Slopes_Decay'),),
                 (self._meld_original_name('FilterEnvelope_Values_Sustain'),),
                 (self._meld_original_name('FilterEnvelope_Times_Release'),),
-                (self._meld_original_name('FilterEnvelope_Slopes_Release'),),
+                (self._meld_original_name('FilterEnvelope_Values_Peak'),),
                 (self._meld_original_name('FilterEnvelope_LoopMode'),),
             ),
             self._parameter_bank(
@@ -653,13 +680,15 @@ class TapDeviceComponent(DeviceComponent):
                 sync_2,
                 self._meld_parameter('Lfo2_SyncedRate'),
                 self._meld_parameter('Lfo2_Rate'),
-                None, None, None, None,
+                retrigger_2,
+                self._meld_parameter('Lfo2_PhaseOffset'),
+                None, None,
             ),
             (
                 self._parameter_by_names('Stack Voices'),
                 self._parameter_by_names('MeldVoice_VoiceSpreadAmount'),
-                self._parameter_by_names('Mono Poly'),
-                self._parameter_by_names('Poly Voices'),
+                mono_poly,
+                mono_voice_parameter,
                 self._meld_parameter('GlideTime'),
                 glide_mode,
                 self._parameter_by_names('MeldVoice_Drive'),
@@ -725,6 +754,12 @@ class TapDeviceComponent(DeviceComponent):
     def _parameter_display(self, parameter):
         if not parameter:
             return ''
+        try:
+            display_value = parameter.display_value
+            if display_value is not None:
+                return str(display_value).strip()
+        except Exception:
+            pass
         try:
             return str(parameter.str_for_value(parameter.value)).strip()
         except Exception:
@@ -1823,10 +1858,19 @@ class Tap(ControlSurface):
             normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
             if normalized_bank_name == 'lfo':
                 add_parameter_listener(self._device._parameter_by_names('LFO Time Mode'), 'value', remap=True)
-            elif normalized_bank_name == 'envelope2cyc':
+            elif normalized_bank_name in ('envelope2', 'envelope2cyc'):
+                add_parameter_listener(
+                    self._device._parameter_by_names('Env 2 Cyc On'),
+                    'value',
+                    remap=normalized_bank_name == 'envelope2'
+                )
                 add_parameter_listener(self._device._parameter_by_names('Cyc Env Time Mode', 'Cyc Mode'), 'value')
-            elif normalized_bank_name == 'global':
-                add_parameter_listener(self._device._parameter_by_names('Voice Mode'), 'value', remap=True)
+            return
+
+        if self._device._is_meld():
+            normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
+            if normalized_bank_name == 'globalout':
+                add_parameter_listener(self._device._parameter_by_names('Mono Poly'), 'value', remap=True)
             return
 
         if not self._device._is_operator():
@@ -1901,6 +1945,12 @@ class Tap(ControlSurface):
 
     def _parameter_display_value(self, device_param):
         try:
+            display_value = device_param.display_value
+            if display_value is not None:
+                return self._format_display_value_numbers(str(display_value).replace('∞', 'Inf'))
+        except Exception:
+            pass
+        try:
             if device_param and hasattr(device_param, 'str_for_value') and hasattr(device_param, 'value'):
                 return self._format_display_value_numbers(device_param.str_for_value(device_param.value).replace('∞', 'Inf'))
         except Exception:
@@ -1909,6 +1959,15 @@ class Tap(ControlSurface):
             return self._format_display_value_numbers(str(device_param.value).replace('∞', 'Inf'))
         except Exception:
             return ""
+
+    def _parameter_value_items(self, device_param):
+        try:
+            return tuple(str(item) for item in device_param.value_items)
+        except Exception:
+            return ()
+
+    def _parameter_is_quantized(self, device_param):
+        return bool(getattr(device_param, 'is_quantized', False) or self._parameter_value_items(device_param))
 
     def _format_display_value_numbers(self, display_value):
         def format_match(match):
@@ -1937,8 +1996,8 @@ class Tap(ControlSurface):
         normalized = max(0.0, min(1.0, float(normalized)))
 
         quantized_without_items = False
-        if getattr(device_param, 'is_quantized', False):
-            item_count = len(tuple(getattr(device_param, 'value_items', ())))
+        if self._parameter_is_quantized(device_param):
+            item_count = len(self._parameter_value_items(device_param))
             if item_count > 1:
                 item_index = int(math.floor(normalized * (item_count - 1) + 0.5))
                 normalized = float(item_index) / float(item_count - 1)
@@ -1958,8 +2017,9 @@ class Tap(ControlSurface):
 
     def _parameter_current_value_item_index(self, device_param, item_count):
         display_value = self._normalized_option_text(self._parameter_display_value(device_param))
-        if display_value and hasattr(device_param, 'value_items') and device_param.value_items:
-            for index, item in enumerate(device_param.value_items):
+        value_items = self._parameter_value_items(device_param)
+        if display_value and value_items:
+            for index, item in enumerate(value_items):
                 if self._normalized_option_text(item) == display_value:
                     return index
 
@@ -1970,12 +2030,8 @@ class Tap(ControlSurface):
             return 0
 
     def _set_device_control_next_option(self, control_index, device_param):
-        if not hasattr(device_param, 'is_quantized') or not device_param.is_quantized:
-            return
-        if not hasattr(device_param, 'value_items') or not device_param.value_items:
-            return
-
-        item_count = len(device_param.value_items)
+        value_items = self._parameter_value_items(device_param)
+        item_count = len(value_items)
         if item_count <= 1:
             return
 
@@ -3061,9 +3117,15 @@ class Tap(ControlSurface):
         except Exception:
             default_val_str = min_val_str
 
-        value_items = ''
-        if hasattr(parameter, 'is_quantized') and parameter.is_quantized and hasattr(parameter, 'value_items'):
-            value_items = ';'.join(self._escape_sysex_string(item) for item in parameter.value_items)
+        parameter_value_items = self._parameter_value_items(parameter)
+        value_items = ';'.join(self._escape_sysex_string(item) for item in parameter_value_items)
+        if parameter_value_items:
+            min_val_str = parameter_value_items[0]
+            max_val_str = parameter_value_items[-1]
+            default_index = int(round(max(0.0, min(1.0, float(raw_default_value))) * (len(parameter_value_items) - 1)))
+            quarter_index = int(round((32.0 / 127.0) * (len(parameter_value_items) - 1)))
+            default_val_str = parameter_value_items[default_index]
+            quarter_str = parameter_value_items[quarter_index]
 
         fields = [
             name.strip(),
@@ -3445,7 +3507,7 @@ class Tap(ControlSurface):
                     
                     raw_default_value = None
                     quarter_str = "0.0"
-                    if (not device_param.is_quantized and hasattr(device_param, 'default_value')):
+                    if (not self._parameter_is_quantized(device_param) and hasattr(device_param, 'default_value')):
                         try:
                             raw_default_value = device_param.default_value
                             if hasattr(device_param, 'str_for_value'):
@@ -3469,10 +3531,15 @@ class Tap(ControlSurface):
                         default_val_str = min_val_str
                         raw_default_value = device_param.min if hasattr(device_param, 'min') else 0.0
                     
-                    if hasattr(device_param, 'is_quantized') and device_param.is_quantized and hasattr(device_param, 'value_items'):
-                        value_items = ';'.join(self._escape_sysex_string(item) for item in device_param.value_items)
-                    else:
-                        value_items = ''
+                    parameter_value_items = self._parameter_value_items(device_param)
+                    value_items = ';'.join(self._escape_sysex_string(item) for item in parameter_value_items)
+                    if parameter_value_items:
+                        min_val_str = parameter_value_items[0]
+                        max_val_str = parameter_value_items[-1]
+                        default_index = int(round(max(0.0, min(1.0, float(raw_default_value))) * (len(parameter_value_items) - 1)))
+                        quarter_index = int(round((32.0 / 127.0) * (len(parameter_value_items) - 1)))
+                        default_val_str = parameter_value_items[default_index]
+                        quarter_str = parameter_value_items[quarter_index]
 
                     default_raw_str = str(raw_default_value) if raw_default_value is not None else ""
                     min_val_str = self._escape_sysex_string(min_val_str.strip())
