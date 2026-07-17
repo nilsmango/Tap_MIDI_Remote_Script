@@ -20,13 +20,32 @@ try:
     from ableton.v2.control_surface.simpler_slice_nudging import SimplerSliceNudging
 except ImportError:
     SimplerSliceNudging = None
+try:
+    # Push's decorator exposes all of Drift's API-backed selectors (mod
+    # sources/targets, shape source, voice mode/count, and on/off options).
+    # The generic decorator only exposes four of these controls.
+    from Push2.drift import DriftDeviceDecorator
+    from ableton.v2.control_surface.drift_decoration import DriftDeviceDecorator as BaseDriftDeviceDecorator
+except ImportError:
+    try:
+        from ableton.v2.control_surface.drift_decoration import DriftDeviceDecorator
+        BaseDriftDeviceDecorator = DriftDeviceDecorator
+    except ImportError:
+        DriftDeviceDecorator = None
+        BaseDriftDeviceDecorator = None
+try:
+    from Push2.meld import MeldDeviceDecorator
+except ImportError:
+    MeldDeviceDecorator = None
 from Live.Clip import MidiNoteSpecification
 
 import threading
+import json
 import random
 import re
 import math
 import os
+import socket
 import shutil
 import struct
 import subprocess
@@ -65,18 +84,55 @@ class TapDeviceComponent(DeviceComponent):
     DRUMCELL_FX_2_BANK_NAME = "FX 2"
     DRUMCELL_FX_3_BANK_NAME = "FX 3"
     DELAY_BANK_NAMES = ("Main", "Time+Flt", "Flt+LFO", "LFO Wave")
+    DRIFT_BANK_NAMES = (
+        "Main", "Oscillators", "Osc 2 / Noise", "Osc Mod", "Filters", "Filter Mod",
+        "Envelope 1", "Envelope 2", "Envelope 2 Cyc", "LFO", "Mod 1 & 2", "Mod 3", "Global",
+    )
+    MELD_ENGINE_BANK_NAME = "A | B"
+    MELD_BANK_NAMES = (
+        MELD_ENGINE_BANK_NAME,
+        "Main",
+        "Osc / Mix",
+        "Filter",
+        "Amp Envelope",
+        "Mod Envelope",
+        "Envelope Setup",
+        "LFO 1 Generator",
+        "LFO 1 FX",
+        "LFO 2",
+        "Global / Out",
+    )
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
         self._use_safe_parameter_banks = False
+        self._operator_parameter_bank_cache = None
+        self._operator_parameter_bank_cache_device = None
+        self._drift_decorator = None
+        self._drift_decorator_device = None
+        self._drift_base_decorator = None
+        self._meld_decorator = None
+        self._meld_decorator_device = None
+
+    def invalidate_parameter_bank_cache(self):
+        self._operator_parameter_bank_cache = None
+        self._operator_parameter_bank_cache_device = None
 
     def set_device(self, device):
+        if device != getattr(self, '_device', None):
+            self._disconnect_drift_decorator()
+            self._disconnect_meld_decorator()
+        self.invalidate_parameter_bank_cache()
         self._use_safe_parameter_banks = False
         try:
-            return DeviceComponent.set_device(self, device)
+            result = DeviceComponent.set_device(self, device)
+            if self._is_meld() and self._bank_index == 0:
+                self._bank_index = 1
+                self.update()
+            return result
         except IndexError:
             self._use_safe_parameter_banks = True
-            self._bank_index = 0
+            self._bank_index = 1 if self._is_meld() else 0
             try:
                 self.update()
             except Exception:
@@ -85,6 +141,11 @@ class TapDeviceComponent(DeviceComponent):
                 self.notify_device()
             except Exception:
                 pass
+
+    def disconnect(self):
+        self._disconnect_drift_decorator()
+        self._disconnect_meld_decorator()
+        DeviceComponent.disconnect(self)
 
     def update(self):
         try:
@@ -109,6 +170,12 @@ class TapDeviceComponent(DeviceComponent):
                 return '', tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
 
     def _parameter_banks(self):
+        device = getattr(self, '_device', None)
+        if ((self._is_operator() or self._is_drift() or self._is_meld()) and
+                self._operator_parameter_bank_cache is not None and
+                self._operator_parameter_bank_cache_device == device):
+            return list(self._operator_parameter_bank_cache)
+
         base_names = self._base_parameter_bank_names()
         if self._use_safe_parameter_banks:
             banks = self._safe_parameter_banks()
@@ -119,7 +186,11 @@ class TapDeviceComponent(DeviceComponent):
                 self._use_safe_parameter_banks = True
                 base_names = self._safe_parameter_bank_names_base()
                 banks = self._safe_parameter_banks()
-        return self._add_tap_custom_banks(banks, base_names)
+        banks = self._add_tap_custom_banks(banks, base_names)
+        if self._is_operator() or self._is_drift() or self._is_meld():
+            self._operator_parameter_bank_cache = tuple(banks)
+            self._operator_parameter_bank_cache_device = device
+        return banks
 
     def _parameter_bank_names(self):
         return self._add_tap_custom_bank_names(self._base_parameter_bank_names())
@@ -190,6 +261,94 @@ class TapDeviceComponent(DeviceComponent):
     def _is_delay(self):
         return self._device_class_name() == 'Delay'
 
+    def _is_drift(self):
+        try:
+            return self._device_class_name() == 'Drift' or str(self._device.class_display_name) == 'Drift'
+        except Exception:
+            return False
+
+    def _is_meld(self):
+        device = getattr(self, '_device', None)
+        try:
+            return (
+                self._device_class_name() in ('InstrumentMeld', 'Meld') or
+                str(device.class_display_name) == 'Meld' or
+                hasattr(device, 'selected_engine')
+            )
+        except Exception:
+            return False
+
+    def _disconnect_drift_decorator(self):
+        decorator = self._drift_decorator
+        base_decorator = self._drift_base_decorator
+        self._drift_decorator = None
+        self._drift_decorator_device = None
+        self._drift_base_decorator = None
+        if decorator:
+            try:
+                decorator.disconnect()
+            except Exception:
+                pass
+        if base_decorator and base_decorator is not decorator:
+            try:
+                base_decorator.disconnect()
+            except Exception:
+                pass
+
+    def _disconnect_meld_decorator(self):
+        decorator = self._meld_decorator
+        self._meld_decorator = None
+        self._meld_decorator_device = None
+        if decorator:
+            try:
+                decorator.disconnect()
+            except Exception:
+                pass
+
+    def _decorated_parameters(self):
+        device = getattr(self, '_device', None)
+        if self._is_drift() and DriftDeviceDecorator is not None:
+            if self._drift_decorator is None or self._drift_decorator_device != device:
+                self._disconnect_drift_decorator()
+                try:
+                    voice_mode = None
+                    if BaseDriftDeviceDecorator is not None:
+                        self._drift_base_decorator = BaseDriftDeviceDecorator(live_object=device)
+                        voice_mode = next(
+                            (parameter for parameter in self._drift_base_decorator.parameters
+                             if str(getattr(parameter, 'name', '')) == 'Voice Mode'),
+                            None
+                        )
+                    additional_properties = {'voice_mode': voice_mode} if voice_mode else {}
+                    self._drift_decorator = DriftDeviceDecorator(
+                        live_object=device, additional_properties=additional_properties
+                    )
+                    self._drift_decorator_device = device
+                except Exception:
+                    self._drift_decorator = None
+            if self._drift_decorator:
+                parameters = list(self._drift_decorator.parameters)
+                if self._drift_base_decorator:
+                    voice_mode = next(
+                        (parameter for parameter in self._drift_base_decorator.parameters
+                         if str(getattr(parameter, 'name', '')) == 'Voice Mode'),
+                        None
+                    )
+                    if voice_mode:
+                        parameters.append(voice_mode)
+                return tuple(parameters)
+        if self._is_meld() and MeldDeviceDecorator is not None:
+            if self._meld_decorator is None or self._meld_decorator_device != device:
+                self._disconnect_meld_decorator()
+                try:
+                    self._meld_decorator = MeldDeviceDecorator(live_object=device)
+                    self._meld_decorator_device = device
+                except Exception:
+                    self._meld_decorator = None
+            if self._meld_decorator:
+                return tuple(self._meld_decorator.parameters)
+        return tuple(getattr(device, 'parameters', ()))
+
     def _simpler_is_classic(self):
         try:
             return self._is_simpler() and int(self._device.playback_mode) == 0
@@ -219,7 +378,11 @@ class TapDeviceComponent(DeviceComponent):
 
     def _add_tap_custom_bank_names(self, bank_names):
         names = list(bank_names)
-        if self._is_operator():
+        if self._is_drift():
+            names = list(self.DRIFT_BANK_NAMES)
+        elif self._is_meld():
+            names = list(self.MELD_BANK_NAMES)
+        elif self._is_operator():
             index = self._operator_waves_insert_index(names)
             names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
             filter_index = self._operator_filter_bank_insert_index(names)
@@ -258,7 +421,11 @@ class TapDeviceComponent(DeviceComponent):
     def _add_tap_custom_banks(self, banks, base_names):
         banks = list(banks)
         names = list(base_names)
-        if self._is_operator():
+        if self._is_drift():
+            banks = list(self._drift_parameter_banks())
+        elif self._is_meld():
+            banks = list(self._meld_parameter_banks())
+        elif self._is_operator():
             self._replace_operator_lfo_bank(banks, names)
             waves = self._operator_wave_parameters(banks)
             index = self._operator_waves_insert_index(names)
@@ -293,6 +460,212 @@ class TapDeviceComponent(DeviceComponent):
         elif self._is_delay():
             banks = list(self._delay_parameter_banks())
         return banks
+
+    def _parameter_bank(self, *specifications):
+        parameters = []
+        for specification in specifications:
+            if not specification:
+                parameters.append(None)
+            elif isinstance(specification, (tuple, list)):
+                parameters.append(self._parameter_by_names(*specification))
+            elif isinstance(specification, str):
+                parameters.append(self._parameter_by_names(specification))
+            else:
+                parameters.append(specification)
+        parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
+        return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
+
+    def _drift_parameter_banks(self):
+        return (
+            self._parameter_bank(
+                'Osc 1 Wave', 'Osc 1 Shape', 'Osc 1 Gain', 'Osc 2 Gain',
+                'LP Freq', 'LP Res', 'Env 1 Attack', 'Env 1 Release',
+            ),
+            self._parameter_bank(
+                'Osc 1 Wave', 'Osc 1 Oct', 'Osc 1 Shape', 'Osc 1 Gain',
+                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Shape', 'Osc 2 Gain',
+            ),
+            self._parameter_bank(
+                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Shape', 'Osc 2 Detune',
+                'Osc 2 Gain', 'Noise Gain', 'Osc Retrig On', 'Noise On',
+            ),
+            self._parameter_bank(
+                'Pitch Mod Src 1', 'Pitch Mod Amt 1', 'Pitch Mod Src 2', 'Pitch Mod Amt 2',
+                'Shape Mod Src', 'Osc 1 Shape Mod Amt', 'Osc Retrig On', 'Noise Gain',
+            ),
+            self._parameter_bank(
+                'LP Freq', 'LP Res', 'LP Type', 'HP Freq',
+                'Osc 1 Flt On', 'Osc 2 Flt On', 'Noise Flt On', 'Noise On',
+            ),
+            self._parameter_bank(
+                'Key > LPF', 'LP Mod Src 1', 'LP Mod Amt 1', 'LP Mod Src 2',
+                'LP Mod Amt 2', None, None, None,
+            ),
+            self._parameter_bank(
+                'Env 1 Attack', 'Env 1 Decay', 'Env 1 Sustain', 'Env 1 Release',
+                None, None, None, None,
+            ),
+            self._parameter_bank(
+                'Env 2 Attack', 'Env 2 Decay', 'Env 2 Sustain', 'Env 2 Release',
+                'Env 2 Cyc On', None, None, None,
+            ),
+            self._parameter_bank(
+                'Env 2 Cyc On', ('Cyc Env Tilt', 'Cyc Tilt'), ('Cyc Env Hold', 'Cyc Hold'),
+                ('Cyc Env Time Mode', 'Cyc Mode'), ('Cyc Env Rate', 'Cyc Rate'),
+                ('Cyc Env Ratio', 'Cyc Ratio'), ('Cyc Env Time', 'Cyc Time'),
+                ('Cyc Env Synced', 'Cyc Synced'),
+            ),
+            self._parameter_bank(
+                'LFO Wave', 'LFO Time Mode', self._drift_lfo_rate_parameter(),
+                'LFO Amt', 'LFO Retrig On', 'LFO Mod Src', 'LFO Mod Amt', None,
+            ),
+            self._parameter_bank(
+                'Mod Source 1', 'Mod Dest 1', 'Mod Matrix Amt 1',
+                'Mod Source 2', 'Mod Dest 2', 'Mod Matrix Amt 2', None, None,
+            ),
+            self._parameter_bank(
+                'Mod Source 3', 'Mod Dest 3', 'Mod Matrix Amt 3', 'Vel > Vol',
+                None, None, None, None,
+            ),
+            self._parameter_bank(
+                'Voice Mode', self._drift_voice_mode_parameter(), 'Voice Count', 'Drift',
+                'Legato On', 'Glide Time', 'Transpose', 'Volume',
+            ),
+        )
+
+    def _parameter_value_text(self, *names):
+        return self._parameter_display(self._parameter_by_names(*names)).lower()
+
+    def _drift_lfo_rate_parameter(self):
+        mode = self._parameter_value_text('LFO Time Mode')
+        if 'ratio' in mode:
+            return self._parameter_by_names('LFO Ratio')
+        if 'time' in mode:
+            return self._parameter_by_names('LFO Time')
+        if 'sync' in mode:
+            return self._parameter_by_names('LFO Synced')
+        return self._parameter_by_names('LFO Rate')
+
+    def _drift_voice_mode_parameter(self):
+        mode = self._parameter_value_text('Voice Mode')
+        if 'mono' in mode:
+            return self._parameter_by_names('Thickness')
+        if 'stereo' in mode:
+            return self._parameter_by_names('Spread')
+        if 'unison' in mode:
+            return self._parameter_by_names('Strength')
+        return None
+
+    def _meld_engine_letter(self):
+        try:
+            return 'B' if int(self._device.selected_engine) == 1 else 'A'
+        except Exception:
+            return 'A'
+
+    def _meld_original_name(self, suffix):
+        return 'MeldVoice_Engine{}_{}'.format(self._meld_engine_letter(), suffix)
+
+    def _meld_parameter(self, suffix, *aliases):
+        return self._parameter_by_names(self._meld_original_name(suffix), *aliases)
+
+    def _meld_parameter_banks(self):
+        engine = self._meld_engine_letter()
+        sync_1 = self._parameter_by_names('LFO 1 {} Sync'.format(engine), self._meld_original_name('Lfo1_Sync'))
+        retrigger_1 = self._parameter_by_names('LFO 1 {} Retrigger'.format(engine))
+        sync_2 = self._parameter_by_names('LFO 2 {} Sync'.format(engine), self._meld_original_name('Lfo2_Sync'))
+        glide_mode = self._parameter_by_names('Glide {}'.format(engine))
+        envelope_delay_aliases = ('MeldVoice_EngineBDelay',) if engine == 'B' else ()
+        return (
+            tuple([None] * self.SAFE_PARAMETER_BANK_SIZE),
+            self._parameter_bank(
+                (self._meld_original_name('Oscillator_OscillatorType'),),
+                (self._meld_original_name('Oscillator_Macro1'),),
+                (self._meld_original_name('Oscillator_Macro2'),),
+                (self._meld_original_name('Filter_Frequency'),),
+                (self._meld_original_name('ToneFilter'),),
+                (self._meld_original_name('Pan'),),
+                (self._meld_original_name('Volume'),),
+                None,
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('Oscillator_OscillatorType'),),
+                (self._meld_original_name('Oscillator_Pitch_Transpose'),),
+                (self._meld_original_name('Oscillator_Pitch_Detune'),),
+                (self._meld_original_name('Oscillator_Macro1'),),
+                (self._meld_original_name('Oscillator_Macro2'),),
+                (self._meld_original_name('ToneFilter'),),
+                (self._meld_original_name('Pan'),),
+                (self._meld_original_name('Volume'),),
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('Filter_FilterType'),),
+                (self._meld_original_name('Filter_Frequency'),),
+                (self._meld_original_name('Filter_Macro1'),),
+                (self._meld_original_name('Filter_Macro2'),),
+                (self._meld_original_name('ToneFilter'),),
+                (self._meld_original_name('Pan'),),
+                (self._meld_original_name('Volume'),),
+                None,
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('AmpEnvelope_Times_Attack'),),
+                (self._meld_original_name('AmpEnvelope_Slopes_Attack'),),
+                (self._meld_original_name('AmpEnvelope_Times_Decay'),),
+                (self._meld_original_name('AmpEnvelope_Slopes_Decay'),),
+                (self._meld_original_name('AmpEnvelope_Sustain'),),
+                (self._meld_original_name('AmpEnvelope_Times_Release'),),
+                (self._meld_original_name('AmpEnvelope_Slopes_Release'),),
+                (self._meld_original_name('AmpEnvelope_LoopMode'),),
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('FilterEnvelope_Times_Attack'),),
+                (self._meld_original_name('FilterEnvelope_Slopes_Attack'),),
+                (self._meld_original_name('FilterEnvelope_Times_Decay'),),
+                (self._meld_original_name('FilterEnvelope_Slopes_Decay'),),
+                (self._meld_original_name('FilterEnvelope_Values_Sustain'),),
+                (self._meld_original_name('FilterEnvelope_Times_Release'),),
+                (self._meld_original_name('FilterEnvelope_Slopes_Release'),),
+                (self._meld_original_name('FilterEnvelope_LoopMode'),),
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('EnvelopeDelay'),) + envelope_delay_aliases,
+                ('Link Envelopes',), None, None, None, None, None, None,
+            ),
+            (
+                self._meld_parameter('Lfo1_GeneratorType'),
+                sync_1,
+                self._meld_parameter('Lfo1_SyncedRate'),
+                self._meld_parameter('Lfo1_Rate'),
+                self._meld_parameter('Lfo1_PhaseOffset'),
+                self._meld_parameter('Lfo1_GeneratorMacro1'),
+                self._meld_parameter('Lfo1_GeneratorMacro2'),
+                retrigger_1,
+            ),
+            self._parameter_bank(
+                (self._meld_original_name('Lfo1_Transformer1Type'),),
+                (self._meld_original_name('Lfo1_Transformer1Macro'),),
+                (self._meld_original_name('Lfo1_Transformer2Type'),),
+                (self._meld_original_name('Lfo1_Transformer2Macro'),),
+                None, None, None, None,
+            ),
+            (
+                self._meld_parameter('Lfo2_Waveform'),
+                sync_2,
+                self._meld_parameter('Lfo2_SyncedRate'),
+                self._meld_parameter('Lfo2_Rate'),
+                None, None, None, None,
+            ),
+            (
+                self._parameter_by_names('Stack Voices'),
+                self._parameter_by_names('MeldVoice_VoiceSpreadAmount'),
+                self._parameter_by_names('Mono Poly'),
+                self._parameter_by_names('Poly Voices'),
+                self._meld_parameter('GlideTime'),
+                glide_mode,
+                self._parameter_by_names('MeldVoice_Drive'),
+                self._parameter_by_names('Volume'),
+            ),
+        )
 
     def _delay_parameter_banks(self):
         main = tuple(self._parameter_by_names(*names) for names in (
@@ -423,7 +796,7 @@ class TapDeviceComponent(DeviceComponent):
     def _parameter_by_names(self, *names):
         wanted = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
         fallback = None
-        for parameter in getattr(self._device, 'parameters', ()):
+        for parameter in self._decorated_parameters():
             parameter_names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
             if any(re.sub(r'[^a-z0-9]+', '', name.lower()) in wanted for name in parameter_names):
                 if self._operator_parameter_is_active(parameter):
@@ -957,8 +1330,12 @@ class Tap(ControlSurface):
             self._bank_parameter_source_device = None
             self._bank_parameter_source_listener = None
             self._wavetable_virtual_property_listeners = []
-            self._operator_virtual_bank_listeners = []
-            self._operator_virtual_bank_refresh_pending = False
+            self._dynamic_parameter_state_listeners = []
+            self._dynamic_parameter_refresh_pending = False
+            self._dynamic_parameter_remap_pending = False
+            self._meld_engine_listener_device = None
+            self._meld_engine_listener = None
+            self._meld_engine_refresh_pending = False
             self._last_sent_parameter_displays = {}
             self._last_sent_parameter_normalized_values = {}
             self._last_sent_parameter_cc_values = {}
@@ -1031,6 +1408,20 @@ class Tap(ControlSurface):
             self._simpler_playhead_high = -1
             self._simpler_playhead_low = -1
             self._simpler_playhead_enabled = None
+            self._granulator_device = None
+            self._granulator_bridge_socket = None
+            self._granulator_bridge_timer = None
+            self._granulator_bridge_states = {}
+            self._granulator_instance = None
+            self._granulator_sample_path = ''
+            self._granulator_sample_name = ''
+            self._granulator_sample_length = 0.0
+            self._granulator_grains = ()
+            self._granulator_last_grain_signature = None
+            self._granulator_last_state = None
+            self._granulator_waveform_generation = 0
+            self._granulator_waveform_pending = set()
+            self._setup_granulator_bridge()
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -1050,6 +1441,7 @@ class Tap(ControlSurface):
             self._load_follow_actions_from_names(force_send=True)
             self._sync_follow_action_runtime_listeners()
             self._start_periodic_execution()
+            self._start_granulator_bridge_timer()
 
     def _setup_device_control(self):
         self._device = TapDeviceComponent()
@@ -1084,7 +1476,20 @@ class Tap(ControlSurface):
                     control.suppress_script_forwarding = False
                 except Exception:
                     pass
-            self._device.set_parameter_controls(self._device_controls)
+            # API-backed virtual parameters (Drift/Meld selectors) are normal
+            # Python control-surface objects, not Live ATimeableValues.  Passing
+            # them to Live's native MIDI mapper raises a Boost.Python
+            # ArgumentError on every rebuild.  Leave those slots script-driven.
+            controls = list(self._device_controls)
+            try:
+                _, bank_parameters = self._device._current_bank_details()
+                selected_device = self._selected_device()
+                for index, parameter in enumerate(bank_parameters or ()):
+                    if index < len(controls) and self._parameter_is_tap_virtual(parameter, selected_device):
+                        controls[index] = None
+            except Exception:
+                pass
+            self._device.set_parameter_controls(tuple(controls))
         self._refresh_parameter_value_listeners_current_bank()
         self._refresh_parameter_name_listeners_current_bank()
         self._readd_disabled_parameter_listeners()
@@ -1324,8 +1729,8 @@ class Tap(ControlSurface):
             except Exception:
                 pass
 
-    def _remove_operator_virtual_bank_listeners(self):
-        for parameter, listener_type, listener in list(getattr(self, '_operator_virtual_bank_listeners', [])):
+    def _remove_dynamic_parameter_state_listeners(self):
+        for parameter, listener_type, listener in list(getattr(self, '_dynamic_parameter_state_listeners', [])):
             remove_listener = getattr(parameter, 'remove_{}_listener'.format(listener_type), None)
             has_listener = getattr(parameter, '{}_has_listener'.format(listener_type), None)
             if remove_listener and liveobj_valid(parameter):
@@ -1334,69 +1739,109 @@ class Tap(ControlSurface):
                         remove_listener(listener)
                 except Exception:
                     pass
-        self._operator_virtual_bank_listeners = []
+        self._dynamic_parameter_state_listeners = []
 
-    def _schedule_operator_virtual_bank_refresh(self):
-        if self._operator_virtual_bank_refresh_pending:
+    def _schedule_dynamic_parameter_refresh(self, remap=False):
+        self._dynamic_parameter_remap_pending = self._dynamic_parameter_remap_pending or remap
+        if self._dynamic_parameter_refresh_pending:
             return
-        self._operator_virtual_bank_refresh_pending = True
-        self.schedule_message(1, self._refresh_operator_virtual_bank)
+        self._dynamic_parameter_refresh_pending = True
+        self.schedule_message(1, self._refresh_dynamic_parameter_state)
 
-    def _refresh_operator_virtual_bank(self):
-        self._operator_virtual_bank_refresh_pending = False
-        if not (self._device._is_operator() or self._device._is_delay()):
+    def _refresh_dynamic_parameter_state(self):
+        self._dynamic_parameter_refresh_pending = False
+        remap = self._dynamic_parameter_remap_pending
+        self._dynamic_parameter_remap_pending = False
+        if not liveobj_valid(self._device):
             return
-        self._connect_device_controls()
-        try:
-            self.request_rebuild_midi_map()
-        except Exception:
-            pass
-        self._on_device_changed(False)
 
-    def _setup_operator_virtual_bank_listeners(self):
-        self._remove_operator_virtual_bank_listeners()
+        if remap:
+            self._device.invalidate_parameter_bank_cache()
+            self._connect_device_controls()
+            self._device.update()
+            try:
+                self.request_rebuild_midi_map()
+            except Exception:
+                pass
+            if self._device._is_drift() or self._device._is_meld():
+                self._force_send_current_bank_metadata()
+                self._setup_dynamic_parameter_state_listeners()
+            else:
+                self._on_device_changed(False)
+        else:
+            self._force_send_current_bank_metadata()
+
+    def _setup_dynamic_parameter_state_listeners(self):
+        self._remove_dynamic_parameter_state_listeners()
         device = getattr(self._device, '_device', None)
-        if not (self._device._is_operator() or self._device._is_delay()) or not device or not liveobj_valid(device):
+        if not device or not liveobj_valid(device):
             return
 
         try:
-            bank_name = self._device._parameter_bank_names()[self._device._bank_index]
+            bank_name, bank_parameters = self._device._current_bank_details()
         except Exception:
             return
 
-        def add_parameter_listener(parameter, listener_type):
+        seen_bindings = set()
+
+        def add_parameter_listener(parameter, listener_type, remap=False):
             add_listener = getattr(parameter, 'add_{}_listener'.format(listener_type), None) if parameter else None
             if not add_listener:
                 return
-            listener = lambda: self._schedule_operator_virtual_bank_refresh()
+            binding = (id(parameter), listener_type, bool(remap))
+            if binding in seen_bindings:
+                return
+            seen_bindings.add(binding)
+            listener = lambda remap=remap: self._schedule_dynamic_parameter_refresh(remap)
             try:
                 add_listener(listener)
-                self._operator_virtual_bank_listeners.append((parameter, listener_type, listener))
+                self._dynamic_parameter_state_listeners.append((parameter, listener_type, listener))
             except Exception:
                 pass
 
+        # Live exposes parameter relevance through DeviceParameter.state.  Listen
+        # only to the eight visible parameters and update metadata when Live
+        # changes their state; no device-specific activity rules are needed.
+        remap_dynamic_bank = self._device._is_drift() or self._device._is_meld()
+        for parameter in bank_parameters or ():
+            add_parameter_listener(parameter, 'state', remap=remap_dynamic_bank)
+
+        if self._device._is_delay():
+            # Delay does not publish relevance changes for all of its dependent
+            # parameters, so refresh the visible metadata when the selectors
+            # that drive Tap's explicit rules change.
+            for names in (
+                ('Link', 'Stereo Time Link'),
+                ('L Sync', 'L Delay Sync'),
+                ('R Sync', 'R Delay Sync'),
+                ('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
+            ):
+                add_parameter_listener(self._device._parameter_by_names(*names), 'value')
+            return
+
+        if self._device._is_drift():
+            normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
+            if normalized_bank_name == 'lfo':
+                add_parameter_listener(self._device._parameter_by_names('LFO Time Mode'), 'value', remap=True)
+            elif normalized_bank_name == 'envelope2cyc':
+                add_parameter_listener(self._device._parameter_by_names('Cyc Env Time Mode', 'Cyc Mode'), 'value')
+            elif normalized_bank_name == 'global':
+                add_parameter_listener(self._device._parameter_by_names('Voice Mode'), 'value', remap=True)
+            return
+
+        if not self._device._is_operator():
+            return
+
         if bank_name == self._device.OPERATOR_WAVES_BANK_NAME:
-            for parameter in self._device._operator_feedback_parameters().values():
-                add_parameter_listener(parameter, 'state')
             add_parameter_listener(self._device._parameter_by_names('Algorithm'), 'value')
         elif bank_name == self._device.OPERATOR_FILTER_PLUS_BANK_NAME:
-            add_parameter_listener(self._device._parameter_by_names('Filter Type', 'Filter Type (Legacy)'), 'value')
-            add_parameter_listener(self._device._parameter_by_names('Filter Circuit - LP/HP'), 'state')
-            add_parameter_listener(self._device._parameter_by_names('Filter Circuit - BP/NO/Morph'), 'state')
-        elif (self._device._is_operator() and
-              re.sub(r'[^a-z0-9]+', '', str(bank_name).lower()) == 'lfo'):
-            add_parameter_listener(self._device._parameter_by_names('LFO Range'), 'value')
-        elif self._device._is_delay():
-            for parameter in (
-                    self._device._parameter_by_names('Link', 'Stereo Time Link'),
-                    self._device._parameter_by_names('L Sync', 'L Delay Sync'),
-                    self._device._parameter_by_names('R Sync', 'R Delay Sync'),
-                    self._device._parameter_by_names('Filter On', 'Filter On/Off'),
-                    self._device._parameter_by_names('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
-                    self._device._parameter_by_names('LFO Wave', 'Mod LFO Wave', 'Modulation Waveform', 'LFO Waveform')):
-                add_parameter_listener(parameter, 'value')
-            for parameter in getattr(device, 'parameters', ()):
-                add_parameter_listener(parameter, 'state')
+            add_parameter_listener(
+                self._device._parameter_by_names('Filter Type', 'Filter Type (Legacy)'),
+                'value',
+                remap=True
+            )
+        elif re.sub(r'[^a-z0-9]+', '', str(bank_name).lower()) == 'lfo':
+            add_parameter_listener(self._device._parameter_by_names('LFO Range'), 'value', remap=True)
 
     def _wavetable_virtual_metadata(self):
         metadata = []
@@ -1491,7 +1936,19 @@ class Tap(ControlSurface):
 
         normalized = max(0.0, min(1.0, float(normalized)))
 
-        return max(min_val, min(max_val, min_val + (max_val - min_val) * normalized))
+        quantized_without_items = False
+        if getattr(device_param, 'is_quantized', False):
+            item_count = len(tuple(getattr(device_param, 'value_items', ())))
+            if item_count > 1:
+                item_index = int(math.floor(normalized * (item_count - 1) + 0.5))
+                normalized = float(item_index) / float(item_count - 1)
+            else:
+                quantized_without_items = True
+
+        target_value = min_val + (max_val - min_val) * normalized
+        if quantized_without_items:
+            target_value = round(target_value)
+        return max(min_val, min(max_val, target_value))
 
     def _normalized_option_text(self, value):
         try:
@@ -1537,8 +1994,6 @@ class Tap(ControlSurface):
 
     def _send_parameter_display_value(self, control_index, device_param, force=False, throttle=False):
         if not device_param or not liveobj_valid(device_param):
-            return
-        if not self._is_current_parameter_for_control(control_index, device_param):
             return
 
         now = time.time()
@@ -1586,8 +2041,11 @@ class Tap(ControlSurface):
 
     def _select_parameter_if_possible(self, mapped_parameter):
         try:
-            if mapped_parameter and liveobj_valid(mapped_parameter) and hasattr(self.song().view, 'selected_parameter'):
-                self.song().view.selected_parameter = mapped_parameter
+            song_view = self.song().view
+            if (mapped_parameter and liveobj_valid(mapped_parameter) and
+                    hasattr(song_view, 'selected_parameter') and
+                    song_view.selected_parameter != mapped_parameter):
+                song_view.selected_parameter = mapped_parameter
         except Exception:
             pass
 
@@ -1854,6 +2312,19 @@ class Tap(ControlSurface):
             if control_index >= 0 and self._set_wavetable_virtual_normalized(control_index, float(value) / 127.0):
                 return
 
+            if control_index >= 0:
+                virtual_parameter = self._current_bank_parameter_for_control(self._selected_device(), control_index)
+                if self._parameter_is_tap_virtual(virtual_parameter):
+                    target_value = self._parameter_target_value_from_normalized(
+                        virtual_parameter, float(value) / 127.0
+                    )
+                    if virtual_parameter.value != target_value:
+                        virtual_parameter.value = target_value
+                    self._send_parameter_feedback(
+                        control_index, virtual_parameter, send_cc=False, force_display=True
+                    )
+                    return
+
             mapped_parameter = self._current_connected_parameter_for_control(control_index) if control_index >= 0 else None
             self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
             if self._consume_remove_automation_request(mapped_parameter):
@@ -1891,6 +2362,9 @@ class Tap(ControlSurface):
 
             control_index = int(message[2])
             gesture_state = int(message[3])
+            if (control_index < 0 or not hasattr(self, '_device_controls') or
+                    control_index >= len(self._device_controls) or gesture_state not in (0, 1, 2, 3, 4)):
+                return
             raw_value = ((int(message[4]) & 0x7F) << 14) | ((int(message[5]) & 0x7F) << 7) | (int(message[6]) & 0x7F)
             raw_value = max(0, min(65535, raw_value))
 
@@ -1975,13 +2449,13 @@ class Tap(ControlSurface):
                     self._active_high_resolution_gestures.discard(control_index)
                 return
 
-            self._select_parameter_if_possible(mapped_parameter)
-
             if gesture_state == 3:
+                self._select_parameter_if_possible(mapped_parameter)
                 self._set_device_control_next_option(control_index, mapped_parameter)
                 return
 
             if gesture_state == 1:
+                self._select_parameter_if_possible(mapped_parameter)
                 self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, force_display=True)
                 return
 
@@ -1989,6 +2463,7 @@ class Tap(ControlSurface):
                 self._remove_parameter_from_smooth_macro_randomize(mapped_parameter)
                 
                 if control_index not in self._active_high_resolution_gestures:
+                    self._select_parameter_if_possible(mapped_parameter)
                     self._begin_high_resolution_undo_step(control_index)
                     if hasattr(mapped_parameter, 'begin_gesture'):
                         mapped_parameter.begin_gesture()
@@ -1999,8 +2474,8 @@ class Tap(ControlSurface):
 
                 normalized = float(raw_value) / 65535.0
                 target_value = self._parameter_target_value_from_normalized(mapped_parameter, normalized)
-                mapped_parameter.value = target_value
-                self._send_parameter_feedback(control_index, mapped_parameter, send_cc=False, throttle_display=True)
+                if mapped_parameter.value != target_value:
+                    mapped_parameter.value = target_value
 
             if gesture_state == 2 and control_index in self._active_high_resolution_gestures:
                 if hasattr(mapped_parameter, 'end_gesture'):
@@ -2045,6 +2520,10 @@ class Tap(ControlSurface):
 
         current_index = self._device._bank_index
         new_index = max(0, min(len(all_bank_names) - 1, current_index + offset))
+        if (self._device._is_meld() and
+                all_bank_names[new_index] == self._device.MELD_ENGINE_BANK_NAME):
+            self._toggle_meld_engine()
+            return
         if new_index != current_index:
             self._device._bank_index = new_index
             self._connect_device_controls()
@@ -2055,6 +2534,81 @@ class Tap(ControlSurface):
                 pass
             self._on_device_changed(False)
             self._schedule_bank_metadata_refreshes()
+
+    def _remove_meld_engine_listener(self):
+        device = self._meld_engine_listener_device
+        listener = self._meld_engine_listener
+        self._meld_engine_listener_device = None
+        self._meld_engine_listener = None
+        if device and listener:
+            try:
+                if (not hasattr(device, 'selected_engine_has_listener') or
+                        device.selected_engine_has_listener(listener)):
+                    device.remove_selected_engine_listener(listener)
+            except Exception:
+                pass
+
+    def _setup_meld_engine_listener(self, device):
+        self._remove_meld_engine_listener()
+        if not device or not liveobj_valid(device) or not self._device._is_meld():
+            return
+        listener = lambda: self._schedule_meld_engine_refresh()
+        try:
+            device.add_selected_engine_listener(listener)
+            self._meld_engine_listener_device = device
+            self._meld_engine_listener = listener
+        except Exception:
+            pass
+
+    def _meld_engine_letter(self, device=None):
+        device = device or getattr(self._device, '_device', None)
+        try:
+            return 'B' if int(device.selected_engine) == 1 else 'A'
+        except Exception:
+            return ''
+
+    def _send_meld_engine_state(self, device=None):
+        device = device or getattr(self._device, '_device', None)
+        if not device or not liveobj_valid(device) or not self._device._is_meld():
+            self._send_sys_ex_message('', 0x4A)
+            return
+        self._send_sys_ex_message(self._meld_engine_letter(device), 0x4A)
+
+    def _toggle_meld_engine(self):
+        device = getattr(self._device, '_device', None)
+        if not device or not liveobj_valid(device) or not self._device._is_meld():
+            return
+        try:
+            device.selected_engine = 0 if int(device.selected_engine) == 1 else 1
+        except Exception as error:
+            self._debug_log('Meld engine switch failed: {}'.format(str(error)))
+            return
+        self._send_meld_engine_state(device)
+        self._schedule_meld_engine_refresh()
+
+    def _schedule_meld_engine_refresh(self):
+        if self._meld_engine_refresh_pending:
+            return
+        self._meld_engine_refresh_pending = True
+        self.schedule_message(1, self._refresh_meld_engine_selection)
+
+    def _refresh_meld_engine_selection(self):
+        self._meld_engine_refresh_pending = False
+        device = getattr(self._device, '_device', None)
+        if not device or not liveobj_valid(device) or not self._device._is_meld():
+            return
+        if self._device._bank_index == 0:
+            self._device._bank_index = 1
+        self._device.invalidate_parameter_bank_cache()
+        self._connect_device_controls()
+        self._device.update()
+        try:
+            self.request_rebuild_midi_map()
+        except Exception:
+            pass
+        self._send_meld_engine_state(device)
+        self._force_send_current_bank_metadata()
+        self._setup_dynamic_parameter_state_listeners()
 
     def _find_drum_rack_in_track(self, track):
         for device in track.devices:
@@ -2556,6 +3110,8 @@ class Tap(ControlSurface):
 
     def _send_bank_state(self, selected_device, track_has_drums):
         all_bank_names, _, _, _ = self._tap_visible_bank_info(selected_device)
+        if self._device._is_meld() and self._device._bank_index == 0 and len(all_bank_names) > 1:
+            self._device._bank_index = 1
         bank_index = self._device._bank_index
         current_bank_name = all_bank_names[bank_index] if 0 <= bank_index < len(all_bank_names) else ''
         connected_bank_names = [name for name in all_bank_names if self._is_bank_connected(selected_device, name)]
@@ -2571,7 +3127,10 @@ class Tap(ControlSurface):
                 else:
                     current_bank_name = ""
 
-        bank_name_drum = self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums)
+        meld_engine = self._meld_engine_letter(selected_device) if self._device._is_meld() else ''
+        bank_name_drum = (
+            self._escape_sysex_string(current_bank_name) + ";" + str(track_has_drums) + ";" + meld_engine
+        )
         bank_names_list = ','.join(self._escape_sysex_string(name) for name in connected_bank_names)
 
         self._send_sys_ex_message(bank_name_drum, 0x6D)
@@ -2648,7 +3207,7 @@ class Tap(ControlSurface):
     def _get_parameter_display_name(self, device_param):
         raw_name = self._escape_sysex_string(device_param.name)
         if hasattr(device_param, 'is_enabled'):
-            if self._parameter_is_inactive_but_controllable(device_param):
+            if self._parameter_is_inactive(device_param):
                 return f"*~{raw_name}"
             if not self._parameter_is_control_available(device_param):
                 return f"*-{raw_name}"
@@ -2662,133 +3221,121 @@ class Tap(ControlSurface):
 
     def _parameter_is_control_available(self, parameter):
         try:
-            if self._parameter_is_inactive_but_controllable(parameter):
+            if self._parameter_is_inactive(parameter):
                 return True
+            if (hasattr(parameter, 'state') and
+                    parameter.state == Live.DeviceParameter.ParameterState.disabled):
+                return False
             if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
                 return False
-            if self._device._is_operator():
-                normalized_name = re.sub(r'[^a-z0-9]+', '', str(getattr(parameter, 'name', '')).lower())
-                if normalized_name.startswith(('osca', 'oscb', 'oscc', 'oscd')) and 'feedb' in normalized_name:
-                    return self._device._operator_parameter_is_active(parameter)
         except Exception:
             pass
         return True
 
-    def _parameter_normalized_names(self, parameter):
-        names = []
-        for attribute in ('name', 'original_name'):
-            try:
-                value = re.sub(r'[^a-z0-9]+', '', str(getattr(parameter, attribute, '')).lower())
-                if value:
-                    names.append(value)
-            except Exception:
-                pass
-        return tuple(names)
-
-    def _parameter_matches_names(self, parameter, *names):
-        wanted = set(re.sub(r'[^a-z0-9]+', '', str(name).lower()) for name in names)
-        return any(name in wanted for name in self._parameter_normalized_names(parameter))
-
-    def _parameter_switch_is_on(self, parameter):
-        if not parameter:
-            return False
+    def _parameter_is_inactive(self, parameter):
         try:
-            display = str(parameter.str_for_value(parameter.value)).strip().lower()
-            if display in ('on', 'yes', 'true', 'linked'):
+            if self._delay_parameter_is_inactive(parameter):
                 return True
-            if display in ('off', 'no', 'false', 'unlinked'):
+            return (
+                hasattr(parameter, 'state') and
+                parameter.state == Live.DeviceParameter.ParameterState.irrelevant
+            )
+        except Exception:
+            return False
+
+    def _parameter_name_key(self, parameter):
+        names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
+        return tuple(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
+
+    def _parameter_switch_is_on(self, *names):
+        parameter = self._device._parameter_by_names(*names)
+        if parameter is None:
+            return False
+        display = self._parameter_display_value(parameter).strip().lower()
+        if display:
+            if display in ('on', 'yes', 'true', 'enabled', 'link'):
+                return True
+            if display in ('off', 'no', 'false', 'disabled', 'unlinked'):
                 return False
-        except Exception:
-            pass
         try:
-            return float(parameter.value) > (float(parameter.min) + float(parameter.max)) * 0.5
+            return float(parameter.value) > float(parameter.min)
         except Exception:
-            return bool(getattr(parameter, 'value', False))
+            return False
 
-    def _delay_parameter_is_logically_active(self, parameter):
-        if not self._device._is_delay():
+    def _delay_parameter_is_inactive(self, parameter):
+        if not hasattr(self, '_device') or not self._device._is_delay() or parameter is None:
+            return False
+
+        keys = set(self._parameter_name_key(parameter))
+        link_on = self._parameter_switch_is_on('Link', 'Stereo Time Link')
+        left_sync_on = self._parameter_switch_is_on('L Sync', 'L Delay Sync')
+        right_sync_on = self._parameter_switch_is_on('R Sync', 'R Delay Sync')
+
+        if keys & {'rsync', 'rdelaysync'} and link_on:
             return True
-
-        link_on = self._parameter_switch_is_on(
-            self._device._parameter_by_names('Link', 'Stereo Time Link')
-        )
-        left_sync_on = self._parameter_switch_is_on(
-            self._device._parameter_by_names('L Sync', 'L Delay Sync')
-        )
-        right_sync_on = left_sync_on if link_on else self._parameter_switch_is_on(
-            self._device._parameter_by_names('R Sync', 'R Delay Sync')
-        )
-
-        if self._parameter_matches_names(parameter, 'R Sync', 'R Delay Sync'):
-            return not link_on
-        if self._parameter_matches_names(parameter, 'L Time', 'L Delay Time'):
-            return not left_sync_on
-        if self._parameter_matches_names(parameter, 'L 16th', 'L Delay 16th'):
+        if keys & {'ltime', 'ldelaytime'}:
             return left_sync_on
-        if self._parameter_matches_names(parameter, 'R Time', 'R Delay Time'):
-            return not link_on and not right_sync_on
-        if self._parameter_matches_names(parameter, 'R 16th', 'R Delay 16th'):
-            return not link_on and right_sync_on
+        if keys & {'rtime', 'rdelaytime'}:
+            return link_on or right_sync_on
+        if keys & {'l16th', 'ldelay16th'}:
+            return not left_sync_on
+        if keys & {'r16th', 'rdelay16th'}:
+            return link_on or not right_sync_on
 
-        lfo_mode = self._device._parameter_by_names(
+        lfo_targets = {
+            'freq': {'lfofreq', 'modlfofreq', 'modulationfrequency', 'lforate'},
+            'time': {'lfotime', 'modlfotime', 'modulationtime'},
+            'synced': {'lfosynced', 'lfosync', 'modlfosynced', 'modulationsyncedrate', 'lfosyncedrate'},
+            '16th': {'lfo16th', 'modlfo16th', 'modulation16th'},
+        }
+        target = next((kind for kind, names in lfo_targets.items() if keys & names), None)
+        if target is None:
+            return False
+
+        mode_parameter = self._device._parameter_by_names(
             'LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'
         )
-        try:
-            lfo_mode_name = re.sub(
-                r'[^a-z0-9]+', '',
-                str(lfo_mode.str_for_value(lfo_mode.value)).strip().lower()
-            ) if lfo_mode else ''
-        except Exception:
-            lfo_mode_name = ''
+        mode = self._parameter_display_value(mode_parameter).strip().lower()
+        if '16' in mode:
+            active = '16th'
+        elif 'sync' in mode or 'note' in mode or 'beat' in mode:
+            active = 'synced'
+        elif 'time' in mode or 'ms' in mode:
+            active = 'time'
+        elif 'freq' in mode or 'hz' in mode:
+            active = 'freq'
+        else:
+            # Delay's mode enum is ordered Freq, Time, Sync, 16th.  Keep an
+            # unknown/future label conservative instead of hiding everything.
+            try:
+                active = ('freq', 'time', 'synced', '16th')[int(round(mode_parameter.value))]
+            except Exception:
+                return False
+        return target != active
 
-        # If Live exposes an unfamiliar mode, leave these controls available
-        # and let DeviceParameter.is_enabled/state provide the fallback.
-        if lfo_mode_name:
-            if self._parameter_matches_names(
-                    parameter, 'LFO Freq', 'Mod LFO Freq', 'Modulation Frequency', 'LFO Rate'):
-                return lfo_mode_name in ('rate', 'freq', 'frequency')
-            if self._parameter_matches_names(parameter, 'LFO Time', 'Mod LFO Time', 'Modulation Time'):
-                return lfo_mode_name == 'time'
-            if self._parameter_matches_names(
-                    parameter, 'LFO Synced', 'LFO Sync', 'Mod LFO Synced',
-                    'Modulation Synced Rate', 'LFO Synced Rate'):
-                return lfo_mode_name in ('sync', 'synced', 'dotted', 'triplet')
-            if self._parameter_matches_names(parameter, 'LFO 16th', 'Mod LFO 16th', 'Modulation 16th'):
-                return lfo_mode_name in ('16th', 'sixteenth')
-        return True
-
-    def _operator_feedback_is_inactive(self, parameter):
-        if not self._device._is_operator():
+    def _parameter_is_tap_virtual(self, parameter, selected_device=None):
+        if parameter is None or not hasattr(self, '_device'):
             return False
-        is_feedback = any(
-            feedback == parameter
-            for feedback in self._device._operator_feedback_parameters().values()
-        )
-        return is_feedback and not self._device._operator_parameter_is_active(parameter)
-
-    def _parameter_is_inactive_but_controllable(self, parameter):
+        if not (self._device._is_drift() or self._device._is_meld()):
+            return False
+        selected_device = selected_device or self._selected_device()
         try:
-            if self._operator_feedback_is_inactive(parameter):
-                return True
-            if self._device._is_delay():
-                physically_inactive = (
-                    (hasattr(parameter, 'is_enabled') and not parameter.is_enabled) or
-                    (hasattr(parameter, 'state') and
-                     parameter.state != Live.DeviceParameter.ParameterState.enabled)
-                )
-                return physically_inactive or not self._delay_parameter_is_logically_active(parameter)
+            return not any(native_parameter == parameter for native_parameter in selected_device.parameters)
         except Exception:
-            pass
-        return False
+            return False
 
     def _current_bank_parameter_for_control(self, selected_device, control_index):
         try:
             if not hasattr(self, '_device') or not liveobj_valid(self._device):
                 return None
+            if control_index < 0:
+                return None
 
             _, bank_parameters = self._device._current_bank_details()
             if bank_parameters and control_index < len(bank_parameters):
                 bank_param = bank_parameters[control_index]
+                if self._parameter_is_tap_virtual(bank_param, selected_device):
+                    return bank_param
                 if bank_param and liveobj_valid(bank_param):
                     if selected_device and hasattr(selected_device, 'parameters'):
                         if not any(device_param == bank_param for device_param in selected_device.parameters):
@@ -2806,6 +3353,8 @@ class Tap(ControlSurface):
             return None
 
     def _current_connected_parameter_for_control(self, control_index, selected_device=None):
+        if control_index < 0:
+            return None
         if self._track_device_is_selected():
             track_parameter = self._track_device_parameter_for_control(control_index)
             return track_parameter if track_parameter and liveobj_valid(track_parameter) else None
@@ -2818,18 +3367,20 @@ class Tap(ControlSurface):
                     return parameter
 
         selected_device = selected_device or self._selected_device()
-        bank_param = self._current_bank_parameter_for_control(selected_device, control_index)
-        if bank_param and liveobj_valid(bank_param):
-            return bank_param
-
+        # EncoderElement owns the authoritative mapping.  Reading it is
+        # constant-time; rebuilding a complete bank is only a fallback during
+        # the brief remapping window after a device or bank change.
         mapped_param = self._mapped_parameter_for_device_control(control_index)
         if mapped_param and selected_device and hasattr(selected_device, 'parameters'):
             try:
                 if not any(device_param == mapped_param for device_param in selected_device.parameters):
-                    return None
+                    mapped_param = None
             except Exception:
-                return None
-        return mapped_param
+                mapped_param = None
+        if mapped_param:
+            return mapped_param
+
+        return self._current_bank_parameter_for_control(selected_device, control_index)
 
     def _is_current_parameter_for_control(self, control_index, device_param):
         if not device_param or not liveobj_valid(device_param):
@@ -3211,6 +3762,245 @@ class Tap(ControlSurface):
             self._drum_pad_change_recheck_count = 0
             self._drum_pad_recheck_start = None
     
+    def _setup_granulator_bridge(self):
+        if self._granulator_bridge_socket is not None:
+            return
+        bridge_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            bridge_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bridge_socket.bind(('127.0.0.1', 22117))
+            bridge_socket.setblocking(False)
+            self._granulator_bridge_socket = bridge_socket
+        except Exception as error:
+            self._debug_log('Granulator bridge unavailable: {}'.format(str(error)))
+            try:
+                bridge_socket.close()
+            except Exception:
+                pass
+
+    def _start_granulator_bridge_timer(self):
+        if self._granulator_bridge_timer is None or not self._granulator_bridge_timer.is_alive():
+            self._granulator_bridge_tick()
+
+    def _granulator_bridge_tick(self):
+        if self.periodic_timer != 1:
+            return
+        self._poll_granulator_bridge()
+        self._send_granulator_state()
+        self._send_granulator_grains()
+        self._granulator_bridge_timer = threading.Timer(0.08, self._granulator_bridge_tick)
+        self._granulator_bridge_timer.daemon = True
+        self._granulator_bridge_timer.start()
+
+    def _poll_granulator_bridge(self):
+        bridge_socket = self._granulator_bridge_socket
+        if bridge_socket is None:
+            return
+        self._refresh_granulator_instance()
+        for _ in range(64):
+            try:
+                payload, _ = bridge_socket.recvfrom(8192)
+            except (BlockingIOError, socket.timeout):
+                break
+            except Exception as error:
+                self._debug_log('Granulator bridge receive failed: {}'.format(str(error)))
+                break
+            try:
+                message = json.loads(payload.decode('utf-8'))
+            except Exception:
+                continue
+            try:
+                instance = int(message.get('instance'))
+            except Exception:
+                continue
+            bridge_state = self._granulator_bridge_states.setdefault(
+                instance,
+                {'path': '', 'name': '', 'length': 0.0, 'grains': ()},
+            )
+            kind = message.get('kind')
+            if kind == 'sample':
+                file_path = str(message.get('path') or '')
+                bridge_state['path'] = file_path
+                bridge_state['name'] = os.path.basename(file_path)
+            elif kind == 'info':
+                if 'name' in message:
+                    bridge_state['name'] = str(message.get('name') or '')
+                if 'length' in message:
+                    try:
+                        bridge_state['length'] = max(0.0, float(message.get('length') or 0.0))
+                    except Exception:
+                        bridge_state['length'] = 0.0
+            elif kind == 'grains':
+                points = []
+                for point in message.get('points') or ():
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    try:
+                        position = max(0.0, min(1.0, float(point[0])))
+                        amplitude = max(0.0, min(1.0, float(point[1])))
+                    except Exception:
+                        continue
+                    points.append((position, amplitude))
+                    if len(points) >= 24:
+                        break
+                bridge_state['grains'] = tuple(points)
+            if instance == self._granulator_instance:
+                self._apply_granulator_bridge_state(bridge_state)
+
+    def _apply_granulator_bridge_state(self, bridge_state):
+        file_path = str(bridge_state.get('path') or '')
+        path_changed = file_path != self._granulator_sample_path
+        self._granulator_sample_path = file_path
+        self._granulator_sample_name = str(bridge_state.get('name') or os.path.basename(file_path))
+        self._granulator_sample_length = max(0.0, float(bridge_state.get('length') or 0.0))
+        self._granulator_grains = tuple(bridge_state.get('grains') or ())
+        if path_changed:
+            self._granulator_waveform_generation += 1
+            self._send_granulator_waveform_clear()
+            self._request_granulator_waveform()
+        self._send_granulator_state()
+
+    def _refresh_granulator_instance(self):
+        if not self._granulator_device:
+            self._granulator_instance = None
+            return
+        marker = self._granulator_parameter('Tap Bridge')
+        try:
+            instance = int(round(float(marker.value))) if marker else None
+        except Exception:
+            instance = None
+        if not instance or instance == self._granulator_instance:
+            return
+        self._granulator_instance = instance
+        self._granulator_last_grain_signature = None
+        bridge_state = self._granulator_bridge_states.get(instance)
+        if bridge_state:
+            self._apply_granulator_bridge_state(bridge_state)
+
+    def _is_granulator_device(self, device):
+        if not device or not liveobj_valid(device):
+            return False
+        names = set(
+            re.sub(r'[^a-z0-9]+', '', str(getattr(parameter, 'name', '')).lower())
+            for parameter in getattr(device, 'parameters', ())
+        )
+        return {'grainmode', 'position', 'scan', 'grainsize', 'shape', 'variation', 'tapbridge'}.issubset(names)
+
+    def _set_granulator_device(self, device):
+        granulator = device if self._is_granulator_device(device) else None
+        changed = granulator != self._granulator_device
+        self._granulator_device = granulator
+        if changed:
+            self._granulator_instance = None
+            self._granulator_sample_path = ''
+            self._granulator_sample_name = ''
+            self._granulator_sample_length = 0.0
+            self._granulator_grains = ()
+            self._granulator_last_grain_signature = None
+            self._granulator_last_state = None
+            self._granulator_waveform_generation += 1
+            self._send_granulator_waveform_clear()
+            self._refresh_granulator_instance()
+            self._send_granulator_state(force=True)
+            self._send_granulator_grains(force=True)
+            if granulator:
+                self._request_granulator_waveform()
+
+    def _granulator_parameter(self, *names):
+        device_component = getattr(self, '_device', None)
+        if not device_component or not self._granulator_device:
+            return None
+        try:
+            return device_component._parameter_by_names(*names)
+        except Exception:
+            return None
+
+    def _send_granulator_state(self, force=False):
+        active = bool(self._granulator_device and liveobj_valid(self._granulator_device))
+        has_sample = bool(self._granulator_sample_path or self._granulator_sample_name) if active else False
+        position = self._parameter_normalized_value(self._granulator_parameter('Position')) if active else 0.0
+        scan = self._parameter_normalized_value(self._granulator_parameter('Scan')) if active else 0.0
+        grain_size = self._parameter_normalized_value(self._granulator_parameter('Grain Size')) if active else 0.0
+        scan_distance = self._parameter_normalized_value(self._granulator_parameter('Scan Distance')) if active else 0.0
+        loop = self._parameter_normalized_value(self._granulator_parameter('Loop')) >= 0.5 if active else False
+        name = self._granulator_sample_name.encode('utf-8', errors='ignore').hex() if active else ''
+        state = '{}|{}|{:.5f}|{:.5f}|{:.5f}|{:.5f}|{}|{:.2f}|{}'.format(
+            1 if active else 0,
+            1 if has_sample else 0,
+            position,
+            scan,
+            grain_size,
+            scan_distance,
+            1 if loop else 0,
+            self._granulator_sample_length if active else 0.0,
+            name,
+        )
+        if not force and state == self._granulator_last_state:
+            return
+        self._granulator_last_state = state
+        self._send_sys_ex_message(state, 0x47)
+
+    def _send_granulator_grains(self, force=False):
+        points = self._granulator_grains if self._granulator_device else ()
+        signature = tuple(
+            (int(round(position * 16383.0)), int(round(amplitude * 127.0)))
+            for position, amplitude in points
+        )
+        if not force and signature == self._granulator_last_grain_signature:
+            return
+        self._granulator_last_grain_signature = signature
+        encoded = ''.join('{:04x}{:02x}'.format(position, amplitude) for position, amplitude in signature)
+        self._send_sys_ex_message(encoded, 0x49)
+
+    def _send_granulator_waveform_clear(self):
+        self._send_sys_ex_message('{}|'.format(self._granulator_waveform_generation & 0x7F), 0x48)
+
+    def _send_granulator_waveform(self, generation, peaks):
+        if generation != self._granulator_waveform_generation or not self._granulator_device:
+            return
+        peaks = list(peaks)
+        target_count = min(112, len(peaks))
+        if len(peaks) > target_count:
+            reduced = []
+            for point_index in range(target_count):
+                start = int(float(point_index) * len(peaks) / target_count)
+                end = max(start + 1, int(float(point_index + 1) * len(peaks) / target_count))
+                reduced.append(max(peaks[start:end]))
+            peaks = reduced
+        else:
+            peaks = peaks[:target_count]
+        encoded = ''.join('{:02x}'.format(max(0, min(127, int(peak)))) for peak in peaks)
+        self._send_sys_ex_message('{}|{}'.format(generation & 0x7F, encoded), 0x48)
+
+    def _request_granulator_waveform(self):
+        file_path = self._granulator_sample_path
+        if not self._granulator_device or not file_path or not os.path.isfile(file_path):
+            return
+        generation = self._granulator_waveform_generation
+        cached = self._simpler_waveform_cache.get(file_path)
+        if cached:
+            self._send_granulator_waveform(generation, cached)
+            return
+        pending_key = (generation, file_path)
+        if pending_key in self._granulator_waveform_pending:
+            return
+        self._granulator_waveform_pending.add(pending_key)
+        worker = threading.Thread(
+            target=self._build_granulator_waveform,
+            args=(generation, file_path),
+            name='TapGranulatorWaveform',
+        )
+        worker.daemon = True
+        worker.start()
+
+    def _build_granulator_waveform(self, generation, file_path):
+        pending_key = (generation, file_path)
+        peaks = self._decode_audio_waveform(file_path, 'tap-granulator-')
+        if peaks:
+            self._cache_simpler_waveform(file_path, peaks)
+            self._send_granulator_waveform(generation, peaks)
+        self._granulator_waveform_pending.discard(pending_key)
+
     def _is_simpler_device(self, device):
         if not liveobj_valid(device):
             return False
@@ -3910,51 +4700,52 @@ class Tap(ControlSurface):
             oldest = self._simpler_waveform_cache_order.pop(0)
             self._simpler_waveform_cache.pop(oldest, None)
 
+    def _decode_audio_waveform(self, file_path, temp_prefix):
+        temp_directory = tempfile.mkdtemp(prefix=temp_prefix)
+        converted_path = os.path.join(temp_directory, 'waveform.wav')
+        peaks = []
+        try:
+            subprocess.run(
+                ['/usr/bin/afconvert', '-f', 'WAVE', '-d', 'LEI16@4000', '-c', '1', file_path, converted_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=120,
+            )
+            with wave.open(converted_path, 'rb') as audio_file:
+                frame_count = audio_file.getnframes()
+                point_count = max(1, min(512, frame_count))
+                for point_index in range(point_count):
+                    end_frame = int(round(float(point_index + 1) * frame_count / point_count))
+                    frames_to_read = max(1, end_frame - audio_file.tell())
+                    frame_data = audio_file.readframes(frames_to_read)
+                    if not frame_data:
+                        peaks.append(0)
+                    elif audioop is not None:
+                        peaks.append(audioop.max(frame_data, 2))
+                    else:
+                        maximum = 0
+                        for byte_index in range(0, len(frame_data) - 1, 2):
+                            value = int.from_bytes(frame_data[byte_index:byte_index + 2], 'little', signed=True)
+                            maximum = max(maximum, abs(value))
+                        peaks.append(maximum)
+            maximum_peak = max(peaks) if peaks else 0
+            if maximum_peak > 0:
+                return [max(0, min(127, int(round(float(value) * 127.0 / maximum_peak)))) for value in peaks]
+            return [0 for _ in peaks]
+        except Exception as error:
+            self._debug_log('Waveform decode failed for {}: {}'.format(file_path, str(error)))
+            return self._simpler_waveform_from_asd(file_path)
+        finally:
+            shutil.rmtree(temp_directory, ignore_errors=True)
+
     def _build_simpler_waveform(self, generation, file_path):
         pending_key = (generation, file_path)
         with self._simpler_waveform_lock:
             if generation != self._simpler_waveform_generation:
                 self._simpler_waveform_pending.discard(pending_key)
                 return
-            temp_directory = tempfile.mkdtemp(prefix='tap-simpler-')
-            converted_path = os.path.join(temp_directory, 'waveform.wav')
-            peaks = []
-            try:
-                subprocess.run(
-                    ['/usr/bin/afconvert', '-f', 'WAVE', '-d', 'LEI16@4000', '-c', '1', file_path, converted_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                    timeout=120,
-                )
-                with wave.open(converted_path, 'rb') as audio_file:
-                    frame_count = audio_file.getnframes()
-                    point_count = max(1, min(512, frame_count))
-                    for point_index in range(point_count):
-                        end_frame = int(round(float(point_index + 1) * frame_count / point_count))
-                        frames_to_read = max(1, end_frame - audio_file.tell())
-                        frame_data = audio_file.readframes(frames_to_read)
-                        if not frame_data:
-                            peaks.append(0)
-                        elif audioop is not None:
-                            peaks.append(audioop.max(frame_data, 2))
-                        else:
-                            maximum = 0
-                            for byte_index in range(0, len(frame_data) - 1, 2):
-                                value = int.from_bytes(frame_data[byte_index:byte_index + 2], 'little', signed=True)
-                                maximum = max(maximum, abs(value))
-                            peaks.append(maximum)
-                maximum_peak = max(peaks) if peaks else 0
-                if maximum_peak > 0:
-                    peaks = [max(0, min(127, int(round(float(value) * 127.0 / maximum_peak)))) for value in peaks]
-                else:
-                    peaks = [0 for _ in peaks]
-            except Exception as error:
-                self._debug_log('Simpler waveform decode failed for {}: {}'.format(file_path, str(error)))
-                peaks = self._simpler_waveform_from_asd(file_path)
-            finally:
-                shutil.rmtree(temp_directory, ignore_errors=True)
-
+            peaks = self._decode_audio_waveform(file_path, 'tap-simpler-')
             if not peaks or generation != self._simpler_waveform_generation:
                 self._simpler_waveform_pending.discard(pending_key)
                 return
@@ -4055,7 +4846,8 @@ class Tap(ControlSurface):
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
         self._remove_wavetable_virtual_property_listeners()
-        self._remove_operator_virtual_bank_listeners()
+        self._remove_dynamic_parameter_state_listeners()
+        self._remove_meld_engine_listener()
         if liveobj_valid(self._device):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
@@ -4064,6 +4856,13 @@ class Tap(ControlSurface):
                 selected_device = selected_track.view.selected_device
             track_device_selected = self._track_device_is_selected()
             self._set_simpler_device(None if track_device_selected else selected_device)
+            self._set_granulator_device(None if track_device_selected else selected_device)
+            if track_device_selected:
+                self._setup_meld_engine_listener(None)
+                self._send_sys_ex_message('', 0x4A)
+            else:
+                self._setup_meld_engine_listener(selected_device)
+                self._send_meld_engine_state(selected_device)
 
             # Send the light bank update before listener and metadata work.
             track_has_drums = 0
@@ -4151,8 +4950,7 @@ class Tap(ControlSurface):
                 self._send_simpler_virtual_feedback_all()
                 return
 
-            if self._device._is_operator() or self._device._is_delay():
-                self._setup_operator_virtual_bank_listeners()
+            self._setup_dynamic_parameter_state_listeners()
 
             self._remove_parameter_value_listeners()
             self._remove_parameter_name_listeners()
@@ -4934,15 +5732,11 @@ class Tap(ControlSurface):
 
     def _create_disabled_param_listener(self, device_param, control_index):
         def listener():
-            if not self._is_current_parameter_for_control(control_index, device_param):
-                return
             self._send_parameter_feedback(control_index, device_param, force_display=True)
         return listener
 
     def _create_parameter_value_listener(self, device_param, control_index):
         def listener():
-            if not self._is_current_parameter_for_control(control_index, device_param):
-                return
             self._send_parameter_feedback(control_index, device_param, throttle_display=True)
             if self._drumcell_dynamic_parameter(device_param):
                 self._schedule_active_bank_parameter_refresh()
@@ -4980,6 +5774,7 @@ class Tap(ControlSurface):
             return
 
         try:
+            self._device.invalidate_parameter_bank_cache()
             if hasattr(self._device, 'update'):
                 self._device.update()
             self._connect_device_controls()
@@ -5433,6 +6228,8 @@ class Tap(ControlSurface):
         self._evaluate_mutator_regeneration()
         if not self.was_initialized:
             return
+        self._poll_granulator_bridge()
+        self._send_granulator_state()
         self._send_group_fold_states_if_changed()
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
@@ -15285,10 +16082,22 @@ class Tap(ControlSurface):
     def disconnect(self):
         # Cancel all pending timers
         self._simpler_waveform_generation += 1
+        self._granulator_waveform_generation += 1
         self._remove_simpler_listeners()
         self._disconnect_simpler_decorator()
         self._simpler_device = None
         self._simpler_sample = None
+        self._granulator_device = None
+        self._remove_meld_engine_listener()
+        if self._granulator_bridge_timer:
+            self._granulator_bridge_timer.cancel()
+            self._granulator_bridge_timer = None
+        if self._granulator_bridge_socket:
+            try:
+                self._granulator_bridge_socket.close()
+            except Exception:
+                pass
+            self._granulator_bridge_socket = None
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
             self._metadata_recheck_timer = None
@@ -15335,7 +16144,7 @@ class Tap(ControlSurface):
         self._remove_parameter_name_listeners()
         self._remove_parameter_source_listener()
         self._remove_wavetable_virtual_property_listeners()
-        self._remove_operator_virtual_bank_listeners()
+        self._remove_dynamic_parameter_state_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
         self._remove_mixer_automation_state_listeners()
