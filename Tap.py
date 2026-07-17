@@ -755,15 +755,16 @@ class TapDeviceComponent(DeviceComponent):
         if not parameter:
             return ''
         try:
+            return str(parameter.str_for_value(parameter.value)).strip()
+        except Exception:
+            pass
+        try:
             display_value = parameter.display_value
             if display_value is not None:
                 return str(display_value).strip()
         except Exception:
             pass
-        try:
-            return str(parameter.str_for_value(parameter.value)).strip()
-        except Exception:
-            return str(getattr(parameter, 'value', '')).strip()
+        return str(getattr(parameter, 'value', '')).strip()
 
     def _drumcell_sample_parameters(self):
         env_mode = self._parameter_by_names('Env Mode')
@@ -1865,6 +1866,8 @@ class Tap(ControlSurface):
                     remap=normalized_bank_name == 'envelope2'
                 )
                 add_parameter_listener(self._device._parameter_by_names('Cyc Env Time Mode', 'Cyc Mode'), 'value')
+            elif normalized_bank_name == 'global':
+                add_parameter_listener(self._device._parameter_by_names('Voice Mode'), 'value')
             return
 
         if self._device._is_meld():
@@ -1945,14 +1948,14 @@ class Tap(ControlSurface):
 
     def _parameter_display_value(self, device_param):
         try:
-            display_value = device_param.display_value
-            if display_value is not None:
-                return self._format_display_value_numbers(str(display_value).replace('∞', 'Inf'))
+            if device_param and hasattr(device_param, 'str_for_value') and hasattr(device_param, 'value'):
+                return self._format_display_value_numbers(device_param.str_for_value(device_param.value).replace('∞', 'Inf'))
         except Exception:
             pass
         try:
-            if device_param and hasattr(device_param, 'str_for_value') and hasattr(device_param, 'value'):
-                return self._format_display_value_numbers(device_param.str_for_value(device_param.value).replace('∞', 'Inf'))
+            display_value = device_param.display_value
+            if display_value is not None:
+                return self._format_display_value_numbers(str(display_value).replace('∞', 'Inf'))
         except Exception:
             pass
         try:
@@ -1961,6 +1964,12 @@ class Tap(ControlSurface):
             return ""
 
     def _parameter_value_items(self, device_param):
+        if not getattr(device_param, 'is_quantized', False):
+            try:
+                if not self._parameter_is_tap_virtual(device_param):
+                    return ()
+            except Exception:
+                return ()
         try:
             return tuple(str(item) for item in device_param.value_items)
         except Exception:
@@ -3119,7 +3128,7 @@ class Tap(ControlSurface):
 
         parameter_value_items = self._parameter_value_items(parameter)
         value_items = ';'.join(self._escape_sysex_string(item) for item in parameter_value_items)
-        if parameter_value_items:
+        if parameter_value_items and self._parameter_is_tap_virtual(parameter):
             min_val_str = parameter_value_items[0]
             max_val_str = parameter_value_items[-1]
             default_index = int(round(max(0.0, min(1.0, float(raw_default_value))) * (len(parameter_value_items) - 1)))
@@ -3298,6 +3307,8 @@ class Tap(ControlSurface):
         try:
             if self._delay_parameter_is_inactive(parameter):
                 return True
+            if self._drift_parameter_is_inactive(parameter):
+                return True
             return (
                 hasattr(parameter, 'state') and
                 parameter.state == Live.DeviceParameter.ParameterState.irrelevant
@@ -3321,6 +3332,36 @@ class Tap(ControlSurface):
                 return False
         try:
             return float(parameter.value) > float(parameter.min)
+        except Exception:
+            return False
+
+    def _drift_parameter_is_inactive(self, parameter):
+        if not hasattr(self, '_device') or not self._device._is_drift() or parameter is None:
+            return False
+
+        keys = set(self._parameter_name_key(parameter))
+        target_mode = None
+        if 'thickness' in keys:
+            target_mode = 'mono'
+        elif 'strength' in keys:
+            target_mode = 'unison'
+        elif 'spread' in keys:
+            target_mode = 'stereo'
+        if target_mode is None:
+            return False
+
+        mode_parameter = self._device._parameter_by_names('Voice Mode')
+        mode = self._parameter_display_value(mode_parameter).strip().lower()
+        for candidate in ('poly', 'mono', 'stereo', 'unison'):
+            if candidate in mode:
+                return candidate != target_mode
+
+        # Drift's public voice_mode_list is ordered Poly, Mono, Stereo,
+        # Unison.  This fallback keeps relevance correct if a future Live
+        # wrapper temporarily exposes only the numeric enum index.
+        try:
+            mode = ('poly', 'mono', 'stereo', 'unison')[int(round(mode_parameter.value))]
+            return mode != target_mode
         except Exception:
             return False
 
@@ -3533,7 +3574,7 @@ class Tap(ControlSurface):
                     
                     parameter_value_items = self._parameter_value_items(device_param)
                     value_items = ';'.join(self._escape_sysex_string(item) for item in parameter_value_items)
-                    if parameter_value_items:
+                    if parameter_value_items and self._parameter_is_tap_virtual(device_param, selected_device):
                         min_val_str = parameter_value_items[0]
                         max_val_str = parameter_value_items[-1]
                         default_index = int(round(max(0.0, min(1.0, float(raw_default_value))) * (len(parameter_value_items) - 1)))
