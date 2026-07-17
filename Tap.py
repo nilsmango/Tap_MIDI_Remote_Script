@@ -76,7 +76,8 @@ class TapDeviceComponent(DeviceComponent):
     WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
     SIMPLER_MAIN_BANK_NAME = "Main"
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
-    SIMPLER_WARP_BANK_NAME = "Warp"
+    SIMPLER_WARP_BANK_NAME = "Options"
+    SIMPLER_BROWSE_BANK_NAME = "Browse Samples"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
@@ -123,6 +124,8 @@ class TapDeviceComponent(DeviceComponent):
         self._drift_base_decorator = None
         self._meld_decorator = None
         self._meld_decorator_device = None
+        self._simpler_bank_decorator = None
+        self._simpler_bank_decorator_device = None
 
     def invalidate_parameter_bank_cache(self):
         self._operator_parameter_bank_cache = None
@@ -132,6 +135,7 @@ class TapDeviceComponent(DeviceComponent):
         if device != getattr(self, '_device', None):
             self._disconnect_drift_decorator()
             self._disconnect_meld_decorator()
+            self._disconnect_simpler_bank_decorator()
         self.invalidate_parameter_bank_cache()
         self._use_safe_parameter_banks = False
         try:
@@ -155,6 +159,7 @@ class TapDeviceComponent(DeviceComponent):
     def disconnect(self):
         self._disconnect_drift_decorator()
         self._disconnect_meld_decorator()
+        self._disconnect_simpler_bank_decorator()
         DeviceComponent.disconnect(self)
 
     def update(self):
@@ -318,8 +323,36 @@ class TapDeviceComponent(DeviceComponent):
             except Exception:
                 pass
 
+    def _disconnect_simpler_bank_decorator(self):
+        decorator = self._simpler_bank_decorator
+        self._simpler_bank_decorator = None
+        self._simpler_bank_decorator_device = None
+        if decorator:
+            try:
+                decorator.disconnect()
+            except Exception:
+                pass
+
     def _decorated_parameters(self):
         device = getattr(self, '_device', None)
+        if self._is_simpler() and SimplerDeviceDecorator is not None:
+            if self._simpler_bank_decorator is None or self._simpler_bank_decorator_device != device:
+                self._disconnect_simpler_bank_decorator()
+                try:
+                    self._simpler_bank_decorator = SimplerDeviceDecorator(
+                        live_object=device, additional_properties={}
+                    )
+                    self._simpler_bank_decorator_device = device
+                except Exception:
+                    self._simpler_bank_decorator = None
+            if self._simpler_bank_decorator:
+                decorated = list(self._simpler_bank_decorator.parameters)
+                decorated_ids = set(id(parameter) for parameter in decorated)
+                decorated.extend(
+                    parameter for parameter in getattr(device, 'parameters', ())
+                    if id(parameter) not in decorated_ids
+                )
+                return tuple(decorated)
         if self._is_drift() and DriftDeviceDecorator is not None:
             if self._drift_decorator is None or self._drift_decorator_device != device:
                 self._disconnect_drift_decorator()
@@ -426,6 +459,7 @@ class TapDeviceComponent(DeviceComponent):
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
             self._configure_simpler_warp_bank_names(names)
             names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
+            names.append(self.SIMPLER_BROWSE_BANK_NAME)
         elif self._is_analog():
             names = self._analog_bank_names(names)
         elif self._is_drumcell():
@@ -480,6 +514,7 @@ class TapDeviceComponent(DeviceComponent):
             self._replace_simpler_lfo_bank(banks, names)
             self._configure_simpler_warp_bank(banks, names)
             banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+            banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_analog():
             banks = self._analog_parameter_banks(banks, names)
         elif self._is_drumcell():
@@ -553,29 +588,35 @@ class TapDeviceComponent(DeviceComponent):
     def _simpler_warp_parameters(self):
         mode = self._simpler_warp_mode_name()
         mode_parameters = {
-            'beats': ('Preserve', 'Loop Mode', 'Envelope'),
+            'beats': ('Preserve', 'Envelope'),
             'tones': ('Grain Size Tones',),
             'texture': ('Grain Size Texture', 'Flux'),
             'complexpro': ('Formants', 'Envelope Complex Pro'),
         }.get(mode, ())
-        return self._parameter_bank(None, 'Warp Mode', *mode_parameters)
+        return self._parameter_bank(
+            None, 'Warp Mode', *mode_parameters,
+            'Filter Type', 'Filter Slope', 'Filter Circuit - LP/HP', 'Filter Drive',
+        )
 
     def _configure_simpler_warp_bank_names(self, bank_names):
-        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME)
+        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME, 'Warp')
         if self._simpler_is_warped():
             if index is None:
                 bank_names.insert(min(1, len(bank_names)), self.SIMPLER_WARP_BANK_NAME)
+            else:
+                bank_names[index] = self.SIMPLER_WARP_BANK_NAME
         elif index is not None:
             bank_names.pop(index)
 
     def _configure_simpler_warp_bank(self, banks, bank_names):
-        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME)
+        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME, 'Warp')
         if self._simpler_is_warped():
             if index is None:
                 index = min(1, len(banks))
                 bank_names.insert(index, self.SIMPLER_WARP_BANK_NAME)
                 banks.insert(index, self._simpler_warp_parameters())
             elif index < len(banks):
+                bank_names[index] = self.SIMPLER_WARP_BANK_NAME
                 banks[index] = self._simpler_warp_parameters()
         elif index is not None:
             bank_names.pop(index)
@@ -610,11 +651,11 @@ class TapDeviceComponent(DeviceComponent):
         custom = [
             self._parameter_bank(
                 'OSC1 Level', 'OSC1 Octave', 'OSC1 Semi', 'OSC1 Detune',
-                'OSC1 Shape', 'PEG1 Amount', 'PEG1 Time', None,
+                'OSC1 Shape', 'PEG1 Amount', 'PEG1 Time', 'Volume',
             ),
             self._parameter_bank(
                 'OSC2 Level', 'OSC2 Octave', 'OSC2 Semi', 'OSC2 Detune',
-                'OSC2 Shape', 'PEG2 Amount', 'PEG2 Time', None,
+                'OSC2 Shape', 'PEG2 Amount', 'PEG2 Time', 'Volume',
             ),
             self._parameter_bank(
                 'Noise On/Off', 'Noise Level', 'Noise Balance', 'Noise Color',
@@ -1300,6 +1341,8 @@ class TapDeviceComponent(DeviceComponent):
             return 'simpler_actions'
         if name == self.SIMPLER_WARP_BANK_NAME and self._is_simpler():
             return 'simpler_warp'
+        if name == self.SIMPLER_BROWSE_BANK_NAME and self._is_simpler():
+            return 'simpler_browse'
         if self._is_drumcell():
             if name == self.DRUMCELL_SAMPLE_BANK_NAME:
                 return 'drumcell_sample'
@@ -2057,7 +2100,7 @@ class Tap(ControlSurface):
             normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
             if normalized_bank_name == 'lfo':
                 add_parameter_listener(self._device._parameter_by_names('L Sync'), 'value', remap=True)
-            elif normalized_bank_name == 'warp':
+            elif normalized_bank_name in ('warp', 'options'):
                 add_parameter_listener(self._device._parameter_by_names('Warp Mode'), 'value', remap=True)
             return
 
@@ -3652,7 +3695,7 @@ class Tap(ControlSurface):
     def _parameter_is_tap_virtual(self, parameter, selected_device=None):
         if parameter is None or not hasattr(self, '_device'):
             return False
-        if not (self._device._is_drift() or self._device._is_meld()):
+        if not (self._device._is_drift() or self._device._is_meld() or self._device._is_simpler()):
             return False
         selected_device = selected_device or self._selected_device()
         try:
@@ -3730,6 +3773,8 @@ class Tap(ControlSurface):
             return self._simpler_action_metadata()
         if self._simpler_warp_active():
             return self._simpler_warp_metadata()
+        if self._simpler_browse_active():
+            return self._simpler_browse_metadata()
         if self._simpler_main_active():
             return self._simpler_virtual_metadata()
         virtual_metadata = self._wavetable_virtual_metadata()
@@ -4586,6 +4631,12 @@ class Tap(ControlSurface):
             self._tap_active_custom_kind(self._simpler_device) == 'simpler_warp'
         )
 
+    def _simpler_browse_active(self):
+        return bool(
+            self._simpler_device and
+            self._tap_active_custom_kind(self._simpler_device) == 'simpler_browse'
+        )
+
     def _simpler_parameter(self, name):
         decorator = getattr(self, '_simpler_decorator', None)
         candidates = []
@@ -4981,6 +5032,10 @@ class Tap(ControlSurface):
             else:
                 metadata.append(self._simpler_parameter_metadata_item(spec['name'], spec['parameter']))
         return ','.join(metadata)
+
+    def _simpler_browse_metadata(self):
+        browse = 'Browse Samples||||0.0||||0.0|browse_sample|0'
+        return ','.join([browse] + [self.UNMAPPED_PARAMETER_METADATA_ITEM] * 7)
 
     def _send_simpler_virtual_feedback(self, control_index):
         spec = self._simpler_virtual_spec(control_index)
