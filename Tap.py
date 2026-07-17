@@ -78,6 +78,7 @@ class TapDeviceComponent(DeviceComponent):
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
     SIMPLER_WARP_BANK_NAME = "Controls"
     SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
+    SIMPLER_CONTROLS_3_BANK_NAME = "Controls 3"
     SIMPLER_BROWSE_BANK_NAME = "Browse Samples"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
@@ -603,29 +604,41 @@ class TapDeviceComponent(DeviceComponent):
             'texture': ('Grain Size Texture', 'Flux'),
             'complexpro': ('Formants', 'Envelope Complex Pro'),
         }.get(mode, ())
-        parameters = [None, self._parameter_by_names('Warp Mode')]
+        parameters = [None]
         parameters.extend(self._parameter_by_names(name) for name in mode_parameters)
-        parameters.extend(self._simpler_filter_parameters()[:3])
+        parameters.extend(self._simpler_filter_parameters())
         parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
         return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
 
     def _simpler_controls_2_parameters(self):
-        filter_drive = self._simpler_filter_parameters()[3]
         return (
-            filter_drive,
             self._parameter_by_names('Transpose'),
             self._parameter_by_names('Detune'),
             self._parameter_by_names('Glide Mode', 'Glide', 'Glide On'),
             self._parameter_by_names('Glide Time'),
-            self._parameter_by_names('Pe < Env'),
             self._parameter_by_names('L R < Key'),
             self._parameter_by_names('L Retrig'),
+            None,
+            None,
+        )
+
+    def _simpler_controls_3_parameters(self):
+        return (
+            self._parameter_by_names('Pe < Env'),
+            self._parameter_by_names('Pe Attack'),
+            self._parameter_by_names('Pe Decay'),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
     def _simpler_control_bank_indices(self, bank_names):
         wanted = {
             self._normalized_bank_name(self.SIMPLER_WARP_BANK_NAME),
             self._normalized_bank_name(self.SIMPLER_CONTROLS_2_BANK_NAME),
+            self._normalized_bank_name(self.SIMPLER_CONTROLS_3_BANK_NAME),
             self._normalized_bank_name('Options'),
             self._normalized_bank_name('Warp'),
         }
@@ -641,6 +654,7 @@ class TapDeviceComponent(DeviceComponent):
             bank_names.pop(index)
         bank_names.insert(insertion_index, self.SIMPLER_WARP_BANK_NAME)
         bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
+        bank_names.insert(insertion_index + 2, self.SIMPLER_CONTROLS_3_BANK_NAME)
 
     def _configure_simpler_control_banks(self, banks, bank_names):
         indices = self._simpler_control_bank_indices(bank_names)
@@ -653,6 +667,8 @@ class TapDeviceComponent(DeviceComponent):
         banks.insert(insertion_index, self._simpler_control_parameters())
         bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
         banks.insert(insertion_index + 1, self._simpler_controls_2_parameters())
+        bank_names.insert(insertion_index + 2, self.SIMPLER_CONTROLS_3_BANK_NAME)
+        banks.insert(insertion_index + 2, self._simpler_controls_3_parameters())
 
     def _analog_bank_names(self, bank_names):
         names = list(bank_names)
@@ -3735,9 +3751,24 @@ class Tap(ControlSurface):
             return False
         selected_device = selected_device or self._selected_device()
         try:
-            return not any(native_parameter == parameter for native_parameter in selected_device.parameters)
+            native_parameters = tuple(selected_device.parameters)
+            if any(native_parameter is parameter for native_parameter in native_parameters):
+                return False
+            # Decorator parameters such as Simpler's Preserve/Loop Mode are
+            # Python wrappers.  Some of them compare equal to their host value,
+            # which previously fooled this check and sent an EnumWrappingParameter
+            # into Live's native MIDI mapper.  Only use proxy equality for real
+            # Live objects; wrapper parameters stay script-driven.
+            parameter_type = type(parameter)
+            is_native_live_parameter = (
+                getattr(parameter_type, '__name__', '') == 'DeviceParameter' or
+                str(getattr(parameter_type, '__module__', '')).startswith('Live.')
+            )
+            if is_native_live_parameter:
+                return not any(native_parameter == parameter for native_parameter in native_parameters)
+            return True
         except Exception:
-            return False
+            return True
 
     def _current_bank_parameter_for_control(self, selected_device, control_index):
         try:
@@ -4895,12 +4926,12 @@ class Tap(ControlSurface):
         specs = [
             toggle(toggle_name, 0, toggle_items, toggle_display, toggle_normalized),
             toggle('Warp', 1, ('Off', 'On'), 'On' if warp_enabled else 'Off', 1.0 if warp_enabled else 0.0),
-            button(':2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
-            button('*2', 3, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_double', False))),
-            button(reset_name, 4) if mode == 2 else warp_mode_spec,
+            button(':2', 2, bool(getattr(self._simpler_device, 'can_warp_half', False))) if warp_enabled else None,
+            button('*2', 3, bool(getattr(self._simpler_device, 'can_warp_double', False))) if warp_enabled else None,
+            button(reset_name, 4) if mode == 2 else (warp_mode_spec if warp_enabled else None),
             button('Split' if mode == 2 else 'Crop', 5),
             button('Reverse', 6),
-            warp_mode_spec if mode == 2 else snap_spec,
+            (warp_mode_spec if warp_enabled else None) if mode == 2 else snap_spec,
         ]
         return tuple(specs)
 
@@ -4989,8 +5020,7 @@ class Tap(ControlSurface):
     def _send_simpler_action_feedback_all(self):
         if self._simpler_actions_active() or self._simpler_warp_active():
             for control_index in range(8):
-                if self._simpler_action_spec(control_index):
-                    self._send_simpler_action_feedback(control_index)
+                self._send_simpler_action_feedback(control_index)
 
     def _set_simpler_parameter_display_item(self, parameter, display_item):
         if not parameter:
