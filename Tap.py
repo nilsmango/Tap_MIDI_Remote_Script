@@ -64,7 +64,7 @@ class TapDeviceComponent(DeviceComponent):
     DRUMCELL_REST_BANK_NAME = "Rest"
     DRUMCELL_FX_2_BANK_NAME = "FX 2"
     DRUMCELL_FX_3_BANK_NAME = "FX 3"
-    DELAY_BANK_NAMES = ("Main", "Time+Flt", "Flt+LFO", "LFO Wave")
+    DELAY_BANK_NAMES = ("Main", "Time / Flt", "Flt / LFO", "LFO Wave")
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
