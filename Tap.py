@@ -109,7 +109,9 @@ class TapDeviceComponent(DeviceComponent):
     ANALOG_OSC_2_BANK_NAME = "OSC 2"
     ANALOG_NOISE_BANK_NAME = "Noise"
     ANALOG_OSC_PLUS_BANK_NAME = "OSC +"
-    ANALOG_FILTER_PLUS_BANK_NAME = "Filter +"
+    ANALOG_MIX_LFO_BANK_NAME = "Mix / LFO"
+    ANALOG_LFO_PLUS_BANK_NAME = "LFO +"
+    ANALOG_LOOPS_FILTER_BANK_NAME = "Loops / Filter"
 
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
@@ -372,6 +374,13 @@ class TapDeviceComponent(DeviceComponent):
         except Exception:
             return False
 
+    def _simpler_is_warped(self):
+        try:
+            sample = self._device.sample
+            return liveobj_valid(sample) and bool(sample.warping)
+        except Exception:
+            return False
+
     def _custom_bank_insert_index(self, bank_names, anchor_name):
         anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
         for index, name in enumerate(bank_names):
@@ -404,14 +413,18 @@ class TapDeviceComponent(DeviceComponent):
             self._replace_wavetable_envelope_bank_names(names)
             index = self._wavetable_waves_insert_index(names)
             names.insert(index, self.WAVETABLE_OSC_BANK_NAME)
-        elif self._is_simpler() and names:
+        elif self._is_simpler():
             # Keep Live's native bank count and indices intact.  Tap's Push-like
             # page replaces bank zero in place instead of inserting a bank.
-            names[0] = self.SIMPLER_MAIN_BANK_NAME
+            if names:
+                names[0] = self.SIMPLER_MAIN_BANK_NAME
+            else:
+                names.append(self.SIMPLER_MAIN_BANK_NAME)
             if self._simpler_is_classic() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
             elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
                 names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
+            self._configure_simpler_warp_bank_names(names)
             names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
         elif self._is_analog():
             names = self._analog_bank_names(names)
@@ -456,14 +469,16 @@ class TapDeviceComponent(DeviceComponent):
             # Tap handles their MIDI mapping and feedback directly.
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-        elif self._is_simpler() and banks:
+        elif self._is_simpler():
+            if not banks:
+                banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
             if self._simpler_is_classic() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
             elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
                 banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
             self._replace_simpler_lfo_bank(banks, names)
-            self._replace_simpler_warp_bank(banks, names)
+            self._configure_simpler_warp_bank(banks, names)
             banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_analog():
             banks = self._analog_parameter_banks(banks, names)
@@ -545,10 +560,27 @@ class TapDeviceComponent(DeviceComponent):
         }.get(mode, ())
         return self._parameter_bank(None, 'Warp Mode', *mode_parameters)
 
-    def _replace_simpler_warp_bank(self, banks, bank_names):
+    def _configure_simpler_warp_bank_names(self, bank_names):
         index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME)
-        if index is not None and index < len(banks):
-            banks[index] = self._simpler_warp_parameters()
+        if self._simpler_is_warped():
+            if index is None:
+                bank_names.insert(min(1, len(bank_names)), self.SIMPLER_WARP_BANK_NAME)
+        elif index is not None:
+            bank_names.pop(index)
+
+    def _configure_simpler_warp_bank(self, banks, bank_names):
+        index = self._bank_index_named(bank_names, self.SIMPLER_WARP_BANK_NAME)
+        if self._simpler_is_warped():
+            if index is None:
+                index = min(1, len(banks))
+                bank_names.insert(index, self.SIMPLER_WARP_BANK_NAME)
+                banks.insert(index, self._simpler_warp_parameters())
+            elif index < len(banks):
+                banks[index] = self._simpler_warp_parameters()
+        elif index is not None:
+            bank_names.pop(index)
+            if index < len(banks):
+                banks.pop(index)
 
     def _analog_bank_names(self, bank_names):
         names = list(bank_names)
@@ -563,7 +595,13 @@ class TapDeviceComponent(DeviceComponent):
             names = custom + names
         else:
             names[oscillator_index:oscillator_index + 1] = custom
-        names.append(self.ANALOG_FILTER_PLUS_BANK_NAME)
+        mix_index = self._bank_index_named(names, 'Mix')
+        if mix_index is not None:
+            names[mix_index] = self.ANALOG_MIX_LFO_BANK_NAME
+            names.insert(mix_index + 1, self.ANALOG_LFO_PLUS_BANK_NAME)
+        else:
+            names.extend((self.ANALOG_MIX_LFO_BANK_NAME, self.ANALOG_LFO_PLUS_BANK_NAME))
+        names.append(self.ANALOG_LOOPS_FILTER_BANK_NAME)
         return tuple(names)
 
     def _analog_parameter_banks(self, banks, bank_names):
@@ -589,11 +627,45 @@ class TapDeviceComponent(DeviceComponent):
         ]
         if oscillator_index is None:
             result = custom + result
+            working_names = [
+                self.ANALOG_OSC_1_BANK_NAME, self.ANALOG_OSC_2_BANK_NAME,
+                self.ANALOG_NOISE_BANK_NAME, self.ANALOG_OSC_PLUS_BANK_NAME,
+            ] + list(bank_names)
         else:
             result[oscillator_index:oscillator_index + 1] = custom
+            working_names = list(bank_names)
+            working_names[oscillator_index:oscillator_index + 1] = [
+                self.ANALOG_OSC_1_BANK_NAME, self.ANALOG_OSC_2_BANK_NAME,
+                self.ANALOG_NOISE_BANK_NAME, self.ANALOG_OSC_PLUS_BANK_NAME,
+            ]
+
+        mix_index = self._bank_index_named(working_names, 'Mix')
+        mix_bank = self._parameter_bank(
+            'AMP1 Level', 'AMP1 Pan', 'AMP2 Level', 'AMP2 Pan',
+            'LFO1 Shape', 'LFO1 Speed', 'LFO1 SncRate', 'LFO1 Sync',
+        )
+        lfo_plus_bank = self._parameter_bank(
+            'LFO2 Shape', 'LFO2 Speed', 'LFO2 SncRate', 'LFO2 Sync',
+            'LFO1 On/Off', 'LFO2 On/Off', None, None,
+        )
+        if mix_index is None:
+            result.extend((mix_bank, lfo_plus_bank))
+            working_names.extend((self.ANALOG_MIX_LFO_BANK_NAME, self.ANALOG_LFO_PLUS_BANK_NAME))
+        else:
+            result[mix_index] = mix_bank
+            result.insert(mix_index + 1, lfo_plus_bank)
+            working_names[mix_index] = self.ANALOG_MIX_LFO_BANK_NAME
+            working_names.insert(mix_index + 1, self.ANALOG_LFO_PLUS_BANK_NAME)
+
+        output_index = self._bank_index_named(working_names, 'Output')
+        if output_index is not None and output_index < len(result):
+            result[output_index] = self._parameter_bank(
+                'Volume', 'Glide On/Off', 'Glide Time', 'Glide Legato',
+                'Unison On/Off', 'Unison Detune', 'Vib On/Off', 'Vib Amount',
+            )
         result.append(self._parameter_bank(
             'FEG1 Loop', 'F1 Drive', 'FEG2 Loop', 'F2 Drive',
-            'F1 On/Off', 'F1 Type', 'F2 On/Off', 'F2 Type',
+            'AEG1 Loop', 'AEG2 Loop', 'F1 On/Off', 'F2 On/Off',
         ))
         return result
 
@@ -4558,7 +4630,8 @@ class Tap(ControlSurface):
         return ('Zoom', 'Start', 'End', 'S Start', 'S Length', 'S Loop Length', 'Detune' if warp_enabled else 'S Loop Fade', 'Mode')
 
     def _simpler_virtual_spec(self, control_index):
-        if not self._simpler_main_active() or not 0 <= control_index < 8:
+        if (not self._simpler_main_active() or not liveobj_valid(self._simpler_sample) or
+                not 0 <= control_index < 8):
             return None
         name = self._simpler_main_spec_names()[control_index]
         if name == 'Zoom':
@@ -4735,8 +4808,8 @@ class Tap(ControlSurface):
         specs = [
             toggle(toggle_name, 0, toggle_items, toggle_display, toggle_normalized),
             toggle('Warp', 1, ('Off', 'On'), 'On' if warp_enabled else 'Off', 1.0 if warp_enabled else 0.0),
-            button('Warp /2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
-            button('Warp ×2', 3, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_double', False))),
+            button(':2', 2, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_half', False))),
+            button('*2', 3, warp_enabled and bool(getattr(self._simpler_device, 'can_warp_double', False))),
             button(reset_name, 4) if mode == 2 else warp_mode_spec,
             button('Split' if mode == 2 else 'Crop', 5),
             button('Reverse', 6),
@@ -4894,6 +4967,9 @@ class Tap(ControlSurface):
             return False
 
     def _simpler_virtual_metadata(self):
+        if self._simpler_main_active() and not liveobj_valid(self._simpler_sample):
+            browse = 'Browse Samples||||0.0||||0.0|browse_sample|0'
+            return ','.join([browse] + [self.UNMAPPED_PARAMETER_METADATA_ITEM] * 7)
         metadata = []
         for control_index in range(8):
             spec = self._simpler_virtual_spec(control_index)
