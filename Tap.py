@@ -49,6 +49,7 @@ import struct
 import subprocess
 import tempfile
 import wave
+from urllib.parse import unquote, urlparse
 try:
     import audioop
 except ImportError:
@@ -16624,6 +16625,58 @@ class Tap(ControlSurface):
         sample_extensions = ('.wav', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.ogg', '.caf')
         return name.endswith(sample_extensions) or any(extension in uri for extension in sample_extensions)
 
+    def _browser_item_file_path(self, item):
+        """Resolve file-backed BrowserItem URIs without assuming every URI is a file."""
+        try:
+            raw_uri = str(item.uri)
+        except Exception:
+            return ''
+        if not raw_uri:
+            return ''
+
+        decoded_uri = unquote(raw_uri)
+        candidates = []
+        try:
+            parsed_uri = urlparse(decoded_uri)
+            if parsed_uri.scheme.casefold() == 'file':
+                candidates.append(parsed_uri.path)
+        except Exception:
+            pass
+        if decoded_uri.startswith('/'):
+            candidates.append(decoded_uri.split('?', 1)[0].split('#', 1)[0])
+        else:
+            path_match = re.search(r'(/[^?#]+\.(?:adv|adg))(?:[?#]|$)', decoded_uri, re.IGNORECASE)
+            if path_match:
+                candidates.append(path_match.group(1))
+
+        for candidate in candidates:
+            candidate = os.path.normpath(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+        return ''
+
+    def _browser_preset_has_preview(self, item):
+        """Check Ableton's on-disk preview location for an .adv or .adg preset."""
+        preset_path = self._browser_item_file_path(item)
+        if not preset_path:
+            return False
+
+        direct_preview = preset_path + '.ogg'
+        if os.path.isfile(direct_preview):
+            return True
+
+        parent = os.path.dirname(preset_path)
+        for _ in range(16):
+            relative_path = os.path.relpath(preset_path, parent)
+            preview_path = os.path.join(parent, 'Ableton Folder Info', 'Previews', relative_path + '.ogg')
+            if os.path.isfile(preview_path):
+                return True
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
+        return False
+
     def _browser_item_can_preview(self, item, path=None):
         """Approximate Live's prehear support from item kind and browser scope."""
         key = self._browser_item_search_key(item)
@@ -16644,6 +16697,9 @@ class Tap(ControlSurface):
         audio_extensions = ('.wav', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.ogg')
         if name.endswith(audio_extensions) or any(extension in uri for extension in audio_extensions):
             return True
+        preset_extensions = ('.adv', '.adg')
+        if name.endswith(preset_extensions) or any(extension in uri for extension in preset_extensions):
+            return self._browser_preset_has_preview(item)
 
         try:
             if bool(item.is_device):
