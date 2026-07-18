@@ -1604,8 +1604,9 @@ class Tap(ControlSurface):
             self.browser_search_tag_indices = []
             self.browser_search_generation = 0
             self.browser_search_work = None
-            self.browser_search_batch_size = 200
+            self.browser_search_batch_size = 100
             self.browser_search_max_items = 50000
+            self.browser_previewable_keys = set()
             # browser navigation history for back button
             self.browser_history = []
             self.browser_folder_mapping = {
@@ -16375,6 +16376,7 @@ class Tap(ControlSurface):
             self.browser_search_tag_indices = []
             self.browser_search_generation += 1
             self.browser_search_work = None
+            self.browser_previewable_keys = set()
             self.browser_current_path = [self.browser_folder_labels.get(folder_index, folder_name)]
 
             # Get the browser item for the requested folder
@@ -16461,7 +16463,8 @@ class Tap(ControlSurface):
             if hasattr(item, 'name'):
                 item_name = item.name
                 item_type = self._get_browser_item_type(item)
-                item_strings.append(f"{self._escape_sysex_string(item_name)}{item_type}")
+                preview_marker = '&' if self._browser_item_can_preview(item) else ''
+                item_strings.append(f"{self._escape_sysex_string(item_name)}{item_type}{preview_marker}")
 
         # Format: current_page^total_pages^item1//,item2||,item3||,...
         items_string = ','.join(item_strings)
@@ -16469,6 +16472,14 @@ class Tap(ControlSurface):
 
         # Send using manufacturer ID 0x13
         self._send_sys_ex_message(message, 0x13)
+
+    def _send_browser_search_progress(self, state, traversed=0, matches=0, location=''):
+        """Send compact search progress: state^checked^matches^current scope."""
+        safe_location = self._escape_sysex_string(str(location)[:48])
+        self._send_sys_ex_message(
+            '{}^{}^{}^{}'.format(int(state), int(traversed), int(matches), safe_location),
+            0x3E
+        )
 
     def _browser_decode_search_payload(self, message):
         try:
@@ -16504,6 +16515,7 @@ class Tap(ControlSurface):
         self.browser_search_restore_state = None
         self.browser_search_query = ''
         self.browser_search_tag_indices = []
+        self.browser_previewable_keys = set()
         if state is None:
             self.browser_current_items = []
             self.browser_current_page = 0
@@ -16511,6 +16523,7 @@ class Tap(ControlSurface):
             self.browser_history = []
             self.browser_current_path = []
             self._send_browser_page(0)
+            self._send_browser_search_progress(2)
             return
         self.browser_current_items = state['items']
         self.browser_current_page = state['page']
@@ -16518,6 +16531,7 @@ class Tap(ControlSurface):
         self.browser_history = state['history']
         self.browser_current_path = state['path']
         self._send_browser_page(self.browser_current_page)
+        self._send_browser_search_progress(2)
 
     def _browser_items_for_category(self, category_index):
         browser = self.application().browser
@@ -16576,6 +16590,47 @@ class Tap(ControlSurface):
             except Exception:
                 return not bool(getattr(item, 'is_folder', False))
 
+    def _browser_item_can_preview(self, item, path=None):
+        """Approximate Live's prehear support from item kind and browser scope."""
+        key = self._browser_item_search_key(item)
+        if key in self.browser_previewable_keys:
+            return True
+        if not self._browser_item_is_loadable(item):
+            return False
+        try:
+            if bool(item.is_folder):
+                return False
+        except Exception:
+            pass
+
+        name = str(getattr(item, 'name', '')).casefold()
+        uri = str(getattr(item, 'uri', '')).casefold()
+        audio_extensions = ('.wav', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.ogg')
+        if name.endswith(audio_extensions) or any(extension in uri for extension in audio_extensions):
+            return True
+
+        try:
+            if bool(item.is_device):
+                return False
+        except Exception:
+            pass
+
+        item_path = tuple(path) if path is not None else tuple(self.browser_current_path)
+        root = str(item_path[0]).casefold() if item_path else ''
+        return root in ('sounds', 'drums', 'instruments', 'samples', 'clips')
+
+    def _publish_browser_search_matches(self, work):
+        ordered_matches = sorted(work['matches'], key=lambda value: (value[0], value[1]))
+        self.browser_current_items = [value[2] for value in ordered_matches]
+        self.browser_previewable_keys = set(
+            self._browser_item_search_key(value[2]) for value in ordered_matches if value[3]
+        )
+        self.browser_pages_count = (
+            (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
+        )
+        self.browser_current_page = min(self.browser_current_page, max(0, self.browser_pages_count - 1))
+        self._send_browser_page(self.browser_current_page)
+
     def _continue_browser_search(self, generation):
         work = self.browser_search_work
         if work is None or generation != self.browser_search_generation:
@@ -16613,7 +16668,7 @@ class Tap(ControlSurface):
                     rank = 2
                 else:
                     rank = 3
-                work['matches'].append((rank, normalized_name, item))
+                work['matches'].append((rank, normalized_name, item, self._browser_item_can_preview(item, path)))
 
             try:
                 children = list(item.children)
@@ -16622,18 +16677,36 @@ class Tap(ControlSurface):
             for child in reversed(children):
                 work['stack'].append((child, path))
 
+        now = time.time()
+        location = ''
+        if work['stack']:
+            next_path = work['stack'][-1][1]
+            location_parts = [str(part) for part in next_path if part]
+            location = ' / '.join(location_parts[-2:])
+        match_count = len(work['matches'])
+        should_publish = match_count and (
+            not work['published_results'] or
+            match_count >= work['published_match_count'] + self.browser_items_per_page or
+            now - work['last_publish_time'] >= 0.6
+        )
+        if should_publish:
+            self._publish_browser_search_matches(work)
+            work['published_results'] = True
+            work['published_match_count'] = match_count
+            work['last_publish_time'] = now
+
+        if location != work['last_location'] or now - work['last_progress_time'] >= 0.35:
+            work['last_location'] = location
+            work['last_progress_time'] = now
+            self._send_browser_search_progress(1, work['traversed'], match_count, location)
+
         if work['stack'] and work['traversed'] < self.browser_search_max_items:
             self.schedule_message(1, lambda: self._continue_browser_search(generation))
             return
 
-        work['matches'].sort(key=lambda value: (value[0], value[1]))
-        self.browser_current_items = [value[2] for value in work['matches']]
-        self.browser_current_page = 0
-        self.browser_pages_count = (
-            (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
-        )
+        self._publish_browser_search_matches(work)
         self.browser_search_work = None
-        self._send_browser_page(0)
+        self._send_browser_search_progress(2, work['traversed'], len(work['matches']), location)
 
     def _browser_search(self, message):
         query, tag_indices = self._browser_decode_search_payload(message)
@@ -16647,15 +16720,44 @@ class Tap(ControlSurface):
         self.browser_search_tag_indices = tag_indices
         self.browser_search_generation += 1
         generation = self.browser_search_generation
+
+        # Selecting a main group without a query is browsing, not a full-tree
+        # flattening operation. Return that group's first level immediately.
+        if not query and len(tag_indices) == 1:
+            category_index = tag_indices[0]
+            self.browser_search_work = None
+            self.browser_current_items = self._browser_items_for_category(category_index)
+            self.browser_current_page = 0
+            self.browser_pages_count = (
+                (len(self.browser_current_items) + self.browser_items_per_page - 1) // self.browser_items_per_page
+            )
+            self.browser_current_path = [self.browser_folder_labels.get(category_index, '')]
+            self.browser_previewable_keys = set()
+            self._send_browser_page(0)
+            self._send_browser_search_progress(2, len(self.browser_current_items), len(self.browser_current_items), '')
+            return
+
         normalized_query = query.casefold()
+        roots = self._browser_search_roots(tag_indices)
+        initial_location = str(roots[0][1][0]) if roots and roots[0][1] else ''
+        self.browser_current_items = []
+        self.browser_current_page = 0
+        self.browser_pages_count = 0
+        self.browser_previewable_keys = set()
         self.browser_search_work = {
-            'stack': list(reversed(self._browser_search_roots(tag_indices))),
+            'stack': list(reversed(roots)),
             'visited': set(),
             'matches': [],
             'traversed': 0,
             'terms': [term for term in normalized_query.split() if term],
-            'normalized_query': normalized_query
+            'normalized_query': normalized_query,
+            'published_results': False,
+            'published_match_count': 0,
+            'last_publish_time': 0.0,
+            'last_progress_time': 0.0,
+            'last_location': initial_location
         }
+        self._send_browser_search_progress(0, 0, 0, initial_location)
         self.schedule_message(1, lambda: self._continue_browser_search(generation))
 
     def _browser_preview(self, value):
@@ -16668,6 +16770,8 @@ class Tap(ControlSurface):
             return
         index = (self.browser_current_page * self.browser_items_per_page) + (value - 1)
         if index < 0 or index >= len(self.browser_current_items):
+            return
+        if not self._browser_item_can_preview(self.browser_current_items[index]):
             return
         try:
             browser.preview_item(self.browser_current_items[index])
