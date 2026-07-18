@@ -57,7 +57,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 16
+secret_version_number = 17
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1527,6 +1527,7 @@ class Tap(ControlSurface):
     )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
+    CLIP_POSITION_FEEDBACK_INTERVAL = 0.1
     CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60)
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
@@ -1728,6 +1729,10 @@ class Tap(ControlSurface):
             self._last_group_hidden_states = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
+            self._clip_position_feedback_enabled = False
+            self._clip_position_feedback_track_indexes = ()
+            self._last_clip_position_feedback_time = 0.0
+            self._last_clip_position_feedback_payload = None
             self._smooth_macro_randomize_token = 0
             self._smooth_macro_randomize_state = None
             self._re_enable_automation_enabled_state = None
@@ -6729,6 +6734,80 @@ class Tap(ControlSurface):
         self.periodic_timer = 1
         if self._periodic_timer_ref is None or not self._periodic_timer_ref.is_alive():
             self._periodic_execution()
+
+    def update_display(self):
+        ControlSurface.update_display(self)
+        if not self.was_initialized or not self._clip_position_feedback_enabled:
+            return
+
+        now = time.monotonic()
+        if now - self._last_clip_position_feedback_time < self.CLIP_POSITION_FEEDBACK_INTERVAL:
+            return
+
+        self._last_clip_position_feedback_time = now
+        self._send_visible_clip_positions()
+
+    def _set_clip_position_feedback(self, values):
+        enabled = bool(values and values[0])
+        track_count = len(self.song().tracks)
+        track_indexes = tuple(dict.fromkeys(
+            int(index) for index in values[1:]
+            if 0 <= int(index) < track_count
+        )) if enabled else ()
+
+        changed = (
+            enabled != self._clip_position_feedback_enabled or
+            track_indexes != self._clip_position_feedback_track_indexes
+        )
+        self._clip_position_feedback_enabled = enabled
+        self._clip_position_feedback_track_indexes = track_indexes
+
+        if changed:
+            self._last_clip_position_feedback_time = 0.0
+            self._last_clip_position_feedback_payload = None
+        if not enabled and self.was_initialized:
+            self._send_sys_ex_message("", 0x47)
+
+    def _normalized_session_clip_position(self, clip):
+        try:
+            position = float(clip.playing_position)
+            if bool(clip.looping):
+                start = float(clip.loop_start)
+                end = float(clip.loop_end)
+            else:
+                start = float(clip.start_marker)
+                end = float(clip.end_marker)
+            length = end - start
+            if length <= 0.0:
+                return 0.0
+            return max(0.0, min(1.0, (position - start) / length))
+        except Exception:
+            return 0.0
+
+    def _send_visible_clip_positions(self):
+        records = []
+        tracks = self.song().tracks
+
+        for track_index in self._clip_position_feedback_track_indexes:
+            try:
+                track = tracks[track_index]
+                scene_index = int(track.playing_slot_index)
+                if scene_index < 0 or scene_index >= len(track.clip_slots):
+                    continue
+                clip_slot = track.clip_slots[scene_index]
+                if not clip_slot.has_clip:
+                    continue
+                progress = self._normalized_session_clip_position(clip_slot.clip)
+                raw_progress = int(round(progress * 127.0))
+                records.append("{}:{}:{}".format(track_index, scene_index, raw_progress))
+            except Exception:
+                continue
+
+        payload = ",".join(records)
+        if payload == self._last_clip_position_feedback_payload:
+            return
+        self._last_clip_position_feedback_payload = payload
+        self._send_sys_ex_message(payload, 0x47)
     
     def _periodic_execution(self):
         self._periodic_check()
@@ -10949,6 +11028,11 @@ class Tap(ControlSurface):
                 self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
+        # Clip/Mixer views explicitly provide the raw track indexes currently
+        # visible in the app. Keep position work completely dormant elsewhere.
+        if len(message) >= 3 and message[1] == 0x47:
+            self._set_clip_position_feedback(self.extract_values_from_sysex_message(message))
+            return
         # Push-style Simpler option row.
         if len(message) >= 4 and message[1] == 0x43:
             values = self.extract_values_from_sysex_message(message)
