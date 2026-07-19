@@ -57,7 +57,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 17
+secret_version_number = 18
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1528,6 +1528,8 @@ class Tap(ControlSurface):
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     CLIP_POSITION_FEEDBACK_INTERVAL = 0.1
+    CLIP_PLAYING_STATUS_CC = 70
+    CLIP_PLAYING_STATUS_CHANNEL = 11
     CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60)
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
@@ -9633,7 +9635,7 @@ class Tap(ControlSurface):
         # Update status only if it has changed
         if force or self.seq_clip_playing_status != new_status:
             self.seq_clip_playing_status = new_status
-            self.send_cc(67, 11, new_status)
+            self.send_cc(self.CLIP_PLAYING_STATUS_CC, self.CLIP_PLAYING_STATUS_CHANNEL, new_status)
 
     def _clip_pos_changed(self, clip_index):
         # Only check and send things if we are in device view
