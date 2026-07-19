@@ -37,6 +37,10 @@ try:
     from Push2.meld import MeldDeviceDecorator
 except ImportError:
     MeldDeviceDecorator = None
+try:
+    from Push2.hybrid_reverb import HybridReverbDeviceDecorator
+except ImportError:
+    HybridReverbDeviceDecorator = None
 from Live.Clip import MidiNoteSpecification
 
 import threading
@@ -87,6 +91,13 @@ class TapDeviceComponent(DeviceComponent):
     DRUMCELL_FX_2_BANK_NAME = "FX 2"
     DRUMCELL_FX_3_BANK_NAME = "FX 3"
     DELAY_BANK_NAMES = ("Main", "Time / Flt", "Flt / LFO", "LFO Wave")
+    AUTO_FILTER_BANK_NAMES = ("Main", "Envelope", "LFO", "Sidechain")
+    AUTO_FILTER_2_BANK_NAMES = ("Main", "LFO", "Envelope", "Quantization")
+    BEAT_REPEAT_BANK_NAMES = ("Main", "Filt/Mix", "Repeat Rate")
+    HYBRID_REVERB_BANK_NAMES = (
+        "Main", "Convolution", "Algorithm Pg1", "Algorithm Pg2",
+        "EQ Pg1", "EQ Pg2", "Global",
+    )
     DRIFT_BANK_NAMES = (
         "Main", "Oscillators", "Osc 2 / Noise", "Osc Mod", "Filters", "Filter Mod",
         "Envelope 1", "Envelope 2", "Envelope 2 Cyc", "LFO", "Mod 1 & 2", "Mod 3",
@@ -117,24 +128,27 @@ class TapDeviceComponent(DeviceComponent):
     def __init__(self, *a, **k):
         DeviceComponent.__init__(self, *a, **k)
         self._use_safe_parameter_banks = False
-        self._operator_parameter_bank_cache = None
-        self._operator_parameter_bank_cache_device = None
+        self._parameter_bank_cache = None
+        self._parameter_bank_cache_device = None
         self._drift_decorator = None
         self._drift_decorator_device = None
         self._drift_base_decorator = None
         self._meld_decorator = None
         self._meld_decorator_device = None
+        self._hybrid_reverb_decorator = None
+        self._hybrid_reverb_decorator_device = None
         self._simpler_bank_decorator = None
         self._simpler_bank_decorator_device = None
 
     def invalidate_parameter_bank_cache(self):
-        self._operator_parameter_bank_cache = None
-        self._operator_parameter_bank_cache_device = None
+        self._parameter_bank_cache = None
+        self._parameter_bank_cache_device = None
 
     def set_device(self, device):
         if device != getattr(self, '_device', None):
             self._disconnect_drift_decorator()
             self._disconnect_meld_decorator()
+            self._disconnect_hybrid_reverb_decorator()
             self._disconnect_simpler_bank_decorator()
         self.invalidate_parameter_bank_cache()
         self._use_safe_parameter_banks = False
@@ -159,6 +173,7 @@ class TapDeviceComponent(DeviceComponent):
     def disconnect(self):
         self._disconnect_drift_decorator()
         self._disconnect_meld_decorator()
+        self._disconnect_hybrid_reverb_decorator()
         self._disconnect_simpler_bank_decorator()
         DeviceComponent.disconnect(self)
 
@@ -186,10 +201,13 @@ class TapDeviceComponent(DeviceComponent):
 
     def _parameter_banks(self):
         device = getattr(self, '_device', None)
-        if ((self._is_operator() or self._is_drift() or self._is_meld()) and
-                self._operator_parameter_bank_cache is not None and
-                self._operator_parameter_bank_cache_device == device):
-            return list(self._operator_parameter_bank_cache)
+        uses_cache = (
+            self._is_operator() or self._is_drift() or self._is_meld() or
+            self._is_hybrid_reverb()
+        )
+        if (uses_cache and self._parameter_bank_cache is not None and
+                self._parameter_bank_cache_device == device):
+            return list(self._parameter_bank_cache)
 
         base_names = self._base_parameter_bank_names()
         if self._use_safe_parameter_banks:
@@ -202,9 +220,9 @@ class TapDeviceComponent(DeviceComponent):
                 base_names = self._safe_parameter_bank_names_base()
                 banks = self._safe_parameter_banks()
         banks = self._add_tap_custom_banks(banks, base_names)
-        if self._is_operator() or self._is_drift() or self._is_meld():
-            self._operator_parameter_bank_cache = tuple(banks)
-            self._operator_parameter_bank_cache_device = device
+        if uses_cache:
+            self._parameter_bank_cache = tuple(banks)
+            self._parameter_bank_cache_device = device
         return banks
 
     def _parameter_bank_names(self):
@@ -294,6 +312,37 @@ class TapDeviceComponent(DeviceComponent):
     def _is_analog(self):
         return self._device_class_name() == 'UltraAnalog'
 
+    def _is_auto_filter(self):
+        try:
+            return (
+                self._device_class_name() == 'AutoFilter' or
+                (str(self._device.class_display_name) == 'Auto Filter' and
+                 not self._is_auto_filter_2())
+            )
+        except Exception:
+            return False
+
+    def _is_auto_filter_2(self):
+        return self._device_class_name() == 'AutoFilter2'
+
+    def _is_beat_repeat(self):
+        try:
+            return (
+                self._device_class_name() == 'BeatRepeat' or
+                str(self._device.class_display_name) == 'Beat Repeat'
+            )
+        except Exception:
+            return False
+
+    def _is_hybrid_reverb(self):
+        try:
+            return (
+                self._device_class_name() in ('Hybrid', 'HybridReverb') or
+                str(self._device.class_display_name) == 'Hybrid Reverb'
+            )
+        except Exception:
+            return False
+
     def _is_drift(self):
         try:
             return self._device_class_name() == 'Drift' or str(self._device.class_display_name) == 'Drift'
@@ -338,6 +387,16 @@ class TapDeviceComponent(DeviceComponent):
             except Exception:
                 pass
 
+    def _disconnect_hybrid_reverb_decorator(self):
+        decorator = self._hybrid_reverb_decorator
+        self._hybrid_reverb_decorator = None
+        self._hybrid_reverb_decorator_device = None
+        if decorator:
+            try:
+                decorator.disconnect()
+            except Exception:
+                pass
+
     def _disconnect_simpler_bank_decorator(self):
         decorator = self._simpler_bank_decorator
         self._simpler_bank_decorator = None
@@ -350,6 +409,25 @@ class TapDeviceComponent(DeviceComponent):
 
     def _decorated_parameters(self):
         device = getattr(self, '_device', None)
+        if self._is_hybrid_reverb() and HybridReverbDeviceDecorator is not None:
+            if (self._hybrid_reverb_decorator is None or
+                    self._hybrid_reverb_decorator_device != device):
+                self._disconnect_hybrid_reverb_decorator()
+                try:
+                    self._hybrid_reverb_decorator = HybridReverbDeviceDecorator(live_object=device)
+                    self._hybrid_reverb_decorator_device = device
+                except TypeError:
+                    try:
+                        self._hybrid_reverb_decorator = HybridReverbDeviceDecorator(
+                            live_object=device, additional_properties={}
+                        )
+                        self._hybrid_reverb_decorator_device = device
+                    except Exception:
+                        self._hybrid_reverb_decorator = None
+                except Exception:
+                    self._hybrid_reverb_decorator = None
+            if self._hybrid_reverb_decorator:
+                return tuple(self._hybrid_reverb_decorator.parameters)
         if self._is_simpler() and SimplerDeviceDecorator is not None:
             if self._simpler_bank_decorator is None or self._simpler_bank_decorator_device != device:
                 self._disconnect_simpler_bank_decorator()
@@ -446,7 +524,15 @@ class TapDeviceComponent(DeviceComponent):
 
     def _add_tap_custom_bank_names(self, bank_names):
         names = list(bank_names)
-        if self._is_drift():
+        if self._is_auto_filter_2():
+            names = list(self.AUTO_FILTER_2_BANK_NAMES)
+        elif self._is_auto_filter():
+            names = list(self.AUTO_FILTER_BANK_NAMES)
+        elif self._is_beat_repeat():
+            names = list(self.BEAT_REPEAT_BANK_NAMES)
+        elif self._is_hybrid_reverb():
+            names = list(self.HYBRID_REVERB_BANK_NAMES)
+        elif self._is_drift():
             names = list(self.DRIFT_BANK_NAMES)
         elif self._is_meld():
             names = list(self.MELD_BANK_NAMES)
@@ -499,7 +585,15 @@ class TapDeviceComponent(DeviceComponent):
     def _add_tap_custom_banks(self, banks, base_names):
         banks = list(banks)
         names = list(base_names)
-        if self._is_drift():
+        if self._is_auto_filter_2():
+            banks = list(self._auto_filter_2_parameter_banks())
+        elif self._is_auto_filter():
+            banks = list(self._auto_filter_parameter_banks())
+        elif self._is_beat_repeat():
+            banks = list(self._beat_repeat_parameter_banks())
+        elif self._is_hybrid_reverb():
+            banks = list(self._hybrid_reverb_parameter_banks())
+        elif self._is_drift():
             banks = list(self._drift_parameter_banks())
         elif self._is_meld():
             banks = list(self._meld_parameter_banks())
@@ -768,6 +862,207 @@ class TapDeviceComponent(DeviceComponent):
                 parameters.append(specification)
         parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
         return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
+
+    def _auto_filter_2_parameter_banks(self):
+        filter_type = self._parameter_value_text('Filter Type')
+        if 'dj' in filter_type:
+            frequency = self._parameter_by_names('Control')
+        elif 'vowel' in filter_type:
+            frequency = self._parameter_by_names('Pitch')
+        else:
+            frequency = self._parameter_by_names('Frequency')
+        resonance = self._parameter_by_names('Formant') if 'vowel' in filter_type else self._parameter_by_names('Resonance')
+
+        lfo_time_mode = self._parameter_value_text('LFO T Mode')
+        if 'sixteenth' in lfo_time_mode or '16' in lfo_time_mode:
+            lfo_rate = self._parameter_by_names('LFO 16th')
+        elif 'time' in lfo_time_mode:
+            lfo_rate = self._parameter_by_names('LFO Time')
+        elif lfo_time_mode == 'rate':
+            lfo_rate = self._parameter_by_names('LFO Freq')
+        else:
+            lfo_rate = self._parameter_by_names('LFO Rate')
+        lfo_spatial_mode = self._parameter_value_text('LFO S Mode')
+        lfo_phase_or_spin = self._parameter_by_names('LFO Phase') if 'phase' in lfo_spatial_mode else self._parameter_by_names('LFO Spin')
+
+        sidechain_eq_type = self._parameter_value_text('S/C EQ Type')
+        sidechain_q_or_gain = self._parameter_by_names('S/C EQ Q') if 'pass' in sidechain_eq_type else self._parameter_by_names('S/C EQ Gain')
+        quantize_mode = self._parameter_value_text('LFO Q Mode')
+        quantize_amount = self._parameter_by_names('LFO Steps') if 'step' in quantize_mode else self._parameter_by_names('LFO S&H')
+
+        return (
+            self._parameter_bank(
+                'Filter Type', frequency, resonance, 'Filter Morph',
+                'Circuit', 'Drive', 'Output', ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'LFO Wave', 'LFO Amount', 'LFO T Mode', lfo_rate,
+                'LFO S Mode', lfo_phase_or_spin, 'LFO Offset', 'LFO Morph',
+            ),
+            self._parameter_bank(
+                'Env Amount', 'Env Hold On', 'Env Attack', 'Env Release',
+                'S/C EQ On', 'S/C EQ Type', 'S/C EQ Freq', sidechain_q_or_gain,
+            ),
+            self._parameter_bank(
+                'LFO Q Mode', quantize_amount, 'Env S&H On', 'Env S&H',
+                None, None, None, None,
+            ),
+        )
+
+    def _auto_filter_parameter_banks(self):
+        filter_type_text = self._parameter_value_text('Filter Type', 'Filter Type (Legacy)')
+        filter_type_key = re.sub(r'[^a-z0-9]+', '', filter_type_text)
+        if 'lowpass' in filter_type_key or 'highpass' in filter_type_key:
+            circuit = self._parameter_by_names('Filter Circuit - LP/HP')
+        else:
+            circuit = self._parameter_by_names('Filter Circuit - BP/NO/Morph')
+        morph_or_drive = self._parameter_by_names('Morph') if 'morph' in filter_type_key else self._parameter_by_names('Drive')
+
+        lfo_sync_text = self._parameter_value_text('LFO Sync')
+        lfo_rate = self._parameter_by_names('LFO Frequency') if 'free' in lfo_sync_text else self._parameter_by_names('LFO Sync Rate')
+        lfo_is_synced = 'sync' in lfo_sync_text and 'free' not in lfo_sync_text
+        stereo_mode_text = self._parameter_value_text('LFO Stereo Mode')
+        lfo_stereo = self._parameter_by_names('LFO Offset') if lfo_is_synced else self._parameter_by_names('LFO Stereo Mode')
+        lfo_phase = self._parameter_by_names('LFO Phase') if lfo_is_synced or 'phase' in stereo_mode_text else self._parameter_by_names('LFO Spin')
+
+        return (
+            self._parameter_bank(
+                ('Filter Type', 'Filter Type (Legacy)'), 'Frequency',
+                ('Resonance', 'Resonance (Legacy)'), circuit, morph_or_drive,
+                'LFO Amount', 'LFO Sync', lfo_rate,
+            ),
+            self._parameter_bank(
+                ('Filter Type', 'Filter Type (Legacy)'), 'Frequency',
+                ('Resonance', 'Resonance (Legacy)'), morph_or_drive, 'Slope',
+                'Env. Attack', 'Env. Release', 'Env. Modulation',
+            ),
+            self._parameter_bank(
+                'LFO Amount', 'LFO Waveform', 'LFO Sync', lfo_rate,
+                lfo_stereo, lfo_phase, 'LFO Quantize On', 'LFO Quantize Rate',
+            ),
+            self._parameter_bank(
+                'S/C On', 'S/C Mix', 'S/C Gain', None, None, None, None, None,
+            ),
+        )
+
+    def _beat_repeat_parameter_banks(self):
+        return (
+            self._parameter_bank(
+                'Grid', 'Interval', 'Offset', 'Gate',
+                'Pitch', 'Pitch Decay', 'Variation', 'Chance',
+            ),
+            self._parameter_bank(
+                'Filter On', 'Filter Freq', 'Filter Width', None,
+                'Mix Type', 'Volume', 'Decay', 'Chance',
+            ),
+            self._parameter_bank(
+                'Repeat', 'Interval', 'Offset', 'Gate',
+                'Grid', 'Block Triplets', 'Variation', 'Variation Type',
+            ),
+        )
+
+    def _hybrid_algorithm_type_key(self):
+        return re.sub(r'[^a-z0-9]+', '', self._parameter_value_text('Algo Type'))
+
+    def _hybrid_algorithm_modulation_parameter(self, algorithm):
+        if 'prism' in algorithm:
+            return None
+        if 'tides' in algorithm:
+            return self._parameter_by_names('Ti Waveform')
+        return self._parameter_by_names('Modulation')
+
+    def _hybrid_algorithm_page_one_parameters(self, algorithm):
+        if 'darkhall' in algorithm:
+            character_one = self._parameter_by_names('DH Shape')
+            character_two = self._parameter_by_names('DH BassMult', 'DH Bass Mult')
+        elif 'quartz' in algorithm:
+            character_one = self._parameter_by_names('Qz Low Damp')
+            character_two = self._parameter_by_names('Qz Distance')
+        elif 'shimmer' in algorithm:
+            character_one = self._parameter_by_names('Sh Pitch Shift')
+            character_two = self._parameter_by_names('Sh Shimmer')
+        elif 'tides' in algorithm:
+            character_one = self._parameter_by_names('Ti Tide')
+            character_two = self._parameter_by_names('Ti Rate')
+        elif 'prism' in algorithm:
+            character_one = self._parameter_by_names('Pr High Mult')
+            character_two = self._parameter_by_names('Pr X Over')
+        else:
+            character_one = None
+            character_two = None
+        return character_one, character_two
+
+    def _hybrid_algorithm_page_two_character(self, algorithm):
+        if 'darkhall' in algorithm:
+            return self._parameter_by_names('DH Bass X')
+        if 'quartz' in algorithm or 'shimmer' in algorithm:
+            return self._parameter_by_names('Diffusion')
+        if 'tides' in algorithm:
+            return self._parameter_by_names('Ti Phase')
+        return None
+
+    def _hybrid_predelay_is_synced(self):
+        text = self._parameter_value_text('P.Dly Sync', 'Predelay Sync')
+        return 'sync' in text or text == 'on'
+
+    def _hybrid_reverb_parameter_banks(self):
+        algorithm = self._hybrid_algorithm_type_key()
+        algorithm_one, algorithm_two = self._hybrid_algorithm_page_one_parameters(algorithm)
+        algorithm_modulation = self._hybrid_algorithm_modulation_parameter(algorithm)
+        damping_or_low_mult = self._parameter_by_names('Pr Low Mult') if 'prism' in algorithm else self._parameter_by_names('Damping')
+
+        low_type = self._parameter_value_text('EQ Low Type', 'EQ Lo Type')
+        low_gain_or_slope = self._parameter_by_names(
+            'EQ Low Slope', 'EQ Lo Slope'
+        ) if 'cut' in low_type else self._parameter_by_names('EQ Low Gain', 'EQ Lo Gain')
+        high_type = self._parameter_value_text('EQ High Type', 'EQ Hi Type')
+        high_gain_or_slope = self._parameter_by_names(
+            'EQ High Slope', 'EQ Hi Slope'
+        ) if 'cut' in high_type else self._parameter_by_names('EQ High Gain', 'EQ Hi Gain')
+        predelay_synced = self._hybrid_predelay_is_synced()
+        predelay = self._parameter_by_names(
+            'P.Dly 16th', 'Predelay 16th'
+        ) if predelay_synced else self._parameter_by_names('P.Dly Time', 'Predelay')
+        predelay_feedback = self._parameter_by_names(
+            'P.Dly Fb 16th', 'Predel. FB 16th', 'Predelay FB 16th'
+        ) if predelay_synced else self._parameter_by_names('P.Dly Fb Time', 'Predelay FB')
+
+        return (
+            self._parameter_bank(
+                ('Send Gain', 'Send'), 'Routing', 'Blend', 'Algo Type',
+                'Decay', 'Size', algorithm_modulation, ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'IR Category', 'IR', 'Ir Attack Time', 'Ir Decay Time',
+                'Ir Size Factor', 'Blend', 'Routing', ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'Algo Type', 'Decay', 'Size', algorithm_one,
+                algorithm_two, algorithm_modulation, 'Width', ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'Algo Type', damping_or_low_mult,
+                self._hybrid_algorithm_page_two_character(algorithm), 'EQ Pre Algo',
+                ('Send Gain', 'Send'), 'Blend', 'Routing', ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'EQ Pre Algo', ('EQ Low Type', 'EQ Lo Type'),
+                ('EQ Low Freq', 'EQ Lo Freq'), low_gain_or_slope,
+                ('EQ High Type', 'EQ Hi Type'), ('EQ High Freq', 'EQ Hi Freq'),
+                high_gain_or_slope, ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'EQ Pre Algo', ('EQ P1 Freq', 'EQ Peak 1 Freq'),
+                ('EQ P1 Q', 'EQ Peak 1 Q'), ('EQ P1 Gain', 'EQ Peak 1 Gain'),
+                ('EQ P2 Freq', 'EQ Peak 2 Freq'), ('EQ P2 Q', 'EQ Peak 2 Q'),
+                ('EQ P2 Gain', 'EQ Peak 2 Gain'), ('Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                ('Send Gain', 'Send'), ('P.Dly Sync', 'Predelay Sync'),
+                predelay, predelay_feedback, ('Vintage', 'Vintage Copy'),
+                'Width', 'Blend', ('Dry/Wet', 'Dry Wet'),
+            ),
+        )
 
     def _drift_parameter_banks(self):
         envelope_2 = self._drift_envelope_2_parameters()
@@ -1838,10 +2133,10 @@ class Tap(ControlSurface):
                     control.suppress_script_forwarding = False
                 except Exception:
                     pass
-            # API-backed virtual parameters (Drift/Meld selectors) are normal
-            # Python control-surface objects, not Live ATimeableValues.  Passing
-            # them to Live's native MIDI mapper raises a Boost.Python
-            # ArgumentError on every rebuild.  Leave those slots script-driven.
+            # API-backed virtual parameters (Drift/Meld/Hybrid selectors) are
+            # normal Python control-surface objects, not Live ATimeableValues.
+            # Passing them to Live's native MIDI mapper raises a Boost.Python
+            # ArgumentError on every rebuild. Leave those slots script-driven.
             controls = list(self._device_controls)
             try:
                 _, bank_parameters = self._device._current_bank_details()
@@ -2164,7 +2459,11 @@ class Tap(ControlSurface):
         # Live exposes parameter relevance through DeviceParameter.state.  Listen
         # only to the eight visible parameters and update metadata when Live
         # changes their state; no device-specific activity rules are needed.
-        remap_dynamic_bank = self._device._is_drift() or self._device._is_meld()
+        remap_dynamic_bank = (
+            self._device._is_drift() or self._device._is_meld() or
+            self._device._is_auto_filter() or self._device._is_auto_filter_2() or
+            self._device._is_hybrid_reverb()
+        )
         for parameter in bank_parameters or ():
             add_parameter_listener(parameter, 'state', remap=remap_dynamic_bank)
 
@@ -2187,6 +2486,46 @@ class Tap(ControlSurface):
                 ('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
             ):
                 add_parameter_listener(self._device._parameter_by_names(*names), 'value')
+            return
+
+        if self._device._is_auto_filter_2():
+            for names in (
+                ('Filter Type',),
+                ('LFO T Mode',),
+                ('LFO S Mode',),
+                ('S/C EQ Type',),
+                ('LFO Q Mode',),
+            ):
+                add_parameter_listener(self._device._parameter_by_names(*names), 'value', remap=True)
+            return
+
+        if self._device._is_auto_filter():
+            for names in (
+                ('Filter Type', 'Filter Type (Legacy)'),
+                ('LFO Sync',),
+                ('LFO Stereo Mode',),
+            ):
+                add_parameter_listener(self._device._parameter_by_names(*names), 'value', remap=True)
+            return
+
+        if self._device._is_hybrid_reverb():
+            normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
+            if normalized_bank_name in ('main', 'algorithmpg1', 'algorithmpg2'):
+                add_parameter_listener(self._device._parameter_by_names('Algo Type'), 'value', remap=True)
+            elif normalized_bank_name == 'eqpg1':
+                add_parameter_listener(
+                    self._device._parameter_by_names('EQ Low Type', 'EQ Lo Type'),
+                    'value', remap=True
+                )
+                add_parameter_listener(
+                    self._device._parameter_by_names('EQ High Type', 'EQ Hi Type'),
+                    'value', remap=True
+                )
+            elif normalized_bank_name == 'global':
+                add_parameter_listener(
+                    self._device._parameter_by_names('P.Dly Sync', 'Predelay Sync'),
+                    'value', remap=True
+                )
             return
 
         if self._device._is_drift():
@@ -3767,7 +4106,9 @@ class Tap(ControlSurface):
     def _parameter_is_tap_virtual(self, parameter, selected_device=None):
         if parameter is None or not hasattr(self, '_device'):
             return False
-        if not (self._device._is_drift() or self._device._is_meld() or self._device._is_simpler()):
+        if not (
+                self._device._is_drift() or self._device._is_meld() or
+                self._device._is_hybrid_reverb() or self._device._is_simpler()):
             return False
         selected_device = selected_device or self._selected_device()
         try:
