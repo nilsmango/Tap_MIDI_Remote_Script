@@ -61,7 +61,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 18
+secret_version_number = 21
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1454,7 +1454,13 @@ class TapDeviceComponent(DeviceComponent):
             circuit = next((parameter for parameter in circuit_candidates if parameter and self._operator_parameter_is_active(parameter)), None)
         circuit = circuit or next((parameter for parameter in circuit_candidates if parameter), None)
         slope = self._parameter_by_names('Filter Slope')
-        filter_morph = self._parameter_by_names('Filter Morph') if self._operator_filter_is_morph(filter_type) else None
+        # Live's Operator schema calls these AntiAlias and Interpolation, but
+        # some versions do not expose either one as a DeviceParameter.
+        quality = (
+            self._parameter_by_names('AntiAlias', 'Antialias', 'Anti Alias') or
+            self._parameter_by_names('Interpolation', 'Interpol', 'UseLinearInterpolation') or
+            self._parameter_by_names('Fe Amount')
+        )
         return (
             filter_type,
             circuit,
@@ -1462,12 +1468,9 @@ class TapDeviceComponent(DeviceComponent):
             self._parameter_by_names('Filter Drive'),
             self._parameter_by_names('LFO Retrigger'),
             self._parameter_by_names('Filter On'),
-            filter_morph,
-            self._parameter_by_names('Fe Amount'),
+            quality,
+            self._parameter_by_names('Pe On'),
         )
-
-    def _operator_filter_is_morph(self, filter_type):
-        return 'morph' in self._operator_filter_type_display(filter_type)
 
     def _operator_filter_type_display(self, filter_type):
         try:
@@ -1841,7 +1844,7 @@ class Tap(ControlSurface):
     )
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
-    CLIP_POSITION_FEEDBACK_INTERVAL = 0.1
+    VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
     CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60)
@@ -1902,6 +1905,7 @@ class Tap(ControlSurface):
             self._return_level_listeners = {}
             self._master_level_listeners = {}
             self._mixer_meter_targets = {}
+            self._last_meter_values = {}
             self._disabled_parameter_listeners = {}
             self._disabled_parameters = []
             self._current_disabled_controls = []
@@ -2048,7 +2052,7 @@ class Tap(ControlSurface):
             self._clip_position_feedback_enabled = False
             self._clip_position_feedback_track_indexes = ()
             self._last_clip_position_feedback_time = 0.0
-            self._last_clip_position_feedback_payload = None
+            self._last_visual_feedback_payload = None
             self._smooth_macro_randomize_token = 0
             self._smooth_macro_randomize_state = None
             self._re_enable_automation_enabled_state = None
@@ -7164,11 +7168,11 @@ class Tap(ControlSurface):
             return
 
         now = time.monotonic()
-        if now - self._last_clip_position_feedback_time < self.CLIP_POSITION_FEEDBACK_INTERVAL:
+        if now - self._last_clip_position_feedback_time < self.VISUAL_FEEDBACK_INTERVAL:
             return
 
         self._last_clip_position_feedback_time = now
-        self._send_visible_clip_positions()
+        self._send_visual_feedback_frame()
 
     def _set_clip_position_feedback(self, values):
         enabled = bool(values and values[0])
@@ -7185,9 +7189,9 @@ class Tap(ControlSurface):
         self._clip_position_feedback_enabled = enabled
         self._clip_position_feedback_track_indexes = track_indexes
 
-        if changed:
+        if changed or enabled:
             self._last_clip_position_feedback_time = 0.0
-            self._last_clip_position_feedback_payload = None
+            self._last_visual_feedback_payload = None
         if not enabled and self.was_initialized:
             self._send_sys_ex_message("", 0x47)
 
@@ -7207,7 +7211,27 @@ class Tap(ControlSurface):
         except Exception:
             return 0.0
 
-    def _send_visible_clip_positions(self):
+    def _normalized_session_clip_velocity(self, clip):
+        try:
+            if bool(clip.looping):
+                start = float(clip.loop_start)
+                end = float(clip.loop_end)
+            else:
+                start = float(clip.start_marker)
+                end = float(clip.end_marker)
+            length = end - start
+            if length <= 0.0:
+                return 0.0
+
+            # Live reports MIDI and warped-audio positions in beats, while
+            # unwarped audio positions use seconds.
+            is_unwarped_audio = bool(clip.is_audio_clip) and not bool(clip.warping)
+            units_per_second = 1.0 if is_unwarped_audio else float(self.song().tempo) / 60.0
+            return max(0.0, units_per_second / length)
+        except Exception:
+            return 0.0
+
+    def _visible_clip_position_bytes(self):
         records = []
         tracks = self.song().tracks
 
@@ -7221,16 +7245,44 @@ class Tap(ControlSurface):
                 if not clip_slot.has_clip:
                     continue
                 progress = self._normalized_session_clip_position(clip_slot.clip)
-                raw_progress = int(round(progress * 127.0))
-                records.append("{}:{}:{}".format(track_index, scene_index, raw_progress))
+                raw_progress = int(round(progress * 16383.0))
+                velocity = self._normalized_session_clip_velocity(clip_slot.clip)
+                raw_velocity = max(0, min(2097151, int(round(velocity * 10000.0))))
+                records.extend((
+                    track_index,
+                    0x01 if bool(clip_slot.clip.looping) else 0x00,
+                    scene_index & 0x7F,
+                    (scene_index >> 7) & 0x7F,
+                    raw_progress & 0x7F,
+                    (raw_progress >> 7) & 0x7F,
+                    raw_velocity & 0x7F,
+                    (raw_velocity >> 7) & 0x7F,
+                    (raw_velocity >> 14) & 0x7F,
+                ))
             except Exception:
                 continue
 
-        payload = ",".join(records)
-        if payload == self._last_clip_position_feedback_payload:
+        return records
+
+    def _send_binary_sys_ex_message(self, values, manufacturer_id):
+        values = tuple(int(value) for value in values)
+        if any(value < 0 or value > 127 for value in values):
             return
-        self._last_clip_position_feedback_payload = payload
-        self._send_sys_ex_message(payload, 0x47)
+        self._send_midi((0xF0, manufacturer_id, 0x01) + values + (0xF7,))
+
+    def _send_visual_feedback_frame(self):
+        clip_bytes = self._visible_clip_position_bytes() if self._clip_position_feedback_enabled else []
+        clip_count = min(127, len(clip_bytes) // 9)
+        flags = 0x01 if self._song_is_playing() else 0x00
+        payload = tuple(
+            [0x03, flags, clip_count] +
+            clip_bytes[:clip_count * 9] +
+            [0x00]  # meter count: meters stay on their native event-driven CC path
+        )
+        if payload == self._last_visual_feedback_payload:
+            return
+        self._last_visual_feedback_payload = payload
+        self._send_binary_sys_ex_message(payload, 0x49)
     
     def _periodic_execution(self):
         self._periodic_check()
@@ -10273,13 +10325,13 @@ class Tap(ControlSurface):
         self._update_mixer_and_tracks()
         self._on_selected_track_changed()
     
-    def _create_level_change_handler(self, index):
+    def _create_level_change_handler(self, index, side):
         """
         A factory that returns a handler function for a specific index.
         This guarantees the index is correctly captured.
         """
         def handler():
-            self._on_output_level_changed(index)
+            self._on_output_level_changed(index, side)
         return handler
 
     def _track_has_output_meter(self, track):
@@ -10307,6 +10359,51 @@ class Tap(ControlSurface):
                 track.remove_output_meter_right_listener(right_listener)
         except (AttributeError, RuntimeError):
             pass
+
+    def _sync_visible_meter_listeners(self, meter_targets):
+        desired_tracks = set(meter_targets.values())
+        listener_maps = (
+            self._track_level_listeners,
+            self._return_level_listeners,
+            self._master_level_listeners,
+        )
+
+        for listener_map in listener_maps:
+            for track, (left_listener, right_listener) in list(listener_map.items()):
+                if track not in desired_tracks or not self._track_has_output_meter(track):
+                    self._remove_output_meter_listener_pair(track, left_listener, right_listener)
+                    listener_map.pop(track, None)
+
+        return_tracks = self.song().return_tracks
+        master_track = self.song().master_track
+        for index, track in meter_targets.items():
+            if not self._track_has_output_meter(track):
+                continue
+            if track == master_track:
+                listener_map = self._master_level_listeners
+            elif track in return_tracks:
+                listener_map = self._return_level_listeners
+            else:
+                listener_map = self._track_level_listeners
+            if track in listener_map:
+                continue
+
+            left_handler = self._create_level_change_handler(index, "left")
+            right_handler = self._create_level_change_handler(index, "right")
+            try:
+                track.add_output_meter_left_listener(left_handler)
+                track.add_output_meter_right_listener(right_handler)
+                listener_map[track] = (left_handler, right_handler)
+                self._on_output_level_changed(index, "left", force=True)
+                self._on_output_level_changed(index, "right", force=True)
+            except RuntimeError:
+                self._remove_output_meter_listener_pair(track, left_handler, right_handler)
+
+        visible_indexes = set(meter_targets.keys())
+        self._last_meter_values = {
+            key: value for key, value in self._last_meter_values.items()
+            if key[0] in visible_indexes
+        }
 
     def _foldable_group_track_for_track(self, track):
         try:
@@ -10419,6 +10516,7 @@ class Tap(ControlSurface):
                 left_listener, right_listener = self._master_level_listeners.get(master_track, (None, None))
                 self._remove_output_meter_listener_pair(master_track, left_listener, right_listener)
                 self._master_level_listeners.clear()
+            self._last_meter_values.clear()
             self._track_list_signature = track_signature
 
             # 2. Build track names, types, colors and send via SysEx
@@ -10461,50 +10559,11 @@ class Tap(ControlSurface):
 
         self._send_group_fold_states_if_changed(tracks)
         
-        # 3. Set up level meter listeners (idempotent, safe to call every time)
-        for index, track in enumerate(tracks):
-            if self._track_has_output_meter(track):
-                if track not in self._track_level_listeners:
-                    left_handler = self._create_level_change_handler(index)
-                    right_handler = self._create_level_change_handler(index)
-                    try:
-                        track.add_output_meter_left_listener(left_handler)
-                        track.add_output_meter_right_listener(right_handler)
-                        self._track_level_listeners[track] = (left_handler, right_handler)
-                    except RuntimeError:
-                        self._remove_output_meter_listener_pair(track, left_handler, right_handler)
-            else:
-                self._track_level_listeners.pop(track, None)
-
+        for track in tracks:
             if not track.color_has_listener(self._on_color_name_changed):
                 track.add_color_listener(self._on_color_name_changed)
             if not track.name_has_listener(self._on_color_name_changed):
                 track.add_name_listener(self._on_color_name_changed)
-
-        for index, return_track in enumerate(return_tracks):
-            if self._track_has_output_meter(return_track):
-                return_index = index + len(tracks)
-                if return_track not in self._return_level_listeners:
-                    left_handler = self._create_level_change_handler(return_index)
-                    right_handler = self._create_level_change_handler(return_index)
-                    try:
-                        return_track.add_output_meter_left_listener(left_handler)
-                        return_track.add_output_meter_right_listener(right_handler)
-                        self._return_level_listeners[return_track] = (left_handler, right_handler)
-                    except RuntimeError:
-                        self._remove_output_meter_listener_pair(return_track, left_handler, right_handler)
-
-        if self._track_has_output_meter(master_track):
-            master_index = 127
-            if master_track not in self._master_level_listeners:
-                left_handler = self._create_level_change_handler(master_index)
-                right_handler = self._create_level_change_handler(master_index)
-                try:
-                    master_track.add_output_meter_left_listener(left_handler)
-                    master_track.add_output_meter_right_listener(right_handler)
-                    self._master_level_listeners[master_track] = (left_handler, right_handler)
-                except RuntimeError:
-                    self._remove_output_meter_listener_pair(master_track, left_handler, right_handler)
 
         self._set_up_mixer_controls()
 
@@ -10712,6 +10771,7 @@ class Tap(ControlSurface):
             if master_track_visible:
                 meter_targets[127] = song.master_track
         self._mixer_meter_targets = meter_targets
+        self._sync_visible_meter_listeners(meter_targets)
         
         # Channels
         for index, track in enumerate(tracks):
@@ -10723,8 +10783,6 @@ class Tap(ControlSurface):
                 self._create_mixer_automation_control("encoder", 5, index, "track", index, "panning")
                 self._create_mixer_toggle_control(6, index, "track", index, "mute")
                 self._create_mixer_toggle_control(7, index, "track", index, "solo")
-                # reseting volume just in case
-                self._on_output_level_changed(index)
 
             # Other strip controls can be configured similarly
             # strip.set_arm_button(...)
@@ -10735,8 +10793,6 @@ class Tap(ControlSurface):
             self._create_mixer_automation_control("slider", 0, 127, "master", 0, "volume")
             self._create_mixer_automation_control("encoder", 0, 126, "master", 0, "cue_volume")
             self._create_mixer_automation_control("encoder", 0, 125, "master", 0, "panning")
-            # reseting volume just in case
-            self._on_output_level_changed(127)
 
         # Return Tracks
         for index, returnTrack in enumerate(return_tracks):
@@ -10748,53 +10804,30 @@ class Tap(ControlSurface):
                 self._create_mixer_automation_control("encoder", 8, index + 36, "return", index, "send", 0)
                 self._create_mixer_automation_control("encoder", 8, index + 48, "return", index, "send", 1)
                 self._create_mixer_automation_control("encoder", 8, index + 60, "return", index, "panning")
-                # reseting volume just in case
-                self._on_output_level_changed(index + len(tracks))
 
         self._schedule_mixer_automation_status_resends()
         
-    def _on_output_level_changed(self, index):
-        if self.mixer_status:
-            if not self.mixer_reset:
-                self.mixer_reset = True
-            track = self._mixer_meter_targets.get(index)
-            if track and liveobj_valid(track):
-                if track.has_audio_output:
-                    left_channel = track.output_meter_left
-                    right_channel = track.output_meter_right
-                else:
-                    left_channel = 0.0
-                    right_channel = 0.0
-    
-                value_left = int(round(left_channel * 100))
-                value_right = int(round(right_channel * 100))
-    
-                # send midi cc left on channel 9, right on channel 10, cc == index, 
-                # value == Int(left_channel * 100)
-    
-                status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
-                midi_cc_message_left = (status_byte_left, index, value_left)
-                self._send_midi(midi_cc_message_left)
-                status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
-                midi_cc_message_right = (status_byte_right, index, value_right)
-                self._send_midi(midi_cc_message_right)
+    def _on_output_level_changed(self, index, side, force=False):
+        if not self.mixer_status or index < 0 or index > 127:
+            return
 
-        elif self.mixer_reset:
-            self.mixer_reset = False
+        track = self._mixer_meter_targets.get(index)
+        if not self._track_has_output_meter(track):
+            return
 
-            song = self.song()
-            tracks = song.tracks
-            return_tracks = song.return_tracks
-            value = 0
-            total_track_number = len(tracks) + len(return_tracks) + 1
+        try:
+            raw_value = track.output_meter_left if side == "left" else track.output_meter_right
+            value = max(0, min(100, int(round(float(raw_value) * 100.0))))
+        except Exception:
+            return
 
-            for index in range(total_track_number):
-                status_byte_left = 0xB8 | 9  # MIDI CC message on channel 9
-                midi_cc_message_left = (status_byte_left, index, value)
-                self._send_midi(midi_cc_message_left)
-                status_byte_right = 0xB8 | 10  # MIDI CC message on channel 10
-                midi_cc_message_right = (status_byte_right, index, value)
-                self._send_midi(midi_cc_message_right)
+        cache_key = (index, side)
+        if not force and self._last_meter_values.get(cache_key) == value:
+            return
+        self._last_meter_values[cache_key] = value
+
+        channel = 9 if side == "left" else 10
+        self._send_midi((0xB0 | channel, index, value))
 
     def _get_track_index(self, track):
         if not track:
@@ -11778,6 +11811,8 @@ class Tap(ControlSurface):
             end = message[3]
             self.visible_channels = (start, end)
             self.mixer_status = True
+            self._last_clip_position_feedback_time = 0.0
+            self._last_visual_feedback_payload = None
             self._set_up_mixer_controls()
             
         # combine clips
@@ -16358,6 +16393,7 @@ class Tap(ControlSurface):
                 self._mixer_disconnect_timer.cancel()
                 self._mixer_disconnect_timer = None
             self.mixer_status = False
+            self._last_visual_feedback_payload = None
             self._set_up_mixer_controls()
             self._connect_device_controls()
             self._send_selected_device_state()
