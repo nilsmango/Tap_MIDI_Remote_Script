@@ -77,7 +77,7 @@ class TapDeviceComponent(DeviceComponent):
     SIMPLER_ACTIONS_BANK_NAME = "Actions"
     SIMPLER_WARP_BANK_NAME = "Controls"
     SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
-    SIMPLER_BROWSE_BANK_NAME = "Browse Samples"
+    SIMPLER_BROWSE_BANK_NAME = "Browse"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
@@ -270,6 +270,21 @@ class TapDeviceComponent(DeviceComponent):
     def _is_simpler(self):
         return self._device_class_name() == 'OriginalSimpler'
 
+    def _simpler_uses_native_banks(self):
+        if not self._is_simpler():
+            return False
+        try:
+            return bool(self._device.multi_sample_mode)
+        except Exception:
+            # If this Live version cannot expose multisample mode, a missing
+            # sample is ambiguous. Keep the normal parameter banks instead of
+            # presenting Simpler as empty; Browse remains available in its own
+            # bank.
+            try:
+                return not liveobj_valid(self._device.sample)
+            except Exception:
+                return True
+
     def _is_drumcell(self):
         return self._device_class_name() == 'DrumCell'
 
@@ -447,18 +462,20 @@ class TapDeviceComponent(DeviceComponent):
             index = self._wavetable_waves_insert_index(names)
             names.insert(index, self.WAVETABLE_OSC_BANK_NAME)
         elif self._is_simpler():
-            # Keep Live's native bank count and indices intact.  Tap's Push-like
-            # page replaces bank zero in place instead of inserting a bank.
-            if names:
-                names[0] = self.SIMPLER_MAIN_BANK_NAME
-            else:
-                names.append(self.SIMPLER_MAIN_BANK_NAME)
-            if self._simpler_is_classic() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
-                names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
-            elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
-                names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
-            self._configure_simpler_control_bank_names(names)
-            names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
+            if not self._simpler_uses_native_banks():
+                # Keep Live's native bank count and indices intact. Tap's
+                # Push-like page replaces bank zero in place instead of
+                # inserting a bank.
+                if names:
+                    names[0] = self.SIMPLER_MAIN_BANK_NAME
+                else:
+                    names.append(self.SIMPLER_MAIN_BANK_NAME)
+                if self._simpler_is_classic() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
+                    names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
+                elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
+                    names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
+                self._configure_simpler_control_bank_names(names)
+                names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
             names.append(self.SIMPLER_BROWSE_BANK_NAME)
         elif self._is_analog():
             names = self._analog_bank_names(names)
@@ -504,16 +521,17 @@ class TapDeviceComponent(DeviceComponent):
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler():
-            if not banks:
-                banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-            banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-            if self._simpler_is_classic() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
-                banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
-            elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
-                banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
-            self._replace_simpler_lfo_bank(banks, names)
-            self._configure_simpler_control_banks(banks, names)
-            banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+            if not self._simpler_uses_native_banks():
+                if not banks:
+                    banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+                banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
+                if self._simpler_is_classic() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
+                    banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
+                elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
+                    banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
+                self._replace_simpler_lfo_bank(banks, names)
+                self._configure_simpler_control_banks(banks, names)
+                banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_analog():
             banks = self._analog_parameter_banks(banks, names)
@@ -1362,11 +1380,12 @@ class TapDeviceComponent(DeviceComponent):
             return 'operator_filter_plus'
         if name == self.OPERATOR_LFO_PLUS_BANK_NAME:
             return 'operator_lfo_plus'
-        if name == self.SIMPLER_MAIN_BANK_NAME and self._is_simpler():
+        custom_simpler = self._is_simpler() and not self._simpler_uses_native_banks()
+        if name == self.SIMPLER_MAIN_BANK_NAME and custom_simpler:
             return 'simpler_main'
-        if name == self.SIMPLER_ACTIONS_BANK_NAME and self._is_simpler():
+        if name == self.SIMPLER_ACTIONS_BANK_NAME and custom_simpler:
             return 'simpler_actions'
-        if name == self.SIMPLER_WARP_BANK_NAME and self._is_simpler():
+        if name == self.SIMPLER_WARP_BANK_NAME and custom_simpler:
             return 'simpler_warp'
         if name == self.SIMPLER_BROWSE_BANK_NAME and self._is_simpler():
             return 'simpler_browse'
@@ -1765,6 +1784,7 @@ class Tap(ControlSurface):
             self._simpler_playhead_high = -1
             self._simpler_playhead_low = -1
             self._simpler_playhead_enabled = None
+            self._last_track_simpler_slice_signature = None
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -4229,6 +4249,47 @@ class Tap(ControlSurface):
             pass
         return str(getattr(device, 'class_name', '')) in ('OriginalSimpler', 'Simpler')
 
+    def _track_sliced_simpler(self, track=None):
+        try:
+            track = track or self.song().view.selected_track
+            if not track or not hasattr(track, 'devices'):
+                return None
+            devices = self._get_all_nested_devices(track.devices)[0]
+            for device in devices:
+                if self._is_simpler_device(device) and int(device.playback_mode) == 2:
+                    return device
+        except Exception:
+            pass
+        return None
+
+    def _send_track_simpler_slice_state(self, force=False):
+        track = None
+        try:
+            track = self.song().view.selected_track
+        except Exception:
+            pass
+        simpler = self._track_sliced_simpler(track)
+        slice_count = 0
+        if simpler:
+            try:
+                sample = simpler.sample
+                if liveobj_valid(sample):
+                    slice_count = min(128, len(tuple(sample.slices)))
+            except Exception:
+                pass
+        signature = (
+            id(track) if track else None,
+            id(simpler) if simpler else None,
+            slice_count,
+        )
+        if not force and signature == self._last_track_simpler_slice_signature:
+            return
+        self._last_track_simpler_slice_signature = signature
+        self._send_sys_ex_message(
+            '{}|{}'.format(1 if simpler else 0, slice_count),
+            0x48,
+        )
+
     def _is_drumcell_device(self, device):
         return liveobj_valid(device) and str(getattr(device, 'class_name', '')) == 'DrumCell'
 
@@ -4402,6 +4463,7 @@ class Tap(ControlSurface):
 
     def _on_simpler_state_changed(self):
         self._send_simpler_state()
+        self._send_track_simpler_slice_state()
         self._send_simpler_virtual_feedback_all()
         if self._simpler_actions_active():
             self._send_sys_ex_message(self._simpler_action_metadata(), 0x7D)
@@ -4412,6 +4474,7 @@ class Tap(ControlSurface):
     def _on_simpler_configuration_changed(self):
         self.schedule_message(1, self._sync_simpler_pad_slicing)
         self._send_simpler_state()
+        self._send_track_simpler_slice_state()
         try:
             selected_track = self.song().view.selected_track
             track_has_drums = 1 if self._find_drum_rack_in_track(selected_track) is not None else 0
@@ -4579,6 +4642,19 @@ class Tap(ControlSurface):
         except Exception:
             return ()
 
+    def _simpler_sample_position_display(self, name, parameter, value):
+        if name not in ('Start', 'End') or not liveobj_valid(self._simpler_sample):
+            return None
+        try:
+            position = float(value)
+            parameter_min = float(parameter.min)
+            parameter_max = float(parameter.max)
+            if parameter_min >= 0.0 and parameter_max <= 1.0:
+                position *= float(self._simpler_sample.length)
+            return str(int(round(position)))
+        except Exception:
+            return None
+
     def _simpler_display_for_value(self, name, parameter, value):
         items = self._simpler_value_items(name, parameter)
         if items:
@@ -4589,6 +4665,9 @@ class Tap(ControlSurface):
                 return items[max(0, min(len(items) - 1, item_index))]
             except Exception:
                 pass
+        sample_position = self._simpler_sample_position_display(name, parameter, value)
+        if sample_position is not None:
+            return sample_position
         try:
             display = parameter.str_for_value(value) if hasattr(parameter, 'str_for_value') else str(value)
             return self._format_display_value_numbers(display)
@@ -5370,6 +5449,7 @@ class Tap(ControlSurface):
             if not liveobj_valid(selected_device) and selected_track:
                 selected_device = selected_track.view.selected_device
             track_device_selected = self._track_device_is_selected()
+            self._send_track_simpler_slice_state(force=True)
             self._set_simpler_device(None if track_device_selected else selected_device)
             if track_device_selected:
                 self._setup_meld_engine_listener(None)
@@ -6831,6 +6911,7 @@ class Tap(ControlSurface):
         self._evaluate_mutator_regeneration()
         if not self.was_initialized:
             return
+        self._send_track_simpler_slice_state()
         self._send_group_fold_states_if_changed()
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
