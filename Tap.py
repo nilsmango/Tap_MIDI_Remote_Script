@@ -61,7 +61,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 21
+secret_version_number = 25
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1776,6 +1776,8 @@ class Tap(ControlSurface):
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
     MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v1\|([^\]]*)\]")
     MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v[0-9]+\|([^\]]*)\]")
+    FLIN_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v1\|([^\]]*)\]")
+    FLIN_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v[0-9]+\|([^\]]*)\]")
     SYSEX_TEXT_SYMBOL_REPLACEMENTS = (
         ('♭', 'b'),
         ('♯', '#'),
@@ -1847,7 +1849,7 @@ class Tap(ControlSurface):
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60)
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62)
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
@@ -7970,6 +7972,120 @@ class Tap(ControlSurface):
     def _strip_mutator_name_marker(self, name):
         return self.MUTATOR_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
 
+    def _strip_flin_name_marker(self, name):
+        return self.FLIN_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
+
+    def _flin_info_from_name(self, name):
+        """Decode only the supported marker version. Unknown versions stay ordinary clips."""
+        try:
+            matches = self.FLIN_NAME_MARKER_RE.findall(str(name or ""))
+            if not matches:
+                return None
+            fields = {}
+            for item in matches[-1].split("|"):
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    fields[key] = value
+            required = ("k", "q", "b", "r", "h", "m", "o", "p", "s", "l", "c")
+            if any(key not in fields for key in required):
+                return None
+            info = {
+                "kind": max(0, min(1, int(fields["k"]))),
+                "quantization": max(0, min(3, int(fields["q"]))),
+                "base_quarters": max(1, min(64, int(fields["b"]))),
+                "rate_mode": max(0, min(5, int(fields["r"]))),
+                "bottom_rate": max(0, min(3, int(fields.get("n", 1)))),
+                "row_interval": max(0, min(5, int(fields.get("i", 4)))),
+                "horizon_bars": int(fields["h"]),
+                "mapping_mode": max(0, min(3, int(fields["m"]))),
+                "global_offset": max(-64, min(63, int(fields["o"]))),
+                "view_page": max(-64, min(63, int(fields.get("v", 0)))),
+                "base_pitch": max(0, min(127, int(fields["p"]))),
+                "seed": max(1, min(2000000, int(fields["s"]))),
+                "default_velocity": max(1, min(127, int(fields.get("f", 100)))),
+                "limited": int(fields["l"]) == 1,
+                "columns": [],
+            }
+            if info["horizon_bars"] not in (4, 8, 16, 32, 64, 96):
+                return None
+            for record in filter(None, fields["c"].split(",")):
+                parts = record.split(":")
+                if len(parts) not in (10, 11):
+                    return None
+                page = int(parts[0]) if len(parts) == 11 else 0
+                offset = 1 if len(parts) == 11 else 0
+                info["columns"].append({
+                    "page": max(-64, min(63, page)),
+                    "id": max(0, min(15, int(parts[offset]))),
+                    "active": int(parts[offset + 1]) == 1,
+                    "rate_row": max(0, min(15, int(parts[offset + 2]))),
+                    "duration_steps": max(1, min(127, int(parts[offset + 3]))),
+                    "phase_ticks": max(0, int(parts[offset + 4])),
+                    "scale_degree": max(-63, min(63, int(parts[offset + 5]))),
+                    "octave_offset": max(-8, min(8, int(parts[offset + 6]))),
+                    "pad_offset": max(-63, min(63, int(parts[offset + 7]))),
+                    "velocity": max(1, min(127, int(parts[offset + 8]))),
+                    "probability": max(0, min(100, int(parts[offset + 9]))),
+                })
+            keys = [(column["page"], column["id"]) for column in info["columns"]]
+            if len(keys) != len(set(keys)):
+                return None
+            info["columns"].sort(key=lambda column: (column["page"], column["id"]))
+            return info
+        except Exception:
+            return None
+
+    def _flin_info(self, clip):
+        if clip is None or not hasattr(clip, "name"):
+            return None
+        return self._flin_info_from_name(clip.name)
+
+    def _flin_marker(self, info):
+        default_velocity = max(1, min(127, int(info.get("default_velocity", 100))))
+        columns = ",".join(":".join(str(value) for value in (
+            column.get("page", 0),
+            column.get("id", 0),
+            1 if column.get("active", False) else 0,
+            column.get("rate_row", 0),
+            column.get("duration_steps", 1),
+            column.get("phase_ticks", 0),
+            column.get("scale_degree", 0),
+            column.get("octave_offset", 0),
+            column.get("pad_offset", 0),
+            column.get("velocity", 100),
+            column.get("probability", 100),
+        )) for column in info.get("columns", []) if (
+            column.get("active", False)
+            or int(column.get("velocity", default_velocity)) != default_velocity
+            or int(column.get("probability", 100)) != 100
+        ))
+        return "[TapFlin:v1|k={}|q={}|b={}|r={}|n={}|i={}|h={}|m={}|o={}|v={}|p={}|s={}|f={}|l={}|c={}]".format(
+            info.get("kind", 0), info.get("quantization", 1), info.get("base_quarters", 16),
+            info.get("rate_mode", 0), info.get("bottom_rate", 1), info.get("row_interval", 4),
+            info.get("horizon_bars", 64), info.get("mapping_mode", 0),
+            info.get("global_offset", 0), info.get("view_page", 0), info.get("base_pitch", 60), info.get("seed", 1),
+            info.get("default_velocity", 100),
+            1 if info.get("limited", False) else 0, columns,
+        )
+
+    def _save_flin_info_to_name(self, clip, info):
+        try:
+            clean_name = self._strip_flin_name_marker(clip.name)
+            marker = self._flin_marker(info)
+            new_name = "{} {}".format(clean_name, marker).strip() if clean_name else marker
+            if clip.name != new_name:
+                clip.name = new_name
+        except Exception:
+            pass
+
+    def _remove_flin_info_from_name(self, clip):
+        try:
+            clean_name = self._strip_flin_name_marker(clip.name)
+            if clip.name != clean_name:
+                clip.name = clean_name
+        except Exception:
+            pass
+
     def _stable_decoupled_hash(self, value):
         result = 2166136261
         for char in str(value or ""):
@@ -10126,6 +10242,22 @@ class Tap(ControlSurface):
                     clip_start = min(clip_playing.start_time, clip_playing.start_marker, clip_playing.loop_start) - self.clip_length_trick
                     time_span = (max(clip_playing.loop_end, clip_playing.end_marker, clip_playing.length) + self.clip_length_trick) - clip_start
                     loop_start = clip_playing.loop_start
+
+                    # Sequencer views need only compact playhead feedback. Avoid
+                    # enumerating large Flin clips for every position callback.
+                    if self.seq_status:
+                        try:
+                            clip_position = clip_playing.playing_position
+                            self._check_clip_playing_status()
+                            if song.view.highlighted_clip_slot.is_playing:
+                                self.send_out_playing_pos(clip_position, self._flin_beats_per_bar(clip_playing))
+                                self.last_sent_out_playing_pos = clip_position
+                            elif self.last_sent_out_playing_pos != 0.0:
+                                self.last_sent_out_playing_pos = 0.0
+                                self.send_out_playing_pos(0.0, 1.0, force=True, hidden=True)
+                        except Exception as e:
+                            self._debug_log("Exception sending sequencer position: {}".format(str(e)))
+                        return
                     
                     try:
                         # Get all the notes in the clip
@@ -11428,10 +11560,431 @@ class Tap(ControlSurface):
         scale_string = "{};{}".format(self._escape_sysex_string(scale), root)
         self._send_sys_ex_message(scale_string, 0x0A)
         self._schedule_mutator_scale_root_sync()
+        rebuilt_flin = self._rebuild_visible_melodic_flin()
+        if not rebuilt_flin:
+            try:
+                self.send_selected_clip_metadata()
+            except Exception:
+                pass
+
+    def _flin_quantum_beats(self, info):
+        return (0.125, 0.25, 0.5, 1.0)[max(0, min(3, int(info.get("quantization", 1))))]
+
+    def _flin_beats_per_bar(self, clip):
+        numerator = max(1, int(getattr(clip, "signature_numerator", 4)))
+        denominator = max(1, int(getattr(clip, "signature_denominator", 4)))
+        return float(numerator) * 4.0 / float(denominator)
+
+    def _flin_period_ticks(self, info, clip, row):
+        quantum = self._flin_quantum_beats(info)
+        base_bars = float(info.get("base_quarters", 16)) / 4.0
+        base_ticks = max(1, int(round(base_bars * self._flin_beats_per_bar(clip) / quantum)))
+        row = max(0, min(15, int(row)))
+        mode = max(0, min(5, int(info.get("rate_mode", 0))))
+        primes = (1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
+        if mode == 1:
+            raw = float(base_ticks) / float(row + 1)
+        elif mode == 2:
+            raw = float(base_ticks) / float(2 ** row)
+        elif mode == 3:
+            raw = float(base_ticks) * ((1.0 / float(base_ticks)) ** (float(row) / 15.0))
+        elif mode == 4:
+            raw = float(base_ticks) / float(primes[row])
+        elif mode == 5:
+            bottom_beats = (0.125, 0.25, 0.5, 1.0)[max(0, min(3, int(info.get("bottom_rate", 1))))]
+            row_step = (2.0, 4.0 / 3.0, 1.0, 0.5, 0.25, 0.125)[max(0, min(5, int(info.get("row_interval", 4))))]
+            raw = (bottom_beats + float(15 - row) * row_step) / quantum
+        else:
+            raw = float(base_ticks) * float(16 - row) / 16.0
+        return max(1, int(math.floor(raw + 0.5)))
+
+    def _flin_loop_ticks(self, info, clip):
+        quantum = self._flin_quantum_beats(info)
+        beats_per_bar = self._flin_beats_per_bar(clip)
+        base_ticks = max(1, int(round((float(info.get("base_quarters", 16)) / 4.0) * beats_per_bar / quantum)))
+        horizon_ticks = max(1, int(round(float(info.get("horizon_bars", 64)) * beats_per_bar / quantum)))
+        common = base_ticks
+        for column in info.get("columns", []):
+            if not column.get("active", False):
+                continue
+            period = self._flin_period_ticks(info, clip, column.get("rate_row", 0))
+            common = (common * period) // math.gcd(common, period)
+            if common > horizon_ticks:
+                info["limited"] = True
+                return horizon_ticks
+        info["limited"] = common > horizon_ticks
+        return min(horizon_ticks, max(base_ticks, common))
+
+    def _flin_column_offset(self, info, page, column_id):
+        density = max(1, min(4, int(info.get("mapping_mode", 0)) + 1))
+        absolute_column = int(page) * 16 + int(column_id)
+        return int(math.floor(float(absolute_column) / float(density)))
+
+    def _flin_column_for_page(self, info, page, column_id):
+        for column in info.get("columns", []):
+            if int(column.get("page", 0)) == int(page) and int(column.get("id", -1)) == int(column_id):
+                return column
+        return None
+
+    def _flin_column_is_persistent(self, info, column):
+        default_velocity = max(1, min(127, int(info.get("default_velocity", 100))))
+        return (
+            bool(column.get("active", False))
+            or int(column.get("velocity", default_velocity)) != default_velocity
+            or int(column.get("probability", 100)) != 100
+        )
+
+    def _flin_remap_density(self, info, new_mode):
+        old_density = max(1, min(4, int(info.get("mapping_mode", 0)) + 1))
+        new_density = max(1, min(4, int(new_mode) + 1))
+        if old_density == new_density:
+            return
+
+        remapped = {}
+        for source in info.get("columns", []):
+            absolute = int(source.get("page", 0)) * 16 + int(source.get("id", 0))
+            pitch_slot = int(math.floor(float(absolute) / float(old_density)))
+            lane = absolute - pitch_slot * old_density
+            # Reducing density deliberately removes the duplicate lanes that
+            # no longer exist; lane zero keeps the pitch and rhythm.
+            if lane >= new_density:
+                continue
+            target_absolute = pitch_slot * new_density + lane
+            target_page = int(math.floor(float(target_absolute) / 16.0))
+            target_id = target_absolute - target_page * 16
+            target = dict(source)
+            target["page"] = target_page
+            target["id"] = target_id
+            key = (target_page, target_id)
+            previous = remapped.get(key)
+            if previous is None or (target.get("active", False) and not previous.get("active", False)):
+                remapped[key] = target
+
+        old_view = int(info.get("view_page", 0))
+        first_pitch_slot = int(math.floor(float(old_view * 16) / float(old_density)))
+        first_new_column = first_pitch_slot * new_density
+        info["view_page"] = max(-64, min(63, int(math.floor(float(first_new_column) / 16.0))))
+        info["mapping_mode"] = new_density - 1
+        info["columns"] = sorted(remapped.values(), key=lambda value: (value["page"], value["id"]))
+
+    def _flin_visible_columns(self, info):
+        page = max(-64, min(63, int(info.get("view_page", 0))))
+        result = []
+        for column_id in range(16):
+            stored = self._flin_column_for_page(info, page, column_id)
+            mapped = self._flin_column_offset(info, page, column_id)
+            if stored is None:
+                stored = {
+                    "page": page, "id": column_id, "active": False,
+                    "rate_row": 0, "duration_steps": 1, "phase_ticks": 0,
+                    "octave_offset": 0,
+                    "velocity": max(1, min(127, int(info.get("default_velocity", 100)))),
+                    "probability": 100,
+                }
+            column = dict(stored)
+            column["id"] = column_id
+            column["page"] = page
+            column["scale_degree"] = mapped
+            column["pad_offset"] = mapped
+            result.append(column)
+        return result
+
+    def _flin_raw_pitch(self, info, column):
+        page = int(column.get("page", info.get("view_page", 0)))
+        mapped = self._flin_column_offset(info, page, int(column.get("id", 0)))
+        if int(info.get("kind", 0)) == 1:
+            return int(info.get("base_pitch", 36)) + int(info.get("global_offset", 0)) * 16 + mapped
+        song = self.song()
+        root = max(0, min(11, int(getattr(song, "root_note", 0))))
+        intervals = self._mutator_scale_intervals(str(getattr(song, "scale_name", "Minor")))
+        octave, normalized_degree = divmod(mapped, max(1, len(intervals)))
+        root_at_octave = (int(info.get("base_pitch", 60)) // 12) * 12 + root
+        return root_at_octave + (int(info.get("global_offset", 0)) + octave) * 12 + intervals[normalized_degree]
+
+    def _flin_pitch_bounds(self, info):
+        active = [column for column in info.get("columns", []) if column.get("active", False)]
+        source = active if active else self._flin_visible_columns(info)
+        pitches = [self._flin_raw_pitch(info, column) for column in source]
+        if not pitches:
+            return (0, 127)
+        return (max(0, min(127, min(pitches))), max(0, min(127, max(pitches))))
+
+    def _flin_pitch(self, info, column):
+        return max(0, min(127, self._flin_raw_pitch(info, column)))
+
+    def _flin_rebuild_clip(self, clip, info, send_updates=True):
+        if clip is None or not getattr(clip, "is_midi_clip", False):
+            return False
+        quantum = self._flin_quantum_beats(info)
+        loop_ticks = self._flin_loop_ticks(info, clip)
+        loop_start = float(getattr(clip, "loop_start", 0.0))
+        loop_length = max(quantum, float(loop_ticks) * quantum)
+        specs = []
+        for column in info.get("columns", []):
+            if not column.get("active", False):
+                continue
+            period = self._flin_period_ticks(info, clip, column.get("rate_row", 0))
+            phase = int(column.get("phase_ticks", 0)) % max(1, period)
+            duration_ticks = max(1, min(int(column.get("duration_steps", 1)), period, loop_ticks))
+            tick = phase
+            while tick < loop_ticks:
+                specs.append(MidiNoteSpecification(
+                    pitch=self._flin_pitch(info, column),
+                    start_time=loop_start + float(tick) * quantum,
+                    duration=max(0.0001, float(duration_ticks) * quantum),
+                    velocity=max(1, min(127, int(column.get("velocity", 100)))),
+                    mute=False,
+                    probability=max(0.0, min(1.0, float(column.get("probability", 100)) / 100.0)),
+                ))
+                tick += period
+
+        remove_start = min(
+            loop_start,
+            float(getattr(clip, "start_time", loop_start)),
+            float(getattr(clip, "start_marker", loop_start)),
+        ) - self.clip_length_trick
+        old_end = max(
+            loop_start + loop_length,
+            float(getattr(clip, "loop_end", loop_start)),
+            float(getattr(clip, "end_marker", loop_start)),
+            float(getattr(clip, "length", loop_length)),
+        )
+        self._begin_selected_clip_update_batch()
+        undo_step_started = self._begin_undo_step()
         try:
+            if hasattr(clip, "remove_notes_extended"):
+                clip.remove_notes_extended(0, 128, remove_start, max(0.0001, old_end - remove_start))
+            for start in range(0, len(specs), 512):
+                clip.add_new_notes(tuple(specs[start:start + 512]))
+            clip.start_marker = min(float(getattr(clip, "start_marker", loop_start)), loop_start)
+            clip.loop_end = loop_start + loop_length
+            clip.end_marker = loop_start + loop_length
+            clip.looping = True
+            self._save_flin_info_to_name(clip, info)
+
+            decoupled = self._decoupled_automation_info(clip)
+            if decoupled:
+                decoupled["note_start"] = loop_start
+                decoupled["note_length"] = loop_length
+                decoupled["note_end"] = loop_start + loop_length
+                self._save_decoupled_automation_info_to_name(clip, decoupled)
+        finally:
+            self._end_undo_step(undo_step_started)
+            self._end_selected_clip_update_batch()
+        if send_updates:
             self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+        return True
+
+    def _flin_settings_from_payload(self, parts):
+        try:
+            if len(parts) < 16:
+                return None
+            info = {
+                "kind": max(0, min(1, int(parts[2]))),
+                "quantization": max(0, min(3, int(parts[3]))),
+                "base_quarters": max(1, min(64, int(parts[4]))),
+                "rate_mode": max(0, min(5, int(parts[5]))),
+                "bottom_rate": max(0, min(3, int(parts[6]))),
+                "row_interval": max(0, min(5, int(parts[7]))),
+                "horizon_bars": int(parts[8]),
+                "mapping_mode": max(0, min(3, int(parts[9]))),
+                "global_offset": max(-64, min(63, int(parts[10]))),
+                "view_page": max(-64, min(63, int(parts[11]))),
+                "base_pitch": max(0, min(127, int(parts[12]))),
+                "seed": max(1, min(2000000, int(parts[13]))),
+                "default_velocity": max(1, min(127, int(parts[14]))),
+                "limited": False,
+                "columns": [],
+            }
+            if info["horizon_bars"] not in (4, 8, 16, 32, 64, 96):
+                return None
+            for record in parts[15].split(","):
+                values = [int(value) for value in record.split(":")]
+                if len(values) != 10:
+                    return None
+                info["columns"].append({
+                    "page": info["view_page"],
+                    "id": max(0, min(15, values[0])), "active": values[1] == 1,
+                    "rate_row": max(0, min(15, values[2])), "duration_steps": max(1, min(127, values[3])),
+                    "phase_ticks": max(0, values[4]), "scale_degree": max(-63, min(63, values[5])),
+                    "octave_offset": max(-8, min(8, values[6])), "pad_offset": max(-63, min(63, values[7])),
+                    "velocity": max(1, min(127, values[8])), "probability": max(0, min(100, values[9])),
+                })
+            if len(info["columns"]) != 16:
+                return None
+            info["columns"].sort(key=lambda column: column["id"])
+            return info
         except Exception:
-            pass
+            return None
+
+    def _handle_flin_command(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode("ascii")
+            parts = payload.split("|")
+            if len(parts) < 2 or parts[0] != "v1":
+                return
+            slot = self.song().view.highlighted_clip_slot
+            if slot is None or not slot.has_clip or not getattr(slot.clip, "is_midi_clip", False):
+                return
+            clip = slot.clip
+            action = parts[1]
+            if action in ("activate", "settings"):
+                incoming = self._flin_settings_from_payload(parts)
+                if not incoming or (action == "activate" and self._mutator_info(clip)):
+                    return
+                if action == "activate":
+                    info = incoming
+                    info["columns"] = [
+                        column for column in incoming["columns"]
+                        if self._flin_column_is_persistent(incoming, column)
+                    ]
+                else:
+                    info = self._flin_info(clip)
+                    if not info:
+                        return
+                    for key in (
+                        "kind", "quantization", "base_quarters", "rate_mode", "bottom_rate", "row_interval", "horizon_bars",
+                        "mapping_mode", "global_offset", "view_page", "base_pitch", "seed",
+                        "default_velocity",
+                    ):
+                        info[key] = incoming[key]
+                    page = incoming["view_page"]
+                    info["columns"] = [
+                        column for column in info.get("columns", [])
+                        if int(column.get("page", 0)) != page
+                    ] + [
+                        column for column in incoming["columns"]
+                        if self._flin_column_is_persistent(incoming, column)
+                    ]
+                if any(
+                    not 0 <= self._flin_raw_pitch(info, column) <= 127
+                    for column in info.get("columns", []) if column.get("active", False)
+                ):
+                    self.send_selected_clip_metadata()
+                    return
+                self._flin_rebuild_clip(clip, info)
+                return
+            info = self._flin_info(clip)
+            if not info:
+                return
+            if action == "gesture" and len(parts) >= 8:
+                was_playing = bool(getattr(slot, "is_playing", False))
+                page = max(-64, min(63, int(parts[2])))
+                column_index = max(0, min(15, int(parts[3])))
+                row = max(0, min(15, int(parts[4])))
+                duration = max(1, min(127, int(parts[5])))
+                velocity = max(1, min(127, int(parts[6])))
+                probability = max(0, min(100, int(parts[7])))
+                period = self._flin_period_ticks(info, clip, row)
+                quantum = self._flin_quantum_beats(info)
+                if was_playing:
+                    position = float(getattr(clip, "playing_position", clip.loop_start))
+                    relative_tick = int(math.ceil(((position - float(clip.loop_start)) / quantum) - 0.000001))
+                    phase_tick = (relative_tick + period) % period
+                else:
+                    # A stopped gesture authors the note at the clip start and
+                    # launches the clip. Live playback, not an audition note,
+                    # produces the sound.
+                    phase_tick = 0
+                column = self._flin_column_for_page(info, page, column_index)
+                if column is None:
+                    column = {"page": page, "id": column_index}
+                    info["columns"].append(column)
+                column.update(
+                    active=True, rate_row=row, duration_steps=duration, phase_ticks=phase_tick,
+                    velocity=velocity, probability=probability, octave_offset=0,
+                )
+                self._flin_rebuild_clip(clip, info)
+                if not was_playing:
+                    slot.fire()
+            elif action == "remove" and len(parts) >= 4:
+                page = max(-64, min(63, int(parts[2])))
+                column_index = max(0, min(15, int(parts[3])))
+                column = self._flin_column_for_page(info, page, column_index)
+                if column is not None:
+                    column["active"] = False
+                self._flin_rebuild_clip(clip, info)
+            elif action == "column" and len(parts) >= 6:
+                page = max(-64, min(63, int(parts[2])))
+                column_index = max(0, min(15, int(parts[3])))
+                velocity = max(1, min(127, int(parts[4])))
+                probability = max(0, min(100, int(parts[5])))
+                column = self._flin_column_for_page(info, page, column_index)
+                if column is None:
+                    column = {
+                        "page": page, "id": column_index, "active": False,
+                        "rate_row": 0, "duration_steps": 1, "phase_ticks": 0,
+                        "octave_offset": 0,
+                    }
+                    info["columns"].append(column)
+                column["velocity"] = velocity
+                column["probability"] = probability
+                if column.get("active", False):
+                    self._flin_rebuild_clip(clip, info)
+                else:
+                    self._save_flin_info_to_name(clip, info)
+                    self.send_selected_clip_metadata()
+            elif action == "density" and len(parts) >= 3:
+                target_mode = max(0, min(3, int(parts[2])))
+                self._flin_remap_density(info, target_mode)
+                if any(
+                    not 0 <= self._flin_raw_pitch(info, column) <= 127
+                    for column in info.get("columns", []) if column.get("active", False)
+                ):
+                    self.send_selected_clip_metadata()
+                    return
+                self._flin_rebuild_clip(clip, info)
+            elif action == "view" and len(parts) >= 3:
+                target = max(-64, min(63, int(parts[2])))
+                candidate = dict(info)
+                candidate["view_page"] = target
+                if all(0 <= self._flin_raw_pitch(candidate, column) <= 127 for column in self._flin_visible_columns(candidate)):
+                    info["view_page"] = target
+                    self._save_flin_info_to_name(clip, info)
+                    self.send_selected_clip_metadata()
+            elif action == "velocity" and len(parts) >= 3:
+                delta = max(-127, min(127, int(parts[2])))
+                info["default_velocity"] = max(1, min(127, int(info.get("default_velocity", 100)) + delta))
+                for column in info.get("columns", []):
+                    column["velocity"] = max(1, min(127, int(column.get("velocity", 100)) + delta))
+                self._flin_rebuild_clip(clip, info)
+            elif action == "reset" and len(parts) >= 4:
+                target = str(parts[2])
+                value = int(parts[3])
+                if target == "velocity":
+                    value = max(1, min(127, value))
+                    info["default_velocity"] = value
+                    for column in info.get("columns", []):
+                        column["velocity"] = value
+                elif target == "probability":
+                    value = max(0, min(100, value))
+                    for column in info.get("columns", []):
+                        column["probability"] = value
+                else:
+                    return
+                self._flin_rebuild_clip(clip, info)
+            elif action == "clear":
+                for column in info.get("columns", []):
+                    column["active"] = False
+                self._flin_rebuild_clip(clip, info)
+            elif action == "exit":
+                self._remove_flin_info_from_name(clip)
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
+        except Exception as e:
+            self._debug_log("Error handling Flin command: {}".format(str(e)))
+
+    def _rebuild_visible_melodic_flin(self):
+        try:
+            slot = self.song().view.highlighted_clip_slot
+            if slot is not None and slot.has_clip:
+                info = self._flin_info(slot.clip)
+                if info and int(info.get("kind", 0)) == 0:
+                    return self._flin_rebuild_clip(slot.clip, info)
+        except Exception as e:
+            self._debug_log("Error following scale for Flin: {}".format(str(e)))
+        return False
 
     def handle_sysex(self, message):
         """
@@ -11515,6 +12068,10 @@ class Tap(ControlSurface):
         if len(message) >= 3 and message[1] == 0x3D:
             values = self.extract_values_from_sysex_message(message)
             self._browser_preview(values[0] if values else 0)
+            return
+        # Flin owns the MIDI notes of a marked clip while the mode is active.
+        if len(message) >= 3 and message[1] == 0x3E:
+            self._handle_flin_command(message)
             return
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
@@ -12402,9 +12959,34 @@ class Tap(ControlSurface):
             "Lydian": [0, 2, 4, 6, 7, 9, 11],
             "Phrygian": [0, 1, 3, 5, 7, 8, 10],
             "Locrian": [0, 1, 3, 5, 6, 8, 10],
+            "Whole Tone": [0, 2, 4, 6, 8, 10],
+            "Half-whole Dim.": [0, 1, 3, 4, 6, 7, 9, 10],
+            "Whole-half Dim.": [0, 2, 3, 5, 6, 8, 9, 11],
             "Minor Pentatonic": [0, 3, 5, 7, 10],
             "Major Pentatonic": [0, 2, 4, 7, 9],
             "Minor Blues": [0, 3, 5, 6, 7, 10],
+            "Harmonic Minor": [0, 2, 3, 5, 7, 8, 11],
+            "Harmonic Major": [0, 2, 4, 5, 7, 8, 11],
+            "Dorian #4": [0, 2, 3, 6, 7, 9, 10],
+            "Phrygian Dominant": [0, 1, 4, 5, 7, 8, 10],
+            "Melodic Minor": [0, 2, 3, 5, 7, 9, 11],
+            "Lydian Augmented": [0, 2, 4, 6, 8, 9, 11],
+            "Lydian Dominant": [0, 2, 4, 6, 7, 9, 10],
+            "Super Locrian": [0, 1, 3, 4, 6, 8, 10],
+            "8-Tone Spanish": [0, 1, 3, 4, 5, 6, 8, 10],
+            "Bhairav": [0, 1, 4, 5, 7, 8, 11],
+            "Hungarian Minor": [0, 2, 3, 6, 7, 8, 11],
+            "Hirajoshi": [0, 2, 3, 7, 8],
+            "In-Sen": [0, 1, 5, 7, 10],
+            "Iwato": [0, 1, 5, 6, 10],
+            "Kumoi": [0, 2, 3, 7, 9],
+            "Pelog Selisir": [0, 1, 3, 7, 8],
+            "Pelog Tembung": [0, 1, 5, 7, 8],
+            "Messiaen 3": [0, 2, 3, 4, 6, 7, 8, 10, 11],
+            "Messiaen 4": [0, 1, 2, 5, 6, 7, 8, 11],
+            "Messiaen 5": [0, 1, 5, 6, 7, 11],
+            "Messiaen 6": [0, 2, 4, 5, 6, 8, 10],
+            "Messiaen 7": [0, 1, 2, 3, 5, 6, 7, 8, 9, 11],
         }
         return table.get(scale_name, table["Minor"])
 
@@ -15817,6 +16399,11 @@ class Tap(ControlSurface):
         else:
             song.scale_mode = True
 
+        # Live's root/scale listeners are not guaranteed to fire in the same
+        # callback turn when both values arrive from Tap. Rebuild explicitly
+        # after the final pair is applied so Flin-owned notes always follow.
+        self._rebuild_visible_melodic_flin()
+
     def _fire_scene(self, value):
         scenes = self.song().scenes
         if value < len(scenes):
@@ -16665,6 +17252,46 @@ class Tap(ControlSurface):
                                 ])
                         note_data.append(mutator_slot_count)
                         note_data.append(1 if mutator_info.get("pending_settings_update", False) else 0)
+                    else:
+                        note_data.append(0)
+
+                    flin_info = self._flin_info(selected_clip)
+                    if flin_info:
+                        columns = self._flin_visible_columns(flin_info)
+                        minimum_pitch, maximum_pitch = self._flin_pitch_bounds(flin_info)
+                        note_data.extend([
+                            1,
+                            int(flin_info.get("kind", 0)) & 0x7F,
+                            int(flin_info.get("quantization", 1)) & 0x7F,
+                            int(flin_info.get("base_quarters", 16)) & 0x7F,
+                            int(flin_info.get("rate_mode", 0)) & 0x7F,
+                            int(flin_info.get("bottom_rate", 1)) & 0x7F,
+                            int(flin_info.get("row_interval", 4)) & 0x7F,
+                            int(flin_info.get("horizon_bars", 64)) & 0x7F,
+                            int(flin_info.get("mapping_mode", 0)) & 0x7F,
+                            max(0, min(127, int(flin_info.get("global_offset", 0)) + 64)),
+                            max(0, min(127, int(flin_info.get("view_page", 0)) + 64)),
+                            max(0, min(127, int(flin_info.get("base_pitch", 60)))),
+                            1 if flin_info.get("limited", False) else 0,
+                            *self._to_3_7bit_bytes(int(flin_info.get("seed", 1))),
+                            max(1, min(127, int(flin_info.get("default_velocity", 100)))),
+                            minimum_pitch,
+                            maximum_pitch,
+                            len(columns),
+                        ])
+                        for column in columns:
+                            note_data.extend([
+                                max(0, min(15, int(column.get("id", 0)))),
+                                1 if column.get("active", False) else 0,
+                                max(0, min(15, int(column.get("rate_row", 0)))),
+                                max(1, min(127, int(column.get("duration_steps", 1)))),
+                                *self._to_3_7bit_bytes(max(0, int(column.get("phase_ticks", 0)))),
+                                max(0, min(127, int(column.get("scale_degree", 0)) + 64)),
+                                max(0, min(127, int(column.get("octave_offset", 0)) + 64)),
+                                max(0, min(127, int(column.get("pad_offset", 0)) + 64)),
+                                max(1, min(127, int(column.get("velocity", 100)))),
+                                max(0, min(100, int(column.get("probability", 100)))),
+                            ])
                     else:
                         note_data.append(0)
                     
