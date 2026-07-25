@@ -18175,8 +18175,15 @@ class Tap(ControlSurface):
             base_path = tuple(state.get('path', ()))
             return [(item, base_path) for item in state['items']]
 
+        # Leave the largest unfiltered roots until the end so common browser
+        # categories can publish matches first. Explicit tag searches keep the
+        # selected tag order above, including when Samples is selected.
+        category_indices = [
+            category_index for category_index in self.browser_searchable_tag_indices
+            if category_index not in (10, 11, 12)
+        ] + [10, 11, 12]
         roots = []
-        for category_index in self.browser_searchable_tag_indices:
+        for category_index in category_indices:
             label = self.browser_folder_labels.get(category_index, '')
             roots.extend((item, (label,)) for item in self._browser_items_for_category(category_index))
         return roots
