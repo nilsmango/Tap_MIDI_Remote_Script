@@ -61,7 +61,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 25
+secret_version_number = 27
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -87,9 +87,9 @@ class TapDeviceComponent(DeviceComponent):
     SIMPLER_AMP_BANK_INDEX = 3
     DRUMCELL_SAMPLE_BANK_NAME = "Sample"
     DRUMCELL_FX_FILTER_BANK_NAME = "FX & Filter"
-    DRUMCELL_REST_BANK_NAME = "Rest"
-    DRUMCELL_FX_2_BANK_NAME = "FX 2"
-    DRUMCELL_FX_3_BANK_NAME = "FX 3"
+    DRUMCELL_REST_BANK_NAME = "Main & Mod"
+    DRUMCELL_FX_2_BANK_NAME = "FX P"
+    DRUMCELL_FX_3_BANK_NAME = "FX P2"
     DELAY_BANK_NAMES = ("Main", "Time / Flt", "Flt / LFO", "LFO Wave")
     AUTO_FILTER_BANK_NAMES = ("Main", "Envelope", "LFO", "Sidechain")
     AUTO_FILTER_2_BANK_NAMES = ("Main", "LFO", "Envelope", "Quantization")
@@ -865,6 +865,13 @@ class TapDeviceComponent(DeviceComponent):
 
     def _auto_filter_2_parameter_banks(self):
         filter_type = self._parameter_value_text('Filter Type')
+        filter_type_key = re.sub(r'[^a-z0-9]+', '', filter_type)
+        uses_morph = any(
+            name in filter_type_key
+            for name in ('morph', 'comb', 'notchlp', 'notchlowpass', 'vowel')
+        )
+        slope = self._parameter_by_names('Slope', 'Filter Slope')
+        morph_or_slope = self._parameter_by_names('Filter Morph') if uses_morph else slope
         if 'dj' in filter_type:
             frequency = self._parameter_by_names('Control')
         elif 'vowel' in filter_type:
@@ -892,7 +899,7 @@ class TapDeviceComponent(DeviceComponent):
 
         return (
             self._parameter_bank(
-                'Filter Type', frequency, resonance, 'Filter Morph',
+                'Filter Type', frequency, resonance, morph_or_slope,
                 'Circuit', 'Drive', 'Output', ('Dry/Wet', 'Dry Wet'),
             ),
             self._parameter_bank(
@@ -1853,7 +1860,7 @@ class Tap(ControlSurface):
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
-    UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
+    UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32||||parameter|0"
     UNMAPPED_PARAMETER_METADATA = ",".join([UNMAPPED_PARAMETER_METADATA_ITEM] * 8)
     TRACK_DEVICE_NAV_NAME = "line.3.horizontal"
     TRACK_DEVICE_MAIN_BANK_NAME = "Main"
@@ -2583,13 +2590,14 @@ class Tap(ControlSurface):
                     value_range = parameter.max - parameter.min
                     default_normalized = ((default_value - parameter.min) / value_range) if value_range else 0.0
                     quarter_display = parameter.str_for_value(parameter.min + (parameter.max - parameter.min) * 32.0 / 127.0)
-                    metadata.append('{}|{}|{}|{}|{}|{}||{}|{}|parameter|1'.format(
+                    metadata.append('{}|{}|{}|{}|{}|{}||{}|{}|parameter|{}'.format(
                         self._escape_sysex_string(spec['name']),
                         self._escape_sysex_string(min_value), self._escape_sysex_string(max_value),
                         self._escape_sysex_string(default_display),
                         default_normalized, self._escape_sysex_string(quarter_display),
                         self._escape_sysex_string(self._parameter_display_value(parameter)),
-                        self._parameter_normalized_value(parameter)))
+                        self._parameter_normalized_value(parameter),
+                        1 if self._parameter_is_automatable(parameter) else 0))
                     continue
                 except Exception:
                     metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
@@ -2843,6 +2851,7 @@ class Tap(ControlSurface):
             song = self.song()
             clip_slot = self._playing_clip_slot_for_track(track or song.view.selected_track)
             envelope_was_cleared = False
+            decoupled_length_was_reset = False
             if clip_slot is not None and clip_slot.has_clip:
                 clip = clip_slot.clip
                 envelope = None
@@ -2853,13 +2862,38 @@ class Tap(ControlSurface):
                         envelope = None
                 if envelope is not None:
                     self._clear_clip_automation_envelope(clip, envelope, device_param, self._parameter_normalized_value(device_param))
-                    self._clear_authored_automation_steps_for_parameter(clip, device_param)
                     envelope_was_cleared = True
+                self._clear_authored_automation_steps_for_parameter(clip, device_param)
+                decoupled_length_was_reset = self._reset_decoupled_automation_length_for_parameter(
+                    clip,
+                    device_param,
+                    send_updates=self._clip_is_highlighted(clip)
+                )
 
-            if envelope_was_cleared:
+            if envelope_was_cleared or decoupled_length_was_reset:
                 self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
             self._debug_log("Error removing automation: {}".format(str(e)))
+
+    def _clip_is_highlighted(self, clip):
+        try:
+            clip_slot = self.song().view.highlighted_clip_slot
+            return bool(clip_slot is not None and clip_slot.has_clip and clip_slot.clip == clip)
+        except Exception:
+            return False
+
+    def _reset_decoupled_automation_length_for_parameter(self, clip, device_param, send_updates=True):
+        info = self._decoupled_automation_info(clip, device_param)
+        if not info or not info.get("has_parameter_length"):
+            return False
+
+        self._apply_decoupled_automation_length(
+            clip,
+            device_param,
+            info["note_length"],
+            send_updates=send_updates
+        )
+        return True
 
     def _automation_clear_end_time(self, clip):
         try:
@@ -2941,7 +2975,9 @@ class Tap(ControlSurface):
         except Exception:
             parameter_identity = id(device_param)
 
-        return (clip_identity, parameter_identity, int(control_index))
+        # A parameter keeps the same authored envelope when the user changes
+        # device bank or the parameter appears under another encoder slot.
+        return (clip_identity, parameter_identity)
 
     def _authored_automation_steps(self, clip, device_param, control_index):
         key = self._automation_envelope_key(clip, device_param, control_index)
@@ -3840,7 +3876,7 @@ class Tap(ControlSurface):
             self._escape_sysex_string(self._parameter_display_value(parameter)),
             str(self._parameter_normalized_value(parameter)),
             "parameter",
-            "1",
+            "1" if self._parameter_is_automatable(parameter) else "0",
         ]
         return "|".join(fields)
 
@@ -3995,6 +4031,16 @@ class Tap(ControlSurface):
         except Exception:
             pass
         return True
+
+    def _parameter_is_automatable(self, parameter):
+        try:
+            return bool(
+                parameter
+                and liveobj_valid(parameter)
+                and hasattr(parameter, 'automation_state')
+            )
+        except Exception:
+            return False
 
     def _parameter_is_inactive(self, parameter):
         try:
@@ -4303,14 +4349,19 @@ class Tap(ControlSurface):
                     max_val_str = self._escape_sysex_string(max_val_str.strip())
                     default_val_str = self._escape_sysex_string(default_val_str.strip())
                     quarter_str = self._escape_sysex_string(quarter_str.strip())
-                    param_str = f"{name.strip()}|{min_val_str}|{max_val_str}|{default_val_str}|{default_raw_str.strip()}|{quarter_str}|{value_items.strip()}"
+                    automatable = 1 if self._parameter_is_automatable(device_param) else 0
+                    param_str = (
+                        f"{name.strip()}|{min_val_str}|{max_val_str}|{default_val_str}|"
+                        f"{default_raw_str.strip()}|{quarter_str}|{value_items.strip()}|||"
+                        f"parameter|{automatable}"
+                    )
                     param_data.append(param_str)
                 else:
-                    param_str = "*--&&-|0|127|0.0|0.0|32|"
+                    param_str = self.UNMAPPED_PARAMETER_METADATA_ITEM
                     param_data.append(param_str)
                     unmapped_encoder_indices.append(control_index)
             else:
-                param_str = "*--&&-|0|127|0.0|0.0|32|"
+                param_str = self.UNMAPPED_PARAMETER_METADATA_ITEM
                 param_data.append(param_str)
                 unmapped_encoder_indices.append(control_index)
         
@@ -4954,7 +5005,7 @@ class Tap(ControlSurface):
                     display_name = '**' + display_name
                 elif parameter.automation_state == 2:
                     display_name = '*/' + display_name
-            automatable = 1 if hasattr(parameter, 'automation_state') else 0
+            automatable = 1 if self._parameter_is_automatable(parameter) else 0
             return '{}|{}|{}|{}|{}|{}|{}|{}|{}|parameter|{}'.format(
                 self._escape_sysex_string(display_name),
                 self._escape_sysex_string(min_value),
@@ -8019,7 +8070,7 @@ class Tap(ControlSurface):
                     "id": max(0, min(15, int(parts[offset]))),
                     "active": int(parts[offset + 1]) == 1,
                     "rate_row": max(0, min(15, int(parts[offset + 2]))),
-                    "duration_steps": max(1, min(127, int(parts[offset + 3]))),
+                    "duration_steps": max(1, min(16, int(parts[offset + 3]))),
                     "phase_ticks": max(0, int(parts[offset + 4])),
                     "scale_degree": max(-63, min(63, int(parts[offset + 5]))),
                     "octave_offset": max(-8, min(8, int(parts[offset + 6]))),
@@ -8927,6 +8978,39 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error rewriting decoupled note copies: {}".format(str(e)))
 
+    def _double_decoupled_note_copies(self, clip, previous_info, doubled_info):
+        try:
+            previous_start = previous_info["note_start"]
+            previous_length = previous_info["note_length"]
+            base_notes = clip.get_notes_extended(0, 128, previous_start, previous_length)
+            specs = []
+            for note in base_notes:
+                for half_offset in (0.0, previous_length):
+                    specs.extend(self._make_repeated_note_specs_from_values(
+                        getattr(note, "pitch", 0),
+                        getattr(note, "start_time", previous_start) + half_offset,
+                        getattr(note, "duration", 0.0001),
+                        getattr(note, "velocity", 100),
+                        getattr(note, "mute", False),
+                        getattr(note, "probability", 1.0),
+                        doubled_info
+                    ))
+
+            if hasattr(clip, "remove_notes_extended"):
+                remove_start = float(doubled_info.get("remove_start", previous_start))
+                current_end = max(
+                    previous_info["physical_end"],
+                    doubled_info["physical_end"],
+                    float(getattr(clip, "loop_end", doubled_info["physical_end"])),
+                    float(getattr(clip, "end_marker", doubled_info["physical_end"])),
+                    float(getattr(clip, "length", doubled_info["physical_length"])),
+                )
+                clip.remove_notes_extended(0, 128, remove_start, max(doubled_info["physical_length"], current_end - remove_start))
+            if specs:
+                clip.add_new_notes(specs)
+        except Exception as e:
+            self._debug_log("Error doubling decoupled note copies: {}".format(str(e)))
+
     def _expanded_decoupled_automation_steps(self, info, logical_steps, sample_duration):
         if not info or not logical_steps:
             return tuple(logical_steps or ())
@@ -9169,17 +9253,123 @@ class Tap(ControlSurface):
             except Exception:
                 pass
 
+    def _track_for_clip(self, clip):
+        if clip is None:
+            return None
+
+        try:
+            selected_track = self.song().view.selected_track
+            if selected_track is not None:
+                for clip_slot in selected_track.clip_slots:
+                    if clip_slot is not None and clip_slot.has_clip and clip_slot.clip == clip:
+                        return selected_track
+        except Exception:
+            pass
+
+        try:
+            for track in self.song().tracks:
+                for clip_slot in track.clip_slots:
+                    if clip_slot is not None and clip_slot.has_clip and clip_slot.clip == clip:
+                        return track
+        except Exception:
+            pass
+        return None
+
+    def _all_track_automation_parameter_candidates(self, track):
+        if track is None:
+            return tuple()
+
+        parameters = []
+        seen_parameter_ids = set()
+        seen_device_ids = set()
+
+        def add_parameter(parameter):
+            if not self._parameter_is_automatable(parameter):
+                return
+            try:
+                identity = self._live_object_identity(parameter)
+            except Exception:
+                identity = id(parameter)
+            if identity in seen_parameter_ids:
+                return
+            seen_parameter_ids.add(identity)
+            parameters.append(parameter)
+
+        def add_devices(devices):
+            for device in tuple(devices or ()):
+                if not device or not liveobj_valid(device):
+                    continue
+                try:
+                    device_identity = self._live_object_identity(device)
+                except Exception:
+                    device_identity = id(device)
+                if device_identity in seen_device_ids:
+                    continue
+                seen_device_ids.add(device_identity)
+
+                for parameter in tuple(getattr(device, "parameters", ()) or ()):
+                    add_parameter(parameter)
+
+                for chain in tuple(getattr(device, "chains", ()) or ()):
+                    if chain and liveobj_valid(chain):
+                        add_devices(getattr(chain, "devices", ()))
+
+        try:
+            mixer_device = track.mixer_device
+            add_parameter(getattr(mixer_device, "volume", None))
+            add_parameter(getattr(mixer_device, "panning", None))
+            for send in tuple(getattr(mixer_device, "sends", ()) or ()):
+                add_parameter(send)
+        except Exception:
+            pass
+
+        add_devices(getattr(track, "devices", ()))
+
+        # Keep mapped/decorated parameters that are not exposed through the
+        # raw device tree (for example some custom Simpler/Wavetable banks).
+        for control_index in range(8):
+            try:
+                add_parameter(self._current_connected_parameter_for_control(control_index))
+            except Exception:
+                pass
+
+        return tuple(parameters)
+
+    def _clip_automation_parameters(self, clip, info=None):
+        track = self._track_for_clip(clip)
+        parameters = []
+        custom_length_keys = set((info or {}).get("automation_lengths", {}).keys())
+
+        for parameter in self._all_track_automation_parameter_candidates(track):
+            has_envelope = False
+            if hasattr(clip, "automation_envelope"):
+                try:
+                    has_envelope = clip.automation_envelope(parameter) is not None
+                except Exception:
+                    has_envelope = False
+
+            parameter_key = self._decoupled_automation_parameter_key(parameter)
+            has_authored_steps = self._authored_automation_steps(clip, parameter, 0) is not None
+            if has_envelope or has_authored_steps or parameter_key in custom_length_keys:
+                parameters.append(parameter)
+
+        return tuple(parameters)
+
     def _rewrite_all_decoupled_automation_envelopes(self, clip, info):
         if clip is None or not info:
             return
 
         sample_duration = 1.0 / 128.0
-        for control_index in range(8):
+        for control_index, device_param in enumerate(self._clip_automation_parameters(clip, info)):
             try:
-                device_param = self._current_connected_parameter_for_control(control_index)
                 self._rewrite_decoupled_automation_for_parameter(clip, device_param, control_index, info, sample_duration)
             except Exception as e:
-                self._debug_log("Error rewriting decoupled automation for control {}: {}".format(control_index, str(e)))
+                self._debug_log(
+                    "Error rewriting decoupled automation for parameter '{}': {}".format(
+                        getattr(device_param, "name", control_index),
+                        str(e)
+                    )
+                )
 
     def _automation_steps_from_step_source(self, steps, start, length, sample_duration):
         steps = self._automation_sorted_steps(steps or ())
@@ -9288,12 +9478,16 @@ class Tap(ControlSurface):
             return False
 
         sample_duration = 1.0 / 128.0
-        for control_index in range(8):
+        for control_index, device_param in enumerate(self._clip_automation_parameters(clip, info)):
             try:
-                device_param = self._current_connected_parameter_for_control(control_index)
                 self._couple_decoupled_automation_for_parameter(clip, device_param, control_index, info, target_length, sample_duration)
             except Exception as e:
-                self._debug_log("Error coupling decoupled automation for control {}: {}".format(control_index, str(e)))
+                self._debug_log(
+                    "Error coupling decoupled automation for parameter '{}': {}".format(
+                        getattr(device_param, "name", control_index),
+                        str(e)
+                    )
+                )
 
         self._remove_decoupled_automation_info_from_name(clip)
         return True
@@ -9308,9 +9502,8 @@ class Tap(ControlSurface):
         sample_duration = 1.0 / 128.0
         duplicated_any = False
 
-        for control_index in range(8):
+        for control_index, device_param in enumerate(self._clip_automation_parameters(clip)):
             try:
-                device_param = self._current_connected_parameter_for_control(control_index)
                 if self._duplicate_loop_automation_for_parameter(
                     clip,
                     device_param,
@@ -9322,9 +9515,95 @@ class Tap(ControlSurface):
                 ):
                     duplicated_any = True
             except Exception as e:
-                self._debug_log("Error duplicating loop automation for control {}: {}".format(control_index, str(e)))
+                self._debug_log(
+                    "Error duplicating loop automation for parameter '{}': {}".format(
+                        getattr(device_param, "name", control_index),
+                        str(e)
+                    )
+                )
 
         return duplicated_any
+
+    def _double_decoupled_loop_automation(self, clip, previous_info, doubled_info):
+        if clip is None:
+            return False
+
+        source_start = previous_info["note_start"]
+        previous_note_length = previous_info["note_length"]
+        doubled_note_length = doubled_info["note_length"]
+        previous_lengths = previous_info.get("automation_lengths", {})
+        doubled_lengths = doubled_info.get("automation_lengths", {})
+        sample_duration = 1.0 / 128.0
+        duplicated_any = False
+
+        for control_index, device_param in enumerate(self._clip_automation_parameters(clip, previous_info)):
+            try:
+                parameter_key = self._decoupled_automation_parameter_key(device_param)
+                source_length = previous_lengths.get(parameter_key, previous_note_length)
+                target_length = doubled_lengths.get(parameter_key, doubled_note_length)
+                if self._duplicate_loop_automation_for_parameter(
+                    clip,
+                    device_param,
+                    control_index,
+                    source_start,
+                    source_length,
+                    target_length,
+                    sample_duration
+                ):
+                    duplicated_any = True
+            except Exception as e:
+                self._debug_log(
+                    "Error doubling decoupled loop automation for parameter '{}': {}".format(
+                        getattr(device_param, "name", control_index),
+                        str(e)
+                    )
+                )
+
+        self._rewrite_all_decoupled_automation_envelopes(clip, doubled_info)
+        return duplicated_any
+
+    def _double_decoupled_loop(self, clip, previous_info):
+        note_start = previous_info["note_start"]
+        previous_note_length = previous_info["note_length"]
+        doubled_note_length = previous_note_length * 2.0
+        max_physical_length = self._decoupled_automation_max_physical_length(clip, doubled_note_length)
+        doubled_lengths = {}
+        for parameter_key, previous_length in previous_info.get("automation_lengths", {}).items():
+            try:
+                doubled_length = min(max_physical_length, max(0.0001, float(previous_length)) * 2.0)
+                if abs(doubled_length - doubled_note_length) > 0.000001:
+                    doubled_lengths[parameter_key] = doubled_length
+            except Exception:
+                pass
+
+        physical_length = self._decoupled_physical_length(
+            doubled_note_length,
+            doubled_lengths.values(),
+            max_physical_length
+        )
+        doubled_info = {
+            "note_start": note_start,
+            "note_length": doubled_note_length,
+            "note_end": note_start + doubled_note_length,
+            "automation_lengths": doubled_lengths,
+            "automation_length": doubled_note_length,
+            "physical_length": physical_length,
+            "physical_end": note_start + physical_length,
+            "remove_start": note_start,
+        }
+
+        clip.loop_start = note_start
+        clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
+        clip.loop_end = doubled_info["physical_end"]
+        clip.end_marker = doubled_info["physical_end"]
+        self._double_decoupled_note_copies(clip, previous_info, doubled_info)
+        self._double_decoupled_loop_automation(clip, previous_info, doubled_info)
+
+        if doubled_lengths:
+            self._save_decoupled_automation_info_to_name(clip, doubled_info)
+        else:
+            self._remove_decoupled_automation_info_from_name(clip)
+        return doubled_info
 
     def _duplicate_loop_automation_for_parameter(self, clip, device_param, control_index, source_start, source_length, target_length, sample_duration):
         if clip is None or device_param is None or not liveobj_valid(device_param):
@@ -11725,13 +12004,15 @@ class Tap(ControlSurface):
                 continue
             period = self._flin_period_ticks(info, clip, column.get("rate_row", 0))
             phase = int(column.get("phase_ticks", 0)) % max(1, period)
-            duration_ticks = max(1, min(int(column.get("duration_steps", 1)), period, loop_ticks))
+            duration_sixteenths = max(1, min(16, int(column.get("duration_steps", 1))))
+            repeat_distance_ticks = max(1, min(period, loop_ticks))
+            duration_beats = float(repeat_distance_ticks) * quantum * float(duration_sixteenths) / 16.0
             tick = phase
             while tick < loop_ticks:
                 specs.append(MidiNoteSpecification(
                     pitch=self._flin_pitch(info, column),
                     start_time=loop_start + float(tick) * quantum,
-                    duration=max(0.0001, float(duration_ticks) * quantum),
+                    duration=max(0.0001, duration_beats),
                     velocity=max(1, min(127, int(column.get("velocity", 100)))),
                     mute=False,
                     probability=max(0.0, min(1.0, float(column.get("probability", 100)) / 100.0)),
@@ -11806,7 +12087,7 @@ class Tap(ControlSurface):
                 info["columns"].append({
                     "page": info["view_page"],
                     "id": max(0, min(15, values[0])), "active": values[1] == 1,
-                    "rate_row": max(0, min(15, values[2])), "duration_steps": max(1, min(127, values[3])),
+                    "rate_row": max(0, min(15, values[2])), "duration_steps": max(1, min(16, values[3])),
                     "phase_ticks": max(0, values[4]), "scale_degree": max(-63, min(63, values[5])),
                     "octave_offset": max(-8, min(8, values[6])), "pad_offset": max(-63, min(63, values[7])),
                     "velocity": max(1, min(127, values[8])), "probability": max(0, min(100, values[9])),
@@ -11873,7 +12154,7 @@ class Tap(ControlSurface):
                 page = max(-64, min(63, int(parts[2])))
                 column_index = max(0, min(15, int(parts[3])))
                 row = max(0, min(15, int(parts[4])))
-                duration = max(1, min(127, int(parts[5])))
+                duration = max(1, min(16, int(parts[5])))
                 velocity = max(1, min(127, int(parts[6])))
                 probability = max(0, min(100, int(parts[7])))
                 period = self._flin_period_ticks(info, clip, row)
@@ -11910,6 +12191,7 @@ class Tap(ControlSurface):
                 column_index = max(0, min(15, int(parts[3])))
                 velocity = max(1, min(127, int(parts[4])))
                 probability = max(0, min(100, int(parts[5])))
+                duration = max(1, min(16, int(parts[6]))) if len(parts) >= 7 else None
                 column = self._flin_column_for_page(info, page, column_index)
                 if column is None:
                     column = {
@@ -11920,10 +12202,27 @@ class Tap(ControlSurface):
                     info["columns"].append(column)
                 column["velocity"] = velocity
                 column["probability"] = probability
+                if duration is not None:
+                    column["duration_steps"] = duration
                 if column.get("active", False):
                     self._flin_rebuild_clip(clip, info)
                 else:
                     self._save_flin_info_to_name(clip, info)
+                    self.send_selected_clip_metadata()
+            elif action == "transpose" and len(parts) >= 3:
+                amount = max(-64, min(63, int(parts[2])))
+                candidate = dict(info)
+                candidate["global_offset"] = max(
+                    -64,
+                    min(63, int(info.get("global_offset", 0)) + amount)
+                )
+                if all(
+                    0 <= self._flin_raw_pitch(candidate, column) <= 127
+                    for column in candidate.get("columns", []) if column.get("active", False)
+                ):
+                    info["global_offset"] = candidate["global_offset"]
+                    self._flin_rebuild_clip(clip, info)
+                else:
                     self.send_selected_clip_metadata()
             elif action == "density" and len(parts) >= 3:
                 target_mode = max(0, min(3, int(parts[2])))
@@ -12197,10 +12496,10 @@ class Tap(ControlSurface):
         if len(message) >= 2 and message[1] == 15:
             note_ids = []
             index = 2
-            while index < (len(message) - 1):
-                note_id = message[index] | (message[index + 1] << 7)
+            while index + 5 <= (len(message) - 1):
+                note_id = self._from_5_7bit_bytes(message, index)
                 note_ids.append(note_id)
-                index += 2
+                index += 5
         
             # Get the selected clip
             song = self.song()
@@ -12261,9 +12560,12 @@ class Tap(ControlSurface):
         
                 # Modify the matching notes
                 while index < (len(message) - 1):
-                    note_id = message[index] | (message[index + 1] << 7)
-                    pitch = message[index + 2]
-                    index += 3
+                    if index + 6 > len(message) - 1:
+                        break
+                    note_id = self._from_5_7bit_bytes(message, index)
+                    index += 5
+                    pitch = message[index]
+                    index += 1
         
                     start_time_raw = self._from_3_7bit_bytes(message, index)
                     start_time = start_time_raw / 1000.0
@@ -15437,6 +15739,7 @@ class Tap(ControlSurface):
                     "physical_end": note_start + note_length,
                 }
                 self._rewrite_decoupled_note_copies(clip, folded_info)
+                self._rewrite_all_decoupled_automation_envelopes(clip, folded_info)
                 self._remove_decoupled_automation_info_from_name(clip)
                 clip.loop_start = note_start
                 clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
@@ -15505,6 +15808,23 @@ class Tap(ControlSurface):
         )
         self._send_sys_ex_message(response, 0x31)
 
+    def _automation_write_error_response(self, control_index, write_token=""):
+        device_param = self._current_connected_parameter_for_control(control_index)
+        current_value = self._parameter_normalized_value(device_param)
+        clip_slot = self.song().view.highlighted_clip_slot
+        clip = clip_slot.clip if clip_slot is not None and clip_slot.has_clip else None
+        response_fields = self._automation_response_decoupled_fields(clip, device_param)
+        response_fields.extend([str(write_token or ""), "error"])
+        response = "{}|{}|{:.6f}|{}|{}|{}".format(
+            control_index,
+            0,
+            current_value,
+            "",
+            "",
+            "|".join(response_fields)
+        )
+        self._send_sys_ex_message(response, 0x31)
+
     def _automation_response_decoupled_fields(self, clip, device_param):
         info = self._decoupled_automation_info(clip, device_param)
         if not info:
@@ -15535,6 +15855,11 @@ class Tap(ControlSurface):
             if envelope is not None:
                 self._clear_clip_automation_envelope(clip, envelope, device_param, current_value)
             self._clear_authored_automation_steps_for_parameter(clip, device_param)
+            self._reset_decoupled_automation_length_for_parameter(
+                clip,
+                device_param,
+                send_updates=True
+            )
             self._automation_clear_response(control_index, current_value)
             self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
@@ -15551,10 +15876,8 @@ class Tap(ControlSurface):
                 return
 
             clip = clip_slot.clip
-            for index in range(8):
-                device_param = self._current_connected_parameter_for_control(index)
-                if not device_param or not liveobj_valid(device_param):
-                    continue
+            decoupled_info = self._decoupled_automation_info(clip)
+            for device_param in self._clip_automation_parameters(clip, decoupled_info):
                 envelope = None
                 if hasattr(clip, 'automation_envelope'):
                     try:
@@ -15565,6 +15888,29 @@ class Tap(ControlSurface):
                     continue
                 self._clear_clip_automation_envelope(clip, envelope, device_param, self._parameter_normalized_value(device_param))
             self._clear_authored_automation_steps_for_clip(clip)
+
+            if decoupled_info:
+                note_start = decoupled_info["note_start"]
+                note_length = decoupled_info["note_length"]
+                folded_info = {
+                    "note_start": note_start,
+                    "note_length": note_length,
+                    "note_end": note_start + note_length,
+                    "automation_lengths": {},
+                    "automation_length": note_length,
+                    "physical_length": note_length,
+                    "physical_end": note_start + note_length,
+                    "remove_start": note_start,
+                }
+                self._rewrite_decoupled_note_copies(clip, folded_info)
+                self._remove_decoupled_automation_info_from_name(clip)
+                clip.loop_start = note_start
+                clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
+                clip.loop_end = note_start + note_length
+                clip.end_marker = note_start + note_length
+                self.send_selected_clip_metadata()
+                self.send_selected_clip_notes()
+
             self._automation_clear_response(control_index, current_value)
             self._refresh_parameter_metadata_on_automation_change()
         except Exception as e:
@@ -15695,14 +16041,18 @@ class Tap(ControlSurface):
                                 actual_checksum
                             )
                         )
+                        self._automation_write_error_response(control_index, write_token)
                         return
                 except Exception:
                     self._debug_log("Rejected automation envelope payload with invalid checksum fields")
+                    self._automation_write_error_response(control_index, write_token)
                     return
 
             device_param = self._current_connected_parameter_for_control(control_index)
             clip_slot = self.song().view.highlighted_clip_slot
-            if clip_slot is None or not clip_slot.has_clip or not device_param or not liveobj_valid(device_param):
+            if (clip_slot is None or not clip_slot.has_clip
+                    or not self._parameter_is_automatable(device_param)):
+                self._automation_write_error_response(control_index, write_token)
                 return
 
             automation_was_enabled = self._parameter_automation_is_enabled(device_param)
@@ -15890,15 +16240,7 @@ class Tap(ControlSurface):
                     envelope = None
 
             if envelope is None:
-                response = "{}|{}|{:.6f}|{}|{}|{}".format(
-                    control_index,
-                    0,
-                    current_normalized,
-                    "",
-                    "",
-                    "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
-                )
-                self._send_sys_ex_message(response, 0x31)
+                self._automation_write_error_response(control_index, write_token)
                 self._refresh_parameter_metadata_on_automation_change()
                 return
 
@@ -15943,6 +16285,7 @@ class Tap(ControlSurface):
                 )
 
             previous_insert_time = None
+            insert_failed = False
             for index, step in enumerate(all_steps):
                 time_value, duration, normalized, _ = step
                 raw_value = self._parameter_target_value_from_normalized(device_param, normalized)
@@ -15960,7 +16303,17 @@ class Tap(ControlSurface):
                     envelope.insert_step(time_value, duration, raw_value)
                     previous_insert_time = time_value
                 except Exception:
-                    pass
+                    insert_failed = True
+
+            if insert_failed or previous_insert_time is None:
+                self._debug_log(
+                    "Automation envelope write did not insert every requested step for control {}".format(
+                        control_index
+                    )
+                )
+                self._automation_write_error_response(control_index, write_token)
+                self._refresh_parameter_metadata_on_automation_change()
+                return
 
             self._store_authored_automation_steps(clip, device_param, control_index, logical_steps)
 
@@ -16241,32 +16594,7 @@ class Tap(ControlSurface):
 
         try:
             if decoupled_info:
-                folded_start = float(decoupled_info.get("note_start", 0.0))
-                folded_length = max(0.0001, float(decoupled_info.get("note_length", 1.0)))
-                auto_lengths = decoupled_info.get("automation_lengths", {})
-                epsilon = 0.0001
-
-                all_auto_fit = True
-                if auto_lengths:
-                    for auto_len in auto_lengths.values():
-                        ratio = folded_length / auto_len
-                        if ratio < 1.0 - epsilon or abs(ratio - round(ratio)) > epsilon:
-                            all_auto_fit = False
-                            break
-
-                if all_auto_fit:
-                    clip.loop_start = folded_start
-                    clip.start_marker = min(float(getattr(clip, "start_marker", folded_start)), folded_start)
-                    clip.loop_end = folded_start + folded_length
-                    clip.end_marker = folded_start + folded_length
-                    clip.duplicate_loop()
-                else:
-                    clip.loop_start = folded_start
-                    clip.start_marker = min(float(getattr(clip, "start_marker", folded_start)), folded_start)
-                    clip.loop_end = folded_start + (folded_length * 2.0)
-                    clip.end_marker = folded_start + (folded_length * 2.0)
-
-                self._remove_decoupled_automation_info_from_name(clip)
+                self._double_decoupled_loop(clip, decoupled_info)
             else:
                 clip.duplicate_loop()
 
@@ -17108,6 +17436,19 @@ class Tap(ControlSurface):
             value & 0x7F,           # Low 7 bits
             (value >> 7) & 0x7F     # High 7 bits
         ]
+
+    def _to_5_7bit_bytes(self, value):
+        """Encode a non-negative Live note ID without 14-bit truncation."""
+        value = max(0, int(value))
+        return [(value >> (shift * 7)) & 0x7F for shift in range(5)]
+
+    def _from_5_7bit_bytes(self, bytes_list, start_index=0):
+        if len(bytes_list) < start_index + 5:
+            return 0
+        return sum(
+            int(bytes_list[start_index + shift]) << (shift * 7)
+            for shift in range(5)
+        )
     
     def _to_3_7bit_bytes(self, value):
         """
@@ -17284,7 +17625,7 @@ class Tap(ControlSurface):
                                 max(0, min(15, int(column.get("id", 0)))),
                                 1 if column.get("active", False) else 0,
                                 max(0, min(15, int(column.get("rate_row", 0)))),
-                                max(1, min(127, int(column.get("duration_steps", 1)))),
+                                max(1, min(16, int(column.get("duration_steps", 1)))),
                                 *self._to_3_7bit_bytes(max(0, int(column.get("phase_ticks", 0)))),
                                 max(0, min(127, int(column.get("scale_degree", 0)) + 64)),
                                 max(0, min(127, int(column.get("octave_offset", 0)) + 64)),
@@ -17345,7 +17686,7 @@ class Tap(ControlSurface):
                         probability = int(note.probability * 127)
                     
                         note_data = [
-                            *self._to_2_7bit_bytes(note_id),   # 2 bytes, 7-bit encoded
+                            *self._to_5_7bit_bytes(note_id),   # 5 bytes, 7-bit encoded
                             pitch,                      # 1 byte
                             *self._to_3_7bit_bytes(start_time),# 3 bytes, 7-bit encoded
                             *self._to_3_7bit_bytes(duration),  # 3 bytes, 7-bit encoded
@@ -17865,12 +18206,17 @@ class Tap(ControlSurface):
         uri = str(getattr(item, 'uri', '')).casefold()
         if name.endswith('.alc') or '.alc' in uri:
             return False
+        item_path = tuple(path) if path is not None else tuple(self.browser_current_path)
+        root = str(item_path[0]).casefold() if item_path else ''
+        preview_roots = ('sounds', 'drums', 'instruments', 'samples')
         audio_extensions = ('.wav', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.ogg')
         if name.endswith(audio_extensions) or any(extension in uri for extension in audio_extensions):
             return True
         preset_extensions = ('.adv', '.adg')
         if name.endswith(preset_extensions) or any(extension in uri for extension in preset_extensions):
-            return self._browser_preset_has_preview(item)
+            # Pack and library URIs are often virtual, so a preset may have a
+            # working Live preview even when no local path can be resolved.
+            return self._browser_preset_has_preview(item) or root in preview_roots
 
         try:
             if bool(item.is_device):
@@ -17878,9 +18224,7 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
-        item_path = tuple(path) if path is not None else tuple(self.browser_current_path)
-        root = str(item_path[0]).casefold() if item_path else ''
-        return root in ('sounds', 'drums', 'instruments', 'samples')
+        return root in preview_roots
 
     def _publish_browser_search_matches(self, work):
         # Search walks one root folder at a time. Keeping discovery order makes
