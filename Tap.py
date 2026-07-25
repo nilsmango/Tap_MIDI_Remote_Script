@@ -1860,7 +1860,7 @@ class Tap(ControlSurface):
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
-    UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32||||parameter|0"
+    UNMAPPED_PARAMETER_METADATA_ITEM = "*--&&-|0|127|0.0|0.0|32|"
     UNMAPPED_PARAMETER_METADATA = ",".join([UNMAPPED_PARAMETER_METADATA_ITEM] * 8)
     TRACK_DEVICE_NAV_NAME = "line.3.horizontal"
     TRACK_DEVICE_MAIN_BANK_NAME = "Main"
@@ -2590,14 +2590,14 @@ class Tap(ControlSurface):
                     value_range = parameter.max - parameter.min
                     default_normalized = ((default_value - parameter.min) / value_range) if value_range else 0.0
                     quarter_display = parameter.str_for_value(parameter.min + (parameter.max - parameter.min) * 32.0 / 127.0)
-                    metadata.append('{}|{}|{}|{}|{}|{}||{}|{}|parameter|{}'.format(
-                        self._escape_sysex_string(spec['name']),
+                    automatable = self._parameter_is_automatable(parameter)
+                    metadata.append('{}|{}|{}|{}|{}|{}||{}|{}'.format(
+                        self._parameter_metadata_name(self._escape_sysex_string(spec['name']), automatable),
                         self._escape_sysex_string(min_value), self._escape_sysex_string(max_value),
                         self._escape_sysex_string(default_display),
                         default_normalized, self._escape_sysex_string(quarter_display),
                         self._escape_sysex_string(self._parameter_display_value(parameter)),
-                        self._parameter_normalized_value(parameter),
-                        1 if self._parameter_is_automatable(parameter) else 0))
+                        self._parameter_normalized_value(parameter)))
                     continue
                 except Exception:
                     metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
@@ -2607,8 +2607,8 @@ class Tap(ControlSurface):
                 continue
             index = max(0, min(len(items) - 1, self._wavetable_virtual_index(spec)))
             normalized = float(index) / float(max(1, len(items) - 1))
-            metadata.append('{}|{}|{}|{}|0.0|{}|{}|{}|{}|parameter|0'.format(
-                self._escape_sysex_string(spec['name']),
+            metadata.append('{}|{}|{}|{}|0.0|{}|{}|{}|{}'.format(
+                self._parameter_metadata_name(self._escape_sysex_string(spec['name']), False),
                 self._escape_sysex_string(str(items[0])),
                 self._escape_sysex_string(str(items[-1])),
                 self._escape_sysex_string(str(items[0])),
@@ -3786,7 +3786,11 @@ class Tap(ControlSurface):
             return self.UNMAPPED_PARAMETER_METADATA_ITEM
 
         if entry.get("kind") != "parameter":
-            name = self._escape_sysex_string(entry.get("name", ""))
+            automatable = bool(entry.get("automatable", False))
+            name = self._parameter_metadata_name(
+                self._escape_sysex_string(entry.get("name", "")),
+                automatable
+            )
             minimum = float(entry.get("min", 0.0))
             maximum = float(entry.get("max", 127.0))
             default = float(entry.get("default", minimum))
@@ -3803,7 +3807,6 @@ class Tap(ControlSurface):
                 display_value,
                 str(max(0.0, min(1.0, normalized))),
                 self._escape_sysex_string(entry.get("kind", "")),
-                "1" if entry.get("automatable", False) else "0",
             ]
             return "|".join(fields)
 
@@ -3814,7 +3817,7 @@ class Tap(ControlSurface):
             escaped_parameter_name = self._escape_sysex_string(getattr(parameter, "name", ""))
             prefix = ""
             display_name = name
-            for candidate_prefix in ("**", "*/", "*-", "*~"):
+            for candidate_prefix in ("**", "*/", "*-", "*~", "*!"):
                 if display_name.startswith(candidate_prefix):
                     prefix = candidate_prefix
                     display_name = display_name[len(candidate_prefix):]
@@ -3823,6 +3826,7 @@ class Tap(ControlSurface):
                 name = prefix + self._escape_sysex_string(fallback_name)
         except Exception:
             pass
+        name = self._parameter_metadata_name(name, self._parameter_is_automatable(parameter))
 
         min_val_str = None
         max_val_str = None
@@ -3875,8 +3879,6 @@ class Tap(ControlSurface):
             value_items.strip(),
             self._escape_sysex_string(self._parameter_display_value(parameter)),
             str(self._parameter_normalized_value(parameter)),
-            "parameter",
-            "1" if self._parameter_is_automatable(parameter) else "0",
         ]
         return "|".join(fields)
 
@@ -4018,6 +4020,12 @@ class Tap(ControlSurface):
                     return f"*/{raw_name}"
             return raw_name
         return raw_name
+
+    def _parameter_metadata_name(self, name, automatable):
+        name = str(name or "")
+        if automatable or name.startswith(("*-", "*~", "*!")):
+            return name
+        return "*!" + name
 
     def _parameter_is_control_available(self, parameter):
         try:
@@ -4349,11 +4357,13 @@ class Tap(ControlSurface):
                     max_val_str = self._escape_sysex_string(max_val_str.strip())
                     default_val_str = self._escape_sysex_string(default_val_str.strip())
                     quarter_str = self._escape_sysex_string(quarter_str.strip())
-                    automatable = 1 if self._parameter_is_automatable(device_param) else 0
+                    name = self._parameter_metadata_name(
+                        name.strip(),
+                        self._parameter_is_automatable(device_param)
+                    )
                     param_str = (
-                        f"{name.strip()}|{min_val_str}|{max_val_str}|{default_val_str}|"
-                        f"{default_raw_str.strip()}|{quarter_str}|{value_items.strip()}|||"
-                        f"parameter|{automatable}"
+                        f"{name}|{min_val_str}|{max_val_str}|{default_val_str}|"
+                        f"{default_raw_str.strip()}|{quarter_str}|{value_items.strip()}"
                     )
                     param_data.append(param_str)
                 else:
@@ -5005,9 +5015,9 @@ class Tap(ControlSurface):
                     display_name = '**' + display_name
                 elif parameter.automation_state == 2:
                     display_name = '*/' + display_name
-            automatable = 1 if self._parameter_is_automatable(parameter) else 0
-            return '{}|{}|{}|{}|{}|{}|{}|{}|{}|parameter|{}'.format(
-                self._escape_sysex_string(display_name),
+            automatable = self._parameter_is_automatable(parameter)
+            return '{}|{}|{}|{}|{}|{}|{}|{}|{}'.format(
+                self._parameter_metadata_name(self._escape_sysex_string(display_name), automatable),
                 self._escape_sysex_string(min_value),
                 self._escape_sysex_string(max_value),
                 self._escape_sysex_string(default_display),
@@ -5016,7 +5026,6 @@ class Tap(ControlSurface):
                 value_items,
                 self._escape_sysex_string(self._simpler_display_value(name, parameter)),
                 self._parameter_normalized_value(parameter),
-                automatable,
             )
         except Exception:
             return self.UNMAPPED_PARAMETER_METADATA_ITEM
@@ -5197,8 +5206,8 @@ class Tap(ControlSurface):
             name = str(spec.get('name', 'Action'))
             if not spec.get('enabled', True):
                 name = '*~' + name
-            return '{}||||0.0||||0.0|momentary_{}|0'.format(
-                self._escape_sysex_string(name),
+            return '{}||||0.0||||0.0|momentary_{}'.format(
+                self._parameter_metadata_name(self._escape_sysex_string(name), False),
                 int(spec.get('action', 0)),
             )
         items = tuple(spec.get('items') or ('Ready', 'Trigger'))
@@ -5207,8 +5216,8 @@ class Tap(ControlSurface):
             name = '*~' + name
         normalized = max(0.0, min(1.0, float(spec.get('normalized', 0.0))))
         quarter_index = int(round((len(items) - 1) * 32.0 / 127.0))
-        return '{}|{}|{}|{}|{}|{}|{}|{}|{}|action|0'.format(
-            self._escape_sysex_string(name),
+        return '{}|{}|{}|{}|{}|{}|{}|{}|{}|action'.format(
+            self._parameter_metadata_name(self._escape_sysex_string(name), False),
             self._escape_sysex_string(items[0]),
             self._escape_sysex_string(items[-1]),
             self._escape_sysex_string(items[0]),
@@ -5328,7 +5337,7 @@ class Tap(ControlSurface):
 
     def _simpler_virtual_metadata(self):
         if self._simpler_main_active() and not liveobj_valid(self._simpler_sample):
-            browse = 'Browse Samples||||0.0||||0.0|browse_sample|0'
+            browse = '*!Browse Samples||||0.0||||0.0|browse_sample'
             return ','.join([browse] + [self.UNMAPPED_PARAMETER_METADATA_ITEM] * 7)
         metadata = []
         for control_index in range(8):
@@ -5337,13 +5346,13 @@ class Tap(ControlSurface):
                 metadata.append(self.UNMAPPED_PARAMETER_METADATA_ITEM)
             elif spec['kind'] == 'zoom':
                 display = '{}%'.format(int(round(self._simpler_zoom * 100.0)))
-                metadata.append('Zoom|Full|Close|Full|0.0|25%||{}|{}|parameter|0'.format(display, self._simpler_zoom))
+                metadata.append('*!Zoom|Full|Close|Full|0.0|25%||{}|{}'.format(display, self._simpler_zoom))
             else:
                 metadata.append(self._simpler_parameter_metadata_item(spec['name'], spec['parameter']))
         return ','.join(metadata)
 
     def _simpler_browse_metadata(self):
-        browse = 'Browse Samples||||0.0||||0.0|browse_sample|0'
+        browse = '*!Browse Samples||||0.0||||0.0|browse_sample'
         return ','.join([browse] + [self.UNMAPPED_PARAMETER_METADATA_ITEM] * 7)
 
     def _send_simpler_virtual_feedback(self, control_index):
