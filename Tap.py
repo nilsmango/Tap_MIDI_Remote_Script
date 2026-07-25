@@ -2087,8 +2087,11 @@ class Tap(ControlSurface):
             self._simpler_waveform_generation = 0
             self._simpler_waveform_cache = {}
             self._simpler_waveform_cache_order = []
+            self._simpler_waveform_failures = {}
+            self._simpler_waveform_failure_order = []
             self._simpler_waveform_lock = threading.Lock()
             self._simpler_waveform_pending = set()
+            self._simpler_waveform_polling = set()
             self._simpler_playhead_high = -1
             self._simpler_playhead_low = -1
             self._simpler_playhead_enabled = None
@@ -5661,39 +5664,63 @@ class Tap(ControlSurface):
             return
 
         generation = self._simpler_waveform_generation
+        source_signature = self._simpler_waveform_source_signature(file_path)
         cached = self._simpler_waveform_cache.get(file_path)
         if cached:
             self._debug_log('Using cached Simpler waveform: {} points'.format(len(cached)))
             self._send_simpler_waveform(generation, cached)
             return
+        if self._simpler_waveform_failures.get(file_path) == source_signature:
+            return
 
-        self._poll_simpler_waveform(generation, file_path, 0)
         pending_key = (generation, file_path)
         if pending_key in self._simpler_waveform_pending:
             return
         self._simpler_waveform_pending.add(pending_key)
+        self._simpler_waveform_polling.add(pending_key)
+        self.schedule_message(5, lambda: self._poll_simpler_waveform(generation, file_path, 0))
 
         worker = threading.Thread(
             target=self._build_simpler_waveform,
-            args=(generation, file_path),
+            args=(generation, file_path, source_signature),
             name='TapSimplerWaveform',
         )
         worker.daemon = True
         worker.start()
 
     def _poll_simpler_waveform(self, generation, file_path, attempt):
+        pending_key = (generation, file_path)
         if generation != self._simpler_waveform_generation:
+            self._simpler_waveform_polling.discard(pending_key)
             return
         cached = self._simpler_waveform_cache.get(file_path)
         if cached:
+            self._simpler_waveform_polling.discard(pending_key)
             self._send_simpler_waveform(generation, cached)
             return
-        if attempt < 120:
+        if pending_key not in self._simpler_waveform_pending:
+            self._simpler_waveform_polling.discard(pending_key)
+            return
+        if attempt < 120 and pending_key in self._simpler_waveform_polling:
             self.schedule_message(5, lambda: self._poll_simpler_waveform(generation, file_path, attempt + 1))
+        else:
+            self._simpler_waveform_polling.discard(pending_key)
+
+    def _simpler_waveform_source_signature(self, file_path):
+        def file_signature(path):
+            try:
+                info = os.stat(path)
+                return (info.st_size, getattr(info, 'st_mtime_ns', int(info.st_mtime * 1000000000)))
+            except Exception:
+                return None
+        return (file_signature(file_path), file_signature(file_path + '.asd'))
 
     def _cache_simpler_waveform(self, file_path, peaks):
         self._debug_log('Cached Simpler waveform: {} points'.format(len(peaks)))
         self._simpler_waveform_cache[file_path] = tuple(peaks)
+        self._simpler_waveform_failures.pop(file_path, None)
+        if file_path in self._simpler_waveform_failure_order:
+            self._simpler_waveform_failure_order.remove(file_path)
         if file_path in self._simpler_waveform_cache_order:
             self._simpler_waveform_cache_order.remove(file_path)
         self._simpler_waveform_cache_order.append(file_path)
@@ -5701,7 +5728,41 @@ class Tap(ControlSurface):
             oldest = self._simpler_waveform_cache_order.pop(0)
             self._simpler_waveform_cache.pop(oldest, None)
 
+    def _cache_simpler_waveform_failure(self, file_path, source_signature):
+        self._simpler_waveform_failures[file_path] = source_signature
+        if file_path in self._simpler_waveform_failure_order:
+            self._simpler_waveform_failure_order.remove(file_path)
+        self._simpler_waveform_failure_order.append(file_path)
+        while len(self._simpler_waveform_failure_order) > 32:
+            oldest = self._simpler_waveform_failure_order.pop(0)
+            self._simpler_waveform_failures.pop(oldest, None)
+
+    def _simpler_audio_file_has_supported_header(self, file_path):
+        try:
+            with open(file_path, 'rb') as audio_file:
+                header = audio_file.read(12)
+            return (
+                (header[:4] in (b'RIFF', b'RF64', b'BW64') and header[8:12] == b'WAVE')
+                or (header[:4] == b'FORM' and header[8:12] in (b'AIFF', b'AIFC'))
+                or header[:4] in (b'fLaC', b'OggS', b'caff')
+                or header[:3] == b'ID3'
+                or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)
+                or header[4:8] == b'ftyp'
+            )
+        except Exception:
+            return False
+
     def _decode_audio_waveform(self, file_path, temp_prefix):
+        # Live's analysis file is both cheaper to read and the only available
+        # source for encrypted Pack samples. Trying afconvert first can leave a
+        # CPU-bound child process running for minutes on those files.
+        peaks = self._simpler_waveform_from_asd(file_path)
+        if peaks:
+            return peaks
+        if not self._simpler_audio_file_has_supported_header(file_path):
+            self._debug_log('Skipping unsupported Simpler waveform source: {}'.format(file_path))
+            return []
+
         temp_directory = tempfile.mkdtemp(prefix=temp_prefix)
         converted_path = os.path.join(temp_directory, 'waveform.wav')
         peaks = []
@@ -5711,7 +5772,7 @@ class Tap(ControlSurface):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=True,
-                timeout=120,
+                timeout=10,
             )
             with wave.open(converted_path, 'rb') as audio_file:
                 frame_count = audio_file.getnframes()
@@ -5736,11 +5797,11 @@ class Tap(ControlSurface):
             return [0 for _ in peaks]
         except Exception as error:
             self._debug_log('Waveform decode failed for {}: {}'.format(file_path, str(error)))
-            return self._simpler_waveform_from_asd(file_path)
+            return []
         finally:
             shutil.rmtree(temp_directory, ignore_errors=True)
 
-    def _build_simpler_waveform(self, generation, file_path):
+    def _build_simpler_waveform(self, generation, file_path, source_signature):
         pending_key = (generation, file_path)
         with self._simpler_waveform_lock:
             if generation != self._simpler_waveform_generation:
@@ -5748,6 +5809,8 @@ class Tap(ControlSurface):
                 return
             peaks = self._decode_audio_waveform(file_path, 'tap-simpler-')
             if not peaks or generation != self._simpler_waveform_generation:
+                if not peaks and generation == self._simpler_waveform_generation:
+                    self._cache_simpler_waveform_failure(file_path, source_signature)
                 self._simpler_waveform_pending.discard(pending_key)
                 return
             self._cache_simpler_waveform(file_path, peaks)
