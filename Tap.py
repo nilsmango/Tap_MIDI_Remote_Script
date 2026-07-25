@@ -1974,11 +1974,12 @@ class Tap(ControlSurface):
                 10: 'User Folders',
                 11: 'User Library',
                 12: 'Samples',
-                13: 'Clips'
+                13: 'Clips',
+                14: 'Drum Hits'
             }
             # These are the content tags exposed by Live's control-surface Browser API.
             # The desktop browser's arbitrary user tag database is not part of that API.
-            self.browser_searchable_tag_indices = (0, 3, 4, 5, 6, 8, 9, 12, 13)
+            self.browser_searchable_tag_indices = (0, 3, 4, 5, 6, 8, 9, 12, 13, 14)
             self._metadata_recheck_timer = None
             self._last_sent_metadata = None
             self._last_drum_pad_metadata = None
@@ -18141,6 +18142,15 @@ class Tap(ControlSurface):
 
     def _browser_items_for_category(self, category_index):
         browser = self.application().browser
+        if category_index == 14:
+            try:
+                for item in browser.drums.children:
+                    if str(getattr(item, 'name', '')).casefold() == 'drum hits':
+                        return list(item.children)
+            except Exception as error:
+                self._debug_log('Browser category Drum Hits unavailable: {}'.format(error))
+            return []
+
         folder_name = self.browser_folder_mapping.get(category_index)
         if folder_name is None:
             return []
@@ -18180,12 +18190,18 @@ class Tap(ControlSurface):
         # selected tag order above, including when Samples is selected.
         category_indices = [
             category_index for category_index in self.browser_searchable_tag_indices
-            if category_index not in (10, 11, 12)
-        ] + [10, 11, 12]
+            if category_index not in (10, 11, 12, 14)
+        ] + [10, 11, 12, 14]
         roots = []
         for category_index in category_indices:
             label = self.browser_folder_labels.get(category_index, '')
-            roots.extend((item, (label,)) for item in self._browser_items_for_category(category_index))
+            items = self._browser_items_for_category(category_index)
+            if category_index == 3:
+                items = [
+                    item for item in items
+                    if str(getattr(item, 'name', '')).casefold() != 'drum hits'
+                ]
+            roots.extend((item, (label,)) for item in items)
         return roots
 
     def _browser_item_search_key(self, item):
