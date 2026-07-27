@@ -82,6 +82,7 @@ class TapDeviceComponent(DeviceComponent):
     SIMPLER_WARP_BANK_NAME = "Controls"
     SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
     SIMPLER_BROWSE_BANK_NAME = "Browse"
+    SIMPLER_BROWSE_PLUS_BANK_NAME = "Browse +"
     SIMPLER_AMP_BANK_NAME = "Volume"
     SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
     SIMPLER_AMP_BANK_INDEX = 3
@@ -242,6 +243,15 @@ class TapDeviceComponent(DeviceComponent):
 
     def _base_parameter_bank_names(self):
         if self._use_safe_parameter_banks:
+            # Simpler's native parameter lookup can briefly fail while its
+            # sample mode is changing.  Keep Live's curated names even when
+            # the safer parameter lookup is needed; otherwise the fallback
+            # leaks unstable "Bank 1" ... "Bank 7" labels to Tap.
+            if self._is_simpler():
+                try:
+                    return tuple(DeviceComponent._parameter_bank_names(self))
+                except IndexError:
+                    pass
             return self._safe_parameter_bank_names_base()
         try:
             return tuple(DeviceComponent._parameter_bank_names(self))
@@ -428,24 +438,37 @@ class TapDeviceComponent(DeviceComponent):
                     self._hybrid_reverb_decorator = None
             if self._hybrid_reverb_decorator:
                 return tuple(self._hybrid_reverb_decorator.parameters)
-        if self._is_simpler() and SimplerDeviceDecorator is not None:
-            if self._simpler_bank_decorator is None or self._simpler_bank_decorator_device != device:
-                self._disconnect_simpler_bank_decorator()
-                try:
-                    self._simpler_bank_decorator = SimplerDeviceDecorator(
-                        live_object=device, additional_properties={}
-                    )
-                    self._simpler_bank_decorator_device = device
-                except Exception:
-                    self._simpler_bank_decorator = None
-            if self._simpler_bank_decorator:
-                decorated = list(self._simpler_bank_decorator.parameters)
-                decorated_ids = set(id(parameter) for parameter in decorated)
+        if self._is_simpler():
+            decorated = []
+            if SimplerDeviceDecorator is not None:
+                if self._simpler_bank_decorator is None or self._simpler_bank_decorator_device != device:
+                    self._disconnect_simpler_bank_decorator()
+                    try:
+                        self._simpler_bank_decorator = SimplerDeviceDecorator(
+                            live_object=device, additional_properties={}
+                        )
+                        self._simpler_bank_decorator_device = device
+                    except Exception:
+                        self._simpler_bank_decorator = None
+                if self._simpler_bank_decorator:
+                    decorated.extend(self._simpler_bank_decorator.parameters)
+
+            decorated_ids = set(id(parameter) for parameter in decorated)
+            decorated.extend(
+                parameter for parameter in getattr(device, 'parameters', ())
+                if id(parameter) not in decorated_ids
+            )
+            # In multisample mode Simpler exposes the actual Sampler as a
+            # nested device. Parameters such as "F On" and "Pe On" live there
+            # rather than in OriginalSimpler's parameter list.
+            sampler = getattr(device, 'sampler', None)
+            if sampler and liveobj_valid(sampler):
+                decorated_ids.update(id(parameter) for parameter in decorated)
                 decorated.extend(
-                    parameter for parameter in getattr(device, 'parameters', ())
+                    parameter for parameter in getattr(sampler, 'parameters', ())
                     if id(parameter) not in decorated_ids
                 )
-                return tuple(decorated)
+            return tuple(decorated)
         if self._is_drift() and DriftDeviceDecorator is not None:
             if self._drift_decorator is None or self._drift_decorator_device != device:
                 self._disconnect_drift_decorator()
@@ -507,6 +530,13 @@ class TapDeviceComponent(DeviceComponent):
         except Exception:
             return False
 
+    def _simpler_browse_bank_name(self):
+        return (
+            self.SIMPLER_BROWSE_PLUS_BANK_NAME
+            if self._simpler_uses_native_banks()
+            else self.SIMPLER_BROWSE_BANK_NAME
+        )
+
     def _custom_bank_insert_index(self, bank_names, anchor_name):
         anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
         for index, name in enumerate(bank_names):
@@ -562,7 +592,7 @@ class TapDeviceComponent(DeviceComponent):
                     names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
                 self._configure_simpler_control_bank_names(names)
                 names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
-            names.append(self.SIMPLER_BROWSE_BANK_NAME)
+            names.append(self._simpler_browse_bank_name())
         elif self._is_analog():
             names = self._analog_bank_names(names)
         elif self._is_drumcell():
@@ -615,7 +645,8 @@ class TapDeviceComponent(DeviceComponent):
             index = self._wavetable_waves_insert_index(names)
             banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
         elif self._is_simpler():
-            if not self._simpler_uses_native_banks():
+            uses_native_banks = self._simpler_uses_native_banks()
+            if not uses_native_banks:
                 if not banks:
                     banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
                 banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
@@ -626,7 +657,15 @@ class TapDeviceComponent(DeviceComponent):
                 self._replace_simpler_lfo_bank(banks, names)
                 self._configure_simpler_control_banks(banks, names)
                 banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-            banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+            else:
+                # DeviceComponent can expose more resolved C++ banks than its
+                # stable curated name table. Keep only the banks represented by
+                # that table, then add Browse + at the matching final index.
+                visible_bank_count = len(names)
+                banks = banks[:visible_bank_count]
+                while len(banks) < visible_bank_count:
+                    banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
+            banks.append(self._simpler_browse_parameters())
         elif self._is_analog():
             banks = self._analog_parameter_banks(banks, names)
         elif self._is_drumcell():
@@ -724,8 +763,23 @@ class TapDeviceComponent(DeviceComponent):
             self._parameter_by_names('Glide Time'),
             self._parameter_by_names('L R < Key'),
             self._parameter_by_names('L Retrig'),
-            None,
-            None,
+            # Live 12.4 exposes Simpler's filter switch as "F On".
+            self._parameter_by_names('F On', 'Filter On', 'Filter On/Off', 'Filter Enable'),
+            self._parameter_by_names('Pe On', 'Pitch Envelope On'),
+        )
+
+    def _simpler_browse_parameters(self):
+        if not self._simpler_uses_native_banks():
+            return tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
+        return (
+            None,  # Browse Samples is handled as a Tap action.
+            self._parameter_by_names('F On', 'Filter On', 'Filter On/Off', 'Filter Enable'),
+            self._parameter_by_names('Filter Type', 'Filter Type (Legacy)'),
+            self._parameter_by_names('Pe On', 'Pitch Envelope On'),
+            self._parameter_by_names('Pe < Env', 'Pitch Envelope Amount'),
+            self._parameter_by_names('Transpose'),
+            self._parameter_by_names('Detune'),
+            self._parameter_by_names('Volume'),
         )
 
     def _simpler_control_bank_indices(self, bank_names):
@@ -1692,7 +1746,9 @@ class TapDeviceComponent(DeviceComponent):
             return 'simpler_actions'
         if name == self.SIMPLER_WARP_BANK_NAME and custom_simpler:
             return 'simpler_warp'
-        if name == self.SIMPLER_BROWSE_BANK_NAME and self._is_simpler():
+        if (
+                name in (self.SIMPLER_BROWSE_BANK_NAME, self.SIMPLER_BROWSE_PLUS_BANK_NAME)
+                and self._is_simpler()):
             return 'simpler_browse'
         if self._is_drumcell():
             if name == self.DRUMCELL_SAMPLE_BANK_NAME:
@@ -4176,7 +4232,7 @@ class Tap(ControlSurface):
             return False
         selected_device = selected_device or self._selected_device()
         try:
-            native_parameters = tuple(selected_device.parameters)
+            native_parameters = self._native_parameters_for_device(selected_device)
             if any(native_parameter is parameter for native_parameter in native_parameters):
                 return False
             # Decorator parameters such as Simpler's Preserve/Loop Mode are
@@ -4195,6 +4251,21 @@ class Tap(ControlSurface):
         except Exception:
             return True
 
+    def _native_parameters_for_device(self, device):
+        parameters = list(getattr(device, 'parameters', ()))
+        try:
+            if self._is_simpler_device(device):
+                sampler = getattr(device, 'sampler', None)
+                if sampler and liveobj_valid(sampler):
+                    parameter_ids = set(id(parameter) for parameter in parameters)
+                    parameters.extend(
+                        parameter for parameter in getattr(sampler, 'parameters', ())
+                        if id(parameter) not in parameter_ids
+                    )
+        except Exception:
+            pass
+        return tuple(parameters)
+
     def _current_bank_parameter_for_control(self, selected_device, control_index):
         try:
             if not hasattr(self, '_device') or not liveobj_valid(self._device):
@@ -4209,7 +4280,8 @@ class Tap(ControlSurface):
                     return bank_param
                 if bank_param and liveobj_valid(bank_param):
                     if selected_device and hasattr(selected_device, 'parameters'):
-                        if not any(device_param == bank_param for device_param in selected_device.parameters):
+                        native_parameters = self._native_parameters_for_device(selected_device)
+                        if not any(device_param == bank_param for device_param in native_parameters):
                             return None
                     return bank_param
         except Exception:
@@ -4244,7 +4316,8 @@ class Tap(ControlSurface):
         mapped_param = self._mapped_parameter_for_device_control(control_index)
         if mapped_param and selected_device and hasattr(selected_device, 'parameters'):
             try:
-                if not any(device_param == mapped_param for device_param in selected_device.parameters):
+                native_parameters = self._native_parameters_for_device(selected_device)
+                if not any(device_param == mapped_param for device_param in native_parameters):
                     mapped_param = None
             except Exception:
                 mapped_param = None
@@ -4902,6 +4975,8 @@ class Tap(ControlSurface):
         elif self._simpler_warp_active():
             self._send_sys_ex_message(self._simpler_warp_metadata(), 0x7D)
             self._send_simpler_action_feedback_all()
+        elif self._simpler_browse_active():
+            self._send_sys_ex_message(self._simpler_browse_metadata(), 0x7D)
 
     def _sync_simpler_pad_slicing(self):
         device = self._simpler_device
@@ -5357,7 +5432,27 @@ class Tap(ControlSurface):
 
     def _simpler_browse_metadata(self):
         browse = '*!Browse Samples||||0.0||||0.0|browse_sample'
-        return ','.join([browse] + [self.UNMAPPED_PARAMETER_METADATA_ITEM] * 7)
+        try:
+            parameters = self._device._simpler_browse_parameters()
+        except Exception:
+            parameters = tuple([None] * 8)
+        display_names = (
+            '',
+            'Filter On/Off',
+            'Filter Type',
+            'Pitch Envelope On/Off',
+            'Pitch Envelope Amount',
+            'Transpose',
+            'Detune',
+            'Volume',
+        )
+        metadata = [browse]
+        for control_index in range(1, 8):
+            parameter = parameters[control_index] if control_index < len(parameters) else None
+            metadata.append(
+                self._simpler_parameter_metadata_item(display_names[control_index], parameter)
+            )
+        return ','.join(metadata)
 
     def _send_simpler_virtual_feedback(self, control_index):
         spec = self._simpler_virtual_spec(control_index)
