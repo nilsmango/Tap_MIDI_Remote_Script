@@ -61,7 +61,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 27
+secret_version_number = 28
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -1830,6 +1830,31 @@ class TapDeviceComponent(DeviceComponent):
         return self._safe_parameter_bank_names_base()
 
 
+class TapScheduledCall:
+    """Cancellable adapter for ControlSurface.schedule_message."""
+
+    TICKS_PER_SECOND = 10.0
+
+    def __init__(self, surface, delay_seconds, callback, args=()):
+        self._active = True
+        self._callback = callback
+        self._args = tuple(args)
+        delay_ticks = max(1, int(math.ceil(max(0.0, delay_seconds) * self.TICKS_PER_SECOND)))
+        surface.schedule_message(delay_ticks, self._run)
+
+    def _run(self):
+        if not self._active:
+            return
+        self._active = False
+        self._callback(*self._args)
+
+    def cancel(self):
+        self._active = False
+
+    def is_alive(self):
+        return self._active
+
+
 class Tap(ControlSurface):
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     SYSEX_STRING_RESERVED_SYMBOLS = (",", "|", ";", "^", "-", "%", ":", "/", "<", "*", "$", "_", "&", "(", ")", "\\")
@@ -2115,6 +2140,7 @@ class Tap(ControlSurface):
             self._last_group_hidden_states = None
             self._previous_selected_track = None
             self._periodic_timer_ref = None
+            self._last_clip_slot_integrity_check = 0.0
             self._clip_position_feedback_enabled = False
             self._clip_position_feedback_track_indexes = ()
             self._last_clip_position_feedback_time = 0.0
@@ -2172,6 +2198,10 @@ class Tap(ControlSurface):
             self._load_follow_actions_from_names(force_send=True)
             self._sync_follow_action_runtime_listeners()
             self._start_periodic_execution()
+
+    def _schedule_main_thread(self, delay_seconds, callback, args=()):
+        """Run Live API work on ControlSurface's main scheduling thread."""
+        return TapScheduledCall(self, delay_seconds, callback, args)
 
     def _setup_device_control(self):
         self._device = TapDeviceComponent()
@@ -4527,8 +4557,9 @@ class Tap(ControlSurface):
         self._drum_pad_recheck_start = time.time()
 
         recheck_delay = delay if delay is not None else self.PARAMETER_METADATA_RECHECK_INTERVAL
-        self._metadata_recheck_timer = threading.Timer(recheck_delay, self._recheck_parameter_metadata)
-        self._metadata_recheck_timer.start()
+        self._metadata_recheck_timer = self._schedule_main_thread(
+            recheck_delay, self._recheck_parameter_metadata
+        )
 
     def _cancel_bank_metadata_refreshes(self):
         for timer in list(getattr(self, '_bank_metadata_refresh_timers', [])):
@@ -4541,9 +4572,8 @@ class Tap(ControlSurface):
     def _schedule_bank_metadata_refreshes(self):
         self._cancel_bank_metadata_refreshes()
         for delay in (0.05, 0.15, 0.35, 0.75):
-            timer = threading.Timer(delay, self._refresh_active_bank_metadata)
+            timer = self._schedule_main_thread(delay, self._refresh_active_bank_metadata)
             self._bank_metadata_refresh_timers.append(timer)
-            timer.start()
 
     def _refresh_active_bank_metadata(self):
         if not liveobj_valid(self._device):
@@ -4706,8 +4736,10 @@ class Tap(ControlSurface):
         if should_continue:
             self._drum_pad_change_recheck_count += 1
             if self._drum_pad_change_recheck_count <= max_iterations:
-                self._metadata_recheck_timer = threading.Timer(self.PARAMETER_METADATA_RECHECK_INTERVAL, self._recheck_parameter_metadata)
-                self._metadata_recheck_timer.start()
+                self._metadata_recheck_timer = self._schedule_main_thread(
+                    self.PARAMETER_METADATA_RECHECK_INTERVAL,
+                    self._recheck_parameter_metadata
+                )
             else:
                 if is_drum_pad_device:
                     self._debug_log(f"Drum pad recheck: Reached max iterations, last metadata: {current_metadata[:100]}...")
@@ -5728,7 +5760,7 @@ class Tap(ControlSurface):
 
     def _send_simpler_waveform_clear(self):
         generation = self._simpler_waveform_generation & 0x7F
-        self._send_sys_ex_message('{}|'.format(generation), 0x41)
+        self._send_binary_sys_ex_message((0x01, generation), 0x41)
 
     def _send_simpler_waveform(self, generation, peaks):
         if generation != self._simpler_waveform_generation:
@@ -5744,9 +5776,12 @@ class Tap(ControlSurface):
             peaks = reduced
         else:
             peaks = peaks[:target_count]
-        encoded_peaks = ''.join('{:02x}'.format(max(0, min(127, int(peak)))) for peak in peaks)
-        self._debug_log('Sending Simpler waveform: {} points in one packet'.format(len(peaks)))
-        self._send_sys_ex_message('{}|{}'.format(generation & 0x7F, encoded_peaks), 0x41)
+        peaks = [max(0, min(127, int(peak))) for peak in peaks]
+        self._debug_log('Sending Simpler waveform: {} raw 7-bit points'.format(len(peaks)))
+        self._send_binary_sys_ex_message(
+            (0x01, generation & 0x7F) + tuple(peaks),
+            0x41
+        )
 
     def _request_simpler_waveform(self):
         sample = self._simpler_sample
@@ -6305,8 +6340,9 @@ class Tap(ControlSurface):
             if self.mixer_status:
                 if hasattr(self, '_mixer_disconnect_timer') and self._mixer_disconnect_timer:
                     self._mixer_disconnect_timer.cancel()
-                self._mixer_disconnect_timer = threading.Timer(0.2, self._disconnect_device_controls)
-                self._mixer_disconnect_timer.start()
+                self._mixer_disconnect_timer = self._schedule_main_thread(
+                    0.2, self._disconnect_device_controls
+                )
 
         else:
             self._set_simpler_device(None)
@@ -6507,8 +6543,9 @@ class Tap(ControlSurface):
                     
                     # Kick off a metadata recheck loop to wait for full pad loading
                     self._debug_log("Drum pad change: starting metadata recheck loop")
-                    self._metadata_recheck_timer = threading.Timer(0.1, self._recheck_parameter_metadata)
-                    self._metadata_recheck_timer.start()
+                    self._metadata_recheck_timer = self._schedule_main_thread(
+                        0.1, self._recheck_parameter_metadata
+                    )
             else:
                 self._debug_log("No drum pad selected")
             
@@ -7175,14 +7212,13 @@ class Tap(ControlSurface):
         self._automation_metadata_retry_count = 0
         self._automation_metadata_retry_start = time.time()
         seq_at_schedule = self._metadata_send_seq_by_device.get(id(selected_device), 0)
-        new_timer = threading.Timer(
+        new_timer = self._schedule_main_thread(
             0.05,
             self._send_refreshed_parameter_metadata,
-            args=[selected_device, seq_at_schedule]
+            args=(selected_device, seq_at_schedule)
         )
         with self._automation_timer_lock:
             self._automation_metadata_update_timer = new_timer
-        new_timer.start()
 
     def _send_refreshed_parameter_metadata(self, selected_device, seq_at_schedule=0):
         with self._automation_timer_lock:
@@ -7206,14 +7242,13 @@ class Tap(ControlSurface):
                     seq_at_schedule = self._metadata_send_seq_by_device.get(id(selected_device), seq_at_schedule)
                 if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
                     self._automation_metadata_retry_count += 1
-                    new_timer = threading.Timer(
+                    new_timer = self._schedule_main_thread(
                         0.05,
                         self._send_refreshed_parameter_metadata,
-                        args=[selected_device, seq_at_schedule]
+                        args=(selected_device, seq_at_schedule)
                     )
                     with self._automation_timer_lock:
                         self._automation_metadata_update_timer = new_timer
-                    new_timer.start()
                 return
 
             cached_metadata = self._get_cached_metadata(selected_device)
@@ -7240,14 +7275,13 @@ class Tap(ControlSurface):
                     elapsed = time.time() - self._automation_metadata_retry_start
                 if self._automation_metadata_retry_count < 3 and elapsed < 0.3:
                     self._automation_metadata_retry_count += 1
-                    new_timer = threading.Timer(
+                    new_timer = self._schedule_main_thread(
                         0.05,
                         self._send_refreshed_parameter_metadata,
-                        args=[selected_device, seq_at_schedule]
+                        args=(selected_device, seq_at_schedule)
                     )
                     with self._automation_timer_lock:
                         self._automation_metadata_update_timer = new_timer
-                    new_timer.start()
                 else:
                     self._automation_metadata_retry_count = 0
                     self._automation_metadata_retry_start = None
@@ -7257,12 +7291,11 @@ class Tap(ControlSurface):
                 self._automation_metadata_retry_start = None
 
     def _schedule_parameter_metadata_resend(self, selected_device, metadata, seq_at_schedule):
-        timer = threading.Timer(
+        self._schedule_main_thread(
             0.1,
             self._resend_parameter_metadata_if_current,
-            args=[selected_device, metadata, seq_at_schedule]
+            args=(selected_device, metadata, seq_at_schedule)
         )
-        timer.start()
 
     def _resend_parameter_metadata_if_current(self, selected_device, metadata, seq_at_schedule):
         try:
@@ -7508,8 +7541,9 @@ class Tap(ControlSurface):
     def _periodic_execution(self):
         self._periodic_check()
         if self.periodic_timer == 1:
-            self._periodic_timer_ref = threading.Timer(0.3, self._periodic_execution)
-            self._periodic_timer_ref.start()
+            self._periodic_timer_ref = self._schedule_main_thread(
+                0.3, self._periodic_execution
+            )
 
     def _periodic_check(self):
         if self.was_initialized:
@@ -7530,7 +7564,9 @@ class Tap(ControlSurface):
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
-        if self.device_status is False:
+        now = time.monotonic()
+        if self.device_status is False and now - self._last_clip_slot_integrity_check >= 5.0:
+            self._last_clip_slot_integrity_check = now
             self._update_clip_slots()
 
     def _has_follow_action_runtime_work(self):
@@ -11262,9 +11298,8 @@ class Tap(ControlSurface):
         if not getattr(self, 'mixer_status', False):
             return
         for delay in (0.05, 0.15, 0.35):
-            timer = threading.Timer(delay, self._send_mixer_automation_statuses)
+            timer = self._schedule_main_thread(delay, self._send_mixer_automation_statuses)
             self._mixer_automation_status_timers.append(timer)
-            timer.start()
 
     def _mixer_automation_state_for_parameter(self, parameter):
         try:
@@ -11460,30 +11495,59 @@ class Tap(ControlSurface):
                         previous_clip.remove_color_listener(old_listener)
 
     # clipSlots
+    def _remove_clip_slot_listener(self, clip_slot, listener_kind, listener):
+        try:
+            if not liveobj_valid(clip_slot):
+                return
+            has_listener = getattr(
+                clip_slot, "{}_has_listener".format(listener_kind), None
+            )
+            remove_listener = getattr(
+                clip_slot, "remove_{}_listener".format(listener_kind), None
+            )
+            if remove_listener and (not has_listener or has_listener(listener)):
+                remove_listener(listener)
+        except Exception:
+            pass
+
+    def _remove_clip_color_listener(self, clip, listener):
+        try:
+            if liveobj_valid(clip) and hasattr(clip, 'remove_color_listener'):
+                if not hasattr(clip, 'color_has_listener') or clip.color_has_listener(listener):
+                    clip.remove_color_listener(listener)
+        except Exception:
+            pass
+
     def _register_clip_listeners(self):
         current_track_ids = set()
+        expected_listener_keys = set()
+        expected_clip_slots = set()
+        expected_clips = set()
         for track in self.song().tracks:
             track_id = id(track)
             current_track_ids.add(track_id)
 
             for clip_slot in track.clip_slots:
-
-                if clip_slot == None:
+                if clip_slot is None:
                     continue
+                expected_clip_slots.add(clip_slot)
 
                 listener_key = (clip_slot, 'has_clip')
+                expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
                     listener = self._make_clip_has_clip_listener(track)
                     self._clip_slot_listeners[listener_key] = listener
                     clip_slot.add_has_clip_listener(listener)
 
                 listener_key = (clip_slot, 'is_triggered')
+                expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
                     listener = self._make_clip_triggered_listener(track)
                     self._clip_slot_listeners[listener_key] = listener
                     clip_slot.add_is_triggered_listener(listener)
 
                 listener_key = (clip_slot, 'is_playing')
+                expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
                     try:
                         listener = self._make_clip_playing_listener(track)
@@ -11491,56 +11555,42 @@ class Tap(ControlSurface):
                         clip_slot.add_is_playing_listener(listener)
                     except Exception:
                         pass
-            
-            self._registered_track_ids.add(track_id)
-        
-        # Clean up stale entries for tracks that no longer exist
-        self._registered_track_ids &= current_track_ids
-        
-        # Sync color listeners for all tracks
-        for track in self.song().tracks:
+
             self._sync_clip_color_listeners_for_track(track)
+            for clip_slot in track.clip_slots:
+                if clip_slot is not None and clip_slot.has_clip:
+                    expected_clips.add(clip_slot.clip)
+
+        # Listener dictionaries retain Live objects, so remove entries for
+        # deleted tracks/scenes rather than merely forgetting their IDs.
+        for listener_key in list(self._clip_slot_listeners.keys()):
+            if listener_key not in expected_listener_keys:
+                clip_slot, listener_kind = listener_key
+                listener = self._clip_slot_listeners.pop(listener_key)
+                self._remove_clip_slot_listener(clip_slot, listener_kind, listener)
+
+        for clip_slot in list(self._clip_slot_color_map.keys()):
+            if clip_slot not in expected_clip_slots:
+                self._clip_slot_color_map.pop(clip_slot, None)
+
+        for clip in list(self._clip_color_listeners.keys()):
+            if clip not in expected_clips:
+                listener = self._clip_color_listeners.pop(clip)
+                self._remove_clip_color_listener(clip, listener)
+
+        self._registered_track_ids = current_track_ids
 
     def _unregister_clip_and_audio_listeners(self):
-        for track in self.song().tracks:
-            for clip_slot in track.clip_slots:
-                listener_key = (clip_slot, 'is_triggered')
-                listener = self._clip_slot_listeners.pop(listener_key, None)
-                if listener:
-                    clip_slot.remove_is_triggered_listener(listener)
-                else:
-                    clip_slot.remove_is_triggered_listener(self._on_clip_playing_status_changed)
+        for (clip_slot, listener_kind), listener in list(self._clip_slot_listeners.items()):
+            self._remove_clip_slot_listener(clip_slot, listener_kind, listener)
 
-                listener_key = (clip_slot, 'is_playing')
-                listener = self._clip_slot_listeners.pop(listener_key, None)
-                if listener:
-                    try:
-                        clip_slot.remove_is_playing_listener(listener)
-                    except Exception:
-                        pass
-                
-                listener_key = (clip_slot, 'has_clip')
-                listener = self._clip_slot_listeners.pop(listener_key, None)
-                if listener:
-                    clip_slot.remove_has_clip_listener(listener)
-                else:
-                    clip_slot.remove_has_clip_listener(self._on_clip_has_clip_changed)
-                
-                if clip_slot.has_clip:
-                    listener = self._clip_color_listeners.pop(clip_slot.clip, None)
-                    if listener:
-                        clip_slot.clip.remove_color_listener(listener)
-                    else:
-                        clip_slot.clip.remove_color_listener(self._on_clip_has_clip_changed)
-                # if clip_slot.has_clip:
-                #     # clip_slot.clip.remove_playing_status_listener(self._on_clip_playing_status_changed)
-                #     clip_slot.clip.remove_playing_position_listener(self._on_playing_position_changed)
-            # output meter listeners - use stored handler references
-            if track in self._track_level_listeners:
-                left_listener, right_listener = self._track_level_listeners[track]
-                self._remove_output_meter_listener_pair(track, left_listener, right_listener)
+        for clip, listener in list(self._clip_color_listeners.items()):
+            self._remove_clip_color_listener(clip, listener)
 
-        for return_track, (left_listener, right_listener) in self._return_level_listeners.items():
+        for track, (left_listener, right_listener) in list(self._track_level_listeners.items()):
+            self._remove_output_meter_listener_pair(track, left_listener, right_listener)
+
+        for return_track, (left_listener, right_listener) in list(self._return_level_listeners.items()):
             self._remove_output_meter_listener_pair(return_track, left_listener, right_listener)
         
         self._track_level_listeners.clear()
@@ -11549,6 +11599,7 @@ class Tap(ControlSurface):
         self._clip_slot_listeners.clear()
         self._clip_color_listeners.clear()
         self._clip_slot_color_map.clear()
+        self._registered_track_ids.clear()
 
     # def _on_playing_position_changed(self):
     #     # self.log_message("trying to log the playing position")
@@ -12576,7 +12627,7 @@ class Tap(ControlSurface):
             new_note_values = []
 
             # Decode all notes in the message
-            while index < (len(message) - 1):
+            while index + 10 <= (len(message) - 1):
                 # Decode the pitch of the note
                 note_pitch = message[index]
                 index += 1
@@ -12599,12 +12650,10 @@ class Tap(ControlSurface):
                 velocity = message[index]
                 index += 1
 
-                # Decode mute and probability
-                if index >= len(message):
-                    break
-                mute_and_probability = message[index]
-                mute = (mute_and_probability & 0x80) != 0
-                probability = (mute_and_probability & 0x7F) / 127.0
+                # Probability and mute are separate SysEx7-safe bytes.
+                probability = message[index] / 127.0
+                index += 1
+                mute = message[index] != 0
                 index += 1
 
                 # Create a MidiNoteSpecification object
@@ -12728,7 +12777,9 @@ class Tap(ControlSurface):
         
                 # Modify the matching notes
                 while index < (len(message) - 1):
-                    if index + 6 > len(message) - 1:
+                    # One record is 15 data bytes. Never decode across the
+                    # terminating F7 byte when a packet is truncated.
+                    if index + 15 > len(message) - 1:
                         break
                     note_id = self._from_5_7bit_bytes(message, index)
                     index += 5
@@ -12746,8 +12797,9 @@ class Tap(ControlSurface):
                     velocity = message[index]
                     index += 1
         
-                    mute = bool(message[index] & 0x80)
-                    probability = (message[index] & 0x7F) / 127.0
+                    probability = message[index] / 127.0
+                    index += 1
+                    mute = message[index] != 0
                     index += 1
 
                     if decoupled_info:
@@ -12798,7 +12850,7 @@ class Tap(ControlSurface):
                     clip.apply_note_modifications(notes)
         
         # markers
-        if len(message) >= 2 and message[1] == 17:
+        if len(message) >= 7 and message[1] == 17:
             # Decode the note ID and data
             marker_id = message[2]
             
@@ -12833,7 +12885,7 @@ class Tap(ControlSurface):
                         clip.loop_end = marker_time
         
         # visible channel and mixer status true
-        if len(message) >= 2 and message[1] == 18:
+        if len(message) >= 5 and message[1] == 18:
             start = message[2]
             end = message[3]
             self.visible_channels = (start, end)
@@ -12849,31 +12901,36 @@ class Tap(ControlSurface):
                 self._append_and_remove_clip(values[0], values[1], values[2], values[3])
         
         # toggle arm for audio tracks
-        if len(message) >= 2 and message[1] == 20:
+        if len(message) >= 4 and message[1] == 20:
             track_index = message[2]
-            track = self.song().tracks[track_index]
-            track.arm = not track.arm
+            tracks = self.song().tracks
+            if 0 <= track_index < len(tracks):
+                track = tracks[track_index]
+                if getattr(track, 'can_be_armed', True):
+                    track.arm = not track.arm
         
         # select next clip
-        if len(message) >= 2 and message[1] == 21:
+        if len(message) >= 4 and message[1] == 21:
             upValue = message[2]
             track = self.song().view.selected_track
             current_clip_slot = self.song().view.highlighted_clip_slot
-            # Find current index
-            current_index = list(track.clip_slots).index(current_clip_slot)
+            clip_slots = list(getattr(track, 'clip_slots', ()))
+            if current_clip_slot not in clip_slots:
+                return
+            current_index = clip_slots.index(current_clip_slot)
             
             if upValue == 0:  # Move down to next clip
                 # Search for next clip slot with a clip
-                for i in range(current_index + 1, len(track.clip_slots)):
-                    if track.clip_slots[i].has_clip:
-                        self.song().view.highlighted_clip_slot = track.clip_slots[i]
+                for i in range(current_index + 1, len(clip_slots)):
+                    if clip_slots[i].has_clip:
+                        self.song().view.highlighted_clip_slot = clip_slots[i]
                         break
                         
             elif upValue == 1:  # Move up to previous clip
                 # Search for previous clip slot with a clip (in reverse)
                 for i in range(current_index - 1, -1, -1):
-                    if track.clip_slots[i].has_clip:
-                        self.song().view.highlighted_clip_slot = track.clip_slots[i]
+                    if clip_slots[i].has_clip:
+                        self.song().view.highlighted_clip_slot = clip_slots[i]
                         break
         if len(message) >= 2 and message[1] == 22:
             tempo_bytes = message[2:-1]
@@ -17858,8 +17915,9 @@ class Tap(ControlSurface):
                             pitch,                      # 1 byte
                             *self._to_3_7bit_bytes(start_time),# 3 bytes, 7-bit encoded
                             *self._to_3_7bit_bytes(duration),  # 3 bytes, 7-bit encoded
-                            velocity,  
-                            (mute << 7) | probability
+                            velocity,
+                            probability,
+                            mute
                         ]
                     
                         data.extend(note_data)
@@ -17871,7 +17929,6 @@ class Tap(ControlSurface):
                 
             # Split data if it's too large for a single SysEx message
             num_of_chunks = max(1, (len(data) + max_chunk_length - 1) // max_chunk_length)
-                    
             for chunk_index in range(num_of_chunks):
                 start_index = chunk_index * max_chunk_length
                 end_index = start_index + max_chunk_length
@@ -17883,7 +17940,6 @@ class Tap(ControlSurface):
             
                 # Send the SysEx message
                 sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte,)
-                # self.log_message("Sending SysEx chunk")
                 self._send_midi(sys_ex_message)
     
     def send_out_playing_pos(self, value, beats_per_bar, force=False, hidden=False):
@@ -18839,6 +18895,7 @@ class Tap(ControlSurface):
         self._remove_automation_state_listeners()
         self._remove_mixer_automation_state_listeners()
         self._cancel_mixer_automation_status_resends()
+        self._unregister_clip_and_audio_listeners()
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         if hasattr(self, 'duplicate_button'):
             self.duplicate_button.remove_value_listener(self._duplicate_button_value)
@@ -18873,7 +18930,6 @@ class Tap(ControlSurface):
         # periodic_check_button.remove_value_listener(self._periodic_check)
         self._remove_song_listener(song, "tracks", self._on_tracks_changed)
         # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
-        # self._unregister_clip_and_audio_listeners()
         # self.remove_midi_listener(self._midi_listener)
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         self._remove_song_listener(song, "scale_name", self._on_scale_changed)
