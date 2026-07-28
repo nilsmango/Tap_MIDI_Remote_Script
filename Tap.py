@@ -41,6 +41,23 @@ try:
     from Push2.hybrid_reverb import HybridReverbDeviceDecorator
 except ImportError:
     HybridReverbDeviceDecorator = None
+try:
+    from ableton.v2.control_surface import BankingInfo, DescribedDeviceParameterBank
+    from Push2.custom_bank_definitions import BANK_DEFINITIONS as PUSH_BANK_DEFINITIONS
+    from Push2.device_decorator_factory import DeviceDecoratorFactory as PushDeviceDecoratorFactory
+except Exception:
+    BankingInfo = None
+    DescribedDeviceParameterBank = None
+    PUSH_BANK_DEFINITIONS = {}
+    PushDeviceDecoratorFactory = None
+try:
+    from Push2.device_parameter_bank_with_options import DescribedDeviceParameterBankWithOptions
+except Exception:
+    DescribedDeviceParameterBankWithOptions = None
+try:
+    from Move.custom_bank_definitions import CUSTOM_BANK_DEFINITIONS as MOVE_BANK_DEFINITIONS
+except Exception:
+    MOVE_BANK_DEFINITIONS = {}
 from Live.Clip import MidiNoteSpecification
 
 import threading
@@ -71,6 +88,34 @@ swing_amount_value = 0.0
 
 class TapDeviceComponent(DeviceComponent):
     SAFE_PARAMETER_BANK_SIZE = 8
+    CURATED_PUSH_BANK_CLASSES = frozenset((
+        'Chorus2',
+        'Tube',
+        'PhaserNew',
+        'Reverb',
+        'Roar',
+        'Shifter',
+        'Transmute',
+        'Spectral',
+        'Saturator',
+        'MidiRandom',
+        'MidiScale',
+        'Eq8',
+    ))
+    CURATED_MOVE_BANK_CLASSES = frozenset((
+        'AutoPan2',
+        'AutoShift',
+        'FilterEQ3',
+        'Redux2',
+        'Resonator',
+        'Vinyl',
+    ))
+    AUTO_SHIFT_DETAILS_BANK_NAME = "Shift"
+    AUTO_PAN_MODE_BANK_NAME = "Mode"
+    CHORUS_MODE_BANK_NAME = "Mode"
+    CHORD_SHIFT_SCALE_BANK_NAME = "Shift Scale"
+    CHORD_STRUM_BANK_NAME = "Strum"
+    CURATED_OPTIONS_BANK_NAME = "Options"
     OPERATOR_WAVES_BANK_NAME = "Waveforms"
     OPERATOR_FILTER_PLUS_BANK_NAME = "Filter +"
     OPERATOR_LFO_PLUS_BANK_NAME = "LFO +"
@@ -92,6 +137,7 @@ class TapDeviceComponent(DeviceComponent):
     DRUMCELL_FX_2_BANK_NAME = "FX P"
     DRUMCELL_FX_3_BANK_NAME = "FX P2"
     DELAY_BANK_NAMES = ("Main", "Time / Flt", "Flt / LFO", "LFO Wave")
+    GRAIN_DELAY_BANK_NAMES = ("Pitch", "Time")
     AUTO_FILTER_BANK_NAMES = ("Main", "Envelope", "LFO", "Sidechain")
     AUTO_FILTER_2_BANK_NAMES = ("Main", "LFO", "Envelope", "Quantization")
     BEAT_REPEAT_BANK_NAMES = ("Main", "Filt/Mix", "Repeat Rate")
@@ -131,6 +177,10 @@ class TapDeviceComponent(DeviceComponent):
         self._use_safe_parameter_banks = False
         self._parameter_bank_cache = None
         self._parameter_bank_cache_device = None
+        self._curated_parameter_display_names = ()
+        self._curated_bank_names_cache = None
+        self._curated_option_pages_cache = None
+        self._curated_dynamic_parameter_keys_cache = None
         self._drift_decorator = None
         self._drift_decorator_device = None
         self._drift_base_decorator = None
@@ -140,10 +190,20 @@ class TapDeviceComponent(DeviceComponent):
         self._hybrid_reverb_decorator_device = None
         self._simpler_bank_decorator = None
         self._simpler_bank_decorator_device = None
+        self._curated_decorator_factory = None
+        if PushDeviceDecoratorFactory is not None:
+            try:
+                self._curated_decorator_factory = PushDeviceDecoratorFactory()
+            except Exception:
+                pass
 
     def invalidate_parameter_bank_cache(self):
         self._parameter_bank_cache = None
         self._parameter_bank_cache_device = None
+        self._curated_parameter_display_names = ()
+        self._curated_bank_names_cache = None
+        self._curated_option_pages_cache = None
+        self._curated_dynamic_parameter_keys_cache = None
 
     def set_device(self, device):
         if device != getattr(self, '_device', None):
@@ -151,6 +211,7 @@ class TapDeviceComponent(DeviceComponent):
             self._disconnect_meld_decorator()
             self._disconnect_hybrid_reverb_decorator()
             self._disconnect_simpler_bank_decorator()
+            self._sync_curated_decorators(device)
         self.invalidate_parameter_bank_cache()
         self._use_safe_parameter_banks = False
         try:
@@ -176,6 +237,13 @@ class TapDeviceComponent(DeviceComponent):
         self._disconnect_meld_decorator()
         self._disconnect_hybrid_reverb_decorator()
         self._disconnect_simpler_bank_decorator()
+        factory = self._curated_decorator_factory
+        self._curated_decorator_factory = None
+        if factory:
+            try:
+                factory.disconnect()
+            except Exception:
+                pass
         DeviceComponent.disconnect(self)
 
     def update(self):
@@ -202,13 +270,26 @@ class TapDeviceComponent(DeviceComponent):
 
     def _parameter_banks(self):
         device = getattr(self, '_device', None)
+        uses_curated_banks = self._uses_curated_banks()
         uses_cache = (
-            self._is_operator() or self._is_drift() or self._is_meld() or
-            self._is_hybrid_reverb()
+            self._is_operator() or self._is_chord() or self._is_drift() or self._is_meld() or
+            self._is_hybrid_reverb() or uses_curated_banks
         )
         if (uses_cache and self._parameter_bank_cache is not None and
                 self._parameter_bank_cache_device == device):
             return list(self._parameter_bank_cache)
+
+        if uses_curated_banks:
+            curated_banks = self._curated_parameter_banks()
+            if curated_banks:
+                self._parameter_bank_cache = tuple(curated_banks)
+                self._parameter_bank_cache_device = device
+                return list(curated_banks)
+            try:
+                return list(DeviceComponent._parameter_banks(self))
+            except IndexError:
+                self._use_safe_parameter_banks = True
+                return self._safe_parameter_banks()
 
         base_names = self._base_parameter_bank_names()
         if self._use_safe_parameter_banks:
@@ -227,6 +308,10 @@ class TapDeviceComponent(DeviceComponent):
         return banks
 
     def _parameter_bank_names(self):
+        if self._uses_curated_banks():
+            curated_names = self._curated_bank_names()
+            if curated_names:
+                return curated_names
         return self._add_tap_custom_bank_names(self._base_parameter_bank_names())
 
     def _best_of_parameter_bank(self):
@@ -284,6 +369,9 @@ class TapDeviceComponent(DeviceComponent):
     def _is_operator(self):
         return self._device_class_name() == 'Operator'
 
+    def _is_chord(self):
+        return self._device_class_name() == 'MidiChord'
+
     def _is_wavetable(self):
         device = getattr(self, '_device', None)
         try:
@@ -318,6 +406,9 @@ class TapDeviceComponent(DeviceComponent):
 
     def _is_delay(self):
         return self._device_class_name() == 'Delay'
+
+    def _is_grain_delay(self):
+        return self._device_class_name() == 'GrainDelay'
 
     def _is_analog(self):
         return self._device_class_name() == 'UltraAnalog'
@@ -370,6 +461,323 @@ class TapDeviceComponent(DeviceComponent):
         except Exception:
             return False
 
+    def _curated_bank_source(self):
+        class_name = self._device_class_name()
+        if class_name in self.CURATED_MOVE_BANK_CLASSES and class_name in MOVE_BANK_DEFINITIONS:
+            return MOVE_BANK_DEFINITIONS
+        if class_name in self.CURATED_PUSH_BANK_CLASSES and class_name in PUSH_BANK_DEFINITIONS:
+            return PUSH_BANK_DEFINITIONS
+        return None
+
+    def _curated_bank_definition(self):
+        source = self._curated_bank_source()
+        return source.get(self._device_class_name()) if source else None
+
+    def _curated_dynamic_parameter_keys(self):
+        cached = self._curated_dynamic_parameter_keys_cache
+        if cached is not None:
+            return cached
+
+        condition_names = set()
+        definitions = []
+        for definition in (
+                self._curated_bank_definition(),
+                PUSH_BANK_DEFINITIONS.get(self._device_class_name())):
+            if definition and not any(definition is existing for existing in definitions):
+                definitions.append(definition)
+        for definition in definitions:
+            for bank_definition in definition.values():
+                for slots in bank_definition.values():
+                    if not isinstance(slots, (tuple, list)):
+                        continue
+                    for slot in slots:
+                        for condition in getattr(slot, '_conditions', ()) or ():
+                            condition_list = condition.get('ConditionsListName', ())
+                            for subcondition in condition_list:
+                                name = subcondition.get('ConditionName')
+                                if name:
+                                    condition_names.add(str(name))
+
+        # These custom pages switch parameter identity with the device mode.
+        if self._device_class_name() in ('AutoPan2', 'Chorus2'):
+            condition_names.add('Mode')
+
+        self._curated_dynamic_parameter_keys_cache = frozenset(
+            re.sub(r'[^a-z0-9]+', '', name.lower())
+            for name in condition_names
+        )
+        return self._curated_dynamic_parameter_keys_cache
+
+    def curated_parameter_drives_bank(self, parameter):
+        if parameter is None or not self._uses_curated_banks():
+            return False
+        names = (
+            str(getattr(parameter, 'name', '')),
+            str(getattr(parameter, 'original_name', '')),
+        )
+        parameter_keys = set(
+            re.sub(r'[^a-z0-9]+', '', name.lower())
+            for name in names
+        )
+        return bool(parameter_keys.intersection(self._curated_dynamic_parameter_keys()))
+
+    def _uses_curated_banks(self):
+        return (
+            BankingInfo is not None and
+            DescribedDeviceParameterBank is not None and
+            self._curated_bank_definition() is not None
+        )
+
+    def _sync_curated_decorators(self, device):
+        factory = self._curated_decorator_factory
+        if not factory:
+            return
+        try:
+            factory.sync_decorated_objects([device] if liveobj_valid(device) else [])
+        except Exception:
+            pass
+
+    def _curated_decorated_device(self):
+        device = getattr(self, '_device', None)
+        factory = self._curated_decorator_factory
+        if not factory or not liveobj_valid(device):
+            return device
+        try:
+            return factory.decorate(device)
+        except Exception:
+            return device
+
+    def _curated_bank_names(self):
+        if self._curated_bank_names_cache is not None:
+            return self._curated_bank_names_cache
+        definition = self._curated_bank_definition()
+        names = list(definition.keys()) if definition else []
+        if self._device_class_name() == 'AutoShift' and names:
+            names.append(self.AUTO_SHIFT_DETAILS_BANK_NAME)
+        elif self._device_class_name() == 'AutoPan2' and names:
+            names.append(self.AUTO_PAN_MODE_BANK_NAME)
+        elif self._device_class_name() == 'Chorus2' and names:
+            names.append(self.CHORUS_MODE_BANK_NAME)
+        option_page_count = len(self._curated_option_pages())
+        if option_page_count == 1:
+            names.append(self.CURATED_OPTIONS_BANK_NAME)
+        elif option_page_count > 1:
+            names.extend(
+                "{} {}".format(self.CURATED_OPTIONS_BANK_NAME, index + 1)
+                for index in range(option_page_count)
+            )
+        self._curated_bank_names_cache = tuple(names)
+        return self._curated_bank_names_cache
+
+    def _set_curated_shift_state(self, bank, shifted):
+        has_shift_slots = False
+        for slot in getattr(bank, '_dynamic_slots', ()):
+            setter = getattr(slot, 'set_shifted_state', None)
+            if callable(setter):
+                has_shift_slots = True
+                try:
+                    setter(bool(shifted))
+                except Exception:
+                    pass
+        if has_shift_slots:
+            try:
+                bank._update_parameters()
+            except Exception:
+                pass
+
+    def _curated_bank_parameters(self, bank, index, shifted=False):
+        bank.index = index
+        self._set_curated_shift_state(bank, shifted)
+        parameters = []
+        display_names = []
+        for item in getattr(bank, 'parameters', ()) or ():
+            if isinstance(item, (tuple, list)):
+                parameters.append(item[0] if item else None)
+                display_names.append(item[1] if len(item) > 1 and item[1] else None)
+            else:
+                parameters.append(item)
+                display_names.append(None)
+        parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
+        display_names.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(display_names)))
+        return (
+            tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE]),
+            tuple(display_names[:self.SAFE_PARAMETER_BANK_SIZE]),
+        )
+
+    def _curated_option_parameter(self, option):
+        parameter = getattr(option, '_parameter', None)
+        if parameter is None:
+            parameter = getattr(option, '_property_host', None)
+        return parameter
+
+    def _curated_option_pages(self):
+        if self._curated_option_pages_cache is not None:
+            return self._curated_option_pages_cache
+        definition = PUSH_BANK_DEFINITIONS.get(self._device_class_name())
+        has_option_slots = bool(definition) and any(
+            any(bool(slot) for slot in bank_definition.get('Options', ()))
+            for bank_definition in definition.values()
+        )
+        if not has_option_slots:
+            self._curated_option_pages_cache = ()
+            return ()
+        device = self._curated_decorated_device()
+        if (
+            not liveobj_valid(device) or
+            BankingInfo is None or
+            DescribedDeviceParameterBankWithOptions is None
+        ):
+            self._curated_option_pages_cache = ()
+            return ()
+        banking_info = BankingInfo({self._device_class_name(): definition})
+        bank = None
+        try:
+            bank = DescribedDeviceParameterBankWithOptions(
+                device=device,
+                size=self.SAFE_PARAMETER_BANK_SIZE,
+                banking_info=banking_info,
+            )
+            option_parameters = []
+            option_names = []
+            seen_parameters = set()
+            for index in range(len(definition)):
+                bank.index = index
+                for option in getattr(bank, 'options', ()) or ():
+                    if option is None:
+                        continue
+                    parameter = self._curated_option_parameter(option)
+                    if parameter is None:
+                        continue
+                    parameter_key = id(parameter)
+                    if parameter_key in seen_parameters:
+                        continue
+                    seen_parameters.add(parameter_key)
+                    option_parameters.append(parameter)
+                    name = str(getattr(option, 'name', '') or getattr(parameter, 'name', ''))
+                    if name == 'frequency_dial_mode_opt':
+                        name = 'Frequency Mode'
+                    option_names.append(name)
+            pages = []
+            for start in range(0, len(option_parameters), self.SAFE_PARAMETER_BANK_SIZE):
+                parameters = option_parameters[start:start + self.SAFE_PARAMETER_BANK_SIZE]
+                display_names = option_names[start:start + self.SAFE_PARAMETER_BANK_SIZE]
+                parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
+                display_names.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(display_names)))
+                pages.append((tuple(parameters), tuple(display_names)))
+            self._curated_option_pages_cache = tuple(pages)
+            return self._curated_option_pages_cache
+        except Exception:
+            self._curated_option_pages_cache = ()
+            return ()
+        finally:
+            if bank:
+                try:
+                    bank.disconnect()
+                except Exception:
+                    pass
+
+    def _curated_auto_pan_mode_bank(self):
+        mode = self._parameter_by_names('Mode')
+        mode_name = self._parameter_display(mode).strip().lower()
+        is_tremolo = 'tremolo' in mode_name
+        is_panning = 'panning' in mode_name or 'pan' in mode_name
+        parameters = (
+            mode,
+            self._parameter_by_names('Vintage') if is_tremolo else None,
+            self._parameter_by_names('Stereo Mode') if is_panning else None,
+        ) + tuple([None] * 5)
+        display_names = ('Mode', 'Vintage' if is_tremolo else None,
+                         'Stereo Mode' if is_panning else None) + tuple([None] * 5)
+        return parameters, display_names
+
+    def _curated_chorus_mode_bank(self):
+        mode = self._parameter_by_names('Mode')
+        mode_name = self._parameter_display(mode).strip().lower()
+        is_chorus = 'classic' in mode_name or 'chorus' in mode_name
+        parameters = (
+            mode,
+            self._parameter_by_names('Delay Time') if is_chorus else None,
+            self._parameter_by_names('Delay Taps') if is_chorus else None,
+            self._parameter_by_names('HP Enabled', 'HP On'),
+            self._parameter_by_names('HP Freq'),
+            None,
+            None,
+            self._parameter_by_names('Dry/Wet'),
+        )
+        display_names = (
+            'Mode',
+            'Delay Time' if is_chorus else None,
+            'Delay Taps' if is_chorus else None,
+            'HP On',
+            'HP Freq',
+            None,
+            None,
+            None,
+        )
+        return parameters, display_names
+
+    def _add_internal_scale_parameter(self, resolved_banks):
+        if self._device_class_name() != 'MidiScale' or not resolved_banks:
+            return
+        internal_scale = self._parameter_by_names('Internal Scale', 'InternalScale', 'Scale')
+        if internal_scale is None:
+            return
+        parameters, display_names = resolved_banks[0]
+        parameters = tuple((parameters[0], internal_scale) + parameters[1:7])
+        display_names = tuple((display_names[0], 'Internal Scale') + display_names[1:7])
+        resolved_banks[0] = parameters, display_names
+
+    def _curated_parameter_banks(self):
+        definition = self._curated_bank_definition()
+        device = self._curated_decorated_device()
+        if not definition or not liveobj_valid(device):
+            return ()
+        banking_info = BankingInfo({self._device_class_name(): definition})
+        bank = None
+        try:
+            bank = DescribedDeviceParameterBank(
+                device=device,
+                size=self.SAFE_PARAMETER_BANK_SIZE,
+                banking_info=banking_info,
+            )
+            resolved_banks = [
+                self._curated_bank_parameters(bank, index)
+                for index in range(len(definition))
+            ]
+            if self._device_class_name() == 'AutoShift' and resolved_banks:
+                resolved_banks.append(self._curated_bank_parameters(bank, 0, shifted=True))
+            elif self._device_class_name() == 'AutoPan2' and resolved_banks:
+                resolved_banks.append(self._curated_auto_pan_mode_bank())
+            elif self._device_class_name() == 'Chorus2' and resolved_banks:
+                resolved_banks.append(self._curated_chorus_mode_bank())
+            self._add_internal_scale_parameter(resolved_banks)
+            resolved_banks.extend(self._curated_option_pages())
+            self._curated_parameter_display_names = tuple(
+                display_names for _, display_names in resolved_banks
+            )
+            return tuple(parameters for parameters, _ in resolved_banks)
+        except Exception:
+            self._curated_parameter_display_names = ()
+            return ()
+        finally:
+            if bank:
+                try:
+                    bank.disconnect()
+                except Exception:
+                    pass
+
+    def curated_parameter_display_name(self, parameter):
+        try:
+            bank_index = self._bank_index
+            display_names = self._curated_parameter_display_names[bank_index]
+            parameter_bank = self._parameter_bank_cache[bank_index]
+            for index, candidate in enumerate(parameter_bank):
+                if candidate is parameter and index < len(display_names):
+                    return display_names[index]
+        except Exception:
+            pass
+        return None
+
     def _disconnect_drift_decorator(self):
         decorator = self._drift_decorator
         base_decorator = self._drift_base_decorator
@@ -419,6 +827,9 @@ class TapDeviceComponent(DeviceComponent):
 
     def _decorated_parameters(self):
         device = getattr(self, '_device', None)
+        if self._uses_curated_banks():
+            decorated = self._curated_decorated_device()
+            return tuple(getattr(decorated, 'parameters', getattr(device, 'parameters', ())))
         if self._is_hybrid_reverb() and HybridReverbDeviceDecorator is not None:
             if (self._hybrid_reverb_decorator is None or
                     self._hybrid_reverb_decorator_device != device):
@@ -554,7 +965,9 @@ class TapDeviceComponent(DeviceComponent):
 
     def _add_tap_custom_bank_names(self, bank_names):
         names = list(bank_names)
-        if self._is_auto_filter_2():
+        if self._uses_curated_banks():
+            names = list(self._curated_bank_names())
+        elif self._is_auto_filter_2():
             names = list(self.AUTO_FILTER_2_BANK_NAMES)
         elif self._is_auto_filter():
             names = list(self.AUTO_FILTER_BANK_NAMES)
@@ -566,6 +979,11 @@ class TapDeviceComponent(DeviceComponent):
             names = list(self.DRIFT_BANK_NAMES)
         elif self._is_meld():
             names = list(self.MELD_BANK_NAMES)
+        elif self._is_chord():
+            names.extend((
+                self.CHORD_SHIFT_SCALE_BANK_NAME,
+                self.CHORD_STRUM_BANK_NAME,
+            ))
         elif self._is_operator():
             index = self._operator_waves_insert_index(names)
             names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
@@ -608,6 +1026,8 @@ class TapDeviceComponent(DeviceComponent):
                 names[3] = self.DRUMCELL_FX_2_BANK_NAME
             if len(names) > 4:
                 names[4] = self.DRUMCELL_FX_3_BANK_NAME
+        elif self._is_grain_delay():
+            names = list(self.GRAIN_DELAY_BANK_NAMES)
         elif self._is_delay():
             names = list(self.DELAY_BANK_NAMES)
         return tuple(names)
@@ -615,7 +1035,11 @@ class TapDeviceComponent(DeviceComponent):
     def _add_tap_custom_banks(self, banks, base_names):
         banks = list(banks)
         names = list(base_names)
-        if self._is_auto_filter_2():
+        if self._uses_curated_banks():
+            curated_banks = self._curated_parameter_banks()
+            if curated_banks:
+                banks = list(curated_banks)
+        elif self._is_auto_filter_2():
             banks = list(self._auto_filter_2_parameter_banks())
         elif self._is_auto_filter():
             banks = list(self._auto_filter_parameter_banks())
@@ -627,6 +1051,11 @@ class TapDeviceComponent(DeviceComponent):
             banks = list(self._drift_parameter_banks())
         elif self._is_meld():
             banks = list(self._meld_parameter_banks())
+        elif self._is_chord():
+            banks.extend((
+                self._chord_shift_scale_parameters(),
+                self._chord_strum_parameters(),
+            ))
         elif self._is_operator():
             self._replace_operator_lfo_bank(banks, names)
             waves = self._operator_wave_parameters(banks)
@@ -677,6 +1106,8 @@ class TapDeviceComponent(DeviceComponent):
             while len(banks) < len(custom_banks):
                 banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             banks[:len(custom_banks)] = custom_banks
+        elif self._is_grain_delay():
+            banks = list(self._grain_delay_parameter_banks())
         elif self._is_delay():
             banks = list(self._delay_parameter_banks())
         return banks
@@ -1388,6 +1819,35 @@ class TapDeviceComponent(DeviceComponent):
             lfo_wave_bank,
         )
 
+    def _grain_delay_uses_beat_delay(self):
+        mode = self._parameter_by_names('Delay Mode')
+        display = self._parameter_display(mode).lower()
+        if display in ('off', 'no', 'false', 'time'):
+            return False
+        if display in ('on', 'yes', 'true', 'sync', 'beat'):
+            return True
+        try:
+            return float(mode.value) > float(mode.min)
+        except Exception:
+            return False
+
+    def _grain_delay_parameter_banks(self):
+        delay_time = (
+            self._parameter_by_names('Beat Delay')
+            if self._grain_delay_uses_beat_delay()
+            else self._parameter_by_names('Time Delay')
+        )
+        return (
+            self._parameter_bank(
+                'Frequency', 'Pitch', 'Delay Mode', delay_time,
+                'Random', 'Spray', 'Feedback', ('DryWet', 'Dry/Wet', 'Dry Wet'),
+            ),
+            self._parameter_bank(
+                'Delay Mode', delay_time, 'Beat Swing', 'Feedback',
+                None, None, None, ('DryWet', 'Dry/Wet', 'Dry Wet'),
+            ),
+        )
+
     def _simpler_amp_parameters(self):
         names = (
             'Ve Attack', 'Ve Decay', 'Ve Sustain', 'Ve Release',
@@ -1474,6 +1934,28 @@ class TapDeviceComponent(DeviceComponent):
             self._parameter_by_names('Mod Src', 'Mod Source', 'Modulation Source'),
             self._parameter_by_names('Mod Dest'),
             self._parameter_by_names('Mod Amt'),
+            None,
+            None,
+        )
+
+    def _chord_shift_scale_parameters(self):
+        parameters = [
+            self._parameter_by_names(
+                'Shift{} Scale Degrees'.format(index),
+                'ShiftScaleDegrees{}'.format(index),
+            )
+            for index in range(1, 7)
+        ]
+        return tuple(parameters + [None, None])
+
+    def _chord_strum_parameters(self):
+        return (
+            self._parameter_by_names('Strum'),
+            self._parameter_by_names('Tension', 'Strum Tension', 'StrumTension'),
+            self._parameter_by_names('Crescendo', 'Strum Crescendo', 'StrumCrescendo'),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -2536,6 +3018,9 @@ class Tap(ControlSurface):
             if self._device._is_drift() or self._device._is_meld():
                 self._force_send_current_bank_metadata()
                 self._setup_dynamic_parameter_state_listeners()
+            elif self._device._uses_curated_banks():
+                self._force_send_current_bank_metadata()
+                self._setup_dynamic_parameter_state_listeners()
             else:
                 self._on_device_changed(False)
         else:
@@ -2579,6 +3064,12 @@ class Tap(ControlSurface):
         )
         for parameter in bank_parameters or ():
             add_parameter_listener(parameter, 'state', remap=remap_dynamic_bank)
+
+        if self._device._uses_curated_banks():
+            # Listen only to selectors referenced by conditional slots.
+            for parameter in self._device._decorated_parameters():
+                if self._device.curated_parameter_drives_bank(parameter):
+                    add_parameter_listener(parameter, 'value', remap=True)
 
         if self._device._is_simpler():
             normalized_bank_name = re.sub(r'[^a-z0-9]+', '', str(bank_name).lower())
@@ -4107,7 +4598,12 @@ class Tap(ControlSurface):
         return fields
 
     def _get_parameter_display_name(self, device_param):
-        raw_name = self._escape_sysex_string(device_param.name)
+        curated_name = None
+        try:
+            curated_name = self._device.curated_parameter_display_name(device_param)
+        except Exception:
+            pass
+        raw_name = self._escape_sysex_string(curated_name or device_param.name)
         if hasattr(device_param, 'is_enabled'):
             if self._parameter_is_inactive(device_param):
                 return f"*~{raw_name}"
@@ -4268,7 +4764,8 @@ class Tap(ControlSurface):
             return False
         if not (
                 self._device._is_drift() or self._device._is_meld() or
-                self._device._is_hybrid_reverb() or self._device._is_simpler()):
+                self._device._is_hybrid_reverb() or self._device._is_simpler() or
+                self._device._uses_curated_banks()):
             return False
         selected_device = selected_device or self._selected_device()
         try:
@@ -4829,6 +5326,18 @@ class Tap(ControlSurface):
         )
         normalized = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
         return bool(normalized.intersection(('envmode', 'fxtype', 'filtertype')))
+
+    def _grain_delay_dynamic_parameter(self, parameter):
+        device = self._selected_device()
+        if not liveobj_valid(device) or str(getattr(device, 'class_name', '')) != 'GrainDelay':
+            return False
+        names = (
+            str(getattr(parameter, 'name', '')),
+            str(getattr(parameter, 'original_name', '')),
+        )
+        return 'delaymode' in set(
+            re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names
+        )
 
     def _add_simpler_listener(self, subject, property_name, callback):
         if not liveobj_valid(subject):
@@ -6960,7 +7469,9 @@ class Tap(ControlSurface):
     def _create_parameter_value_listener(self, device_param, control_index):
         def listener():
             self._send_parameter_feedback(control_index, device_param, throttle_display=True)
-            if self._drumcell_dynamic_parameter(device_param):
+            if (
+                    self._drumcell_dynamic_parameter(device_param) or
+                    self._grain_delay_dynamic_parameter(device_param)):
                 self._schedule_active_bank_parameter_refresh()
         return listener
 
