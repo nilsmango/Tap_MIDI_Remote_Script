@@ -2108,6 +2108,9 @@ class Tap(ControlSurface):
             self._last_song_is_playing = False
             self._last_sent_transport_state = None
             self._last_sent_session_record_state = None
+            self._decoupled_automation_recording_active = False
+            self._decoupled_automation_recording_snapshots = {}
+            self._decoupled_automation_recording_generation = 0
             self._follow_action_scene_triggered_listeners = {}
             self._follow_action_clip_slot_runtime_listeners = {}
             self._follow_action_scene_name_listeners = {}
@@ -7719,6 +7722,9 @@ class Tap(ControlSurface):
         self._handled_follow_action_launches = set()
         self._follow_action_missing_clip_counts = {}
         self._last_follow_action_state = None
+        self._decoupled_automation_recording_active = False
+        self._decoupled_automation_recording_snapshots = {}
+        self._decoupled_automation_recording_generation += 1
         self._remove_follow_action_runtime_listeners()
         self._remove_follow_action_name_listeners()
         self._ensure_follow_action_song_listeners(current_song)
@@ -8177,6 +8183,31 @@ class Tap(ControlSurface):
         self._last_sent_session_record_state = value
         self.send_cc(119, 0, value)
 
+    def _begin_decoupled_automation_recording_tracking(self, clip):
+        self._decoupled_automation_recording_generation += 1
+        snapshots = self._capture_decoupled_automation_recording_snapshots((clip,))
+        self._decoupled_automation_recording_active = bool(snapshots)
+        self._decoupled_automation_recording_snapshots = snapshots
+
+    def _finish_decoupled_automation_recording_tracking(self):
+        if self._decoupled_automation_recording_active:
+            snapshots = self._decoupled_automation_recording_snapshots
+            generation = self._decoupled_automation_recording_generation
+            self._decoupled_automation_recording_active = False
+            self._decoupled_automation_recording_snapshots = {}
+            self.schedule_message(
+                2,
+                lambda: self._reconcile_recorded_decoupled_automation_if_current(
+                    snapshots,
+                    generation
+                )
+            )
+
+    def _reconcile_recorded_decoupled_automation_if_current(self, snapshots, generation):
+        if generation != self._decoupled_automation_recording_generation:
+            return
+        self._reconcile_recorded_decoupled_automation(snapshots)
+
     def _on_session_record_changed(self):
         self._send_session_record_state()
 
@@ -8454,6 +8485,192 @@ class Tap(ControlSurface):
             return info
         except Exception:
             return None
+
+    def _all_decoupled_automation_clips(self):
+        clips = []
+        try:
+            for track in self.song().tracks:
+                for clip_slot in track.clip_slots:
+                    if clip_slot is None or not clip_slot.has_clip:
+                        continue
+                    clip = clip_slot.clip
+                    if self._decoupled_automation_info(clip):
+                        clips.append(clip)
+        except Exception:
+            pass
+        return tuple(clips)
+
+    def _decoupled_automation_cycle_samples(self, envelope, device_param, info):
+        if envelope is None or device_param is None or not liveobj_valid(device_param) or not info:
+            return tuple()
+
+        automation_length = max(0.0001, float(info.get("automation_length", info["note_length"])))
+        physical_length = max(automation_length, float(info.get("physical_length", automation_length)))
+        cycle_count = max(1, int(math.floor((physical_length + 0.000001) / automation_length)))
+        samples_per_cycle = max(3, int(self.AUTOMATION_ENVELOPE_MAX_SAMPLES / cycle_count))
+        cycles = []
+
+        for cycle_index in range(cycle_count):
+            cycle_start = info["note_start"] + (float(cycle_index) * automation_length)
+            if cycle_start + automation_length > info["physical_end"] + 0.000001:
+                break
+
+            values = []
+            for sample_index in range(samples_per_cycle):
+                # Keep the sample inside this loop so the next loop's first
+                # value cannot make an otherwise flat loop look recorded.
+                time_value = cycle_start + (
+                    automation_length * float(sample_index) / float(samples_per_cycle)
+                )
+                try:
+                    raw_value = envelope.value_at_time(time_value)
+                    if device_param.max != device_param.min:
+                        normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                    else:
+                        normalized = self._parameter_normalized_value(device_param)
+                except Exception:
+                    normalized = self._parameter_normalized_value(device_param)
+                values.append(max(0.0, min(1.0, normalized)))
+            cycles.append(tuple(values))
+
+        return tuple(cycles)
+
+    def _capture_decoupled_automation_recording_snapshots(self, clips=None):
+        snapshots = {}
+        target_clips = tuple(clips) if clips is not None else self._all_decoupled_automation_clips()
+        for clip in target_clips:
+            try:
+                info = self._decoupled_automation_info(clip)
+                if not info:
+                    continue
+
+                parameters = {}
+                for device_param in self._clip_automation_parameters(clip, info):
+                    parameter_key = self._decoupled_automation_parameter_key(device_param)
+                    if not parameter_key:
+                        continue
+
+                    envelope = None
+                    if hasattr(clip, "automation_envelope"):
+                        try:
+                            envelope = clip.automation_envelope(device_param)
+                        except Exception:
+                            envelope = None
+                    if envelope is None:
+                        continue
+
+                    parameter_info = self._decoupled_info_for_parameter_key(info, parameter_key)
+                    parameters[parameter_key] = {
+                        "automation_length": parameter_info["automation_length"],
+                        "cycles": self._decoupled_automation_cycle_samples(
+                            envelope,
+                            device_param,
+                            parameter_info
+                        ),
+                    }
+
+                clip_identity = self._live_object_identity(clip)
+                snapshots[clip_identity] = {
+                    "clip": clip,
+                    "parameters": parameters,
+                }
+            except Exception as e:
+                self.log_message("TapAuto snapshot error: {}".format(str(e)))
+
+        return snapshots
+
+    def _decoupled_automation_cycle_changed(self, current_values, previous_values):
+        if previous_values is None or len(current_values) != len(previous_values):
+            return True
+        return any(
+            abs(float(current) - float(previous)) > self.AUTOMATION_ENVELOPE_LINEAR_EPSILON
+            for current, previous in zip(current_values, previous_values)
+        )
+
+    def _reconcile_recorded_decoupled_automation(self, snapshots):
+        recorded_parameter_found = False
+        for snapshot in tuple((snapshots or {}).values()):
+            clip = snapshot.get("clip")
+            try:
+                if clip is None or not liveobj_valid(clip):
+                    continue
+                info = self._decoupled_automation_info(clip)
+                if not info:
+                    continue
+
+                previous_parameters = snapshot.get("parameters", {})
+                automation_lengths = dict(info.get("automation_lengths", {}))
+                full_clip_length = max(
+                    0.0001,
+                    float(getattr(clip, "loop_end", info["physical_end"])) - info["note_start"]
+                )
+                marker_changed = False
+
+                for device_param in self._clip_automation_parameters(clip, info):
+                    parameter_key = self._decoupled_automation_parameter_key(device_param)
+                    if not parameter_key:
+                        continue
+
+                    envelope = None
+                    if hasattr(clip, "automation_envelope"):
+                        try:
+                            envelope = clip.automation_envelope(device_param)
+                        except Exception:
+                            envelope = None
+                    if envelope is None:
+                        continue
+
+                    parameter_info = self._decoupled_info_for_parameter_key(info, parameter_key)
+                    current_cycles = self._decoupled_automation_cycle_samples(
+                        envelope,
+                        device_param,
+                        parameter_info
+                    )
+                    if not current_cycles:
+                        continue
+
+                    previous_parameter = previous_parameters.get(parameter_key)
+                    previous_cycles = (
+                        previous_parameter.get("cycles", ())
+                        if previous_parameter is not None
+                        and abs(
+                            float(previous_parameter.get("automation_length", 0.0))
+                            - float(parameter_info["automation_length"])
+                        ) <= 0.000001
+                        else ()
+                    )
+                    parameter_was_recorded = any(
+                        self._decoupled_automation_cycle_changed(
+                            current_values,
+                            previous_cycles[cycle_index] if cycle_index < len(previous_cycles) else None
+                        )
+                        for cycle_index, current_values in enumerate(current_cycles)
+                    )
+                    if not parameter_was_recorded:
+                        continue
+
+                    recorded_parameter_found = True
+                    self._clear_authored_automation_steps_for_parameter(clip, device_param)
+                    if abs(automation_lengths.get(parameter_key, 0.0) - full_clip_length) > 0.000001:
+                        automation_lengths[parameter_key] = full_clip_length
+                        marker_changed = True
+                    self.log_message(
+                        "Marked recorded automation for '{}' with full clip length {:.6f}".format(
+                            getattr(device_param, "name", parameter_key),
+                            full_clip_length
+                        )
+                    )
+
+                if marker_changed:
+                    updated_info = dict(info)
+                    updated_info["automation_lengths"] = automation_lengths
+                    self._save_decoupled_automation_info_to_name(clip, updated_info)
+            except Exception as e:
+                self.log_message("TapAuto reconciliation error: {}".format(str(e)))
+
+        if recorded_parameter_found:
+            self._refresh_parameter_metadata_on_automation_change()
+            self.send_selected_clip_metadata()
 
     def _decoupled_automation_marker(self, info):
         return "[TapAuto:v2|{:.6f}|{:.6f}|{}]".format(
@@ -10445,11 +10662,23 @@ class Tap(ControlSurface):
 
     def _sesh_record_value(self, value):
         if value != 0:
-            record = self.song().session_record
-            if record == False:
-                self.song().session_record = True
+            song = self.song()
+            record = bool(song.session_record)
+            if not record:
+                clip_slot = song.view.highlighted_clip_slot
+                clip = clip_slot.clip if clip_slot is not None and clip_slot.has_clip else None
+                if self._decoupled_automation_info(clip):
+                    self._begin_decoupled_automation_recording_tracking(clip)
+                else:
+                    # Ordinary clip recording must not create or alter TapAuto
+                    # metadata.
+                    self._decoupled_automation_recording_generation += 1
+                    self._decoupled_automation_recording_active = False
+                    self._decoupled_automation_recording_snapshots = {}
+                song.session_record = True
             else:
-                self.song().session_record = False
+                song.session_record = False
+                self._finish_decoupled_automation_recording_tracking()
             self._send_session_record_state(force=True)
             self._set_up_notes_playing("clip")
 
@@ -18838,6 +19067,9 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._decoupled_automation_recording_active = False
+        self._decoupled_automation_recording_snapshots = {}
+        self._decoupled_automation_recording_generation += 1
         self._simpler_waveform_generation += 1
         self._remove_simpler_listeners()
         self._disconnect_simpler_decorator()
