@@ -7455,6 +7455,15 @@ class Tap(ControlSurface):
     def _normalized_session_clip_position(self, clip):
         try:
             position = float(clip.playing_position)
+            decoupled_info = self._decoupled_automation_info(clip)
+            if decoupled_info:
+                loop_length = max(0.0001, float(decoupled_info["note_length"]))
+                loop_position = self._positive_mod(
+                    position - float(decoupled_info["note_start"]),
+                    loop_length
+                )
+                return max(0.0, min(1.0, loop_position / loop_length))
+
             if bool(clip.looping):
                 start = float(clip.loop_start)
                 end = float(clip.loop_end)
@@ -7470,13 +7479,17 @@ class Tap(ControlSurface):
 
     def _normalized_session_clip_velocity(self, clip):
         try:
-            if bool(clip.looping):
+            decoupled_info = self._decoupled_automation_info(clip)
+            if decoupled_info:
+                length = max(0.0001, float(decoupled_info["note_length"]))
+            elif bool(clip.looping):
                 start = float(clip.loop_start)
                 end = float(clip.loop_end)
+                length = end - start
             else:
                 start = float(clip.start_marker)
                 end = float(clip.end_marker)
-            length = end - start
+                length = end - start
             if length <= 0.0:
                 return 0.0
 
