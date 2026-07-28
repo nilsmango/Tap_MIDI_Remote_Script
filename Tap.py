@@ -7568,7 +7568,7 @@ class Tap(ControlSurface):
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
         now = time.monotonic()
-        if self.device_status is False and now - self._last_clip_slot_integrity_check >= 5.0:
+        if self.device_status is False and now - self._last_clip_slot_integrity_check >= 1.0:
             self._last_clip_slot_integrity_check = now
             self._update_clip_slots()
 
@@ -10827,8 +10827,13 @@ class Tap(ControlSurface):
         track_index = list(song.tracks).index(selected_track)
         destination_scene_index = len(all_scenes)
 
-        # checking if clip was playing
-        was_playing = song.view.highlighted_clip_slot.is_playing == 1
+        source_clip_slot = selected_track.clip_slots[scene_index]
+        if source_clip_slot is None or not source_clip_slot.has_clip:
+            return
+
+        # Keep the launch decision tied to the slot being duplicated. Live's
+        # highlighted slot can temporarily lag behind selected scene changes.
+        was_playing = bool(source_clip_slot.is_playing)
 
         # check if there is a free clip slot after the current clip
         for index, clip_slot in enumerate(selected_track.clip_slots):
@@ -10844,12 +10849,14 @@ class Tap(ControlSurface):
             song.create_scene(-1)
 
         self._copy_paste_clip(track_index, scene_index, track_index, destination_scene_index)
+        destination_clip_slot = selected_track.clip_slots[destination_scene_index]
 
         # select newly created clip
         song.view.selected_scene = song.scenes[destination_scene_index]
+        song.view.highlighted_clip_slot = destination_clip_slot
         # fire the new clip if the old clip was playing
         if was_playing:
-            song.view.highlighted_clip_slot.fire(force_legato=True)
+            destination_clip_slot.fire(force_legato=True)
         
         # set up everything new
         self._on_selected_track_changed()
@@ -11700,6 +11707,17 @@ class Tap(ControlSurface):
             self._on_clip_has_clip_changed(track)
         return listener
 
+    def _add_clip_color_listener(self, clip, listener):
+        try:
+            if not liveobj_valid(clip) or not hasattr(clip, 'add_color_listener'):
+                return False
+            if not hasattr(clip, 'color_has_listener') or not clip.color_has_listener(listener):
+                clip.add_color_listener(listener)
+            return True
+        except Exception as e:
+            self._debug_log("Error adding clip color listener: {}".format(str(e)))
+            return False
+
     def _sync_clip_color_listeners_for_track(self, track):
         for clip_slot in track.clip_slots:
             if clip_slot is None:
@@ -11713,8 +11731,8 @@ class Tap(ControlSurface):
                         previous_clip.remove_color_listener(old_listener)
                 if current_clip not in self._clip_color_listeners:
                     listener = self._make_clip_color_listener(track)
-                    self._clip_color_listeners[current_clip] = listener
-                    current_clip.add_color_listener(listener)
+                    if self._add_clip_color_listener(current_clip, listener):
+                        self._clip_color_listeners[current_clip] = listener
                 self._clip_slot_color_map[clip_slot] = current_clip
             else:
                 previous_clip = self._clip_slot_color_map.pop(clip_slot, None)
@@ -11738,6 +11756,27 @@ class Tap(ControlSurface):
                 remove_listener(listener)
         except Exception:
             pass
+
+    def _add_clip_slot_listener(self, clip_slot, listener_kind, listener):
+        try:
+            if not liveobj_valid(clip_slot):
+                return False
+            has_listener = getattr(
+                clip_slot, "{}_has_listener".format(listener_kind), None
+            )
+            add_listener = getattr(
+                clip_slot, "add_{}_listener".format(listener_kind), None
+            )
+            if not add_listener:
+                return False
+            if not has_listener or not has_listener(listener):
+                add_listener(listener)
+            return True
+        except Exception as e:
+            self._debug_log(
+                "Error adding {} clip-slot listener: {}".format(listener_kind, str(e))
+            )
+            return False
 
     def _remove_clip_color_listener(self, clip, listener):
         try:
@@ -11765,25 +11804,22 @@ class Tap(ControlSurface):
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
                     listener = self._make_clip_has_clip_listener(track)
-                    self._clip_slot_listeners[listener_key] = listener
-                    clip_slot.add_has_clip_listener(listener)
+                    if self._add_clip_slot_listener(clip_slot, 'has_clip', listener):
+                        self._clip_slot_listeners[listener_key] = listener
 
                 listener_key = (clip_slot, 'is_triggered')
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
                     listener = self._make_clip_triggered_listener(track)
-                    self._clip_slot_listeners[listener_key] = listener
-                    clip_slot.add_is_triggered_listener(listener)
+                    if self._add_clip_slot_listener(clip_slot, 'is_triggered', listener):
+                        self._clip_slot_listeners[listener_key] = listener
 
                 listener_key = (clip_slot, 'is_playing')
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
-                    try:
-                        listener = self._make_clip_playing_listener(track)
+                    listener = self._make_clip_playing_listener(track)
+                    if self._add_clip_slot_listener(clip_slot, 'is_playing', listener):
                         self._clip_slot_listeners[listener_key] = listener
-                        clip_slot.add_is_playing_listener(listener)
-                    except Exception:
-                        pass
 
             self._sync_clip_color_listeners_for_track(track)
             for clip_slot in track.clip_slots:
@@ -11795,8 +11831,9 @@ class Tap(ControlSurface):
         for listener_key in list(self._clip_slot_listeners.keys()):
             if listener_key not in expected_listener_keys:
                 clip_slot, listener_kind = listener_key
-                listener = self._clip_slot_listeners.pop(listener_key)
-                self._remove_clip_slot_listener(clip_slot, listener_kind, listener)
+                listener = self._clip_slot_listeners.pop(listener_key, None)
+                if listener is not None:
+                    self._remove_clip_slot_listener(clip_slot, listener_kind, listener)
 
         for clip_slot in list(self._clip_slot_color_map.keys()):
             if clip_slot not in expected_clip_slots:
@@ -11804,8 +11841,9 @@ class Tap(ControlSurface):
 
         for clip in list(self._clip_color_listeners.keys()):
             if clip not in expected_clips:
-                listener = self._clip_color_listeners.pop(clip)
-                self._remove_clip_color_listener(clip, listener)
+                listener = self._clip_color_listeners.pop(clip, None)
+                if listener is not None:
+                    self._remove_clip_color_listener(clip, listener)
 
         self._registered_track_ids = current_track_ids
 
@@ -17077,7 +17115,11 @@ class Tap(ControlSurface):
         self._send_follow_action_state()
         
         # set up new clip listeners
-        self._register_clip_listeners()
+        try:
+            self._register_clip_listeners()
+        except Exception as e:
+            # Listener bookkeeping must never abort a completed clip copy.
+            self._debug_log("Error refreshing clip listeners after copy: {}".format(str(e)))
 
     def _append_and_remove_clip(self, from_track, from_clip, to_track, to_clip):
         """
@@ -17859,14 +17901,16 @@ class Tap(ControlSurface):
         """
         song = self.song()
         selected_clip_slot = song.view.highlighted_clip_slot
-        if selected_clip_slot.has_clip:
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
-            # add notes listener
-            # self.log_message("slot now has a clip adding notes listener")
-            selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
+        if selected_clip_slot is not None and selected_clip_slot.has_clip:
             if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                 selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
+
+            selected_clip = selected_clip_slot.clip
+            self.send_selected_clip_metadata()
+            self.send_selected_clip_notes()
+            if not selected_clip.notes_has_listener(self.send_selected_clip_notes):
+                selected_clip.add_notes_listener(self.send_selected_clip_notes)
+            self.add_clip_metadata_listeners(selected_clip)
     
     def stop_step_seq(self):
         song = self.song()
