@@ -1977,8 +1977,13 @@ class Tap(ControlSurface):
             return_count = 12  # Maximum of 12 Sends and 12 Returns
             max_clip_slots = 800  # Adjust this number based on your needs
             self.playing_position_listeners = [None] * max_clip_slots
+            self._playing_position_listener_clips = {}
+            self._playing_note_cache = {}
+            self._playing_note_cache_listeners = {}
+            self._playing_note_cache_dirty = set()
             self.current_clip_notes = []
             self.last_selected_clip_slot = None
+            self._step_seq_listener_clip = None
             self.last_raw_notes = None
             self.currently_playing_notes = [False] * 128
             self.last_playing_position = 0.0
@@ -2127,6 +2132,8 @@ class Tap(ControlSurface):
             self._last_mutator_generation_signatures = {}
             self._mutator_playing_clip_keys = set()
             self._mutator_triggered_clip_keys = set()
+            self._has_mutator_clips = False
+            self._mutator_clip_presence_dirty = True
             self._mutator_generation_lock = threading.RLock()
             self._last_mutator_scale_root_signature = None
             self._mutator_scale_root_sync_scheduled = False
@@ -7644,12 +7651,14 @@ class Tap(ControlSurface):
         self._follow_action_song_listener_subject = None
 
     def _on_follow_action_topology_changed(self):
+        self._mutator_clip_presence_dirty = True
         self._sync_follow_actions_to_track_topology()
         self._sync_follow_action_name_listeners()
         self._load_follow_actions_from_names()
         self._sync_follow_action_runtime_listeners()
 
     def _on_follow_action_name_changed(self):
+        self._mutator_clip_presence_dirty = True
         self._load_follow_actions_from_names()
         self._sync_follow_action_runtime_listeners()
         self._evaluate_follow_actions()
@@ -7725,6 +7734,7 @@ class Tap(ControlSurface):
         if current_song == self.song_instance:
             return False
 
+        self._remove_all_notes_playing_listeners()
         self.song_instance = current_song
         self._track_list_signature = None
         self._last_group_fold_states = None
@@ -7735,6 +7745,8 @@ class Tap(ControlSurface):
         self._handled_follow_action_launches = set()
         self._follow_action_missing_clip_counts = {}
         self._last_follow_action_state = None
+        self._has_mutator_clips = False
+        self._mutator_clip_presence_dirty = True
         self._decoupled_automation_recording_active = False
         self._decoupled_automation_recording_snapshots = {}
         self._decoupled_automation_recording_generation += 1
@@ -7761,6 +7773,8 @@ class Tap(ControlSurface):
         self._handled_follow_action_launches = set()
         self._follow_action_missing_clip_counts = {}
         self._last_follow_action_state = None
+        self._has_mutator_clips = False
+        self._mutator_clip_presence_dirty = True
         self._remove_follow_action_runtime_listeners()
         self._remove_follow_action_name_listeners()
         self._ensure_follow_action_song_listeners(current_song)
@@ -9284,6 +9298,8 @@ class Tap(ControlSurface):
             new_name = "{} {}".format(clean_name, marker).strip() if clean_name else marker
             if clip.name != new_name:
                 clip.name = new_name
+            self._has_mutator_clips = True
+            self._mutator_clip_presence_dirty = False
         except Exception:
             pass
 
@@ -9294,6 +9310,7 @@ class Tap(ControlSurface):
             clean_name = self._strip_mutator_name_marker(clip.name)
             if clip.name != clean_name:
                 clip.name = clean_name
+            self._mutator_clip_presence_dirty = True
         except Exception:
             pass
 
@@ -10915,28 +10932,128 @@ class Tap(ControlSurface):
                     self.start_step_seq()
 
     def _set_up_notes_playing(self, selected_track):
-        if selected_track != "clip":
-            # Only remove playing position listeners from the PREVIOUSLY selected track,
-            # not from all tracks. This changes O(tracks * clips) to O(clips).
-            if hasattr(self, '_previous_selected_track') and self._previous_selected_track is not None:
-                old_track = self._previous_selected_track
-                if liveobj_valid(old_track):
-                    for (clip_index, clip_slot) in enumerate(old_track.clip_slots):
-                        if clip_slot is not None and clip_slot.has_clip:
-                            if clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
-                                clip_slot.clip.remove_playing_position_listener(self.playing_position_listeners[clip_index])
-            self._previous_selected_track = selected_track
-        else:
+        if selected_track == "clip":
             selected_track = self.song().view.selected_track
+        else:
+            self._previous_selected_track = selected_track
 
-        if selected_track.has_midi_input:
-            for (clip_index, clip_slot) in enumerate(selected_track.clip_slots):
-                if clip_slot is not None and clip_slot.has_clip:
-                    if not clip_slot.clip.playing_position_has_listener(self.playing_position_listeners[clip_index]):
-                        # self.log_message("adding pos listener: {}".format(clip_index))
-                        listener = lambda index=clip_index: self._clip_pos_changed(index)
-                        self.playing_position_listeners[clip_index] = listener
-                        clip_slot.clip.add_playing_position_listener(listener)
+        desired_clips = {}
+        if selected_track is not None and liveobj_valid(selected_track) and selected_track.has_midi_input:
+            desired_clips = {
+                clip_index: clip_slot.clip
+                for clip_index, clip_slot in enumerate(selected_track.clip_slots)
+                if clip_slot is not None and clip_slot.has_clip
+            }
+
+        # Reconcile exact clip objects, not only scene indexes. A duplicated,
+        # deleted, or replaced clip can occupy the same slot index while the old
+        # Live object still owns our listener.
+        for clip_index, (old_clip, listener) in list(self._playing_position_listener_clips.items()):
+            desired_clip = desired_clips.get(clip_index)
+            if desired_clip is not None and not liveobj_changed(old_clip, desired_clip):
+                continue
+            try:
+                if liveobj_valid(old_clip) and old_clip.playing_position_has_listener(listener):
+                    old_clip.remove_playing_position_listener(listener)
+            except Exception:
+                pass
+            self._remove_playing_note_cache_listener(old_clip)
+            self._playing_position_listener_clips.pop(clip_index, None)
+            if clip_index < len(self.playing_position_listeners):
+                self.playing_position_listeners[clip_index] = None
+
+        for clip_index, clip in desired_clips.items():
+            existing = self._playing_position_listener_clips.get(clip_index)
+            if existing is None:
+                listener = lambda index=clip_index: self._clip_pos_changed(index)
+                try:
+                    if not clip.playing_position_has_listener(listener):
+                        clip.add_playing_position_listener(listener)
+                    self._playing_position_listener_clips[clip_index] = (clip, listener)
+                    if clip_index >= len(self.playing_position_listeners):
+                        self.playing_position_listeners.extend(
+                            [None] * (clip_index + 1 - len(self.playing_position_listeners))
+                        )
+                    self.playing_position_listeners[clip_index] = listener
+                except Exception as e:
+                    self._debug_log("Exception adding clip position listener: {}".format(str(e)))
+
+    def _playing_note_snapshot(self, clip):
+        clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+        time_span = (
+            max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick
+        ) - clip_start
+        raw_notes = clip.get_notes_extended(0, 128, clip_start, time_span)
+        return tuple(
+            (midi_note.pitch, midi_note.start_time, midi_note.start_time + midi_note.duration)
+            for midi_note in raw_notes
+        )
+
+    def _refresh_playing_note_cache(self, clip):
+        try:
+            if not liveobj_valid(clip) or not getattr(clip, "is_midi_clip", False):
+                self._playing_note_cache.pop(clip, None)
+                self._playing_note_cache_dirty.discard(clip)
+                return False
+            self._playing_note_cache[clip] = self._playing_note_snapshot(clip)
+            self._playing_note_cache_dirty.discard(clip)
+            return True
+        except Exception as e:
+            self._playing_note_cache.pop(clip, None)
+            self._playing_note_cache_dirty.add(clip)
+            self._debug_log("Exception refreshing playing-note cache: {}".format(str(e)))
+            return False
+
+    def _ensure_playing_note_cache_listener(self, clip):
+        listener = self._playing_note_cache_listeners.get(clip)
+        if listener is None:
+            def listener(clip=clip):
+                # A note edit can produce several notifications in one Live
+                # operation. Marking dirty coalesces them into one snapshot on
+                # the next play-position callback.
+                self._playing_note_cache_dirty.add(clip)
+
+            try:
+                if not clip.notes_has_listener(listener):
+                    clip.add_notes_listener(listener)
+                self._playing_note_cache_listeners[clip] = listener
+            except Exception as e:
+                # Keep correctness if this Live object cannot expose a notes
+                # listener: _clip_pos_changed will refresh on every callback.
+                self._playing_note_cache_listeners.pop(clip, None)
+                self._debug_log("Exception adding playing-note listener: {}".format(str(e)))
+
+        # Always take the initial snapshot after attempting registration.
+        self._refresh_playing_note_cache(clip)
+        return clip in self._playing_note_cache_listeners
+
+    def _remove_playing_note_cache_listener(self, clip):
+        listener = self._playing_note_cache_listeners.pop(clip, None)
+        if listener is not None:
+            try:
+                if liveobj_valid(clip) and clip.notes_has_listener(listener):
+                    clip.remove_notes_listener(listener)
+            except Exception:
+                pass
+        self._playing_note_cache.pop(clip, None)
+        self._playing_note_cache_dirty.discard(clip)
+
+    def _remove_all_notes_playing_listeners(self):
+        for clip_index, (clip, listener) in list(self._playing_position_listener_clips.items()):
+            try:
+                if liveobj_valid(clip) and clip.playing_position_has_listener(listener):
+                    clip.remove_playing_position_listener(listener)
+            except Exception:
+                pass
+            self._remove_playing_note_cache_listener(clip)
+            if clip_index < len(self.playing_position_listeners):
+                self.playing_position_listeners[clip_index] = None
+        self._playing_position_listener_clips.clear()
+
+        # Normally emptied above; this also covers a note listener whose
+        # position-listener registration failed part-way through.
+        for clip in list(self._playing_note_cache_listeners.keys()):
+            self._remove_playing_note_cache_listener(clip)
 
     def _check_clip_playing_status(self, force=False):
         try:
@@ -10971,8 +11088,6 @@ class Tap(ControlSurface):
                 if clip_slot is not None and clip_slot.has_clip:
                     clip_playing = clip_slot.clip
                     
-                    clip_start = min(clip_playing.start_time, clip_playing.start_marker, clip_playing.loop_start) - self.clip_length_trick
-                    time_span = (max(clip_playing.loop_end, clip_playing.end_marker, clip_playing.length) + self.clip_length_trick) - clip_start
                     loop_start = clip_playing.loop_start
 
                     # Sequencer views need only compact playhead feedback. Avoid
@@ -10992,24 +11107,16 @@ class Tap(ControlSurface):
                         return
                     
                     try:
-                        # Get all the notes in the clip
-                        current_raw_notes = clip_playing.get_notes_extended(0, 128, clip_start, time_span)
-                        
-                        # if the current clip has different notes save the new notes.
-                        if current_raw_notes != self.last_raw_notes:
-                            self.last_raw_notes = current_raw_notes
-
-                            # Reset the current clip notes array
-                            self.current_clip_notes = []
-                            # add all the notes to the array
-                            for midi_note in current_raw_notes:
-                                pitch = midi_note.pitch
-                                duration = midi_note.duration
-                                note_start_time = midi_note.start_time
-                                # Process note properties as needed
-                                # self.log_message("Note: Pitch {}, Start Time {}, Duration {}".format(pitch, start_time, duration))
-                                end_time = note_start_time + duration
-                                self.current_clip_notes.append([pitch, note_start_time, end_time])
+                        listener_active = clip_playing in self._playing_note_cache_listeners
+                        if not listener_active:
+                            listener_active = self._ensure_playing_note_cache_listener(clip_playing)
+                        if listener_active and (
+                            clip_playing in self._playing_note_cache_dirty
+                            or clip_playing not in self._playing_note_cache
+                        ):
+                            self._refresh_playing_note_cache(clip_playing)
+                        current_clip_notes = self._playing_note_cache.get(clip_playing, ())
+                        self.current_clip_notes = current_clip_notes
 
                         # check which notes are playing at position
                         # if we detect changes send them out to app
@@ -11043,7 +11150,7 @@ class Tap(ControlSurface):
                                     found_playing_note = False
     
                                     # Find the notes that stopped playing in since the last update
-                                    for note in self.current_clip_notes:
+                                    for note in current_clip_notes:
                                         pitch, note_start_time, end_time = note
     
                                         if note_start_time <= self.last_playing_position and clip_position < end_time and pitch == note_index:
@@ -11059,7 +11166,7 @@ class Tap(ControlSurface):
                                         self.send_note_off(note_index, 0, 100)
     
                             # check current clip notes array which notes are on for that playing position
-                            for note in self.current_clip_notes:
+                            for note in current_clip_notes:
                                 pitch, note_start_time, end_time = note
                                 if self.last_playing_position <= note_start_time <= clip_position:
                                     # note starts playing
@@ -11168,6 +11275,7 @@ class Tap(ControlSurface):
                     pass
 
     def _on_tracks_changed(self):
+        self._mutator_clip_presence_dirty = True
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
             self._metadata_recheck_timer = None
@@ -12239,6 +12347,7 @@ class Tap(ControlSurface):
 
     def _on_clip_has_clip_changed(self, track=None):
         # self.log_message("has clip status changed")
+        self._mutator_clip_presence_dirty = True
         self._refresh_parameter_metadata_on_automation_change()
         if track:
             track_index = self._get_track_index(track)
@@ -15928,9 +16037,42 @@ class Tap(ControlSurface):
             self._debug_log("Error requesting mutator generation for launch: {}".format(str(e)))
         return False
 
+    def _refresh_mutator_clip_presence(self):
+        previous_presence = self._has_mutator_clips
+        try:
+            has_mutator_clips = False
+            for track in self.song().tracks:
+                for clip_slot in track.clip_slots:
+                    if not clip_slot.has_clip:
+                        continue
+                    clip = clip_slot.clip
+                    if self._mutator_info_from_name(clip.name, resolve_scale_root=False):
+                        has_mutator_clips = True
+                        break
+                if has_mutator_clips:
+                    break
+        except Exception as e:
+            # Do not cache a false negative when Live is temporarily changing
+            # its topology; try again on the next evaluation.
+            self._mutator_clip_presence_dirty = True
+            self._debug_log("Error checking mutator clip presence: {}".format(str(e)))
+            return previous_presence
+        self._has_mutator_clips = has_mutator_clips
+        self._mutator_clip_presence_dirty = False
+        return self._has_mutator_clips
+
     def _evaluate_mutator_regeneration(self, only_track_index=None):
         try:
             if not self._song_is_playing():
+                self._mutator_regeneration_states.clear()
+                self._last_mutator_generation_signatures.clear()
+                self._mutator_playing_clip_keys.clear()
+                self._mutator_triggered_clip_keys.clear()
+                return
+
+            if self._mutator_clip_presence_dirty:
+                self._refresh_mutator_clip_presence()
+            if not self._has_mutator_clips:
                 self._mutator_regeneration_states.clear()
                 self._last_mutator_generation_signatures.clear()
                 self._mutator_playing_clip_keys.clear()
@@ -17848,17 +17990,24 @@ class Tap(ControlSurface):
         self._check_clip_playing_status(force=True)
         # self.log_message("Starting step seq")
         if self.last_selected_clip_slot is not selected_clip_slot:
-            if self.last_selected_clip_slot is not None and self.last_selected_clip_slot.has_clip:
-                clip = self.last_selected_clip_slot.clip
-                
-                if clip.notes_has_listener(self.send_selected_clip_notes):
-                    # self.log_message("removing notes listener")
-                    clip.remove_notes_listener(self.send_selected_clip_notes)
+            previous_slot = self.last_selected_clip_slot
+            if previous_slot is not None:
+                try:
+                    if previous_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
+                        previous_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
+                except Exception:
+                    pass
 
-                if self.last_selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
-                    self.last_selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
-                
-                self.remove_clip_metadata_listeners(clip)
+            previous_clip = self._step_seq_listener_clip
+            if previous_clip is not None:
+                try:
+                    if liveobj_valid(previous_clip) and previous_clip.notes_has_listener(self.send_selected_clip_notes):
+                        previous_clip.remove_notes_listener(self.send_selected_clip_notes)
+                    if liveobj_valid(previous_clip):
+                        self.remove_clip_metadata_listeners(previous_clip)
+                except Exception as e:
+                    self._debug_log("Exception changing step-sequencer clip listeners: {}".format(str(e)))
+            self._step_seq_listener_clip = None
             
             # updating last selected clip
             self.last_selected_clip_slot = selected_clip_slot
@@ -17868,6 +18017,7 @@ class Tap(ControlSurface):
                     # self.log_message("adding notes listener")
                     if not selected_clip_slot.clip.notes_has_listener(self.send_selected_clip_notes):
                         selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
+                    self._step_seq_listener_clip = selected_clip_slot.clip
                     
                     self.add_clip_metadata_listeners(selected_clip_slot.clip)
                 else:
@@ -17923,22 +18073,47 @@ class Tap(ControlSurface):
             self.send_selected_clip_notes()
             if not selected_clip.notes_has_listener(self.send_selected_clip_notes):
                 selected_clip.add_notes_listener(self.send_selected_clip_notes)
+            self._step_seq_listener_clip = selected_clip
             self.add_clip_metadata_listeners(selected_clip)
     
     def stop_step_seq(self):
-        song = self.song()
-        selected_clip_slot = song.view.highlighted_clip_slot
-        if selected_clip_slot is not None:
-            if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
-                selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
-            if selected_clip_slot.has_clip:
-                # remove notes listener
-                if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
-                    selected_clip_slot.clip.remove_notes_listener(self.send_selected_clip_notes)
-                # remove metadata listeners
-                self.remove_clip_metadata_listeners(selected_clip_slot.clip)
-            
-        # reseting last selected clip
+        # The highlighted slot can lag while selection changes. Clean the slot
+        # that start_step_seq actually registered, plus the current one if it
+        # differs, without removing the separate playing-note cache listener.
+        selected_clip_slot = self.song().view.highlighted_clip_slot
+        slots_to_clean = []
+        for clip_slot in (self.last_selected_clip_slot, selected_clip_slot):
+            if clip_slot is not None and all(clip_slot is not item for item in slots_to_clean):
+                slots_to_clean.append(clip_slot)
+
+        clips_to_clean = []
+        if self._step_seq_listener_clip is not None:
+            clips_to_clean.append(self._step_seq_listener_clip)
+
+        for clip_slot in slots_to_clean:
+            try:
+                if clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
+                    clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
+            except Exception:
+                pass
+            try:
+                if clip_slot.has_clip:
+                    clip = clip_slot.clip
+                    if all(clip is not item for item in clips_to_clean):
+                        clips_to_clean.append(clip)
+            except Exception as e:
+                self._debug_log("Exception removing step-sequencer listeners: {}".format(str(e)))
+
+        for clip in clips_to_clean:
+            try:
+                if liveobj_valid(clip) and clip.notes_has_listener(self.send_selected_clip_notes):
+                    clip.remove_notes_listener(self.send_selected_clip_notes)
+                if liveobj_valid(clip):
+                    self.remove_clip_metadata_listeners(clip)
+            except Exception as e:
+                self._debug_log("Exception removing step-sequencer clip listeners: {}".format(str(e)))
+
+        self._step_seq_listener_clip = None
         self.last_selected_clip_slot = None
     
     # Use 7-bit encoding for multi-byte values below 1000
@@ -18266,24 +18441,22 @@ class Tap(ControlSurface):
     def _add_random_synth(self, value):
         if value:
             browser = self.application().browser
-            # selecting an instrument from the instrument folder
-            found_instrument = False
-            instruments = browser.instruments
-            inst_children = instruments.children
-
-            while not found_instrument:
-                random_number = random.randint(0, len(inst_children) - 1)
-                rand_instrument = inst_children[random_number]
-                if rand_instrument.name not in ["CV Instrument", "CV Triggers", "External Instrument", "Ext. Instrument", "Drum Rack", "Instrument Rack", "Sampler", "Simpler", "Impulse"]:
-                    if rand_instrument.is_device:
-                        found_instrument = True
-                    else:
-                        # open folder (Drum Synth)
-                        children = rand_instrument.children
-                        rand_index = random.randint(0, len(children) - 1)
-                        rand_instrument = children[rand_index]
-                        found_instrument = True
-
+            excluded = {
+                "CV Instrument", "CV Triggers", "External Instrument",
+                "Ext. Instrument", "Drum Rack", "Instrument Rack",
+                "Sampler", "Simpler", "Impulse"
+            }
+            candidates = []
+            for instrument in browser.instruments.children:
+                if instrument.name in excluded:
+                    continue
+                if instrument.is_device or len(instrument.children) > 0:
+                    candidates.append(instrument)
+            if not candidates:
+                return
+            rand_instrument = random.choice(candidates)
+            if not rand_instrument.is_device:
+                rand_instrument = random.choice(rand_instrument.children)
             browser.load_item(rand_instrument)
             self._on_tracks_changed()
             self._on_device_changed()
@@ -18291,15 +18464,13 @@ class Tap(ControlSurface):
     def _add_random_drums(self, value):
         if value:
             browser = self.application().browser
-            # selecting a drum rack
-            drums = browser.drums.children
-            number_of_drums = len(drums)
-            found_drum = False
-            while not found_drum:
-                random_index = random.randint(0, number_of_drums - 1)
-                random_drum = drums[random_index]
-                if random_drum.name not in ["Drum Hits", "Drum Rack"]:
-                    found_drum = True
+            candidates = [
+                drum for drum in browser.drums.children
+                if drum.name not in ("Drum Hits", "Drum Rack")
+            ]
+            if not candidates:
+                return
+            random_drum = random.choice(candidates)
             browser.load_item(random_drum)
             self._on_tracks_changed()
             self._on_device_changed()
@@ -18346,23 +18517,21 @@ class Tap(ControlSurface):
         effects = browser.audio_effects
         effect_children = effects.children
         number_of_effects = len(effect_children)
+        if number_of_effects == 0:
+            return None
         # check if effects are in folders or not
         if number_of_effects >= 10:
-            random_effect_index = random.randint(0, number_of_effects - 1)
-            return effect_children[random_effect_index]
+            return random.choice(effect_children)
 
-        finished = False
-        while not finished:
-            random_folder_index = random.randint(0, number_of_effects - 1)
-            selected_folder = effect_children[random_folder_index]
-            self._debug_log("Selected FOlder: {}".format(selected_folder.name))
-            if selected_folder.name != "Utilities":
-                finished = True
-
-        folder_children = selected_folder.children
-        number_folder_children = len(folder_children)
-        random_folder_child_index = random.randint(0, number_folder_children - 1)
-        return folder_children[random_folder_child_index]
+        eligible_folders = [
+            folder for folder in effect_children
+            if folder.name != "Utilities" and len(folder.children) > 0
+        ]
+        if not eligible_folders:
+            return None
+        selected_folder = random.choice(eligible_folders)
+        self._debug_log("Selected Folder: {}".format(selected_folder.name))
+        return random.choice(selected_folder.children)
 
     def _add_random_effect(self, value):
         if value:
@@ -19150,6 +19319,7 @@ class Tap(ControlSurface):
         self._remove_follow_action_runtime_listeners()
         self._remove_follow_action_name_listeners()
         self._remove_follow_action_song_listeners()
+        self._remove_all_notes_playing_listeners()
         self._mutator_regeneration_states.clear()
         self._mutator_generation_in_progress.clear()
         self._mutator_generation_scheduled.clear()
