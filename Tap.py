@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 29
+secret_version_number = 30
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2444,6 +2444,10 @@ class Tap(ControlSurface):
     TRACK_DEVICE_BANK_SIZE = 8
     TRACK_DEVICE_PITCH_BEND_CENTER = 8192.0
     TRACK_DEVICE_PITCH_BEND_MAX = 16383.0
+    NOTE_REPEAT_RATES = (1.0, 2.0 / 3.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0)
+    NOTE_REPEAT_DEFAULT_INDEX = 2
+    NOTE_REPEAT_ENABLED_DATA_KEY = "tap-note-repeat-enabled"
+    NOTE_REPEAT_RATE_DATA_KEY = "tap-note-repeat-rate"
     TRACK_DEVICE_MIDI_CONTROLS = (
         {"name": "Mod Wheel", "kind": "mod_wheel", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
         {"name": "Pressure", "kind": "pressure", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
@@ -2608,6 +2612,15 @@ class Tap(ControlSurface):
             self._last_song_is_playing = False
             self._last_sent_transport_state = None
             self._last_sent_session_record_state = None
+            self._note_repeat = getattr(c_instance, "note_repeat", None)
+            self._note_repeat_last_record_quantization = None
+            self._last_note_repeat_feedback = None
+            if self._note_repeat is not None:
+                try:
+                    self._note_repeat.enabled = False
+                    self._note_repeat.repeat_rate = self.NOTE_REPEAT_RATES[self.NOTE_REPEAT_DEFAULT_INDEX]
+                except Exception:
+                    self._note_repeat = None
             self._decoupled_automation_recording_active = False
             self._decoupled_automation_recording_snapshots = {}
             self._decoupled_automation_recording_generation = 0
@@ -4077,6 +4090,168 @@ class Tap(ControlSurface):
     def _update_tempo(self):
         new_tempo = round(self.song().tempo, 2)
         self._send_sys_ex_message(str(new_tempo), 0x12)
+
+    def _selected_note_repeat_track(self):
+        try:
+            selected_track = self.song().view.selected_track
+            if (selected_track is not None
+                    and liveobj_valid(selected_track)
+                    and bool(getattr(selected_track, "has_midi_input", False))):
+                return selected_track
+        except Exception:
+            pass
+        return None
+
+    def _note_repeat_rate_index(self, rate):
+        try:
+            numeric_rate = float(rate)
+        except Exception:
+            return self.NOTE_REPEAT_DEFAULT_INDEX
+        return min(
+            range(len(self.NOTE_REPEAT_RATES)),
+            key=lambda index: abs(self.NOTE_REPEAT_RATES[index] - numeric_rate)
+        )
+
+    def _track_note_repeat_state(self, track):
+        if track is None or self._note_repeat is None:
+            return False, self.NOTE_REPEAT_DEFAULT_INDEX
+
+        try:
+            enabled = bool(track.get_data(self.NOTE_REPEAT_ENABLED_DATA_KEY, False))
+        except Exception:
+            enabled = False
+        try:
+            stored_rate = track.get_data(
+                self.NOTE_REPEAT_RATE_DATA_KEY,
+                self.NOTE_REPEAT_RATES[self.NOTE_REPEAT_DEFAULT_INDEX]
+            )
+        except Exception:
+            stored_rate = self.NOTE_REPEAT_RATES[self.NOTE_REPEAT_DEFAULT_INDEX]
+        return enabled, self._note_repeat_rate_index(stored_rate)
+
+    def _set_track_note_repeat_data(self, track, enabled=None, rate_index=None):
+        if track is None:
+            return
+        try:
+            if enabled is not None:
+                track.set_data(self.NOTE_REPEAT_ENABLED_DATA_KEY, bool(enabled))
+            if rate_index is not None:
+                track.set_data(
+                    self.NOTE_REPEAT_RATE_DATA_KEY,
+                    self.NOTE_REPEAT_RATES[rate_index]
+                )
+        except Exception:
+            pass
+
+    def _apply_note_repeat_engine(self, enabled, rate_index):
+        note_repeat = self._note_repeat
+        if note_repeat is None:
+            return
+
+        rate_index = max(0, min(len(self.NOTE_REPEAT_RATES) - 1, int(rate_index)))
+        try:
+            note_repeat.repeat_rate = self.NOTE_REPEAT_RATES[rate_index]
+        except Exception:
+            pass
+        if enabled:
+            # Match Live's own Move repeat model. This lets polyphonic
+            # aftertouch update the velocity of already-held repeating notes.
+            try:
+                note_repeat.aftertouch_ramp_start = 300
+                note_repeat.aftertouch_ramp_length = 250
+            except Exception:
+                pass
+
+        try:
+            was_enabled = bool(note_repeat.enabled)
+        except Exception:
+            was_enabled = False
+
+        song = self.song()
+        if enabled and not was_enabled:
+            try:
+                self._note_repeat_last_record_quantization = song.midi_recording_quantization
+                song.midi_recording_quantization = False
+            except Exception:
+                self._note_repeat_last_record_quantization = None
+        elif not enabled and was_enabled:
+            try:
+                if (not song.midi_recording_quantization
+                        and self._note_repeat_last_record_quantization):
+                    song.midi_recording_quantization = self._note_repeat_last_record_quantization
+            except Exception:
+                pass
+            self._note_repeat_last_record_quantization = None
+
+        try:
+            note_repeat.enabled = bool(enabled)
+        except Exception:
+            pass
+
+    def _restore_note_repeat_for_selected_track(self, force_feedback=False):
+        track = self._selected_note_repeat_track()
+        enabled, rate_index = self._track_note_repeat_state(track)
+        self._apply_note_repeat_engine(enabled if track is not None else False, rate_index)
+        self._send_note_repeat_state(force=force_feedback)
+
+    def _swing_percent(self):
+        try:
+            return max(0, min(100, int(round(float(self.song().swing_amount) * 100.0))))
+        except Exception:
+            return 0
+
+    def _send_note_repeat_state(self, force=False):
+        track = self._selected_note_repeat_track()
+        available = track is not None and self._note_repeat is not None
+        enabled, rate_index = self._track_note_repeat_state(track)
+        if not available:
+            enabled = False
+            rate_index = self.NOTE_REPEAT_DEFAULT_INDEX
+        swing_percent = self._swing_percent()
+        signature = (available, enabled, rate_index, swing_percent)
+        if not force and signature == self._last_note_repeat_feedback:
+            return
+        self._last_note_repeat_feedback = signature
+        self._send_sys_ex_message(
+            "{}|{}|{}|{}".format(
+                1 if available else 0,
+                1 if enabled else 0,
+                rate_index,
+                swing_percent
+            ),
+            0x4C
+        )
+
+    def _update_swing_amount(self):
+        self._send_note_repeat_state(force=True)
+
+    def _handle_note_repeat_command(self, message):
+        values = list(message[2:-1])
+        if not values:
+            return
+
+        command = values[0]
+        track = self._selected_note_repeat_track()
+        if command == 0 and len(values) >= 2:
+            enabled = bool(values[1]) and track is not None and self._note_repeat is not None
+            if track is not None:
+                self._set_track_note_repeat_data(track, enabled=enabled)
+                _, rate_index = self._track_note_repeat_state(track)
+                self._apply_note_repeat_engine(enabled, rate_index)
+        elif command == 1 and len(values) >= 2 and track is not None:
+            rate_index = max(0, min(len(self.NOTE_REPEAT_RATES) - 1, int(values[1])))
+            self._set_track_note_repeat_data(track, rate_index=rate_index)
+            enabled, _ = self._track_note_repeat_state(track)
+            self._apply_note_repeat_engine(enabled, rate_index)
+        elif command == 2 and len(values) >= 2:
+            try:
+                self.song().swing_amount = max(0.0, min(1.0, float(values[1]) / 100.0))
+            except Exception:
+                pass
+        elif command != 3:
+            return
+
+        self._send_note_repeat_state(force=True)
 
     def _metronome_value(self):
         try:
@@ -8140,6 +8315,7 @@ class Tap(ControlSurface):
         self._ensure_song_listener(song, "scale_name", self._on_scale_changed)
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
+        self._ensure_song_listener(song, "swing_amount", self._update_swing_amount)
         self._ensure_song_listener(song, "metronome", self._update_metronome)
         self._ensure_song_listener(song, "session_record", self._on_session_record_changed)
         try:
@@ -8225,6 +8401,9 @@ class Tap(ControlSurface):
         self._send_re_enable_automation_enabled()
         self._update_mixer_and_tracks()
         self._send_selected_track_state()
+        # Send repeat feedback after the selected-track message so Tap cannot
+        # clear the newly restored state while processing the track change.
+        self._restore_note_repeat_for_selected_track(force_feedback=True)
         self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
@@ -8258,6 +8437,13 @@ class Tap(ControlSurface):
         if current_song == self.song_instance:
             return False
 
+        try:
+            if self._note_repeat is not None:
+                self._note_repeat.enabled = False
+        except Exception:
+            pass
+        self._note_repeat_last_record_quantization = None
+        self._last_note_repeat_feedback = None
         self._remove_all_notes_playing_listeners()
         self.song_instance = current_song
         self._track_list_signature = None
@@ -11251,8 +11437,12 @@ class Tap(ControlSurface):
 
     def _swing_amount_value(self, value):
         global swing_amount_value
-        # 100% swing amount did strange things, so I went down to 10% max
-        swing_amount_value = value / 1000.0
+        swing_amount_value = value / 100.0
+        try:
+            self.song().swing_amount = swing_amount_value
+        except Exception:
+            pass
+        self._send_note_repeat_state(force=True)
 
     def _quantize_button_value(self, value):
         if value != 0:
@@ -11429,6 +11619,7 @@ class Tap(ControlSurface):
             self._set_other_tracks_implicit_arm()
             # send new index of selected track
             self._send_selected_track_index(selected_track)
+            self._restore_note_repeat_for_selected_track(force_feedback=True)
             self._on_selected_scene_changed()
             # send sys ex of track midi input status.
             self._send_sys_ex_message(str(track_has_midi_input), 0x0B)
@@ -13469,6 +13660,11 @@ class Tap(ControlSurface):
                 self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
+        # Native Live note repeat always targets the selected MIDI track.
+        if len(message) >= 3 and message[1] == 0x4B:
+            self._handle_note_repeat_command(message)
+            return
+
         # Clip/Mixer views explicitly provide the raw track indexes currently
         # visible in the app. Keep position work completely dormant elsewhere.
         if len(message) >= 3 and message[1] == 0x47:
@@ -19902,6 +20098,7 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._apply_note_repeat_engine(False, self.NOTE_REPEAT_DEFAULT_INDEX)
         self._decoupled_automation_recording_active = False
         self._decoupled_automation_recording_snapshots = {}
         self._decoupled_automation_recording_generation += 1
@@ -20002,6 +20199,7 @@ class Tap(ControlSurface):
         # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
         self._remove_song_listener(song, "scale_name", self._on_scale_changed)
         self._remove_song_listener(song, "root_note", self._on_scale_changed)
+        self._remove_song_listener(song, "swing_amount", self._update_swing_amount)
         self._remove_song_listener(song, "metronome", self._update_metronome)
         self._remove_song_listener(song, "session_record", self._on_session_record_changed)
         self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
