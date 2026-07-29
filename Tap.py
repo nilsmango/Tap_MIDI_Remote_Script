@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 28
+secret_version_number = 29
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2420,6 +2420,19 @@ class Tap(ControlSurface):
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
     CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62)
+    SYSEX_21_BIT_MAX_MAGNITUDE = 0x1FFFFF
+    NOTE_FLAG_MUTE = 0x01
+    NOTE_FLAG_NEGATIVE_START = 0x02
+    NOTE_FLAG_NEGATIVE_DURATION = 0x04
+    MARKER_ID_MASK = 0x3F
+    MARKER_FLAG_NEGATIVE_TIME = 0x40
+    DECOUPLED_FLAG_ACTIVE = 0x01
+    DECOUPLED_FLAG_NEGATIVE_NOTE_START = 0x02
+    DECOUPLED_FLAG_NEGATIVE_NOTE_END = 0x04
+    DECOUPLED_FLAG_NEGATIVE_NOTE_LENGTH = 0x08
+    DECOUPLED_FLAG_NEGATIVE_PHYSICAL_END = 0x10
+    MUTATOR_SECTION_ROLE_MASK = 0x3F
+    MUTATOR_SECTION_FLAG_NEGATIVE_START = 0x40
     DISPLAY_VALUE_NUMBER_PATTERN = re.compile(r'(?<![\d.])([+-]?\d+)\.(\d+)(?![\d.])')
     PARAMETER_METADATA_RECHECK_INTERVAL = 0.1
     PARAMETER_METADATA_RECHECK_DURATION = 1.2
@@ -13532,16 +13545,16 @@ class Tap(ControlSurface):
                 note_pitch = message[index]
                 index += 1
 
-                # Decode the start time (3 bytes, 7-bit packed)
+                # Decode the start-time magnitude (3 bytes, 7-bit packed)
                 if index + 3 > len(message):
                     break
-                start_time = self._from_3_7bit_bytes(message, index)
+                start_time_magnitude = self._from_3_7bit_magnitude(message, index)
                 index += 3
 
-                # Decode the duration (3 bytes, 7-bit packed)
+                # Decode the duration magnitude (3 bytes, 7-bit packed)
                 if index + 3 > len(message):
                     break
-                duration = self._from_3_7bit_bytes(message, index)
+                duration_magnitude = self._from_3_7bit_magnitude(message, index)
                 index += 3
 
                 # Decode velocity
@@ -13550,11 +13563,22 @@ class Tap(ControlSurface):
                 velocity = message[index]
                 index += 1
 
-                # Probability and mute are separate SysEx7-safe bytes.
+                # Probability and note/sign flags are separate SysEx7-safe bytes.
                 probability = message[index] / 127.0
                 index += 1
-                mute = message[index] != 0
+                note_flags = message[index]
                 index += 1
+                start_time = self._value_from_magnitude(
+                    start_time_magnitude,
+                    note_flags,
+                    1
+                )
+                duration = self._value_from_magnitude(
+                    duration_magnitude,
+                    note_flags,
+                    2
+                )
+                mute = bool(note_flags & self.NOTE_FLAG_MUTE)
 
                 # Create a MidiNoteSpecification object
                 note_spec = MidiNoteSpecification(
@@ -13686,12 +13710,10 @@ class Tap(ControlSurface):
                     pitch = message[index]
                     index += 1
         
-                    start_time_raw = self._from_3_7bit_bytes(message, index)
-                    start_time = start_time_raw / 1000.0
+                    start_time_magnitude = self._from_3_7bit_magnitude(message, index)
                     index += 3
         
-                    duration_raw = self._from_3_7bit_bytes(message, index)
-                    duration = duration_raw / 1000.0
+                    duration_magnitude = self._from_3_7bit_magnitude(message, index)
                     index += 3
         
                     velocity = message[index]
@@ -13699,8 +13721,19 @@ class Tap(ControlSurface):
         
                     probability = message[index] / 127.0
                     index += 1
-                    mute = message[index] != 0
+                    note_flags = message[index]
                     index += 1
+                    start_time = self._value_from_magnitude(
+                        start_time_magnitude,
+                        note_flags,
+                        1
+                    ) / 1000.0
+                    duration = self._value_from_magnitude(
+                        duration_magnitude,
+                        note_flags,
+                        2
+                    ) / 1000.0
+                    mute = bool(note_flags & self.NOTE_FLAG_MUTE)
 
                     if decoupled_info:
                         target_note = None
@@ -13752,11 +13785,17 @@ class Tap(ControlSurface):
         # markers
         if len(message) >= 7 and message[1] == 17:
             # Decode the note ID and data
-            marker_id = message[2]
+            marker_flags = message[2]
+            marker_id = marker_flags & self.MARKER_ID_MASK
             
-            # Decode start time (variable-length value)
+            # Decode the marker magnitude and apply its flag-carried sign.
             index = 3
-            marker_time_raw = self._from_3_7bit_bytes(message, index)
+            marker_time_magnitude = self._from_3_7bit_magnitude(message, index)
+            marker_time_raw = (
+                -marker_time_magnitude
+                if marker_flags & self.MARKER_FLAG_NEGATIVE_TIME
+                else marker_time_magnitude
+            )
             marker_time = marker_time_raw / 1000.0
             
             # Get the selected clip
@@ -18647,36 +18686,38 @@ class Tap(ControlSurface):
             for shift in range(5)
         )
     
-    def _to_3_7bit_bytes(self, value):
-        """
-        Convert an integer into 3 MIDI 7-bit bytes.
-        Uses the highest bit of the first byte as a sign indicator.
-        """
-        is_negative = value < 0
-        value = abs(value)
-        
-        if value > 0x1FFFFF:  # Cap at 2,097,151
-            value = 0x1FFFFF
-    
-        first_byte = (value >> 14) & 0x7F
-        if is_negative:
-            first_byte |= 0x40  # Set the sign bit for negative numbers
-    
-        return [first_byte, (value >> 7) & 0x7F, value & 0x7F]
-    
-    def _from_3_7bit_bytes(self, bytes_list, start_index=0):
-        """
-        Convert 3 MIDI 7-bit bytes back into an integer.
-        The highest bit of the first byte is used as a sign indicator.
-        """
+    def _to_3_7bit_magnitude(self, value):
+        """Encode an absolute magnitude from 0 through 2,097,151."""
+        value = min(abs(int(value)), self.SYSEX_21_BIT_MAX_MAGNITUDE)
+        return [(value >> 14) & 0x7F, (value >> 7) & 0x7F, value & 0x7F]
+
+    def _from_3_7bit_magnitude(self, bytes_list, start_index=0):
+        """Decode an unsigned 21-bit magnitude from three SysEx7 bytes."""
         if len(bytes_list) < start_index + 3:
             return 0
-    
-        first_byte = bytes_list[start_index]
-        is_negative = (first_byte & 0x40) != 0  # Check if the sign bit is set
-        value = ((first_byte & 0x3F) << 14) | (bytes_list[start_index + 1] << 7) | bytes_list[start_index + 2]
-    
-        return -value if is_negative else value
+
+        return (
+            ((int(bytes_list[start_index]) & 0x7F) << 14)
+            | ((int(bytes_list[start_index + 1]) & 0x7F) << 7)
+            | (int(bytes_list[start_index + 2]) & 0x7F)
+        )
+
+    def _signed_magnitude_flags(self, values):
+        flags = 0
+        for value_index, value in enumerate(values[:7]):
+            if int(value) < 0:
+                flags |= 1 << value_index
+        return flags
+
+    def _value_from_magnitude(self, magnitude, sign_flags, value_index):
+        return -magnitude if sign_flags & (1 << value_index) else magnitude
+
+    def _note_record_flags(self, mute, start_time, duration):
+        return (
+            (self.NOTE_FLAG_MUTE if mute else 0)
+            | (self.NOTE_FLAG_NEGATIVE_START if start_time < 0 else 0)
+            | (self.NOTE_FLAG_NEGATIVE_DURATION if duration < 0 else 0)
+        )
     
     def send_selected_clip_metadata(self):
         """
@@ -18705,12 +18746,19 @@ class Tap(ControlSurface):
                     signature_denominator = int(selected_clip.signature_denominator)
                     signature_numerator = int(selected_clip.signature_numerator)
                     decoupled_info = self._decoupled_automation_info(selected_clip)
+                    marker_values = (
+                        start_marker,
+                        end_marker,
+                        loop_start,
+                        loop_end
+                    )
                     
                     note_data = [
-                        *self._to_3_7bit_bytes(start_marker),
-                        *self._to_3_7bit_bytes(end_marker),
-                        *self._to_3_7bit_bytes(loop_start),
-                        *self._to_3_7bit_bytes(loop_end),
+                        self._signed_magnitude_flags(marker_values),
+                        *self._to_3_7bit_magnitude(start_marker),
+                        *self._to_3_7bit_magnitude(end_marker),
+                        *self._to_3_7bit_magnitude(loop_start),
+                        *self._to_3_7bit_magnitude(loop_end),
                         signature_denominator,
                         signature_numerator
                     ]
@@ -18721,18 +18769,45 @@ class Tap(ControlSurface):
                             parameter_key = self._decoupled_automation_parameter_key(device_param)
                             if parameter_key in decoupled_info.get("automation_lengths", {}):
                                 control_lengths.append((control_index, decoupled_info["automation_lengths"][parameter_key]))
+                        decoupled_values = (
+                            int(decoupled_info["note_start"] * 1000),
+                            int(decoupled_info["note_end"] * 1000),
+                            int(decoupled_info["note_length"] * 1000),
+                            int(decoupled_info["physical_end"] * 1000)
+                        )
+                        decoupled_flags = (
+                            self.DECOUPLED_FLAG_ACTIVE
+                            | (
+                                self.DECOUPLED_FLAG_NEGATIVE_NOTE_START
+                                if decoupled_values[0] < 0 else 0
+                            )
+                            | (
+                                self.DECOUPLED_FLAG_NEGATIVE_NOTE_END
+                                if decoupled_values[1] < 0 else 0
+                            )
+                            | (
+                                self.DECOUPLED_FLAG_NEGATIVE_NOTE_LENGTH
+                                if decoupled_values[2] < 0 else 0
+                            )
+                            | (
+                                self.DECOUPLED_FLAG_NEGATIVE_PHYSICAL_END
+                                if decoupled_values[3] < 0 else 0
+                            )
+                        )
                         note_data.extend([
-                            1,
-                            *self._to_3_7bit_bytes(int(decoupled_info["note_start"] * 1000)),
-                            *self._to_3_7bit_bytes(int(decoupled_info["note_end"] * 1000)),
-                            *self._to_3_7bit_bytes(int(decoupled_info["note_length"] * 1000)),
-                            *self._to_3_7bit_bytes(int(decoupled_info["physical_end"] * 1000)),
+                            decoupled_flags,
+                            *self._to_3_7bit_magnitude(decoupled_values[0]),
+                            *self._to_3_7bit_magnitude(decoupled_values[1]),
+                            *self._to_3_7bit_magnitude(decoupled_values[2]),
+                            *self._to_3_7bit_magnitude(decoupled_values[3]),
                             len(control_lengths),
                         ])
                         for control_index, automation_length in control_lengths:
                             note_data.extend([
                                 control_index,
-                                *self._to_3_7bit_bytes(int(automation_length * 1000)),
+                                *self._to_3_7bit_magnitude(
+                                    max(0, int(automation_length * 1000))
+                                ),
                             ])
                     else:
                         note_data.append(0)
@@ -18741,16 +18816,31 @@ class Tap(ControlSurface):
                     if mutator_info:
                         note_data.extend([
                             1,
-                            *self._to_3_7bit_bytes(int(mutator_info.get("original_loop_length", 0.0001) * 1000)),
-                            *self._to_3_7bit_bytes(int(mutator_info.get("structure_length", 0.0001) * 1000)),
+                            *self._to_3_7bit_magnitude(
+                                max(0, int(mutator_info.get("original_loop_length", 0.0001) * 1000))
+                            ),
+                            *self._to_3_7bit_magnitude(
+                                max(0, int(mutator_info.get("structure_length", 0.0001) * 1000))
+                            ),
                             int(mutator_info.get("preset", 9)) & 0x7F,
                             min(32, len(mutator_info.get("sections", []))),
                         ])
                         for section in mutator_info.get("sections", [])[:32]:
+                            section_start = int(section.get("start", 0.0) * 1000)
+                            section_length = max(
+                                0,
+                                int(section.get("length", 0.0) * 1000)
+                            )
+                            section_flags = (
+                                int(section.get("role", 1)) & self.MUTATOR_SECTION_ROLE_MASK
+                            ) | (
+                                self.MUTATOR_SECTION_FLAG_NEGATIVE_START
+                                if section_start < 0 else 0
+                            )
                             note_data.extend([
-                                int(section.get("role", 1)) & 0x7F,
-                                *self._to_3_7bit_bytes(int(section.get("start", 0.0) * 1000)),
-                                *self._to_3_7bit_bytes(int(section.get("length", 0.0) * 1000)),
+                                section_flags,
+                                *self._to_3_7bit_magnitude(section_start),
+                                *self._to_3_7bit_magnitude(section_length),
                         ])
                         target_pitches = [max(0, min(127, int(pitch))) for pitch in mutator_info.get("target_pitches", [])[:16]]
                         operation_order = [int(slot.get("operation", 0)) for slot in self._mutator_active_slots(mutator_info)]
@@ -18811,7 +18901,9 @@ class Tap(ControlSurface):
                             max(0, min(127, int(flin_info.get("view_page", 0)) + 64)),
                             max(0, min(127, int(flin_info.get("base_pitch", 60)))),
                             1 if flin_info.get("limited", False) else 0,
-                            *self._to_3_7bit_bytes(int(flin_info.get("seed", 1))),
+                            *self._to_3_7bit_magnitude(
+                                max(0, int(flin_info.get("seed", 1)))
+                            ),
                             max(1, min(127, int(flin_info.get("default_velocity", 100)))),
                             minimum_pitch,
                             maximum_pitch,
@@ -18823,7 +18915,9 @@ class Tap(ControlSurface):
                                 1 if column.get("active", False) else 0,
                                 max(0, min(15, int(column.get("rate_row", 0)))),
                                 max(1, min(16, int(column.get("duration_steps", 1)))),
-                                *self._to_3_7bit_bytes(max(0, int(column.get("phase_ticks", 0)))),
+                                *self._to_3_7bit_magnitude(
+                                    max(0, int(column.get("phase_ticks", 0)))
+                                ),
                                 max(0, min(127, int(column.get("scale_degree", 0)) + 64)),
                                 max(0, min(127, int(column.get("octave_offset", 0)) + 64)),
                                 max(0, min(127, int(column.get("pad_offset", 0)) + 64)),
@@ -18879,17 +18973,21 @@ class Tap(ControlSurface):
                         start_time = int(note.start_time * 1000)
                         duration = int(note.duration * 1000)
                         velocity = int(note.velocity)
-                        mute = 1 if note.mute else 0
+                        note_flags = self._note_record_flags(
+                            bool(note.mute),
+                            start_time,
+                            duration
+                        )
                         probability = int(note.probability * 127)
                     
                         note_data = [
                             *self._to_5_7bit_bytes(note_id),   # 5 bytes, 7-bit encoded
                             pitch,                      # 1 byte
-                            *self._to_3_7bit_bytes(start_time),# 3 bytes, 7-bit encoded
-                            *self._to_3_7bit_bytes(duration),  # 3 bytes, 7-bit encoded
+                            *self._to_3_7bit_magnitude(start_time),# 3 bytes, 7-bit encoded
+                            *self._to_3_7bit_magnitude(duration),  # 3 bytes, 7-bit encoded
                             velocity,
                             probability,
-                            mute
+                            note_flags
                         ]
                     
                         data.extend(note_data)
