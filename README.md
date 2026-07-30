@@ -141,3 +141,17 @@ If USB-C is not available, you can also use MIDI over WiFi on macOS. Use a clean
 3. Select the script `Tap` using the dropdown menu in the Control Surface column.
 4. Assign your device or Network Session as input and output ports.
 5. Activate `Track` and `Remote` for your active MIDI Ports.
+6. If you enable **MPE Pads** in Tap, also activate `MPE` for Tap's input
+   port. Tap's green **MPE Remote Script Ready** message confirms script
+   compatibility only; it cannot detect Live's separate input-port switch.
+
+Tap sends MPE in the lower zone with channel 1 as the manager channel and
+channels 2-15 as member channels. Channel 16 remains reserved for the Tap
+control surface. Set MPE instruments and external hardware to a 48-semitone
+per-note pitch-bend range. Tap explicitly configures that range on every member
+channel. In the app, vertical pad movement can send per-note Pressure or Slide
+(CC74), with its zero point based on the first finger position or touch height.
+
+Tap's **Track Controls Expression** setting chooses whether the expression
+encoder sends Slide (CC74, the default) or channel Pressure. Both can be changed
+while notes are playing.
