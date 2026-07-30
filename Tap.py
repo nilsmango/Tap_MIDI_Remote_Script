@@ -1,4 +1,4 @@
-# 7III Tap 2.0.1
+# 7III Tap 2.0.3
 
 from __future__ import with_statement
 import Live
@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 30
+secret_version_number = 34
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2419,7 +2419,7 @@ class Tap(ControlSurface):
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62)
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82)
     SYSEX_21_BIT_MAX_MAGNITUDE = 0x1FFFFF
     NOTE_FLAG_MUTE = 0x01
     NOTE_FLAG_NEGATIVE_START = 0x02
@@ -2448,12 +2448,22 @@ class Tap(ControlSurface):
     NOTE_REPEAT_DEFAULT_INDEX = 2
     NOTE_REPEAT_ENABLED_DATA_KEY = "tap-note-repeat-enabled"
     NOTE_REPEAT_RATE_DATA_KEY = "tap-note-repeat-rate"
+    MPE_MEMBER_CHANNEL_COUNT = 14
+    MPE_PITCH_BEND_RANGE = 48
     TRACK_DEVICE_MIDI_CONTROLS = (
         {"name": "Mod Wheel", "kind": "mod_wheel", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
         {"name": "Pressure", "kind": "pressure", "min": 0.0, "max": 127.0, "default": 0.0, "automatable": False},
         {"name": "Pitch Bend", "kind": "pitch_bend", "min": 0.0, "max": 16383.0, "default": 8192.0, "automatable": False},
         {"name": "Velocity", "kind": "velocity", "min": 1.0, "max": 127.0, "default": 100.0, "automatable": False},
     )
+    TRACK_DEVICE_SLIDE_CONTROL = {
+        "name": "Slide",
+        "kind": "slide",
+        "min": 0.0,
+        "max": 127.0,
+        "default": 0.0,
+        "automatable": False,
+    }
     AUTOMATION_ENVELOPE_MAX_SAMPLES = 1024
     AUTOMATION_ENVELOPE_LINEAR_EPSILON = 0.0015
     AUTOMATION_ENVELOPE_JUMP_THRESHOLD = 0.1
@@ -2514,6 +2524,8 @@ class Tap(ControlSurface):
             self.browser_pages_count = 0
             self.browser_items_per_page = 12
             self.browser_insert_after_device_index = None
+            self.browser_audio_clip_target = None
+            self.browser_drum_pad_target = None
             self.browser_current_path = []
             self.browser_search_restore_state = None
             self.browser_search_query = ''
@@ -2678,6 +2690,7 @@ class Tap(ControlSurface):
             self._track_control_selection_by_track = {}
             self._track_control_bank_index_by_track = {}
             self._track_midi_control_values_by_track = {}
+            self._track_expression_control_kind = "slide"
             self._simpler_device = None
             self._simpler_sample = None
             self._simpler_decorator = None
@@ -2693,10 +2706,18 @@ class Tap(ControlSurface):
             self._simpler_waveform_lock = threading.Lock()
             self._simpler_waveform_pending = set()
             self._simpler_waveform_polling = set()
+            self._simpler_warp_as_beats = 2.0
             self._simpler_playhead_high = -1
             self._simpler_playhead_low = -1
             self._simpler_playhead_enabled = None
             self._last_track_simpler_slice_signature = None
+            self._audio_clip_waveform_generation = 0
+            self._audio_clip_listener_bindings = []
+            self._audio_clip_listener_clip = None
+            self._audio_clip_listener_slot = None
+            self._last_audio_clip_state = None
+            self._last_audio_clip_position_state_time = 0.0
+            self._last_audio_clip_action_result = None
             self.periodic_timer = 1
             # connection check button
             connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
@@ -3769,7 +3790,10 @@ class Tap(ControlSurface):
 
             if gesture_state == 4:
                 track = self.song().view.selected_track
-                kind = {0: "mod_wheel", 1: "pressure"}.get(control_index)
+                kind = {
+                    0: "mod_wheel",
+                    1: getattr(self, "_track_expression_control_kind", "slide"),
+                }.get(control_index)
                 entry = self._track_midi_control_entry_for_kind(kind, track)
                 if entry:
                     self._set_track_midi_control_normalized_value(
@@ -4347,7 +4371,7 @@ class Tap(ControlSurface):
             track_has_midi_input = bool(getattr(track, "has_midi_input", False))
             midi_controls = [
                 dict(control)
-                for control in self.TRACK_DEVICE_MIDI_CONTROLS
+                for control in self._track_device_midi_controls()
             ] if track_has_midi_input else []
     
             mixer_controls = [
@@ -4390,6 +4414,13 @@ class Tap(ControlSurface):
     
         except Exception:
             return []
+
+    def _track_device_midi_controls(self):
+        controls = [dict(control) for control in self.TRACK_DEVICE_MIDI_CONTROLS]
+        if (len(controls) > 1
+                and getattr(self, "_track_expression_control_kind", "slide") == "slide"):
+            controls[1] = dict(self.TRACK_DEVICE_SLIDE_CONTROL)
+        return controls
 
     def _track_device_main_entries(self, track=None):
         return self._track_device_parameters(track)[:self.TRACK_DEVICE_BANK_SIZE]
@@ -4473,7 +4504,10 @@ class Tap(ControlSurface):
             track = track or self.song().view.selected_track
             if not bool(getattr(track, "has_midi_input", False)):
                 return None
-            for control in self.TRACK_DEVICE_MIDI_CONTROLS:
+            controls = self._track_device_midi_controls()
+            if kind in ("pressure", "slide") and len(controls) > 1:
+                controls = [controls[1]]
+            for control in controls:
                 if control.get("kind") == kind:
                     return dict(control)
         except Exception:
@@ -4538,10 +4572,23 @@ class Tap(ControlSurface):
             state = self._track_midi_control_state(track) if has_midi_input else {}
             mod_wheel = max(0.0, min(1.0, float(state.get("mod_wheel", 0.0))))
             pressure = max(0.0, min(1.0, float(state.get("pressure", 0.0))))
-            payload = "mod_wheel|{:.6f},pressure|{:.6f}".format(mod_wheel, pressure)
+            slide = max(0.0, min(1.0, float(state.get("slide", 0.0))))
+            payload = "mod_wheel|{:.6f},pressure|{:.6f},slide|{:.6f}".format(
+                mod_wheel,
+                pressure,
+                slide
+            )
             self._send_sys_ex_message(payload, 0x3B)
         except Exception:
             pass
+
+    def _handle_track_expression_control_command(self, message):
+        values = self.extract_values_from_sysex_message(message)
+        self._track_expression_control_kind = "slide" if values and values[0] else "pressure"
+        track = self.song().view.selected_track
+        self._send_track_local_control_state(track)
+        if self._track_device_is_selected(track):
+            self._send_track_device_parameter_metadata(track)
 
     def _set_track_midi_control_value_for_control(self, control_index, value=None, normalized=None, track=None, require_selected=True, send_feedback=True):
         if require_selected and not self._track_device_is_selected(track):
@@ -5606,6 +5653,10 @@ class Tap(ControlSurface):
         self._remove_simpler_listeners()
         self._disconnect_simpler_decorator()
         self._simpler_waveform_generation += 1
+        self._audio_clip_waveform_generation += 1
+        self._remove_audio_clip_listeners()
+        self._audio_clip_listener_clip = None
+        self._audio_clip_listener_slot = None
         self._simpler_device = device if self._is_simpler_device(device) else None
         self._simpler_sample = None
         self._simpler_playhead_high = -1
@@ -6005,13 +6056,19 @@ class Tap(ControlSurface):
             if control_index != 0:
                 return None
             enabled = bool(getattr(self._simpler_device, 'can_warp_as', False))
+            warp_lengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+            warp_labels = ('1/2 Beat', '1 Beat', '2 Beats', '4 Beats', '8 Beats', '16 Beats', '32 Beats')
+            selected_index = min(
+                range(len(warp_lengths)),
+                key=lambda index: abs(warp_lengths[index] - self._simpler_warp_as_beats),
+            )
             return {
-                'name': 'Warp as 2 Beats',
+                'name': 'Warp As',
                 'action': 13,
-                'kind': 'button',
-                'items': (),
-                'display': '',
-                'normalized': 0.0,
+                'kind': 'warp_length',
+                'items': warp_labels,
+                'display': warp_labels[selected_index],
+                'normalized': float(selected_index) / float(len(warp_lengths) - 1),
                 'enabled': enabled,
             }
         specs = self._simpler_action_specs()
@@ -6142,6 +6199,12 @@ class Tap(ControlSurface):
                 )
                 index = int(round(normalized * (len(warp_modes) - 1)))
                 self._simpler_sample.warp_mode = warp_modes[index]
+            elif action == 13:
+                warp_lengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+                index = int(round(normalized * (len(warp_lengths) - 1)))
+                self._simpler_warp_as_beats = warp_lengths[index]
+                if bool(getattr(self._simpler_device, 'can_warp_as', False)):
+                    self._simpler_device.warp_as(self._simpler_warp_as_beats)
             else:
                 self._send_simpler_action_feedback(control_index)
                 return True
@@ -6424,7 +6487,7 @@ class Tap(ControlSurface):
                 self._simpler_waveform_center += direction * visible_width * 0.25
                 self._clamp_simpler_waveform_center()
             elif action_index == 13 and bool(getattr(device, 'can_warp_as', False)):
-                device.warp_as(2.0)
+                device.warp_as(self._simpler_warp_as_beats)
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
             if self._simpler_actions_active():
@@ -8404,10 +8467,23 @@ class Tap(ControlSurface):
         # Send repeat feedback after the selected-track message so Tap cannot
         # clear the newly restored state while processing the track change.
         self._restore_note_repeat_for_selected_track(force_feedback=True)
+        self._send_mpe_state()
         self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
         self._check_clip_playing_status(force=True)
+
+    def _send_mpe_state(self):
+        # Tap uses MPE lower-zone member channels 2-15. Channel 1 remains the
+        # manager channel and channel 16 remains reserved for Tap's control
+        # surface buttons, preventing MPE notes from triggering commands.
+        self._send_sys_ex_message(
+            "1|{}|{}".format(
+                self.MPE_MEMBER_CHANNEL_COUNT,
+                self.MPE_PITCH_BEND_RANGE
+            ),
+            0x4E
+        )
 
     def _re_enable_automation_value(self):
         try:
@@ -12720,6 +12796,7 @@ class Tap(ControlSurface):
     def _on_clip_playing_status_changed(self, track=None):
         # self.log_message("clip playing status changed")
         self._refresh_parameter_metadata_on_automation_change()
+        self._send_audio_clip_state()
         if track:
             track_index = self._get_track_index(track)
             if track_index is not None:
@@ -13660,6 +13737,16 @@ class Tap(ControlSurface):
                 self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
+        # Selected audio-clip editing, sample loading and conversion commands.
+        if len(message) >= 3 and message[1] == 0x52:
+            self._handle_audio_clip_command(message)
+            return
+
+        # Select the expression encoder shown in Track Controls.
+        if len(message) >= 3 and message[1] == 0x4F:
+            self._handle_track_expression_control_command(message)
+            return
+
         # Native Live note repeat always targets the selected MIDI track.
         if len(message) >= 3 and message[1] == 0x4B:
             self._handle_note_repeat_command(message)
@@ -18156,6 +18243,7 @@ class Tap(ControlSurface):
         scenes_list = self.song().scenes
         new_index = self._find_track_index(selected_scene, scenes_list)
         self._send_selected_clip_slot(new_index)
+        self._send_audio_clip_state(force=True)
         self._check_clip_playing_status(force=True)
         if self.seq_status:
             self.start_step_seq()
@@ -18732,7 +18820,12 @@ class Tap(ControlSurface):
         song = self.song()
         selected_clip_slot = song.view.highlighted_clip_slot
         self.send_selected_clip_metadata()
-        self.send_selected_clip_notes()
+        if (
+            selected_clip_slot is not None
+            and selected_clip_slot.has_clip
+            and bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
+        ):
+            self.send_selected_clip_notes()
         self._check_clip_playing_status(force=True)
         # self.log_message("Starting step seq")
         if self.last_selected_clip_slot is not selected_clip_slot:
@@ -18747,7 +18840,11 @@ class Tap(ControlSurface):
             previous_clip = self._step_seq_listener_clip
             if previous_clip is not None:
                 try:
-                    if liveobj_valid(previous_clip) and previous_clip.notes_has_listener(self.send_selected_clip_notes):
+                    if (
+                        liveobj_valid(previous_clip)
+                        and bool(getattr(previous_clip, 'is_midi_clip', False))
+                        and previous_clip.notes_has_listener(self.send_selected_clip_notes)
+                    ):
                         previous_clip.remove_notes_listener(self.send_selected_clip_notes)
                     if liveobj_valid(previous_clip):
                         self.remove_clip_metadata_listeners(previous_clip)
@@ -18759,9 +18856,12 @@ class Tap(ControlSurface):
             self.last_selected_clip_slot = selected_clip_slot
             if selected_clip_slot is not None:
                 if selected_clip_slot.has_clip:
-                    # add notes listener
-                    # self.log_message("adding notes listener")
-                    if not selected_clip_slot.clip.notes_has_listener(self.send_selected_clip_notes):
+                    # Audio clips share the selected-clip screen, but do not
+                    # expose MIDI-note listeners.
+                    if (
+                        bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
+                        and not selected_clip_slot.clip.notes_has_listener(self.send_selected_clip_notes)
+                    ):
                         selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
                     self._step_seq_listener_clip = selected_clip_slot.clip
                     
@@ -18816,8 +18916,12 @@ class Tap(ControlSurface):
 
             selected_clip = selected_clip_slot.clip
             self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
-            if not selected_clip.notes_has_listener(self.send_selected_clip_notes):
+            if bool(getattr(selected_clip, 'is_midi_clip', False)):
+                self.send_selected_clip_notes()
+            if (
+                bool(getattr(selected_clip, 'is_midi_clip', False))
+                and not selected_clip.notes_has_listener(self.send_selected_clip_notes)
+            ):
                 selected_clip.add_notes_listener(self.send_selected_clip_notes)
             self._step_seq_listener_clip = selected_clip
             self.add_clip_metadata_listeners(selected_clip)
@@ -18852,7 +18956,11 @@ class Tap(ControlSurface):
 
         for clip in clips_to_clean:
             try:
-                if liveobj_valid(clip) and clip.notes_has_listener(self.send_selected_clip_notes):
+                if (
+                    liveobj_valid(clip)
+                    and bool(getattr(clip, 'is_midi_clip', False))
+                    and clip.notes_has_listener(self.send_selected_clip_notes)
+                ):
                     clip.remove_notes_listener(self.send_selected_clip_notes)
                 if liveobj_valid(clip):
                     self.remove_clip_metadata_listeners(clip)
@@ -18914,11 +19022,593 @@ class Tap(ControlSurface):
             | (self.NOTE_FLAG_NEGATIVE_START if start_time < 0 else 0)
             | (self.NOTE_FLAG_NEGATIVE_DURATION if duration < 0 else 0)
         )
+
+    # MARK: - Selected audio clip
+
+    def _selected_audio_clip_context(self, include_empty=False):
+        try:
+            song = self.song()
+            slot = song.view.highlighted_clip_slot
+            track = song.view.selected_track
+            tracks = list(song.tracks)
+            if slot is None or track not in tracks:
+                return (None, None, -1, -1)
+            track_index = tracks.index(track)
+            clip_slots = list(track.clip_slots)
+            if slot not in clip_slots:
+                return (None, None, -1, -1)
+            scene_index = clip_slots.index(slot)
+            if not slot.has_clip:
+                return (slot, None, track_index, scene_index) if include_empty else (None, None, -1, -1)
+            clip = slot.clip
+            if not bool(getattr(clip, 'is_audio_clip', False)):
+                return (slot, None, track_index, scene_index) if include_empty else (None, None, -1, -1)
+            return (slot, clip, track_index, scene_index)
+        except Exception:
+            return (None, None, -1, -1)
+
+    def _audio_clip_float(self, clip, property_name, default=0.0):
+        try:
+            return float(getattr(clip, property_name))
+        except Exception:
+            return float(default)
+
+    def _audio_clip_warp_mode_label(self, mode):
+        names = {
+            int(Live.Clip.WarpMode.beats): 'Beats',
+            int(Live.Clip.WarpMode.tones): 'Tones',
+            int(Live.Clip.WarpMode.texture): 'Texture',
+            int(Live.Clip.WarpMode.repitch): 'Re-Pitch',
+            int(Live.Clip.WarpMode.complex): 'Complex',
+            int(Live.Clip.WarpMode.complex_pro): 'Complex Pro',
+        }
+        try:
+            return names.get(int(mode), str(int(mode)))
+        except Exception:
+            return str(mode)
+
+    def _audio_clip_warp_markers_payload(self, clip):
+        markers = []
+        try:
+            for marker in list(clip.warp_markers)[:64]:
+                markers.append('{:.6f}:{:.6f}'.format(
+                    float(marker.beat_time),
+                    float(marker.sample_time),
+                ))
+        except Exception:
+            pass
+        return ';'.join(markers)
+
+    def _audio_clip_sample_duration(self, clip):
+        sample_length = self._audio_clip_float(clip, 'sample_length', 0.0)
+        sample_rate = self._audio_clip_float(clip, 'sample_rate', 0.0)
+        return sample_length / sample_rate if sample_length > 0.0 and sample_rate > 0.0 else 0.0
+
+    def _audio_clip_sample_end(self, clip):
+        """Return the source-file end in the clip's current seconds/beats domain."""
+        sample_duration = self._audio_clip_sample_duration(clip)
+        if sample_duration <= 0.0 or not bool(getattr(clip, 'warping', False)):
+            return sample_duration
+
+        converter = getattr(clip, 'sample_to_beat_time', None)
+        if callable(converter):
+            try:
+                return float(converter(sample_duration))
+            except Exception:
+                pass
+
+        try:
+            markers = sorted(
+                (
+                    (float(marker.sample_time), float(marker.beat_time))
+                    for marker in clip.warp_markers
+                ),
+                key=lambda marker: marker[0],
+            )
+        except Exception:
+            markers = []
+
+        if len(markers) < 2:
+            return max(
+                self._audio_clip_float(clip, 'end_marker'),
+                self._audio_clip_float(clip, 'loop_end'),
+                markers[0][1] if markers else 0.0,
+            )
+
+        left, right = markers[0], markers[1]
+        for index in range(1, len(markers)):
+            left, right = markers[index - 1], markers[index]
+            if sample_duration <= right[0]:
+                break
+        sample_span = right[0] - left[0]
+        if abs(sample_span) <= 0.0000001:
+            return right[1]
+        fraction = (sample_duration - left[0]) / sample_span
+        return left[1] + fraction * (right[1] - left[1])
+
+    def _audio_clip_navigation_availability(self, track_index, scene_index):
+        try:
+            slots = list(self.song().tracks[track_index].clip_slots)
+        except Exception:
+            return (False, False)
+        return (scene_index > 0, scene_index + 1 < len(slots))
+
+    def _select_adjacent_audio_clip(self, direction):
+        slot, _, track_index, scene_index = self._selected_audio_clip_context(include_empty=True)
+        if slot is None:
+            raise RuntimeError('No selected audio clip slot.')
+        track = self.song().tracks[track_index]
+        slots = list(track.clip_slots)
+        if direction not in ('previous', 'next'):
+            raise ValueError('Unknown audio clip navigation direction.')
+        target_index = scene_index - 1 if direction == 'previous' else scene_index + 1
+        if target_index < 0 or target_index >= len(slots):
+            raise RuntimeError('No {} audio clip slot.'.format(direction))
+
+        song = self.song()
+        song.view.selected_track = track
+        if target_index < len(song.scenes):
+            song.view.selected_scene = song.scenes[target_index]
+        song.view.highlighted_clip_slot = slots[target_index]
+        self._send_selected_clip_slot(target_index)
+        self._send_audio_clip_state(force=True, request_waveform=True)
+
+    def _audio_clip_add_listener(self, subject, property_name, callback):
+        add_listener = getattr(subject, 'add_{}_listener'.format(property_name), None)
+        has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+        if not callable(add_listener):
+            return
+        try:
+            if callable(has_listener) and has_listener(callback):
+                return
+            add_listener(callback)
+            self._audio_clip_listener_bindings.append((subject, property_name, callback))
+        except Exception:
+            pass
+
+    def _remove_audio_clip_listeners(self):
+        for subject, property_name, callback in self._audio_clip_listener_bindings:
+            remove_listener = getattr(subject, 'remove_{}_listener'.format(property_name), None)
+            has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+            try:
+                if callable(remove_listener) and (not callable(has_listener) or has_listener(callback)):
+                    remove_listener(callback)
+            except Exception:
+                pass
+        self._audio_clip_listener_bindings = []
+
+    def _connect_audio_clip_listeners(self, slot, clip):
+        current_clip = getattr(self, '_audio_clip_listener_clip', None)
+        current_slot = getattr(self, '_audio_clip_listener_slot', None)
+        if current_clip is clip and current_slot is slot:
+            return False
+        self._remove_audio_clip_listeners()
+        self._audio_clip_listener_clip = clip
+        self._audio_clip_listener_slot = slot
+        self._audio_clip_waveform_generation += 1
+        if slot is not None:
+            for property_name in ('has_clip', 'is_playing', 'is_triggered'):
+                self._audio_clip_add_listener(slot, property_name, self._on_audio_clip_changed)
+        if clip is None:
+            return True
+        for property_name in (
+            'looping', 'warping', 'warp_mode', 'gain', 'pitch_coarse', 'pitch_fine',
+            'start_marker', 'end_marker', 'loop_start', 'loop_end', 'warp_markers',
+            'name', 'playing_status',
+        ):
+            self._audio_clip_add_listener(clip, property_name, self._on_audio_clip_changed)
+        self._audio_clip_add_listener(
+            clip,
+            'playing_position',
+            self._on_audio_clip_playing_position_changed,
+        )
+        return True
+
+    def _on_audio_clip_changed(self):
+        self._send_audio_clip_state()
+
+    def _on_audio_clip_playing_position_changed(self):
+        now = time.time()
+        if now - self._last_audio_clip_position_state_time >= 0.05:
+            self._last_audio_clip_position_state_time = now
+            self._send_audio_clip_state()
+
+    def _send_audio_clip_state(self, force=False, request_waveform=False):
+        slot, clip, track_index, scene_index = self._selected_audio_clip_context(include_empty=True)
+        selection_changed = self._connect_audio_clip_listeners(slot, clip)
+        if slot is None:
+            payload = '2|none'
+        elif clip is None:
+            can_previous, can_next = self._audio_clip_navigation_availability(track_index, scene_index)
+            payload = '2|empty|{}|{}|{}|{}'.format(
+                track_index,
+                scene_index,
+                1 if can_previous else 0,
+                1 if can_next else 0,
+            )
+        else:
+            warping = bool(getattr(clip, 'warping', False))
+            available_modes = []
+            try:
+                available_modes = [
+                    '{}:{}'.format(int(mode), self._audio_clip_warp_mode_label(mode))
+                    for mode in clip.available_warp_modes
+                ]
+            except Exception:
+                pass
+            is_playing = bool(getattr(slot, 'is_playing', False) or getattr(clip, 'is_playing', False))
+            is_triggered = bool(getattr(slot, 'is_triggered', False) or getattr(clip, 'is_triggered', False))
+            name = self._escape_sysex_string(str(getattr(clip, 'name', 'Audio Clip')))
+            gain_display = self._escape_sysex_string(str(getattr(clip, 'gain_display_string', '')))
+            unit = 'beats' if warping else 'seconds'
+            sample_length = self._audio_clip_float(clip, 'sample_length', 0.0)
+            sample_rate = self._audio_clip_float(clip, 'sample_rate', 0.0)
+            sample_duration = self._audio_clip_sample_duration(clip)
+            sample_end = self._audio_clip_sample_end(clip)
+            can_previous, can_next = self._audio_clip_navigation_availability(track_index, scene_index)
+            can_crop = callable(getattr(clip, 'crop', None))
+            can_convert = bool(
+                hasattr(Live, 'Conversions')
+                and not bool(getattr(clip, 'is_recording', False))
+            )
+            can_set_one = bool(
+                callable(getattr(clip, 'set_one_one_one', None))
+                or (
+                    bool(getattr(clip, 'warp_markers', ()))
+                    and callable(getattr(clip, 'move_warp_marker', None))
+                )
+            )
+            can_warp_to_grid = any(
+                callable(getattr(clip, method_name, None))
+                for method_name in ('warp_to_grid', 'warp_to_current_tempo')
+            )
+            values = (
+                '2', 'audio', track_index, scene_index, name,
+                1 if bool(getattr(clip, 'looping', False)) else 0,
+                1 if warping else 0,
+                int(getattr(clip, 'warp_mode', 0)) if warping else -1,
+                ';'.join(available_modes),
+                self._audio_clip_float(clip, 'gain', 1.0),
+                gain_display,
+                int(getattr(clip, 'pitch_coarse', 0)),
+                int(getattr(clip, 'pitch_fine', 0)),
+                self._audio_clip_float(clip, 'start_marker'),
+                self._audio_clip_float(clip, 'end_marker'),
+                self._audio_clip_float(clip, 'loop_start'),
+                self._audio_clip_float(clip, 'loop_end'),
+                sample_length,
+                sample_rate,
+                sample_duration,
+                sample_end,
+                unit,
+                1 if is_playing else 0,
+                1 if is_triggered else 0,
+                self._audio_clip_float(clip, 'playing_position'),
+                1 if can_crop else 0,
+                1 if can_convert else 0,
+                1 if can_set_one else 0,
+                1 if can_warp_to_grid else 0,
+                1 if can_previous else 0,
+                1 if can_next else 0,
+                self._audio_clip_warp_markers_payload(clip) if warping else '',
+                '{}:{}'.format(
+                    max(1, int(getattr(clip, 'signature_numerator', 4))),
+                    max(1, int(getattr(clip, 'signature_denominator', 4))),
+                ),
+            )
+            payload = '|'.join(str(value) for value in values)
+        state_changed = force or payload != self._last_audio_clip_state
+        if state_changed:
+            self._last_audio_clip_state = payload
+            self._send_sys_ex_message(payload, 0x50)
+        if clip is not None and (selection_changed or request_waveform):
+            self._request_audio_clip_waveform()
+        elif clip is None and selection_changed:
+            self._audio_clip_waveform_generation += 1
+            self._send_binary_sys_ex_message((0x01, self._audio_clip_waveform_generation & 0x7F), 0x51)
+
+    def _send_audio_clip_action_result(self, action, succeeded, message):
+        payload = '{}|{}|{}'.format(
+            self._escape_sysex_string(action),
+            1 if succeeded else 0,
+            self._escape_sysex_string(message),
+        )
+        if payload != self._last_audio_clip_action_result or not succeeded:
+            self._last_audio_clip_action_result = payload
+            self._send_sys_ex_message(payload, 0x53)
+
+    def _send_audio_clip_waveform(self, generation, peaks):
+        if generation != self._audio_clip_waveform_generation:
+            return
+        peaks = list(peaks)[:112]
+        self._send_binary_sys_ex_message(
+            (0x01, generation & 0x7F) + tuple(max(0, min(127, int(value))) for value in peaks),
+            0x51,
+        )
+
+    def _request_audio_clip_waveform(self):
+        _, clip, _, _ = self._selected_audio_clip_context()
+        if clip is None:
+            return
+        try:
+            file_path = str(clip.file_path)
+        except Exception:
+            file_path = ''
+        if not file_path or not os.path.isfile(file_path):
+            return
+        generation = self._audio_clip_waveform_generation
+        cached = self._simpler_waveform_cache.get(file_path)
+        if cached:
+            self._send_audio_clip_waveform(generation, cached)
+            return
+        pending_key = ('audio', generation, file_path)
+        if pending_key in self._simpler_waveform_pending:
+            return
+        self._simpler_waveform_pending.add(pending_key)
+
+        def build():
+            peaks = self._decode_audio_waveform(file_path, 'tap-audio-clip-')
+            with self._simpler_waveform_lock:
+                if peaks:
+                    self._cache_simpler_waveform(file_path, peaks)
+                self._simpler_waveform_pending.discard(pending_key)
+
+        worker = threading.Thread(target=build, name='TapAudioClipWaveform')
+        worker.daemon = True
+        worker.start()
+
+        def poll(attempt=0):
+            if generation != self._audio_clip_waveform_generation:
+                return
+            cached_peaks = self._simpler_waveform_cache.get(file_path)
+            if cached_peaks:
+                self._send_audio_clip_waveform(generation, cached_peaks)
+            elif pending_key in self._simpler_waveform_pending and attempt < 120:
+                self.schedule_message(5, lambda: poll(attempt + 1))
+        self.schedule_message(5, poll)
+
+    def _set_audio_clip_property(self, clip, property_name, raw_value):
+        boolean_properties = ('looping', 'warping')
+        integer_properties = ('warp_mode', 'pitch_coarse', 'pitch_fine')
+        allowed = boolean_properties + integer_properties + (
+            'gain', 'start_marker', 'end_marker', 'loop_start', 'loop_end', 'position',
+        )
+        if property_name not in allowed:
+            raise ValueError('Unknown audio clip property: {}'.format(property_name))
+        if property_name in boolean_properties:
+            value = str(raw_value).lower() in ('1', 'true', 'on')
+        elif property_name in integer_properties:
+            value = int(float(raw_value))
+        else:
+            value = float(raw_value)
+        if property_name == 'gain':
+            value = max(0.0, min(1.0, value))
+        elif property_name == 'pitch_coarse':
+            value = max(-48, min(48, value))
+        elif property_name == 'pitch_fine':
+            value = max(-50, min(50, value))
+        elif property_name == 'warp_mode':
+            available = list(getattr(clip, 'available_warp_modes', ()))
+            matching = next((mode for mode in available if int(mode) == value), None)
+            if matching is None:
+                raise ValueError('Warp mode is not available for this clip.')
+            value = matching
+        elif property_name in ('start_marker', 'end_marker', 'loop_start', 'loop_end', 'position'):
+            marker_values = (
+                self._audio_clip_float(clip, 'start_marker'),
+                self._audio_clip_float(clip, 'end_marker'),
+                self._audio_clip_float(clip, 'loop_start'),
+                self._audio_clip_float(clip, 'loop_end'),
+            )
+            if bool(getattr(clip, 'warping', False)):
+                try:
+                    marker_beats = [float(marker.beat_time) for marker in clip.warp_markers]
+                except Exception:
+                    marker_beats = []
+            else:
+                marker_beats = []
+            lower = min([0.0] + marker_beats + list(marker_values))
+            upper = max(
+                [lower + 0.001, self._audio_clip_sample_end(clip)]
+                + marker_beats
+                + list(marker_values)
+            )
+            gap = max(0.000001, (upper - lower) / 1000000.0)
+            if property_name == 'start_marker':
+                value = max(lower, min(value, marker_values[1] - gap))
+            elif property_name == 'end_marker':
+                value = min(upper, max(value, marker_values[0] + gap))
+            elif property_name == 'loop_start':
+                value = max(lower, min(value, marker_values[3] - gap))
+            elif property_name == 'loop_end':
+                value = min(upper, max(value, marker_values[2] + gap))
+            else:
+                loop_length = max(gap, marker_values[3] - marker_values[2])
+                value = max(lower, min(value, upper - loop_length))
+        setattr(clip, property_name, value)
+
+    def _set_audio_clip_one(self, clip):
+        method = getattr(clip, 'set_one_one_one', None)
+        if callable(method):
+            method()
+            return True
+        markers = list(getattr(clip, 'warp_markers', ()))
+        if not markers:
+            return False
+        marker = min(markers, key=lambda item: abs(float(item.beat_time)))
+        move_marker = getattr(clip, 'move_warp_marker', None)
+        if not callable(move_marker):
+            return False
+        for args in (
+            (float(marker.beat_time), 0.0),
+            (marker, 0.0),
+        ):
+            try:
+                move_marker(*args)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _warp_audio_clip_to_grid(self, clip):
+        for method_name in ('warp_to_grid', 'warp_to_current_tempo'):
+            method = getattr(clip, method_name, None)
+            if callable(method):
+                method()
+                return 'Warped to Set tempo'
+        raise RuntimeError(
+            'Warp to Grid is a private Push operation and is not exposed by this Live version.'
+        )
+
+    def _convert_selected_audio_clip(self, conversion):
+        _, clip, _, _ = self._selected_audio_clip_context()
+        if clip is None:
+            raise RuntimeError('No selected audio clip.')
+        conversions = getattr(Live, 'Conversions', None)
+        if conversions is None:
+            raise RuntimeError('Audio conversion is unavailable in this Live version.')
+        song = self.song()
+        if conversion == 'simpler':
+            conversions.create_midi_track_with_simpler(song, clip)
+        elif conversion == 'drum_pad':
+            conversions.create_drum_rack_from_audio_clip(song, clip)
+        else:
+            type_names = {
+                'harmony': 'harmony_to_midi',
+                'melody': 'melody_to_midi',
+                'drums': 'drums_to_midi',
+            }
+            type_name = type_names.get(conversion)
+            audio_to_midi_type = getattr(conversions, 'AudioToMidiType', None)
+            conversion_type = getattr(audio_to_midi_type, type_name, None) if type_name else None
+            if conversion_type is None:
+                raise RuntimeError('This audio-to-MIDI conversion is unavailable.')
+            if not conversions.is_convertible_to_midi(song, clip):
+                raise RuntimeError('Live cannot convert this clip to MIDI.')
+            conversions.audio_to_midi_clip(song, clip, conversion_type)
+
+    def _handle_audio_clip_command(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
+            fields = [
+                self._unescape_sysex_string(value)
+                for value in self._split_escaped_sysex_fields(payload, '|')
+            ]
+            action = fields[0] if fields else ''
+            if action == 'request':
+                self._send_audio_clip_state(force=True, request_waveform=True)
+                return
+            if action == 'browse' and len(fields) >= 3:
+                self.browser_drum_pad_target = None
+                self.browser_audio_clip_target = (int(fields[1]), int(fields[2]))
+                self._send_audio_clip_action_result(action, True, 'Choose a sample')
+                return
+            if action == 'browseDrumPad' and len(fields) >= 2:
+                note = max(0, min(127, int(fields[1])))
+                rack = self._drum_rack_device
+                if not liveobj_valid(rack) or not bool(getattr(rack, 'can_have_drum_pads', False)):
+                    raise RuntimeError('No Drum Rack is selected.')
+                pads = list(getattr(rack, 'drum_pads', ()))
+                if note >= len(pads):
+                    raise RuntimeError('That Drum Rack pad is unavailable.')
+                pad = pads[note]
+                if bool(getattr(pad, 'chains', ())):
+                    raise RuntimeError('Choose an empty Drum Rack pad.')
+                rack.view.selected_drum_pad = pad
+                self.browser_audio_clip_target = None
+                self.browser_drum_pad_target = pad
+                self._send_audio_clip_action_result(action, True, 'Choose a sample')
+                return
+            if action == 'select' and len(fields) >= 2:
+                self._select_adjacent_audio_clip(fields[1])
+                return
+            if action == 'simplerWarpAs' and len(fields) >= 2:
+                beats = max(0.125, min(128.0, float(fields[1])))
+                if not liveobj_valid(self._simpler_device) or not bool(getattr(self._simpler_device, 'can_warp_as', False)):
+                    raise RuntimeError('Warp As is unavailable for the selected Simpler.')
+                self._simpler_warp_as_beats = beats
+                self._simpler_device.warp_as(beats)
+                self._send_simpler_state()
+                self._send_audio_clip_action_result(action, True, 'Warped as {} beats'.format(beats))
+                return
+
+            slot, clip, _, _ = self._selected_audio_clip_context()
+            if clip is None:
+                raise RuntimeError('No selected audio clip.')
+            if action == 'set' and len(fields) >= 3:
+                self._set_audio_clip_property(clip, fields[1], fields[2])
+                self._send_audio_clip_state(force=True)
+                if fields[1] == 'warping':
+                    # Live documents Warp as a deferred property. Refresh after
+                    # the engine has converted all marker values to the new unit.
+                    self.schedule_message(2, lambda: self._send_audio_clip_state(force=True))
+                    self.schedule_message(8, lambda: self._send_audio_clip_state(force=True))
+                return
+            elif action == 'play':
+                slot.fire()
+                self._send_audio_clip_state(force=True)
+                self.schedule_message(1, lambda: self._send_audio_clip_state(force=True))
+                self.schedule_message(6, lambda: self._send_audio_clip_state(force=True))
+                return
+            elif action == 'stop':
+                slot.stop()
+                self._send_audio_clip_state(force=True)
+                self.schedule_message(1, lambda: self._send_audio_clip_state(force=True))
+                return
+            elif action == 'scrub' and len(fields) >= 2:
+                clip.scrub(float(fields[1]))
+                return
+            elif action == 'stopScrub':
+                clip.stop_scrub()
+                return
+            elif action == 'crop':
+                clip.crop()
+                self._audio_clip_waveform_generation += 1
+            elif action == 'setOne':
+                if not self._set_audio_clip_one(clip):
+                    raise RuntimeError('Set 1.1.1 is not exposed by this Live version.')
+            elif action == 'warpGrid':
+                message_text = self._warp_audio_clip_to_grid(clip)
+                self._send_audio_clip_action_result(action, True, message_text)
+                self._send_audio_clip_state(force=True)
+                return
+            elif action == 'convert' and len(fields) >= 2:
+                conversion = fields[1]
+
+                # Push defers conversions out of the control callback. Live's
+                # audio-to-MIDI engine can silently reject the first request
+                # when it is invoked directly while handling incoming MIDI.
+                def convert_deferred():
+                    try:
+                        self._convert_selected_audio_clip(conversion)
+                        self._send_audio_clip_action_result('convert', True, 'Conversion started')
+                        self._send_audio_clip_state(force=True)
+                    except Exception as error:
+                        self._send_audio_clip_action_result('convert', False, str(error))
+
+                self.schedule_message(1, convert_deferred)
+                return
+            elif action == 'waveform':
+                self._audio_clip_waveform_generation += 1
+            else:
+                raise ValueError('Unknown audio clip action: {}'.format(action))
+            self._send_audio_clip_action_result(action, True, 'Done')
+            self._send_audio_clip_state(
+                force=True,
+                request_waveform=action in ('crop', 'waveform'),
+            )
+        except Exception as error:
+            self._send_audio_clip_action_result(
+                fields[0] if 'fields' in locals() and fields else 'command',
+                False,
+                str(error),
+            )
     
     def send_selected_clip_metadata(self):
         """
         Encode clip metadata into a compact SysEx message and send it out.
         """
+        self._send_audio_clip_state()
         if self._selected_clip_updates_are_suppressed():
             self._selected_clip_update_pending_metadata = True
             return
@@ -19663,7 +20353,11 @@ class Tap(ControlSurface):
         if decoded_uri.startswith('/'):
             candidates.append(decoded_uri.split('?', 1)[0].split('#', 1)[0])
         else:
-            path_match = re.search(r'(/[^?#]+\.(?:adv|adg))(?:[?#]|$)', decoded_uri, re.IGNORECASE)
+            path_match = re.search(
+                r'(/[^?#]+\.(?:wav|aif|aiff|flac|mp3|m4a|ogg|caf|adv|adg))(?:[?#]|$)',
+                decoded_uri,
+                re.IGNORECASE,
+            )
             if path_match:
                 candidates.append(path_match.group(1))
 
@@ -20024,6 +20718,70 @@ class Tap(ControlSurface):
             self._on_tracks_changed()
             self._on_device_changed()
 
+    def _load_browser_item_into_audio_clip(self, item, track_index, scene_index):
+        song = self.song()
+        tracks = list(song.tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            raise RuntimeError('The destination audio track no longer exists.')
+        track = tracks[track_index]
+        clip_slots = list(track.clip_slots)
+        if scene_index < 0 or scene_index >= len(clip_slots):
+            raise RuntimeError('The destination clip slot no longer exists.')
+        clip_slot = clip_slots[scene_index]
+        if clip_slot.has_clip:
+            raise RuntimeError('The destination clip slot is no longer empty.')
+
+        song.view.selected_track = track
+        if scene_index < len(song.scenes):
+            song.view.selected_scene = song.scenes[scene_index]
+        song.view.highlighted_clip_slot = clip_slot
+
+        browser = self.application().browser
+        file_path = self._browser_item_file_path(item)
+        if file_path:
+            clip_slot.create_audio_clip(file_path)
+            return clip_slot
+
+        load_into_slot = getattr(browser, 'load_item_into_selected_clipslot', None)
+        if callable(load_into_slot):
+            try:
+                load_into_slot(item)
+                return clip_slot
+            except Exception as error:
+                private_load_error = error
+        else:
+            private_load_error = None
+
+        load_item = getattr(browser, 'load_item', None)
+        if callable(load_item):
+            try:
+                load_item(item)
+                return clip_slot
+            except Exception as error:
+                raise RuntimeError(str(error))
+        if private_load_error is not None:
+            raise RuntimeError(str(private_load_error))
+        raise RuntimeError('The selected browser item is not a readable audio file.')
+
+    def _finish_browser_audio_clip_load(self, track_index, scene_index, attempt=0):
+        try:
+            track = self.song().tracks[track_index]
+            clip_slot = track.clip_slots[scene_index]
+            if clip_slot.has_clip and bool(getattr(clip_slot.clip, 'is_audio_clip', False)):
+                self.song().view.highlighted_clip_slot = clip_slot
+                self._send_audio_clip_action_result('load', True, 'Audio clip created')
+                self._send_audio_clip_state(force=True, request_waveform=True)
+                return
+            if attempt < 20:
+                self.schedule_message(
+                    2,
+                    lambda: self._finish_browser_audio_clip_load(track_index, scene_index, attempt + 1),
+                )
+                return
+            raise RuntimeError('Live did not create an audio clip from that browser item.')
+        except Exception as error:
+            self._send_audio_clip_action_result('load', False, str(error))
+
     def _browser_load_item(self, value):
         """
         Load a browser item based on MIDI note velocity, never opening children.
@@ -20048,6 +20806,34 @@ class Tap(ControlSurface):
 
         item = self.browser_current_items[index]
         browser = self.application().browser
+        audio_clip_target = self.browser_audio_clip_target
+        self.browser_audio_clip_target = None
+        if audio_clip_target is not None:
+            try:
+                track_index, scene_index = audio_clip_target
+                self._load_browser_item_into_audio_clip(item, track_index, scene_index)
+                self._finish_browser_audio_clip_load(track_index, scene_index)
+                return
+            except Exception as error:
+                self._send_audio_clip_action_result('load', False, str(error))
+                return
+        drum_pad_target = self.browser_drum_pad_target
+        self.browser_drum_pad_target = None
+        if liveobj_valid(drum_pad_target):
+            try:
+                previous_hotswap_target = getattr(browser, 'hotswap_target', None)
+                browser.hotswap_target = drum_pad_target
+                try:
+                    browser.load_item(item)
+                finally:
+                    browser.hotswap_target = previous_hotswap_target
+                self._send_audio_clip_action_result('load', True, 'Sample loaded to Drum Rack pad')
+                self._on_tracks_changed()
+                self._on_device_changed()
+                return
+            except Exception as error:
+                self._send_audio_clip_action_result('load', False, str(error))
+                return
         target_index = self.browser_insert_after_device_index
         self.browser_insert_after_device_index = None
         if target_index is not None:
