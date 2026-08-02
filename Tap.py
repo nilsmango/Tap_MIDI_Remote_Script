@@ -4103,9 +4103,21 @@ class Tap(ControlSurface):
             
             # Add index of first chain pad
             pad_names.append(str(first_index))
-            for pad in pads[first_index:last_index + 1]:
+            pads_by_note = {
+                int(pad.note): pad
+                for pad in pads
+                if hasattr(pad, 'note')
+            }
+            for note in range(first_index, last_index + 1):
+                pad = pads_by_note.get(note)
+                if pad is None:
+                    pad_names.append(str(note))
+                    continue
                 if pad.chains:
-                    pad_names.append(self._escape_sysex_string(pad.name))
+                    pad_name = str(getattr(pad, 'name', '') or '').strip()
+                    if not pad_name:
+                        pad_name = 'Pad {}'.format(pad.note)
+                    pad_names.append(self._escape_sysex_string(pad_name))
                 else:
                     pad_names.append(str(pad.note))
             payload = ",".join(pad_names)
@@ -19070,10 +19082,23 @@ class Tap(ControlSurface):
     def _audio_clip_warp_markers_payload(self, clip):
         markers = []
         try:
-            for marker in list(clip.warp_markers)[:64]:
-                markers.append('{:.6f}:{:.6f}'.format(
+            all_markers = list(clip.warp_markers)
+            if len(all_markers) <= 64:
+                marker_indexes = list(range(len(all_markers)))
+            else:
+                # Keep coverage across the complete source and always include
+                # Live's final hidden/shadow marker. Truncating the first 64
+                # made long clips look as if the waveform ended part-way in.
+                marker_indexes = sorted(set(
+                    int(round(float(index) * (len(all_markers) - 1) / 63.0))
+                    for index in range(64)
+                ))
+            for index in marker_indexes:
+                marker = all_markers[index]
+                markers.append('{:.6f}:{:.6f}:{}'.format(
                     float(marker.beat_time),
                     float(marker.sample_time),
+                    1 if index == len(all_markers) - 1 else 0,
                 ))
         except Exception:
             pass
@@ -19090,13 +19115,9 @@ class Tap(ControlSurface):
         if sample_duration <= 0.0 or not bool(getattr(clip, 'warping', False)):
             return sample_duration
 
-        converter = getattr(clip, 'sample_to_beat_time', None)
-        if callable(converter):
-            try:
-                return float(converter(sample_duration))
-            except Exception:
-                pass
-
+        # WarpMarker.sample_time is documented in seconds. Derive the source
+        # end from those public values instead of Live's private conversion
+        # helpers, whose Python binding uses frames in some versions.
         try:
             markers = sorted(
                 (
@@ -19193,6 +19214,7 @@ class Tap(ControlSurface):
             return True
         for property_name in (
             'looping', 'warping', 'warp_mode', 'gain', 'pitch_coarse', 'pitch_fine',
+            'ram_mode', 'muted', 'legato', 'launch_mode', 'launch_quantization',
             'start_marker', 'end_marker', 'loop_start', 'loop_end', 'warp_markers',
             'name', 'playing_status',
         ):
@@ -19205,6 +19227,8 @@ class Tap(ControlSurface):
         return True
 
     def _on_audio_clip_changed(self):
+        if getattr(self, '_audio_clip_pitch_update_in_progress', False):
+            return
         self._send_audio_clip_state()
 
     def _on_audio_clip_playing_position_changed(self):
@@ -19216,15 +19240,28 @@ class Tap(ControlSurface):
     def _send_audio_clip_state(self, force=False, request_waveform=False):
         slot, clip, track_index, scene_index = self._selected_audio_clip_context(include_empty=True)
         selection_changed = self._connect_audio_clip_listeners(slot, clip)
+
+        def adjacent_has_audio(offset):
+            try:
+                adjacent_slot = self.song().tracks[track_index].clip_slots[scene_index + offset]
+                return bool(
+                    adjacent_slot.has_clip
+                    and getattr(adjacent_slot.clip, 'is_audio_clip', False)
+                )
+            except Exception:
+                return False
+
         if slot is None:
             payload = '2|none'
         elif clip is None:
             can_previous, can_next = self._audio_clip_navigation_availability(track_index, scene_index)
-            payload = '2|empty|{}|{}|{}|{}'.format(
+            payload = '2|empty|{}|{}|{}|{}|{}|{}'.format(
                 track_index,
                 scene_index,
                 1 if can_previous else 0,
                 1 if can_next else 0,
+                1 if adjacent_has_audio(-1) else 0,
+                1 if adjacent_has_audio(1) else 0,
             )
         else:
             warping = bool(getattr(clip, 'warping', False))
@@ -19295,6 +19332,14 @@ class Tap(ControlSurface):
                     max(1, int(getattr(clip, 'signature_numerator', 4))),
                     max(1, int(getattr(clip, 'signature_denominator', 4))),
                 ),
+                0,  # Reserved: reverse is not exposed by Live's public Clip API.
+                1 if adjacent_has_audio(-1) else 0,
+                1 if adjacent_has_audio(1) else 0,
+                1 if bool(getattr(clip, 'ram_mode', False)) else 0,
+                1 if bool(getattr(clip, 'muted', False)) else 0,
+                1 if bool(getattr(clip, 'legato', False)) else 0,
+                int(getattr(clip, 'launch_mode', 0)),
+                int(getattr(clip, 'launch_quantization', 0)),
             )
             payload = '|'.join(str(value) for value in values)
         state_changed = force or payload != self._last_audio_clip_state
@@ -19320,7 +19365,17 @@ class Tap(ControlSurface):
     def _send_audio_clip_waveform(self, generation, peaks):
         if generation != self._audio_clip_waveform_generation:
             return
-        peaks = list(peaks)[:112]
+        peaks = list(peaks)
+        target_count = min(112, len(peaks))
+        if len(peaks) > target_count:
+            reduced = []
+            for point_index in range(target_count):
+                start = int(float(point_index) * len(peaks) / target_count)
+                end = max(start + 1, int(float(point_index + 1) * len(peaks) / target_count))
+                reduced.append(max(peaks[start:end]))
+            peaks = reduced
+        else:
+            peaks = peaks[:target_count]
         self._send_binary_sys_ex_message(
             (0x01, generation & 0x7F) + tuple(max(0, min(127, int(value))) for value in peaks),
             0x51,
@@ -19368,8 +19423,10 @@ class Tap(ControlSurface):
         self.schedule_message(5, poll)
 
     def _set_audio_clip_property(self, clip, property_name, raw_value):
-        boolean_properties = ('looping', 'warping')
-        integer_properties = ('warp_mode', 'pitch_coarse', 'pitch_fine')
+        boolean_properties = ('looping', 'warping', 'ram_mode', 'muted', 'legato')
+        integer_properties = (
+            'warp_mode', 'pitch_coarse', 'pitch_fine', 'launch_mode', 'launch_quantization',
+        )
         allowed = boolean_properties + integer_properties + (
             'gain', 'start_marker', 'end_marker', 'loop_start', 'loop_end', 'position',
         )
@@ -19387,6 +19444,10 @@ class Tap(ControlSurface):
             value = max(-48, min(48, value))
         elif property_name == 'pitch_fine':
             value = max(-50, min(50, value))
+        elif property_name == 'launch_mode':
+            value = max(0, min(3, value))
+        elif property_name == 'launch_quantization':
+            value = max(0, min(14, value))
         elif property_name == 'warp_mode':
             available = list(getattr(clip, 'available_warp_modes', ()))
             matching = next((mode for mode in available if int(mode) == value), None)
@@ -19427,6 +19488,16 @@ class Tap(ControlSurface):
                 value = max(lower, min(value, upper - loop_length))
         setattr(clip, property_name, value)
 
+    def _set_audio_clip_pitch(self, clip, raw_coarse, raw_fine):
+        coarse = max(-48, min(48, int(float(raw_coarse))))
+        fine = max(-50, min(50, int(float(raw_fine))))
+        self._audio_clip_pitch_update_in_progress = True
+        try:
+            clip.pitch_coarse = coarse
+            clip.pitch_fine = fine
+        finally:
+            self._audio_clip_pitch_update_in_progress = False
+
     def _set_audio_clip_one(self, clip):
         method = getattr(clip, 'set_one_one_one', None)
         if callable(method):
@@ -19449,6 +19520,46 @@ class Tap(ControlSurface):
             except Exception:
                 pass
         return False
+
+    def _edit_audio_clip_warp_marker(self, clip, action, values):
+        if not bool(getattr(clip, 'warping', False)):
+            raise RuntimeError('Enable Warp before editing Warp Markers.')
+
+        def nearest_marker_beat_time(requested):
+            markers = list(getattr(clip, 'warp_markers', ()))
+            if not markers:
+                raise RuntimeError('No Warp Marker is available.')
+            marker = min(markers, key=lambda item: abs(float(item.beat_time) - requested))
+            return float(marker.beat_time)
+
+        if action == 'addWarpMarker':
+            method = getattr(clip, 'add_warp_marker', None)
+            if not callable(method) or len(values) < 1:
+                raise RuntimeError('Adding Warp Markers is unavailable.')
+            beat_time = float(values[0])
+            beat_to_sample_time = getattr(clip, 'beat_to_sample_time', None)
+            warp_marker_type = getattr(getattr(Live, 'Clip', None), 'WarpMarker', None)
+            sample_rate = self._audio_clip_float(clip, 'sample_rate', 0.0)
+            if not callable(beat_to_sample_time) or not callable(warp_marker_type) or sample_rate <= 0.0:
+                raise RuntimeError('Adding Warp Markers is unavailable in this Live version.')
+            # Live's Python LOM binding does not convert a plain Python dict
+            # here. Mirror Ableton's _MxDCore handler and pass its API value.
+            sample_time = float(beat_to_sample_time(beat_time)) / sample_rate
+            method(warp_marker_type(beat_time=beat_time, sample_time=sample_time))
+        elif action == 'moveWarpMarker':
+            method = getattr(clip, 'move_warp_marker', None)
+            if not callable(method) or len(values) < 2:
+                raise RuntimeError('Moving Warp Markers is unavailable.')
+            original_beat_time = nearest_marker_beat_time(float(values[0]))
+            target_beat_time = float(values[1])
+            method(original_beat_time, target_beat_time - original_beat_time)
+        elif action == 'removeWarpMarker':
+            method = getattr(clip, 'remove_warp_marker', None)
+            if not callable(method) or len(values) < 1:
+                raise RuntimeError('Removing Warp Markers is unavailable.')
+            method(nearest_marker_beat_time(float(values[0])))
+        else:
+            raise ValueError('Unknown Warp Marker action.')
 
     def _warp_audio_clip_to_grid(self, clip):
         for method_name in ('warp_to_grid', 'warp_to_current_tempo'):
@@ -19487,6 +19598,58 @@ class Tap(ControlSurface):
                 raise RuntimeError('Live cannot convert this clip to MIDI.')
             conversions.audio_to_midi_clip(song, clip, conversion_type)
 
+    def _refresh_audio_conversion(self, tracks_before, conversion, attempt=0):
+        song = self.song()
+        tracks = list(song.tracks)
+        new_tracks = [track for track in tracks if track not in tracks_before]
+        target_track = new_tracks[-1] if new_tracks else song.view.selected_track
+        drum_rack = (
+            self._find_drum_rack_in_track(target_track)
+            if conversion == 'drum_pad' and target_track is not None
+            else None
+        )
+        ready = conversion != 'drum_pad' or drum_rack is not None
+        if not ready and attempt < 20:
+            self.schedule_message(
+                3,
+                lambda: self._refresh_audio_conversion(
+                    tracks_before,
+                    conversion,
+                    attempt + 1,
+                ),
+            )
+            return
+
+        if new_tracks:
+            song.view.selected_track = target_track
+        if drum_rack is not None:
+            occupied_pad = next(
+                (
+                    pad
+                    for pad in getattr(drum_rack, 'drum_pads', ())
+                    if bool(getattr(pad, 'chains', ()))
+                ),
+                None,
+            )
+            if occupied_pad is not None:
+                drum_rack.view.selected_drum_pad = occupied_pad
+            try:
+                song.view.select_device(drum_rack)
+            except Exception:
+                try:
+                    target_track.view.selected_device = drum_rack
+                except Exception:
+                    pass
+
+        self._on_tracks_changed()
+        self._on_selected_track_changed()
+        if drum_rack is not None:
+            # `_on_selected_track_changed` normally installs this rack through
+            # `_on_device_changed`. Keep the refresh deterministic when Live's
+            # selected-device notification arrives a tick later.
+            self._drum_rack_device = drum_rack
+            self._send_all_drum_pad_names()
+
     def _handle_audio_clip_command(self, message):
         try:
             payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
@@ -19512,12 +19675,17 @@ class Tap(ControlSurface):
                 if note >= len(pads):
                     raise RuntimeError('That Drum Rack pad is unavailable.')
                 pad = pads[note]
-                if bool(getattr(pad, 'chains', ())):
-                    raise RuntimeError('Choose an empty Drum Rack pad.')
                 rack.view.selected_drum_pad = pad
                 self.browser_audio_clip_target = None
                 self.browser_drum_pad_target = pad
-                self._send_audio_clip_action_result(action, True, 'Choose a sample')
+                browser = self.application().browser
+                self.browser_previous_drum_pad_hotswap_target = getattr(
+                    browser,
+                    'hotswap_target',
+                    None,
+                )
+                browser.hotswap_target = pad
+                self._send_audio_clip_action_result(action, True, 'Choose a Drum Pad replacement')
                 return
             if action == 'select' and len(fields) >= 2:
                 self._select_adjacent_audio_clip(fields[1])
@@ -19544,6 +19712,13 @@ class Tap(ControlSurface):
                     self.schedule_message(2, lambda: self._send_audio_clip_state(force=True))
                     self.schedule_message(8, lambda: self._send_audio_clip_state(force=True))
                 return
+            elif action == 'setPitch' and len(fields) >= 3:
+                # Coarse and fine pitch form one logical value when Detune
+                # crosses +/-50 cents. Apply both before echoing state so a
+                # listener cannot send a half-updated wrap back to Tap.
+                self._set_audio_clip_pitch(clip, fields[1], fields[2])
+                self._send_audio_clip_state(force=True)
+                return
             elif action == 'play':
                 slot.fire()
                 self._send_audio_clip_state(force=True)
@@ -19555,11 +19730,12 @@ class Tap(ControlSurface):
                 self._send_audio_clip_state(force=True)
                 self.schedule_message(1, lambda: self._send_audio_clip_state(force=True))
                 return
-            elif action == 'scrub' and len(fields) >= 2:
-                clip.scrub(float(fields[1]))
-                return
-            elif action == 'stopScrub':
-                clip.stop_scrub()
+            elif action in ('addWarpMarker', 'moveWarpMarker', 'removeWarpMarker'):
+                self._edit_audio_clip_warp_marker(clip, action, fields[1:])
+                # Live applies Warp Marker edits after this MIDI callback. Avoid
+                # immediately echoing stale marker positions back to the app.
+                self.schedule_message(1, lambda: self._send_audio_clip_state(force=True))
+                self.schedule_message(4, lambda: self._send_audio_clip_state(force=True))
                 return
             elif action == 'crop':
                 clip.crop()
@@ -19574,6 +19750,7 @@ class Tap(ControlSurface):
                 return
             elif action == 'convert' and len(fields) >= 2:
                 conversion = fields[1]
+                tracks_before = tuple(self.song().tracks)
 
                 # Push defers conversions out of the control callback. Live's
                 # audio-to-MIDI engine can silently reject the first request
@@ -19582,7 +19759,7 @@ class Tap(ControlSurface):
                     try:
                         self._convert_selected_audio_clip(conversion)
                         self._send_audio_clip_action_result('convert', True, 'Conversion started')
-                        self._send_audio_clip_state(force=True)
+                        self._refresh_audio_conversion(tracks_before, conversion)
                     except Exception as error:
                         self._send_audio_clip_action_result('convert', False, str(error))
 
@@ -19595,7 +19772,7 @@ class Tap(ControlSurface):
             self._send_audio_clip_action_result(action, True, 'Done')
             self._send_audio_clip_state(
                 force=True,
-                request_waveform=action in ('crop', 'waveform'),
+                request_waveform=action in ('crop', 'reverse', 'waveform'),
             )
         except Exception as error:
             self._send_audio_clip_action_result(
@@ -20821,12 +20998,17 @@ class Tap(ControlSurface):
         self.browser_drum_pad_target = None
         if liveobj_valid(drum_pad_target):
             try:
-                previous_hotswap_target = getattr(browser, 'hotswap_target', None)
+                previous_hotswap_target = getattr(
+                    self,
+                    'browser_previous_drum_pad_hotswap_target',
+                    None,
+                )
                 browser.hotswap_target = drum_pad_target
                 try:
                     browser.load_item(item)
                 finally:
                     browser.hotswap_target = previous_hotswap_target
+                    self.browser_previous_drum_pad_hotswap_target = None
                 self._send_audio_clip_action_result('load', True, 'Sample loaded to Drum Rack pad')
                 self._on_tracks_changed()
                 self._on_device_changed()

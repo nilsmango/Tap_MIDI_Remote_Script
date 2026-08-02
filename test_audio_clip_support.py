@@ -14,13 +14,18 @@ METHOD_NAMES = {
     "_audio_clip_warp_markers_payload",
     "_audio_clip_sample_duration",
     "_audio_clip_sample_end",
+    "_send_audio_clip_waveform",
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
+    "_send_all_drum_pad_names",
     "_send_audio_clip_state",
     "_set_audio_clip_property",
+    "_set_audio_clip_pitch",
     "_set_audio_clip_one",
+    "_edit_audio_clip_warp_marker",
     "_warp_audio_clip_to_grid",
     "_convert_selected_audio_clip",
+    "_refresh_audio_conversion",
     "_handle_audio_clip_command",
     "_browser_item_file_path",
     "_load_browser_item_into_audio_clip",
@@ -35,6 +40,12 @@ class WarpMode:
     repitch = 3
     complex = 4
     complex_pro = 5
+
+
+class WarpMarkerSpec:
+    def __init__(self, beat_time, sample_time):
+        self.beat_time = beat_time
+        self.sample_time = sample_time
 
 
 class AudioToMidiType:
@@ -65,7 +76,7 @@ class ConversionSpy:
 
 CONVERSIONS = ConversionSpy()
 Live = types.SimpleNamespace(
-    Clip=types.SimpleNamespace(WarpMode=WarpMode),
+    Clip=types.SimpleNamespace(WarpMode=WarpMode, WarpMarker=WarpMarkerSpec),
     Conversions=CONVERSIONS,
 )
 
@@ -111,6 +122,11 @@ class Clip:
     gain_display_string = "-2.50 dB"
     pitch_coarse = 3
     pitch_fine = -7
+    ram_mode = True
+    muted = False
+    legato = True
+    launch_mode = 2
+    launch_quantization = 12
     start_marker = 0.25
     end_marker = 3.5
     loop_start = 0.5
@@ -125,6 +141,30 @@ class Clip:
 
     def crop(self):
         pass
+
+    def add_warp_marker(self, marker):
+        assert isinstance(marker, WarpMarkerSpec)
+        self.added_warp_marker = marker
+        beat_time = float(marker.beat_time)
+        markers = list(self.warp_markers)
+        markers.insert(-1, Marker(beat_time, marker.sample_time))
+        self.warp_markers = tuple(sorted(markers, key=lambda item: item.beat_time))
+
+    def beat_to_sample_time(self, beat_time):
+        return float(beat_time) * self.sample_rate
+
+    def sample_to_beat_time(self, _):
+        raise AssertionError("private frame-based converter must not be used")
+
+    def move_warp_marker(self, beat_time, distance):
+        marker = next(item for item in self.warp_markers if item.beat_time == beat_time)
+        marker.beat_time += distance
+
+    def remove_warp_marker(self, beat_time):
+        self.warp_markers = tuple(
+            item for item in self.warp_markers
+            if item.beat_time != beat_time
+        )
 
 
 class ClipSlot:
@@ -153,6 +193,8 @@ class ClipSlot:
 class Track:
     def __init__(self, slots):
         self.clip_slots = slots
+        self.devices = []
+        self.view = types.SimpleNamespace(selected_device=None)
 
 
 class Song:
@@ -289,6 +331,18 @@ class Harness:
     def _on_device_changed(self):
         self.device_changed = True
 
+    def _on_selected_track_changed(self):
+        self.selected_track_changed = True
+
+    def _find_drum_rack_in_track(self, track):
+        return next(
+            (
+                device for device in getattr(track, "devices", ())
+                if bool(getattr(device, "can_have_drum_pads", False))
+            ),
+            None,
+        )
+
 
 for method_name, method in extracted_methods().items():
     setattr(Harness, method_name, method)
@@ -312,16 +366,79 @@ class AudioClipSupportTests(unittest.TestCase):
             self.harness._unescape_sysex_string(value)
             for value in self.harness._split_escaped_sysex_fields(payload, "|")
         ]
-        self.assertEqual(len(fields), 33)
+        self.assertEqual(len(fields), 41)
         self.assertEqual(fields[4], "Kick | bright")
         self.assertEqual(fields[19:25], ["3.5", "3.5", "seconds", "0", "0", "1.25"])
         self.assertEqual(fields[32], "7:8")
+        self.assertEqual(fields[33], "0")
+        self.assertEqual(fields[34:36], ["1", "1"])
+        self.assertEqual(fields[36:41], ["1", "0", "1", "2", "12"])
 
     def test_state_switches_to_beats_when_warped(self):
         self.harness.clip.warping = True
         self.harness._send_audio_clip_state(force=True)
         self.assertIn("|beats|", self.harness.sent[-1][1])
         self.assertIn("|3.5|4.0|beats|", self.harness.sent[-1][1])
+        fields = self.harness._split_escaped_sysex_fields(self.harness.sent[-1][1], "|")
+        self.assertEqual(fields[31], "0.000000:0.250000:0;4.000000:3.500000:1")
+
+    def test_warp_marker_payload_keeps_the_shadow_marker_for_long_clips(self):
+        self.harness.clip.warping = True
+        self.harness.clip.warp_markers = tuple(
+            Marker(float(index), float(index) / 10.0)
+            for index in range(100)
+        )
+        payload = self.harness._audio_clip_warp_markers_payload(self.harness.clip)
+        markers = payload.split(";")
+        self.assertEqual(len(markers), 64)
+        self.assertTrue(markers[-1].startswith("99.000000:9.900000:"))
+        self.assertTrue(markers[-1].endswith(":1"))
+
+    def test_audio_waveform_reduction_uses_the_complete_file(self):
+        peaks = [0] * 511 + [100]
+        self.harness._send_audio_clip_waveform(0, peaks)
+        manufacturer_id, payload = self.harness.sent[-1]
+        self.assertEqual(manufacturer_id, 0x51)
+        self.assertEqual(len(payload), 114)
+        self.assertEqual(payload[-1], 100)
+
+    def test_add_move_and_remove_warp_markers(self):
+        self.harness.clip.warping = True
+        add = [0xF0, 0x52] + list(b"addWarpMarker|2") + [0xF7]
+        self.harness._handle_audio_clip_command(add)
+        self.assertTrue(any(marker.beat_time == 2 for marker in self.harness.clip.warp_markers))
+        self.assertIsInstance(self.harness.clip.added_warp_marker, WarpMarkerSpec)
+        self.assertEqual(self.harness.clip.added_warp_marker.sample_time, 2)
+
+        move = [0xF0, 0x52] + list(b"moveWarpMarker|2|3") + [0xF7]
+        self.harness._handle_audio_clip_command(move)
+        self.assertTrue(any(marker.beat_time == 3 for marker in self.harness.clip.warp_markers))
+
+        remove = [0xF0, 0x52] + list(b"removeWarpMarker|3") + [0xF7]
+        self.harness._handle_audio_clip_command(remove)
+        self.assertFalse(any(marker.beat_time == 3 for marker in self.harness.clip.warp_markers))
+
+    def test_move_and_remove_resolve_rounded_marker_timestamp(self):
+        self.harness.clip.warping = True
+        precise = Marker(2.1234564, 2.0)
+        self.harness.clip.warp_markers = (
+            self.harness.clip.warp_markers[0],
+            precise,
+            self.harness.clip.warp_markers[-1],
+        )
+        move = [0xF0, 0x52] + list(b"moveWarpMarker|2.123456|3") + [0xF7]
+        self.harness._handle_audio_clip_command(move)
+        self.assertAlmostEqual(precise.beat_time, 3)
+
+        remove = [0xF0, 0x52] + list(b"removeWarpMarker|3.000000") + [0xF7]
+        self.harness._handle_audio_clip_command(remove)
+        self.assertNotIn(precise, self.harness.clip.warp_markers)
+
+    def test_waveform_playback_scrub_commands_are_rejected(self):
+        scrub = [0xF0, 0x52] + list(b"scrub|1") + [0xF7]
+        self.harness._handle_audio_clip_command(scrub)
+        self.assertEqual(self.harness.results[-1][0], "scrub")
+        self.assertFalse(self.harness.results[-1][1])
 
     def test_state_refresh_does_not_resend_the_waveform(self):
         self.harness._send_audio_clip_state(force=True)
@@ -343,8 +460,48 @@ class AudioClipSupportTests(unittest.TestCase):
         self.assertEqual(self.harness.clip.gain, 1.0)
         self.harness._set_audio_clip_property(self.harness.clip, "pitch_coarse", "-99")
         self.assertEqual(self.harness.clip.pitch_coarse, -48)
+        self.harness._set_audio_clip_property(self.harness.clip, "ram_mode", "0")
+        self.assertFalse(self.harness.clip.ram_mode)
+        self.harness._set_audio_clip_property(self.harness.clip, "legato", "1")
+        self.assertTrue(self.harness.clip.legato)
+        self.harness._set_audio_clip_property(self.harness.clip, "launch_mode", "99")
+        self.assertEqual(self.harness.clip.launch_mode, 3)
+        self.harness._set_audio_clip_property(self.harness.clip, "launch_quantization", "99")
+        self.assertEqual(self.harness.clip.launch_quantization, 14)
         with self.assertRaises(ValueError):
             self.harness._set_audio_clip_property(self.harness.clip, "warp_mode", "4")
+
+    def test_pitch_command_updates_coarse_and_fine_as_one_value(self):
+        message = [0xF0, 0x52] + list(b"setPitch|-4|50") + [0xF7]
+        self.harness._handle_audio_clip_command(message)
+
+        self.assertEqual(self.harness.clip.pitch_coarse, -4)
+        self.assertEqual(self.harness.clip.pitch_fine, 50)
+        self.assertFalse(self.harness._audio_clip_pitch_update_in_progress)
+
+        fields = [
+            self.harness._unescape_sysex_string(value)
+            for value in self.harness._split_escaped_sysex_fields(self.harness.sent[-1][1], "|")
+        ]
+        self.assertEqual(fields[11:13], ["-4", "50"])
+
+    def test_pitch_command_clamps_both_parts_together(self):
+        message = [0xF0, 0x52] + list(b"setPitch|-99|99") + [0xF7]
+        self.harness._handle_audio_clip_command(message)
+
+        self.assertEqual(self.harness.clip.pitch_coarse, -48)
+        self.assertEqual(self.harness.clip.pitch_fine, 50)
+
+    def test_existing_pitch_properties_remain_editable_while_playing(self):
+        self.harness.clip.is_playing = True
+
+        coarse = [0xF0, 0x52] + list(b"set|pitch_coarse|-12") + [0xF7]
+        fine = [0xF0, 0x52] + list(b"set|pitch_fine|37") + [0xF7]
+        self.harness._handle_audio_clip_command(coarse)
+        self.harness._handle_audio_clip_command(fine)
+
+        self.assertEqual(self.harness.clip.pitch_coarse, -12)
+        self.assertEqual(self.harness.clip.pitch_fine, 37)
 
     def test_marker_domain_uses_full_sample_and_position_preserves_loop_move(self):
         self.harness._set_audio_clip_property(self.harness.clip, "end_marker", "99")
@@ -369,6 +526,26 @@ class AudioClipSupportTests(unittest.TestCase):
         self.harness._handle_audio_clip_command(message)
         self.assertIn(("audio_to_midi", self.harness.song_state, self.harness.clip, "melody"), CONVERSIONS.calls)
         self.assertEqual(self.harness.results[-1], ("convert", True, "Conversion started"))
+
+    def test_drum_conversion_refresh_selects_occupied_pad(self):
+        occupied_pad = types.SimpleNamespace(chains=(object(),), name="", note=36)
+        empty_pad = types.SimpleNamespace(chains=(), name="", note=37)
+        rack = types.SimpleNamespace(
+            can_have_drum_pads=True,
+            drum_pads=[occupied_pad, empty_pad],
+            view=types.SimpleNamespace(selected_drum_pad=None),
+        )
+        converted_track = Track([])
+        converted_track.devices = [rack]
+        self.harness.song_state.tracks.append(converted_track)
+        self.harness._refresh_audio_conversion(
+            (self.harness.track,),
+            "drum_pad",
+        )
+        self.assertIs(self.harness.song_state.view.selected_track, converted_track)
+        self.assertIs(rack.view.selected_drum_pad, occupied_pad)
+        self.assertTrue(self.harness.selected_track_changed)
+        self.assertIn((0x11, "36,Pad 36"), self.harness.sent)
 
     def test_browse_command_records_exact_empty_slot_target(self):
         message = [0xF0, 0x52] + list(b"browse|4|9") + [0xF7]
@@ -407,6 +584,37 @@ class AudioClipSupportTests(unittest.TestCase):
         self.assertEqual(
             self.harness.results[-1],
             ("load", True, "Sample loaded to Drum Rack pad"),
+        )
+
+    def test_drum_pad_browser_enters_hotswap_before_listing_items(self):
+        pad = types.SimpleNamespace(chains=())
+        rack = types.SimpleNamespace(
+            can_have_drum_pads=True,
+            drum_pads=[pad],
+            view=types.SimpleNamespace(selected_drum_pad=None),
+        )
+        self.harness._drum_rack_device = rack
+        browse = [0xF0, 0x52] + list(b"browseDrumPad|0") + [0xF7]
+        self.harness._handle_audio_clip_command(browse)
+        self.assertIs(rack.view.selected_drum_pad, pad)
+        self.assertIs(self.harness.browser.hotswap_target, pad)
+        self.assertIs(self.harness.browser_drum_pad_target, pad)
+
+    def test_drum_pad_browser_can_replace_an_occupied_pad(self):
+        pad = types.SimpleNamespace(chains=(object(),))
+        rack = types.SimpleNamespace(
+            can_have_drum_pads=True,
+            drum_pads=[pad],
+            view=types.SimpleNamespace(selected_drum_pad=None),
+        )
+        self.harness._drum_rack_device = rack
+        browse = [0xF0, 0x52] + list(b"browseDrumPad|0") + [0xF7]
+        self.harness._handle_audio_clip_command(browse)
+        self.assertIs(rack.view.selected_drum_pad, pad)
+        self.assertIs(self.harness.browser.hotswap_target, pad)
+        self.assertEqual(
+            self.harness.results[-1],
+            ("browseDrumPad", True, "Choose a Drum Pad replacement"),
         )
 
     def test_play_stop_and_adjacent_selection_are_direct(self):
