@@ -1010,6 +1010,12 @@ class TapDeviceComponent(DeviceComponent):
                     names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
                 self._configure_simpler_control_bank_names(names)
                 names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
+            else:
+                # Multisample Simpler uses Live's native banks, but its Warp
+                # As parameter is still a quantized encoder. Replace the
+                # native control pages so Tap can expose Warp As as a real
+                # momentary action here as well.
+                self._configure_simpler_control_bank_names(names)
             names.append(self._simpler_browse_bank_name())
         elif self._is_analog():
             names = self._analog_bank_names(names)
@@ -1087,6 +1093,7 @@ class TapDeviceComponent(DeviceComponent):
                 self._configure_simpler_control_banks(banks, names)
                 banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
             else:
+                self._configure_simpler_control_banks(banks, names)
                 # DeviceComponent can expose more resolved C++ banks than its
                 # stable curated name table. Keep only the banks represented by
                 # that table, then add Browse + at the matching final index.
@@ -2226,7 +2233,7 @@ class TapDeviceComponent(DeviceComponent):
             return 'simpler_main'
         if name == self.SIMPLER_ACTIONS_BANK_NAME and custom_simpler:
             return 'simpler_actions'
-        if name == self.SIMPLER_WARP_BANK_NAME and custom_simpler:
+        if name == self.SIMPLER_WARP_BANK_NAME and self._is_simpler():
             return 'simpler_warp'
         if (
                 name in (self.SIMPLER_BROWSE_BANK_NAME, self.SIMPLER_BROWSE_PLUS_BANK_NAME)
@@ -5701,7 +5708,7 @@ class Tap(ControlSurface):
             for property_name in (
                 'file_path', 'start_marker', 'end_marker', 'slices', 'slicing_style',
                 'slicing_sensitivity', 'slicing_beat_division', 'slicing_region_count',
-                'warping', 'warp_mode',
+                'warping', 'warp_mode', 'warp_markers',
             ):
                 callback = self._on_simpler_file_changed if property_name == 'file_path' else self._on_simpler_state_changed
                 if property_name in ('slicing_style', 'warping', 'warp_mode'):
@@ -6068,19 +6075,13 @@ class Tap(ControlSurface):
             if control_index != 0:
                 return None
             enabled = bool(getattr(self._simpler_device, 'can_warp_as', False))
-            warp_lengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
-            warp_labels = ('1/2 Beat', '1 Beat', '2 Beats', '4 Beats', '8 Beats', '16 Beats', '32 Beats')
-            selected_index = min(
-                range(len(warp_lengths)),
-                key=lambda index: abs(warp_lengths[index] - self._simpler_warp_as_beats),
-            )
             return {
-                'name': 'Warp As',
+                'name': 'Warp as 2 Beats',
                 'action': 13,
-                'kind': 'warp_length',
-                'items': warp_labels,
-                'display': warp_labels[selected_index],
-                'normalized': float(selected_index) / float(len(warp_lengths) - 1),
+                'kind': 'button',
+                'items': ('Ready', 'Trigger'),
+                'display': 'Ready',
+                'normalized': 0.0,
                 'enabled': enabled,
             }
         specs = self._simpler_action_specs()
@@ -6212,9 +6213,10 @@ class Tap(ControlSurface):
                 index = int(round(normalized * (len(warp_modes) - 1)))
                 self._simpler_sample.warp_mode = warp_modes[index]
             elif action == 13:
-                warp_lengths = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
-                index = int(round(normalized * (len(warp_lengths) - 1)))
-                self._simpler_warp_as_beats = warp_lengths[index]
+                # This slot is presented as a momentary "Warp as 2 Beats"
+                # action. Keep the legacy normalized path fixed to the same
+                # value so an encoder message can never turn it into 1 Beat.
+                self._simpler_warp_as_beats = 2.0
                 if bool(getattr(self._simpler_device, 'can_warp_as', False)):
                     self._simpler_device.warp_as(self._simpler_warp_as_beats)
             else:
@@ -6335,11 +6337,99 @@ class Tap(ControlSurface):
         except Exception:
             return fallback
 
+    def _simpler_warp_marker_pairs(self, sample):
+        """Return Simpler Warp Markers as sorted (sample seconds, beat time) pairs."""
+        try:
+            raw_markers = sample.warp_markers
+        except Exception:
+            return []
+
+        marker_items = raw_markers
+        pairs = []
+        if isinstance(raw_markers, dict):
+            beat_values = raw_markers.get('beat_time')
+            sample_values = raw_markers.get('sample_time')
+            if isinstance(beat_values, (list, tuple)) and isinstance(sample_values, (list, tuple)):
+                marker_items = [
+                    {'beat_time': beat, 'sample_time': sample_time}
+                    for beat, sample_time in zip(beat_values, sample_values)
+                ]
+            elif 'beat_time' in raw_markers and 'sample_time' in raw_markers:
+                marker_items = [raw_markers]
+            else:
+                marker_items = []
+                for sample_time, beat_time in raw_markers.items():
+                    if isinstance(beat_time, (dict, list, tuple)):
+                        if isinstance(beat_time, dict):
+                            marker_items.append(beat_time)
+                        else:
+                            marker_items.extend(beat_time)
+                        continue
+                    try:
+                        # Some Live Python bindings expose the documented dict
+                        # as sample-time keys mapped directly to beat times.
+                        pairs.append((float(sample_time), float(beat_time)))
+                    except Exception:
+                        continue
+
+        for marker in marker_items or ():
+            try:
+                if isinstance(marker, dict):
+                    beat_time = marker.get('beat_time')
+                    sample_time = marker.get('sample_time')
+                elif isinstance(marker, (list, tuple)) and len(marker) >= 2:
+                    beat_time, sample_time = marker[0], marker[1]
+                else:
+                    beat_time = marker.beat_time
+                    sample_time = marker.sample_time
+                pairs.append((float(sample_time), float(beat_time)))
+            except Exception:
+                continue
+
+        if len(pairs) < 2:
+            return []
+
+        try:
+            sample_length = max(1.0, float(sample.length))
+            sample_rate = max(1.0, float(sample.sample_rate))
+            sample_duration = sample_length / sample_rate
+            # Live's Sample LOM has returned both seconds and sample frames in
+            # different bindings. Normalize frame-valued markers to seconds.
+            if max(pair[0] for pair in pairs) > sample_duration * 2.0:
+                pairs = [(sample_time / sample_rate, beat_time) for sample_time, beat_time in pairs]
+        except Exception:
+            pass
+        return sorted(pairs, key=lambda pair: pair[0])
+
+    def _simpler_warp_timeline(self, sample):
+        # Simpler normally has no user-visible Warp Markers. Live already
+        # exposes the estimated playback length for its active region, which
+        # is enough to draw a regular musical grid from start to sample end.
+        guessed_length = 0.0
+        try:
+            guessed_length = self._simpler_device.guess_playback_length()
+            if isinstance(guessed_length, (list, tuple)):
+                guessed_length = guessed_length[0] if guessed_length else 0.0
+            guessed_length = max(0.0, float(guessed_length))
+        except Exception:
+            guessed_length = 0.0
+
+        try:
+            sample_duration = float(sample.length) / max(1.0, float(sample.sample_rate))
+        except Exception:
+            return (0.0, [])
+        if guessed_length <= 0.0:
+            try:
+                guessed_length = sample_duration * max(1.0, float(self.song().tempo)) / 60.0
+            except Exception:
+                guessed_length = sample_duration * 2.0
+        return (max(0.25, guessed_length), [])
+
     def _send_simpler_state(self):
         device = self._simpler_device
         sample = self._simpler_sample
         if not liveobj_valid(device) or not liveobj_valid(sample):
-            self._send_sys_ex_message('1|0|1|0|1||0|0|0|0|0|0|0|0|0|0|0|0|0.5', 0x42)
+            self._send_sys_ex_message('1|0|1|0|1||0|0|0|0|0|0|0|0|0|0|0|0|0.5|0|4|4|', 0x42)
             return
 
         try:
@@ -6396,6 +6486,13 @@ class Tap(ControlSurface):
             warp_mode = int(sample.warp_mode)
         except Exception:
             warp_mode = 0
+        beat_length, warp_markers = self._simpler_warp_timeline(sample) if warp_enabled else (0.0, [])
+        try:
+            signature_numerator = max(1, int(self.song().signature_numerator))
+            signature_denominator = max(1, int(self.song().signature_denominator))
+        except Exception:
+            signature_numerator = 4
+            signature_denominator = 4
         active_length = max(1.0, (sample_end - sample_start) * length)
         loop_length = max(1.0, (loop_end - loop_start) * length)
         fade_in = max(0.0, min(0.5, float(getattr(view, 'sample_env_fade_in', 0.0)) / active_length))
@@ -6405,7 +6502,7 @@ class Tap(ControlSurface):
             length,
             0.0,
         )
-        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}|{:.6f}'.format(
+        payload = '1|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{:.6f}|{:.6f}|{}|{}|{}|{}|1|{}|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{:.6f}|{}|{}|{}'.format(
             sample_start,
             sample_end,
             loop_start,
@@ -6423,6 +6520,10 @@ class Tap(ControlSurface):
             fade_out,
             loop_fade,
             self._simpler_waveform_center,
+            beat_length,
+            signature_numerator,
+            signature_denominator,
+            ';'.join('{:.6f}:{:.6f}'.format(beat_time, sample_time) for beat_time, sample_time in warp_markers),
         )
         self._send_sys_ex_message(payload, 0x42)
 
@@ -6499,7 +6600,8 @@ class Tap(ControlSurface):
                 self._simpler_waveform_center += direction * visible_width * 0.25
                 self._clamp_simpler_waveform_center()
             elif action_index == 13 and bool(getattr(device, 'can_warp_as', False)):
-                device.warp_as(self._simpler_warp_as_beats)
+                self._simpler_warp_as_beats = 2.0
+                device.warp_as(2.0)
             self._send_simpler_state()
             self._send_sys_ex_message(str(action_index), 0x44)
             if self._simpler_actions_active():
@@ -13380,8 +13482,27 @@ class Tap(ControlSurface):
             result.append(column)
         return result
 
+    def _flin_simpler_slice_count(self):
+        try:
+            simpler = self._track_sliced_simpler()
+            if not liveobj_valid(simpler):
+                return 0
+            sample = simpler.sample
+            if not liveobj_valid(sample):
+                return 0
+            return max(0, min(64, len(tuple(sample.slices))))
+        except Exception:
+            return 0
+
     def _flin_raw_pitch(self, info, column):
         page = int(column.get("page", info.get("view_page", 0)))
+        slice_count = self._flin_simpler_slice_count()
+        if slice_count > 0:
+            # Simpler slices are triggered chromatically from C1 (MIDI 36).
+            # Repeat the available slices across Flin's sixteen columns, and
+            # continue the same wrapping pattern on subsequent Flin pages.
+            absolute_column = page * 16 + int(column.get("id", 0))
+            return 36 + (absolute_column % slice_count)
         mapped = self._flin_column_offset(info, page, int(column.get("id", 0)))
         if int(info.get("kind", 0)) == 1:
             return int(info.get("base_pitch", 36)) + int(info.get("global_offset", 0)) * 16 + mapped
@@ -18834,8 +18955,10 @@ class Tap(ControlSurface):
         self.send_selected_clip_metadata()
         if (
             selected_clip_slot is not None
-            and selected_clip_slot.has_clip
-            and bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
+            and (
+                not selected_clip_slot.has_clip
+                or bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
+            )
         ):
             self.send_selected_clip_notes()
         self._check_clip_playing_status(force=True)
@@ -19798,8 +19921,7 @@ class Tap(ControlSurface):
             
             song = self.song()
             clip_slot = song.view.highlighted_clip_slot
-            if clip_slot is not None:
-                if clip_slot.has_clip:
+            if clip_slot is not None and clip_slot.has_clip:
                     selected_clip = clip_slot.clip
                     # Extract clip metadata, make ints
                     start_marker = int(selected_clip.start_marker * 1000)
@@ -20055,10 +20177,16 @@ class Tap(ControlSurface):
                     
                         data.extend(note_data)
                 else:
-                    # Indicate no clip selected by adding a recognizable marker
+                    # Empty highlighted slot: send the explicit no-clip marker
+                    # and listen for the slot becoming populated.
                     data.extend([0x7F, 0x7F, 0x7F])
                     if not clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                         clip_slot.add_has_clip_listener(self.on_highlighted_slot_changed)
+            else:
+                # Indicate no clip selected by adding a recognizable marker.
+                # This also covers Live's short startup window where no
+                # highlighted slot object is available yet.
+                data.extend([0x7F, 0x7F, 0x7F])
                 
             # Split data if it's too large for a single SysEx message
             num_of_chunks = max(1, (len(data) + max_chunk_length - 1) // max_chunk_length)
