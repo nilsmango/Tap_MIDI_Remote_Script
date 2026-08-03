@@ -18,6 +18,8 @@ METHOD_NAMES = {
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
     "_send_all_drum_pad_names",
+    "_sync_drum_rack_device",
+    "_set_simpler_device",
     "_send_audio_clip_state",
     "_set_audio_clip_property",
     "_set_audio_clip_pitch",
@@ -30,6 +32,7 @@ METHOD_NAMES = {
     "_browser_item_file_path",
     "_load_browser_item_into_audio_clip",
     "_browser_load_item",
+    "_browser_jump_to_page",
 }
 
 
@@ -255,7 +258,11 @@ class Harness:
         self.browser_current_items = []
         self.browser_current_page = 0
         self.browser_items_per_page = 12
+        self.browser_pages_count = 0
+        self.browser_page_requests = []
         self._simpler_device = None
+        self._simpler_waveform_generation = 0
+        self.audio_clip_listener_removals = 0
 
     def song(self):
         return self.song_state
@@ -343,6 +350,33 @@ class Harness:
             None,
         )
 
+    def _is_simpler_device(self, _):
+        return False
+
+    def _remove_simpler_listeners(self):
+        pass
+
+    def _disconnect_simpler_decorator(self):
+        pass
+
+    def _remove_audio_clip_listeners(self):
+        self.audio_clip_listener_removals += 1
+
+    def _send_simpler_waveform_clear(self):
+        pass
+
+    def _send_simpler_playhead(self, **_):
+        pass
+
+    def _send_browser_page(self, page):
+        self.browser_page_requests.append(page)
+
+    def _remove_drum_pad_name_listeners(self):
+        self.drum_listener_removals = getattr(self, "drum_listener_removals", 0) + 1
+
+    def _setup_drum_pad_listeners(self):
+        self.drum_listener_setups = getattr(self, "drum_listener_setups", 0) + 1
+
 
 for method_name, method in extracted_methods().items():
     setattr(Harness, method_name, method)
@@ -373,6 +407,26 @@ class AudioClipSupportTests(unittest.TestCase):
         self.assertEqual(fields[33], "0")
         self.assertEqual(fields[34:36], ["1", "1"])
         self.assertEqual(fields[36:41], ["1", "0", "1", "2", "12"])
+
+    def test_non_simpler_device_refresh_keeps_audio_clip_listener(self):
+        self.harness._set_simpler_device(object())
+        self.assertEqual(self.harness.audio_clip_listener_removals, 0)
+
+    def test_unchanged_drum_rack_is_resent_on_reconnect_refresh(self):
+        rack = object()
+        self.harness._drum_rack_device = rack
+        self.harness._sync_drum_rack_device(rack)
+        self.assertEqual(self.harness.drum_listener_setups, 1)
+        self.assertEqual(getattr(self.harness, "drum_listener_removals", 0), 0)
+
+    def test_accelerated_browser_hold_requests_only_the_final_clamped_page(self):
+        self.harness.browser_pages_count = 1_250
+        self.harness._browser_jump_to_page([0x7F, 0x7F, 0x7F])
+        self.assertEqual(self.harness.browser_page_requests, [1_249])
+
+        self.harness.browser_page_requests = []
+        self.harness._browser_jump_to_page([103, 7, 0])
+        self.assertEqual(self.harness.browser_page_requests, [999])
 
     def test_state_switches_to_beats_when_warped(self):
         self.harness.clip.warping = True

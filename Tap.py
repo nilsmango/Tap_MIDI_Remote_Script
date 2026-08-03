@@ -4074,6 +4074,18 @@ class Tap(ControlSurface):
             if not self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
                 self._drum_rack_device.view.add_selected_drum_pad_listener(self._send_selected_drum_pad_number)
 
+    def _sync_drum_rack_device(self, drum_rack_device):
+        if drum_rack_device != self._drum_rack_device:
+            if self._drum_rack_device:
+                self._remove_drum_pad_name_listeners()
+            self._drum_rack_device = drum_rack_device
+
+        # A Tap reconnect clears its cached names while the Live object remains
+        # unchanged. Re-running the idempotent setup resends the current names
+        # as well as repairing any listeners Live may have dropped.
+        if self._drum_rack_device:
+            self._setup_drum_pad_listeners()
+
     def _remove_drum_pad_name_listeners(self):
         if self._drum_rack_device:
             for pad in self._drum_rack_device.drum_pads:
@@ -5672,10 +5684,6 @@ class Tap(ControlSurface):
         self._remove_simpler_listeners()
         self._disconnect_simpler_decorator()
         self._simpler_waveform_generation += 1
-        self._audio_clip_waveform_generation += 1
-        self._remove_audio_clip_listeners()
-        self._audio_clip_listener_clip = None
-        self._audio_clip_listener_slot = None
         self._simpler_device = device if self._is_simpler_device(device) else None
         self._simpler_sample = None
         self._simpler_playhead_high = -1
@@ -7105,15 +7113,7 @@ class Tap(ControlSurface):
                         break
             
             # set up drum pad listeners after the fast bank update
-            if drum_rack_device is not None:
-                if drum_rack_device != self._drum_rack_device:
-                    if self._drum_rack_device:
-                        self._remove_drum_pad_name_listeners()
-                    self._drum_rack_device = drum_rack_device
-                    self._setup_drum_pad_listeners()
-            elif self._drum_rack_device:
-                self._remove_drum_pad_name_listeners()
-                self._drum_rack_device = None
+            self._sync_drum_rack_device(drum_rack_device)
                 
             if send_device_navigation:
                 # CHANGE 3: Send the index from our comprehensive device list
@@ -13905,6 +13905,12 @@ class Tap(ControlSurface):
         if len(message) >= 4 and message[1] == 0x45:
             self._debug_log('Simpler waveform requested by app')
             self._request_simpler_waveform()
+            return
+        # A long browser hold previews page numbers locally in Tap, then sends
+        # one absolute destination when the finger is released. This avoids a
+        # SysEx page payload for every accelerated intermediate page.
+        if len(message) >= 3 and message[1] == 0x54:
+            self._browser_jump_to_page(self.extract_values_from_sysex_message(message))
             return
         # Browser name search and content-tag filtering are performed here in the
         # Remote Script so the app only ever receives the current 12-item page.
@@ -20938,6 +20944,16 @@ class Tap(ControlSurface):
             # Note off: go to previous page
             if self.browser_current_page > 0:
                 self._send_browser_page(self.browser_current_page - 1)
+
+    def _browser_jump_to_page(self, values):
+        if self.browser_pages_count <= 0 or not values:
+            return
+
+        target_page = 0
+        for byte_index, value in enumerate(values[:3]):
+            target_page |= (int(value) & 0x7F) << (byte_index * 7)
+        target_page = max(0, min(self.browser_pages_count - 1, target_page))
+        self._send_browser_page(target_page)
 
     def _browser_open_item(self, value):
         """
