@@ -4063,6 +4063,17 @@ class Tap(ControlSurface):
                     if drum_rack is not None:
                         return drum_rack
         return None
+
+    def _find_drum_rack_for_device(self, device):
+        """Return the Drum Rack containing the selected device, if any."""
+        current = device
+        visited = set()
+        while liveobj_valid(current) and id(current) not in visited:
+            visited.add(id(current))
+            if bool(getattr(current, 'can_have_drum_pads', False)):
+                return current
+            current = getattr(current, 'canonical_parent', None)
+        return None
     
     def _setup_drum_pad_listeners(self):
         if self._drum_rack_device:
@@ -6953,7 +6964,9 @@ class Tap(ControlSurface):
 
             # Send the light bank update before listener and metadata work.
             track_has_drums = 0
-            drum_rack_device = self._find_drum_rack_in_track(selected_track) if selected_track else None
+            drum_rack_device = self._find_drum_rack_for_device(selected_device)
+            if drum_rack_device is None and selected_track:
+                drum_rack_device = self._find_drum_rack_in_track(selected_track)
             if drum_rack_device is not None:
                 track_has_drums = 1
 

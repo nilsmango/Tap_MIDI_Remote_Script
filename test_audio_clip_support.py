@@ -18,6 +18,7 @@ METHOD_NAMES = {
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
     "_send_all_drum_pad_names",
+    "_find_drum_rack_for_device",
     "_sync_drum_rack_device",
     "_set_simpler_device",
     "_send_audio_clip_state",
@@ -600,6 +601,19 @@ class AudioClipSupportTests(unittest.TestCase):
         self.assertIs(rack.view.selected_drum_pad, occupied_pad)
         self.assertTrue(self.harness.selected_track_changed)
         self.assertIn((0x11, "36,Pad 36"), self.harness.sent)
+
+    def test_selected_nested_device_resolves_its_own_drum_rack(self):
+        rack = types.SimpleNamespace(can_have_drum_pads=True, canonical_parent=None)
+        chain = types.SimpleNamespace(can_have_drum_pads=False, canonical_parent=rack)
+        nested_device = types.SimpleNamespace(
+            can_have_drum_pads=False,
+            canonical_parent=chain,
+        )
+
+        self.assertIs(
+            self.harness._find_drum_rack_for_device(nested_device),
+            rack,
+        )
 
     def test_browse_command_records_exact_empty_slot_target(self):
         message = [0xF0, 0x52] + list(b"browse|4|9") + [0xF7]
