@@ -31,6 +31,8 @@ METHOD_NAMES = {
     "_refresh_audio_conversion",
     "_handle_audio_clip_command",
     "_browser_item_file_path",
+    "_browser_items_for_category",
+    "_browser_search_roots",
     "_load_browser_item_into_audio_clip",
     "_browser_load_item",
     "_browser_jump_to_page",
@@ -261,6 +263,10 @@ class Harness:
         self.browser_items_per_page = 12
         self.browser_pages_count = 0
         self.browser_page_requests = []
+        self.browser_search_restore_state = None
+        self.browser_folder_mapping = {3: "drums"}
+        self.browser_folder_labels = {3: "Drums", 14: "Drum Hits"}
+        self.browser_searchable_tag_indices = (3, 14)
         self._simpler_device = None
         self._simpler_waveform_generation = 0
         self.audio_clip_listener_removals = 0
@@ -428,6 +434,15 @@ class AudioClipSupportTests(unittest.TestCase):
         self.harness.browser_page_requests = []
         self.harness._browser_jump_to_page([103, 7, 0])
         self.assertEqual(self.harness.browser_page_requests, [999])
+
+    def test_drums_tag_searches_drum_hits_after_other_drum_folders(self):
+        drum_hits = types.SimpleNamespace(name="Drum Hits", children=[])
+        kits = types.SimpleNamespace(name="Drum Racks", children=[])
+        self.harness.browser.drums = types.SimpleNamespace(children=[drum_hits, kits])
+
+        roots = self.harness._browser_search_roots([3])
+
+        self.assertEqual([item.name for item, _ in roots], ["Drum Racks", "Drum Hits"])
 
     def test_state_switches_to_beats_when_warped(self):
         self.harness.clip.warping = True

@@ -6970,6 +6970,11 @@ class Tap(ControlSurface):
             if drum_rack_device is not None:
                 track_has_drums = 1
 
+            # The virtual track device returns early below, so synchronize the
+            # rack before branching. This also resends names for racks that
+            # were already loaded when Tap connected.
+            self._sync_drum_rack_device(drum_rack_device)
+
             if track_device_selected:
                 self._connect_track_device_parameter_controls(selected_track)
                 self._send_track_device_bank_state(track_has_drums)
@@ -7125,9 +7130,6 @@ class Tap(ControlSurface):
                         selected_device_index = str(index + 1)
                         break
             
-            # set up drum pad listeners after the fast bank update
-            self._sync_drum_rack_device(drum_rack_device)
-                
             if send_device_navigation:
                 # CHANGE 3: Send the index from our comprehensive device list
                 self._send_sys_ex_message(selected_device_index, 0x4D)
@@ -20602,7 +20604,19 @@ class Tap(ControlSurface):
             roots = []
             for category_index in tag_indices:
                 label = self.browser_folder_labels.get(category_index, '')
-                roots.extend((item, (label,)) for item in self._browser_items_for_category(category_index))
+                items = self._browser_items_for_category(category_index)
+                if category_index == 3:
+                    # Drum Hits is enormous. Search the focused drum folders
+                    # first so racks and kits appear before individual hits.
+                    drum_hits = [
+                        item for item in items
+                        if str(getattr(item, 'name', '')).casefold() == 'drum hits'
+                    ]
+                    items = [
+                        item for item in items
+                        if str(getattr(item, 'name', '')).casefold() != 'drum hits'
+                    ] + drum_hits
+                roots.extend((item, (label,)) for item in items)
             return roots
 
         state = self.browser_search_restore_state
