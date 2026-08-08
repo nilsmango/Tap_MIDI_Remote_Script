@@ -5750,7 +5750,9 @@ class Tap(ControlSurface):
 
         self._send_simpler_state()
         self._send_simpler_playhead(force=True)
-        self._request_simpler_waveform()
+        # Waveform decoding is intentionally demand-driven. Tap requests it
+        # only after the selected Simpler has remained visible briefly, which
+        # avoids starting a decoder thread for every pad crossed in a rack.
         self.schedule_message(1, self._sync_simpler_pad_slicing)
 
     def _on_simpler_sample_changed(self):
@@ -5772,7 +5774,6 @@ class Tap(ControlSurface):
         self._simpler_waveform_generation += 1
         self._send_simpler_waveform_clear()
         self._send_simpler_state()
-        self._request_simpler_waveform()
 
     def _on_simpler_state_changed(self):
         self._send_simpler_state()
@@ -6758,7 +6759,10 @@ class Tap(ControlSurface):
         if file_path in self._simpler_waveform_cache_order:
             self._simpler_waveform_cache_order.remove(file_path)
         self._simpler_waveform_cache_order.append(file_path)
-        while len(self._simpler_waveform_cache_order) > 8:
+        # A Drum Rack commonly has 16 or more unique Simpler samples. Keeping
+        # a full rack cached prevents repeated decode spikes when revisiting
+        # pads; each entry contains at most 512 compact amplitude values.
+        while len(self._simpler_waveform_cache_order) > 64:
             oldest = self._simpler_waveform_cache_order.pop(0)
             self._simpler_waveform_cache.pop(oldest, None)
 
@@ -6949,10 +6953,16 @@ class Tap(ControlSurface):
         if liveobj_valid(self._device):
             # get and send name of bank and device
             selected_track = self.song().view.selected_track
-            selected_device = getattr(self._device, '_device', None)
-            if not liveobj_valid(selected_device) and selected_track:
-                selected_device = selected_track.view.selected_device
             track_device_selected = self._track_device_is_selected()
+            if track_device_selected:
+                # The DeviceComponent can still point at the previous track's
+                # device while Tap's virtual Track Controls are selected.
+                # Never use that stale object to derive the new track's rack.
+                selected_device = selected_track.view.selected_device if selected_track else None
+            else:
+                selected_device = getattr(self._device, '_device', None)
+                if not liveobj_valid(selected_device) and selected_track:
+                    selected_device = selected_track.view.selected_device
             self._send_track_simpler_slice_state(force=True)
             self._set_simpler_device(None if track_device_selected else selected_device)
             if track_device_selected:
@@ -6964,7 +6974,7 @@ class Tap(ControlSurface):
 
             # Send the light bank update before listener and metadata work.
             track_has_drums = 0
-            drum_rack_device = self._find_drum_rack_for_device(selected_device)
+            drum_rack_device = None if track_device_selected else self._find_drum_rack_for_device(selected_device)
             if drum_rack_device is None and selected_track:
                 drum_rack_device = self._find_drum_rack_in_track(selected_track)
             if drum_rack_device is not None:
@@ -7435,16 +7445,15 @@ class Tap(ControlSurface):
                     self._drum_pad_change_recheck_count = 0
                     self._last_drum_pad_metadata = None
                     self._last_sent_metadata = None
-                    self._drum_pad_recheck_start = time.time()
+                    self._drum_pad_recheck_start = None
                     
                     # Only auto-follow pad if we're already on a pad device
                     self._select_device_in_selected_drum_pad()
-                    
-                    # Kick off a metadata recheck loop to wait for full pad loading
-                    self._debug_log("Drum pad change: starting metadata recheck loop")
-                    self._metadata_recheck_timer = self._schedule_main_thread(
-                        0.1, self._recheck_parameter_metadata
-                    )
+
+                    # Device selection runs the normal metadata path, which
+                    # schedules a recheck only when mappings are incomplete.
+                    # Starting another unconditional loop here made Simpler's
+                    # custom banks rebuild metadata up to 12 times per pad.
             else:
                 self._debug_log("No drum pad selected")
             
@@ -7475,6 +7484,13 @@ class Tap(ControlSurface):
         selected_track = self.song().view.selected_track
         current_device = selected_track.view.selected_device
         if not current_device or not self._is_device_in_any_drum_pad(current_device):
+            return
+
+        # Selecting a nested device can also make Live select its containing
+        # drum pad. The requested device is already correct in that case. If
+        # we continue, controls may still be mapped to the enclosing rack for
+        # one tick and would immediately select that rack again.
+        if self._is_device_in_drum_pad(current_device):
             return
         
         selected_drum_pad = self._get_selected_drum_pad(self._drum_rack_device)
@@ -7749,6 +7765,12 @@ class Tap(ControlSurface):
         # add midi track
         add_midi_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 21)
         add_midi_track_button.add_value_listener(self._add_midi_track)
+        # add audio track
+        add_audio_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 26)
+        add_audio_track_button.add_value_listener(self._add_audio_track)
+        # duplicate track
+        duplicate_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 27)
+        duplicate_track_button.add_value_listener(self._duplicate_track)
         # delete midi track
         delete_midi_track_button = ButtonElement(1, MIDI_CC_TYPE, 1, 22)
         delete_midi_track_button.add_value_listener(self._delete_midi_track)
@@ -18904,6 +18926,17 @@ class Tap(ControlSurface):
         song = self.song()
         song.create_midi_track(value)
         self._sync_follow_actions_to_track_topology()
+
+    def _add_audio_track(self, value):
+        song = self.song()
+        song.create_audio_track(value)
+        self._sync_follow_actions_to_track_topology()
+
+    def _duplicate_track(self, value):
+        song = self.song()
+        if 0 <= value < len(song.tracks):
+            song.duplicate_track(value)
+            self._sync_follow_actions_to_track_topology()
 
     def _delete_midi_track(self, value):
         song = self.song()
