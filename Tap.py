@@ -2678,6 +2678,7 @@ class Tap(ControlSurface):
             self._selected_clip_update_pending_metadata = False
             self._selected_clip_update_pending_notes = False
             self._clip_slot_listeners = {}
+            self._track_arm_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
             self._clip_listener_track_slots = {}
@@ -12872,6 +12873,36 @@ class Tap(ControlSurface):
 
         return "{} {}".format(prefix, name[dash_index + 1:].lstrip())
 
+    def _track_input_state_codes(self, tracks=None):
+        tracks = list(self.song().tracks) if tracks is None else list(tracks)
+        states = []
+        for track in tracks:
+            try:
+                is_group = any(clip_slot.is_group_slot for clip_slot in track.clip_slots)
+                is_grouped = bool(track.is_grouped)
+                has_audio = bool(track.has_audio_input)
+                is_armed = has_audio and bool(track.arm)
+            except Exception:
+                is_group = False
+                is_grouped = False
+                has_audio = False
+                is_armed = False
+
+            if is_group:
+                states.append("2")
+            elif is_grouped and has_audio:
+                states.append("6" if is_armed else "4")
+            elif is_grouped:
+                states.append("3")
+            elif has_audio:
+                states.append("5" if is_armed else "1")
+            else:
+                states.append("0")
+        return states
+
+    def _send_track_input_states(self, tracks=None):
+        self._send_sys_ex_message(",".join(self._track_input_state_codes(tracks)), 0x0C)
+
     def _update_mixer_and_tracks(self):
         tracks = list(self.song().tracks)
         return_tracks = list(self.song().return_tracks)
@@ -12914,28 +12945,16 @@ class Tap(ControlSurface):
 
             # 2. Build track names, types, colors and send via SysEx
             track_names = []
-            track_is_audio = []
             track_colors = []
             
             for index, track in enumerate(tracks):
                 name = self._format_track_name_for_display(track.name)
                 track_names.append(name)
-                if any(clip_slot.is_group_slot for clip_slot in track.clip_slots):
-                    track_is_audio.append("2")
-                elif track.is_grouped:
-                    if track.has_audio_input:
-                        track_is_audio.append("4")
-                    else:
-                        track_is_audio.append("3")
-                elif track.has_audio_input:
-                    track_is_audio.append("1")
-                else:
-                    track_is_audio.append("0")
                 color_string = self._make_color_string(track.color)
                 track_colors.append(color_string)
 
             self._send_sys_ex_message(",".join(self._escape_sysex_string(name) for name in track_names), 0x02)
-            self._send_sys_ex_message(",".join(track_is_audio), 0x0C)
+            self._send_track_input_states(tracks)
             self._send_sys_ex_message("-".join(track_colors), 0x04)
 
             return_track_names = []
@@ -13229,6 +13248,29 @@ class Tap(ControlSurface):
         except ValueError:
             return None
 
+    def _make_track_arm_listener(self, track):
+        def listener():
+            self._on_track_arm_changed(track)
+        return listener
+
+    def _remove_track_arm_listener(self, track, listener):
+        try:
+            if not liveobj_valid(track) or not hasattr(track, 'remove_arm_listener'):
+                return
+            if not hasattr(track, 'arm_has_listener') or track.arm_has_listener(listener):
+                track.remove_arm_listener(listener)
+        except Exception:
+            pass
+
+    def _on_track_arm_changed(self, track):
+        track_index = self._get_track_index(track)
+        if track_index is None:
+            return
+        # One compact track-state message updates the context-menu label. The
+        # existing per-track slot message updates every empty record destination.
+        self._send_track_input_states()
+        self._update_clip_slots(track_index)
+
     def _make_clip_has_clip_listener(self, track, scene_index, clip_slot):
         def listener():
             self._on_clip_has_clip_changed(track, scene_index, clip_slot)
@@ -13333,9 +13375,29 @@ class Tap(ControlSurface):
         expected_listener_keys = set()
         expected_clip_slots = set()
         expected_clips = set()
+        expected_arm_tracks = set()
         for track in self.song().tracks:
             track_id = id(track)
             current_track_ids.add(track_id)
+
+            try:
+                supports_arm_feedback = (
+                    bool(track.has_audio_input)
+                    and bool(getattr(track, 'can_be_armed', True))
+                    and hasattr(track, 'add_arm_listener')
+                )
+            except Exception:
+                supports_arm_feedback = False
+            if supports_arm_feedback:
+                expected_arm_tracks.add(track)
+                if track not in self._track_arm_listeners:
+                    listener = self._make_track_arm_listener(track)
+                    try:
+                        if not hasattr(track, 'arm_has_listener') or not track.arm_has_listener(listener):
+                            track.add_arm_listener(listener)
+                        self._track_arm_listeners[track] = listener
+                    except Exception as e:
+                        self._debug_log("Error adding track arm listener: {}".format(str(e)))
 
             for scene_index, clip_slot in enumerate(track.clip_slots):
                 if clip_slot is None:
@@ -13387,6 +13449,12 @@ class Tap(ControlSurface):
                 if listener is not None:
                     self._remove_clip_color_listener(clip, listener)
 
+        for track in list(self._track_arm_listeners.keys()):
+            if track not in expected_arm_tracks:
+                listener = self._track_arm_listeners.pop(track, None)
+                if listener is not None:
+                    self._remove_track_arm_listener(track, listener)
+
         self._registered_track_ids = current_track_ids
 
     def _unregister_clip_and_audio_listeners(self):
@@ -13399,6 +13467,9 @@ class Tap(ControlSurface):
         for clip, listener in list(self._clip_color_listeners.items()):
             self._remove_clip_color_listener(clip, listener)
 
+        for track, listener in list(self._track_arm_listeners.items()):
+            self._remove_track_arm_listener(track, listener)
+
         for track, (left_listener, right_listener) in list(self._track_level_listeners.items()):
             self._remove_output_meter_listener_pair(track, left_listener, right_listener)
 
@@ -13409,6 +13480,7 @@ class Tap(ControlSurface):
         self._return_level_listeners.clear()
         self._clip_listener_track_slots.clear()
         self._clip_slot_listeners.clear()
+        self._track_arm_listeners.clear()
         self._clip_color_listeners.clear()
         self._clip_slot_color_map.clear()
         self._registered_track_ids.clear()
@@ -14955,17 +15027,17 @@ class Tap(ControlSurface):
                 self._append_and_remove_clip(*decoded[1])
             return
         
-        # toggle arm for audio tracks
+        # set arm state for audio tracks
         if len(message) >= 2 and message[1] == 20:
-            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
-            if decoded is None:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is None or decoded[0][0] not in (0, 1):
                 return
             track_index = decoded[1][0]
             tracks = self.song().tracks
             if 0 <= track_index < len(tracks):
                 track = tracks[track_index]
                 if getattr(track, 'can_be_armed', True):
-                    track.arm = not track.arm
+                    track.arm = decoded[0][0] == 1
             return
         
         # select next clip
@@ -18945,6 +19017,21 @@ class Tap(ControlSurface):
             if 0 <= scene_index < len(self.song().scenes):
                 self.song().delete_scene(scene_index)
                 self._shift_follow_actions_after_scene_delete(scene_index)
+            return
+        if action == 0x06:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=2)
+            if decoded is not None:
+                self._multiply_loop_by_two(decoded[1][0], decoded[1][1])
+            return
+        if action == 0x07:
+            decoded = self._decode_wide_index_message(message, prefix_count=2, index_count=2)
+            if decoded is not None and decoded[0][1] in (0, 1):
+                self._set_midi_clip_looping(
+                    decoded[1][0],
+                    decoded[1][1],
+                    decoded[0][1] == 1
+                )
+            return
 
     def _fire_clip(self, fire, track_index, clip_index):
         tracks = list(self.song().tracks)
@@ -19038,6 +19125,74 @@ class Tap(ControlSurface):
         if decoupled_info:
             self.send_selected_clip_metadata()
             self.send_selected_clip_notes()
+
+    def _multiply_loop_by_two(self, track_index, clip_index):
+        tracks = list(self.song().tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            return
+        slots = list(tracks[track_index].clip_slots)
+        if clip_index < 0 or clip_index >= len(slots) or not slots[clip_index].has_clip:
+            return
+
+        clip = slots[clip_index].clip
+        if not bool(getattr(clip, 'is_midi_clip', False)):
+            return
+        if self._decoupled_automation_info(clip):
+            self._debug_log("Loop multiplication is unavailable while automation is decoupled.")
+            return
+
+        loop_start = float(clip.loop_start)
+        loop_end = float(clip.loop_end)
+        loop_length = loop_end - loop_start
+        if loop_length <= 0.000001:
+            return
+
+        clip_start = min(float(clip.start_time), float(clip.start_marker), loop_start) - self.clip_length_trick
+        clip_end = max(loop_end, float(clip.end_marker), float(clip.length)) + self.clip_length_trick
+        notes = clip.get_notes_extended(0, 128, clip_start, clip_end - clip_start)
+        target_loop_end = loop_start + loop_length * 2.0
+
+        self._begin_selected_clip_update_batch()
+        undo_step_started = self._begin_undo_step()
+        try:
+            changed_notes = False
+            for note in notes:
+                note_start = float(note.start_time)
+                if loop_start <= note_start < loop_end:
+                    note.start_time = loop_start + (note_start - loop_start) * 2.0
+                    note.duration = max(0.0001, float(note.duration) * 2.0)
+                    changed_notes = True
+
+            # Live requires the complete fetched collection here. Updating the
+            # existing note objects preserves note IDs and Live-owned MPE data.
+            if changed_notes:
+                clip.apply_note_modifications(notes)
+            clip.loop_end = target_loop_end
+            if float(clip.end_marker) < target_loop_end:
+                clip.end_marker = target_loop_end
+        except Exception as e:
+            self._debug_log("Error in _multiply_loop_by_two: {}".format(str(e)))
+            raise
+        finally:
+            self._end_undo_step(undo_step_started)
+            self._end_selected_clip_update_batch()
+
+    def _set_midi_clip_looping(self, track_index, clip_index, looping):
+        tracks = list(self.song().tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            return
+        slots = list(tracks[track_index].clip_slots)
+        if clip_index < 0 or clip_index >= len(slots) or not slots[clip_index].has_clip:
+            return
+        clip = slots[clip_index].clip
+        if not bool(getattr(clip, 'is_midi_clip', False)):
+            return
+
+        undo_step_started = self._begin_undo_step()
+        try:
+            clip.looping = bool(looping)
+        finally:
+            self._end_undo_step(undo_step_started)
 
     def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
         tracks = list(self.song().tracks)
@@ -19870,6 +20025,8 @@ class Tap(ControlSurface):
             clip.add_loop_end_listener(self.send_selected_clip_metadata)
         if not clip.loop_start_has_listener(self.send_selected_clip_metadata):
             clip.add_loop_start_listener(self.send_selected_clip_metadata)
+        if hasattr(clip, "add_looping_listener") and (not hasattr(clip, "looping_has_listener") or not clip.looping_has_listener(self.send_selected_clip_metadata)):
+            clip.add_looping_listener(self.send_selected_clip_metadata)
         if not clip.signature_denominator_has_listener(self.send_selected_clip_metadata):
             clip.add_signature_denominator_listener(self.send_selected_clip_metadata)
         if not clip.signature_numerator_has_listener(self.send_selected_clip_metadata):
@@ -19886,6 +20043,8 @@ class Tap(ControlSurface):
             clip.remove_loop_end_listener(self.send_selected_clip_metadata)
         if clip.loop_start_has_listener(self.send_selected_clip_metadata):
             clip.remove_loop_start_listener(self.send_selected_clip_metadata)
+        if hasattr(clip, "remove_looping_listener") and (not hasattr(clip, "looping_has_listener") or clip.looping_has_listener(self.send_selected_clip_metadata)):
+            clip.remove_looping_listener(self.send_selected_clip_metadata)
         if clip.signature_denominator_has_listener(self.send_selected_clip_metadata):
             clip.remove_signature_denominator_listener(self.send_selected_clip_metadata)
         if clip.signature_numerator_has_listener(self.send_selected_clip_metadata):
@@ -20968,6 +21127,10 @@ class Tap(ControlSurface):
                             ])
                     else:
                         note_data.append(0)
+
+                    # The selected MIDI clip's loop switch follows the variable
+                    # Flin record so every earlier field keeps its v35 offset.
+                    note_data.append(1 if bool(getattr(selected_clip, 'looping', True)) else 0)
                     
                     # Send the SysEx message
                     sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(note_data) + (end_byte,)

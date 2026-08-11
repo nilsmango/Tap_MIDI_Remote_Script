@@ -425,6 +425,96 @@ class TransportTests(unittest.TestCase):
         )
         self.assertNotIn("get_all_notes_extended", handler_source)
 
+    def test_loop_multiply_stretches_existing_notes_and_preserves_expression(self):
+        expression = object()
+        inside = type("Note", (), {
+            "note_id": 101,
+            "start_time": 1.0,
+            "duration": 0.5,
+            "expression": expression,
+        })()
+        outside = type("Note", (), {
+            "note_id": 202,
+            "start_time": 5.0,
+            "duration": 0.25,
+            "expression": expression,
+        })()
+
+        class Clip:
+            is_midi_clip = True
+            start_time = 0.0
+            start_marker = 0.0
+            loop_start = 0.0
+            loop_end = 4.0
+            end_marker = 4.0
+            length = 6.0
+
+            def get_notes_extended(self, *_args):
+                return [inside, outside]
+
+            def apply_note_modifications(self, notes):
+                self.applied = tuple(notes)
+
+        clip = Clip()
+        slot = type("Slot", (), {"has_clip": True, "clip": clip})()
+        track = type("Track", (), {"clip_slots": [slot]})()
+
+        class Harness:
+            clip_length_trick = 110.0
+            _multiply_loop_by_two = extracted_method("_multiply_loop_by_two")
+
+            def song(self):
+                return type("Song", (), {"tracks": [track]})()
+
+            def _decoupled_automation_info(self, _clip):
+                return None
+
+            def _begin_selected_clip_update_batch(self):
+                pass
+
+            def _end_selected_clip_update_batch(self):
+                pass
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        Harness()._multiply_loop_by_two(0, 0)
+
+        self.assertEqual((inside.start_time, inside.duration), (2.0, 1.0))
+        self.assertEqual((outside.start_time, outside.duration), (5.0, 0.25))
+        self.assertEqual(clip.loop_end, 8.0)
+        self.assertEqual(clip.end_marker, 8.0)
+        self.assertEqual(clip.applied, (inside, outside))
+        self.assertIs(inside.expression, expression)
+
+    def test_track_input_state_codes_include_audio_arm_state(self):
+        class Harness:
+            _track_input_state_codes = extracted_method("_track_input_state_codes")
+
+        def track(has_audio, armed, grouped=False, group=False):
+            slots = [type("Slot", (), {"is_group_slot": group})()]
+            return type("Track", (), {
+                "has_audio_input": has_audio,
+                "arm": armed,
+                "is_grouped": grouped,
+                "clip_slots": slots,
+            })()
+
+        states = Harness()._track_input_state_codes([
+            track(False, False),
+            track(True, False),
+            track(True, True),
+            track(True, True, grouped=True),
+            track(False, False, group=True),
+        ])
+        self.assertEqual(states, ["0", "1", "5", "6", "2"])
+
     def test_cut_paste_moves_original_note_ids_and_expression(self):
         expression = object()
         notes = [
