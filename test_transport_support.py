@@ -58,6 +58,52 @@ class NoteCodecHarness:
     _note_record_flags = extracted_method("_note_record_flags")
 
 
+class NoteTransferHarness:
+    clip_length_trick = 110.0
+    _handle_note_transfer_command = extracted_method("_handle_note_transfer_command")
+    _from_3_7bit_magnitude = extracted_method("_from_3_7bit_magnitude")
+    _from_5_7bit_bytes = extracted_method("_from_5_7bit_bytes")
+
+    def __init__(self, clip):
+        slot = type("Slot", (), {"has_clip": True, "clip": clip})()
+        track = type("Track", (), {"clip_slots": [slot]})()
+        self._song = type("Song", (), {"tracks": [track]})()
+        self.results = []
+        self.logs = []
+
+    def song(self):
+        return self._song
+
+    def _mutator_allows_source_note_time(self, _clip, _time):
+        return True
+
+    def _send_note_add_result(self, transaction_id, success, error_code, note_ids):
+        self.results.append((transaction_id, success, error_code, list(note_ids)))
+
+    def _debug_log(self, message):
+        self.logs.append(message)
+
+
+def note_transfer_message(operation, transaction_id, destination_ms, note_ids):
+    def wide(value):
+        return [(value >> 14) & 0x7F, (value >> 7) & 0x7F, value & 0x7F]
+
+    def note_id(value):
+        return [(value >> (shift * 7)) & 0x7F for shift in range(5)]
+
+    flags = (1 if operation == "move" else 0) | (2 if destination_ms < 0 else 0)
+    payload = (
+        [flags]
+        + wide(transaction_id)
+        + wide(0)
+        + wide(0)
+        + wide(abs(destination_ms))
+        + wide(len(note_ids))
+        + [byte for value in note_ids for byte in note_id(value)]
+    )
+    return [0xF0, 0x5C, *payload, 0xF7]
+
+
 class FlinColumnHarness:
     _handle_flin_command = extracted_method("_handle_flin_command")
 
@@ -120,6 +166,12 @@ class TransportTests(unittest.TestCase):
         record = [1] * 11
         harness.handle_sysex([0xF0, 14, ord("_"), *record, 0xF7])
         self.assertEqual(harness.received, [[0xF0, 14, *record, 0xF7]])
+
+    def test_single_final_native_note_transfer_is_not_dropped(self):
+        harness = SysExHarness()
+        command = note_transfer_message("duplicate", 9, 2000, [0x12345])
+        harness.handle_sysex([0xF0, 0x5C, ord("_"), *command[2:-1], 0xF7])
+        self.assertEqual(harness.received, [command])
 
     def test_direct_note_records_cannot_be_mistaken_for_chunk_markers(self):
         harness = SysExHarness()
@@ -311,6 +363,103 @@ class TransportTests(unittest.TestCase):
         self.assertIn("if transaction_id is not None:", addition)
         self.assertNotIn("self.send_selected_clip_notes()", addition)
 
+    def test_native_note_duplicate_preserves_live_owned_expression(self):
+        expression = object()
+        note = type("Note", (), {
+            "note_id": 0x12345,
+            "start_time": 1.0,
+            "expression": expression,
+        })()
+
+        class Clip:
+            is_midi_clip = True
+            start_time = 0.0
+            start_marker = 0.0
+            loop_start = 0.0
+            loop_end = 4.0
+            end_marker = 4.0
+            length = 4.0
+
+            def __init__(self):
+                self.notes = [note]
+
+            def get_notes_by_id(self, note_ids):
+                return tuple(item for item in self.notes if item.note_id in note_ids)
+
+            def get_notes_extended(self, _pitch, _pitch_span, start, span):
+                end = start + span
+                return tuple(item for item in self.notes if start <= item.start_time < end)
+
+            def get_all_notes_extended(self):
+                return tuple(self.notes)
+
+            def duplicate_notes_by_id(self, note_ids, destination_time):
+                earliest = min(item.start_time for item in self.notes if item.note_id in note_ids)
+                added = []
+                for source in [item for item in self.notes if item.note_id in note_ids]:
+                    clone = type("Note", (), {
+                        "note_id": source.note_id + 1_000_000,
+                        "start_time": destination_time + source.start_time - earliest,
+                        "expression": source.expression,
+                    })()
+                    self.notes.append(clone)
+                    added.append(clone.note_id)
+                return tuple(added)
+
+        clip = Clip()
+        harness = NoteTransferHarness(clip)
+        harness._handle_note_transfer_command(
+            note_transfer_message("duplicate", 7, 3000, [note.note_id])
+        )
+
+        self.assertEqual(harness.results, [(7, True, 0, [note.note_id + 1_000_000])])
+        self.assertEqual(clip.notes[-1].start_time, 3.0)
+        self.assertIs(clip.notes[-1].expression, expression)
+
+        handler_source = ast.get_source_segment(
+            SOURCE.read_text(encoding="utf-8"),
+            next(
+                node for node in tap_class_node().body
+                if isinstance(node, ast.FunctionDef) and node.name == "_handle_note_transfer_command"
+            ),
+        )
+        self.assertNotIn("get_all_notes_extended", handler_source)
+
+    def test_cut_paste_moves_original_note_ids_and_expression(self):
+        expression = object()
+        notes = [
+            type("Note", (), {"note_id": 11, "start_time": 1.0, "expression": expression})(),
+            type("Note", (), {"note_id": 22, "start_time": 1.5, "expression": expression})(),
+        ]
+
+        class Clip:
+            is_midi_clip = True
+            start_time = 0.0
+            start_marker = 0.0
+            loop_start = 0.0
+            loop_end = 8.0
+            end_marker = 8.0
+            length = 8.0
+
+            def get_notes_by_id(self, note_ids):
+                return tuple(item for item in notes if item.note_id in note_ids)
+
+            def get_notes_extended(self, *_args):
+                return tuple(notes)
+
+            def apply_note_modifications(self, modified):
+                self.applied = tuple(modified)
+
+        clip = Clip()
+        harness = NoteTransferHarness(clip)
+        harness._handle_note_transfer_command(
+            note_transfer_message("move", 8, 4000, [11, 22])
+        )
+
+        self.assertEqual(harness.results, [(8, True, 0, [11, 22])])
+        self.assertEqual([item.start_time for item in clip.applied], [4.0, 4.5])
+        self.assertTrue(all(item.expression is expression for item in clip.applied))
+
     def test_groove_mutations_are_chunk_capable(self):
         harness = SysExHarness()
         harness.handle_sysex([0xF0, 0x60, ord("$"), 1, 2, 0xF7])
@@ -328,7 +477,14 @@ class TransportTests(unittest.TestCase):
             "_send_scene_edit_result",
         ):
             self.assertNotIn(removed_name, source)
-        self.assertNotIn("message[1] == 0x5C", source)
+        transfer_source = ast.get_source_segment(
+            source,
+            next(
+                node for node in tap_class_node().body
+                if isinstance(node, ast.FunctionDef) and node.name == "_handle_note_transfer_command"
+            ),
+        )
+        self.assertNotIn("scene_metadata", transfer_source)
 
     def test_empty_triggered_slots_use_a_distinct_non_clip_state(self):
         method = next(

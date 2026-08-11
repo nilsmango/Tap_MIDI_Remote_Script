@@ -2426,7 +2426,7 @@ class Tap(ControlSurface):
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 88, 96)
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 88, 92, 96)
     SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
     SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 1048576
     SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {
@@ -2434,7 +2434,7 @@ class Tap(ControlSurface):
         35: 65536, 36: 65536,
         49: 1048576, 50: 1048576, 51: 65536,
         55: 262144, 57: 262144, 58: 262144,
-        60: 262144, 62: 262144,
+        60: 262144, 62: 262144, 92: 524288,
         82: 524288, 88: 262144, 96: 65536,
     }
     SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
@@ -12042,6 +12042,132 @@ class Tap(ControlSurface):
             0x5B,
         )
 
+    def _handle_note_transfer_command(self, message):
+        """Duplicate or move existing note IDs without recreating their MPE data."""
+        transaction_id = None
+        try:
+            payload = list(message[2:-1])
+            if len(payload) < 16:
+                return
+
+            flags = int(payload[0])
+            transaction_id = self._from_3_7bit_magnitude(payload, 1)
+            track_index = self._from_3_7bit_magnitude(payload, 4)
+            scene_index = self._from_3_7bit_magnitude(payload, 7)
+            destination_magnitude = self._from_3_7bit_magnitude(payload, 10)
+            note_count = self._from_3_7bit_magnitude(payload, 13)
+            if flags & ~0x03 or transaction_id < 0 or note_count <= 0:
+                self._send_note_add_result(transaction_id, False, 1, [])
+                return
+            expected_length = 16 + (note_count * 5)
+            if len(payload) != expected_length:
+                self._send_note_add_result(transaction_id, False, 1, [])
+                return
+
+            destination_time = destination_magnitude / 1000.0
+            if flags & 0x02:
+                destination_time = -destination_time
+            note_ids = [
+                self._from_5_7bit_bytes(payload, 16 + (index * 5))
+                for index in range(note_count)
+            ]
+            if len(set(note_ids)) != note_count:
+                self._send_note_add_result(transaction_id, False, 1, [])
+                return
+
+            song = self.song()
+            if track_index >= len(song.tracks):
+                self._send_note_add_result(transaction_id, False, 2, [])
+                return
+            track = song.tracks[track_index]
+            if scene_index >= len(track.clip_slots):
+                self._send_note_add_result(transaction_id, False, 2, [])
+                return
+            clip_slot = track.clip_slots[scene_index]
+            if not clip_slot.has_clip or not clip_slot.clip.is_midi_clip:
+                self._send_note_add_result(transaction_id, False, 2, [])
+                return
+            clip = clip_slot.clip
+
+            all_notes_for_move = None
+            if flags & 0x01:
+                clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+                clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
+                all_notes_for_move = clip.get_notes_extended(0, 128, clip_start, clip_length)
+                requested_ids = set(note_ids)
+                source_notes = [
+                    note for note in all_notes_for_move
+                    if int(note.note_id) in requested_ids
+                ]
+            elif hasattr(clip, "get_notes_by_id"):
+                source_notes = list(clip.get_notes_by_id(tuple(note_ids)))
+            else:
+                clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+                clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
+                source_notes = [
+                    note for note in clip.get_notes_extended(0, 128, clip_start, clip_length)
+                    if int(note.note_id) in set(note_ids)
+                ]
+            source_by_id = {int(note.note_id): note for note in source_notes}
+            if len(source_by_id) != note_count or any(note_id not in source_by_id for note_id in note_ids):
+                self._send_note_add_result(transaction_id, False, 3, [])
+                return
+            if any(not self._mutator_allows_source_note_time(clip, note.start_time) for note in source_notes):
+                self._send_note_add_result(transaction_id, False, 3, [])
+                return
+
+            earliest = min(note.start_time for note in source_notes)
+            if flags & 0x01:
+                delta = destination_time - earliest
+                for note in source_notes:
+                    target_time = note.start_time + delta
+                    if not self._mutator_allows_source_note_time(clip, target_time):
+                        self._send_note_add_result(transaction_id, False, 3, [])
+                        return
+                for note in source_notes:
+                    note.start_time += delta
+                # Match Tap's proven ordinary note-move path exactly. Some Live
+                # control-surface builds reject an ID-only subset here even
+                # though the public LOM documents subsets as valid.
+                clip.apply_note_modifications(all_notes_for_move)
+                result_ids = note_ids
+            else:
+                source_start_span = max(note.start_time for note in source_notes) - earliest
+                destination_query_start = destination_time - 0.000001
+                destination_query_span = max(0.001, source_start_span + 0.000002)
+                before_notes = list(clip.get_notes_extended(
+                    0,
+                    128,
+                    destination_query_start,
+                    destination_query_span,
+                ))
+                before_ids = {int(note.note_id) for note in before_notes}
+                returned_ids = clip.duplicate_notes_by_id(
+                    note_ids=tuple(note_ids),
+                    destination_time=destination_time,
+                )
+                try:
+                    result_ids = [int(note_id) for note_id in (returned_ids or ())]
+                except (TypeError, ValueError):
+                    result_ids = []
+                if len(result_ids) != note_count:
+                    after_notes = list(clip.get_notes_extended(
+                        0,
+                        128,
+                        destination_query_start,
+                        destination_query_span,
+                    ))
+                    result_ids = [int(note.note_id) for note in after_notes if int(note.note_id) not in before_ids]
+                if len(result_ids) != note_count:
+                    self._send_note_add_result(transaction_id, False, 4, [])
+                    return
+
+            self._send_note_add_result(transaction_id, True, 0, result_ids)
+        except Exception as error:
+            self._debug_log("Note transfer failed: {}".format(str(error)))
+            if transaction_id is not None:
+                self._send_note_add_result(transaction_id, False, 5, [])
+
     def _duplicate_button_value(self, value):
         if value != 0:
             self._duplicate_clip()
@@ -14341,7 +14467,10 @@ class Tap(ControlSurface):
                 if buffer_info is None:
                     record_width = {14: 11, 15: 5, 16: 16}.get(manufacturer_id)
                     final_length = len(message[3:-1])
-                    if record_width is None or final_length <= 0 or final_length % record_width != 0:
+                    if manufacturer_id == 92:
+                        if final_length < 21:
+                            return
+                    elif record_width is None or final_length <= 0 or final_length % record_width != 0:
                         return
                     buffer_info = {"bytes": [], "last_chunk_at": now}
                 chunk = list(message[3:-1])
@@ -14908,6 +15037,9 @@ class Tap(ControlSurface):
                 self._pending_note_add_transaction = None
             else:
                 self._pending_note_add_transaction = (decoded[1][0], decoded[1][1])
+            return
+        if len(message) >= 2 and message[1] == 0x5C:
+            self._handle_note_transfer_command(message)
             return
         if len(message) >= 2 and message[1] == 0x60:
             self._handle_groove_edit(message)
