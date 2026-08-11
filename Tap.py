@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 34
+secret_version_number = 35
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2426,11 +2426,23 @@ class Tap(ControlSurface):
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82)
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 88, 96)
+    SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
+    SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 1048576
+    SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {
+        14: 262144, 15: 262144, 16: 524288,
+        35: 65536, 36: 65536,
+        49: 1048576, 50: 1048576, 51: 65536,
+        55: 262144, 57: 262144, 58: 262144,
+        60: 262144, 62: 262144,
+        82: 524288, 88: 262144, 96: 65536,
+    }
+    SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
     SYSEX_21_BIT_MAX_MAGNITUDE = 0x1FFFFF
     NOTE_FLAG_MUTE = 0x01
     NOTE_FLAG_NEGATIVE_START = 0x02
     NOTE_FLAG_NEGATIVE_DURATION = 0x04
+    NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION = 0x08
     MARKER_ID_MASK = 0x3F
     MARKER_FLAG_NEGATIVE_TIME = 0x40
     DECOUPLED_FLAG_ACTIVE = 0x01
@@ -2491,8 +2503,6 @@ class Tap(ControlSurface):
             self.seq_clip_playing_status = 2
             track_count = 127
             return_count = 12  # Maximum of 12 Sends and 12 Returns
-            max_clip_slots = 800  # Adjust this number based on your needs
-            self.playing_position_listeners = [None] * max_clip_slots
             self._playing_position_listener_clips = {}
             self._playing_note_cache = {}
             self._playing_note_cache_listeners = {}
@@ -2672,6 +2682,13 @@ class Tap(ControlSurface):
             self._clip_color_listeners = {}
             self._clip_listener_track_slots = {}
             self._clip_slot_color_map = {}
+            self._pending_clip_slot_deltas = {}
+            self._clip_slot_delta_scheduled = False
+            self._project_snapshot_generation = 0
+            self._groove_pool_listener_bindings = []
+            self._groove_detail_listener_bindings = []
+            self._actively_edited_groove_index = None
+            self._pending_note_add_transaction = None
             self._track_list_signature = None
             self._last_group_fold_states = None
             self._last_group_hidden_states = None
@@ -2725,15 +2742,17 @@ class Tap(ControlSurface):
             self._last_audio_clip_state = None
             self._last_audio_clip_position_state_time = 0.0
             self._last_audio_clip_action_result = None
+            self._sysex_buffers = {}
+            self._last_periodic_integrity_check = 0.0
             self.periodic_timer = 1
             # connection check button
-            connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
-            connection_check_button.add_value_listener(self._connection_established)
+            self.connection_check_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 94)
+            self.connection_check_button.add_value_listener(self._connection_established)
             self.transport_toggle_button = ButtonElement(1, MIDI_CC_TYPE, 0, 116)
             self.transport_toggle_button.add_value_listener(self._transport_toggle_value)
             # send project again button
-            send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
-            send_project_button.add_value_listener(self._send_project)
+            self.send_project_button = ButtonElement(1, MIDI_NOTE_TYPE, 15, 88)
+            self.send_project_button.add_value_listener(self._send_project)
 
             # making a song instance
             self.song_instance = self.song()
@@ -7669,7 +7688,7 @@ class Tap(ControlSurface):
         device_id = 0x01
         name_string = self._sanitize_sysex_text(name_string)
         data = name_string.encode('ascii', errors='ignore')
-        max_chunk_length = 240
+        max_chunk_length = self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH
         if len(data) <= max_chunk_length:
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
             self._send_midi(sys_ex_message)
@@ -8314,10 +8333,10 @@ class Tap(ControlSurface):
                 self._send_current_project_state()
                 self._start_periodic_execution()
             
-            # hack to get new tracks if we have a new song.
-            did_send_new_song = self._check_for_new_song()
-            if was_initialized and not did_send_new_song:
-                self._send_current_project_state()
+            # Liveness handshakes are ACK-only after initialization. A Set
+            # replacement performs its own explicit state send.
+            if was_initialized:
+                self._check_for_new_song()
 
     def _transport_toggle_value(self, value):
         if value:
@@ -8486,13 +8505,23 @@ class Tap(ControlSurface):
             self._check_for_new_song()
         else:
             self._check_for_follow_action_song_change()
-        self._sync_follow_actions_to_track_topology()
-        if self._has_follow_action_runtime_work():
+
+        now = time.monotonic()
+        has_follow_work = self._has_follow_action_runtime_work()
+        if has_follow_work:
+            self._sync_follow_actions_to_track_topology()
             self._reconcile_follow_action_rules()
             self._sync_follow_action_runtime_listeners()
-        self._sync_follow_actions_to_transport()
-        self._evaluate_follow_actions()
-        self._evaluate_mutator_regeneration()
+            self._sync_follow_actions_to_transport()
+            self._evaluate_follow_actions()
+        elif now - self._last_periodic_integrity_check >= 1.0:
+            self._sync_follow_actions_to_track_topology()
+
+        if self._has_mutator_clips or self._mutator_clip_presence_dirty or self._queued_mutator_work:
+            self._evaluate_mutator_regeneration()
+
+        if now - self._last_periodic_integrity_check >= 1.0:
+            self._last_periodic_integrity_check = now
         if not self.was_initialized:
             return
         self._send_track_simpler_slice_state()
@@ -8500,7 +8529,6 @@ class Tap(ControlSurface):
         # update clip slots
         # we only need to update clip slots periodically when we are in clip slots view
         # meaning not in the device view
-        now = time.monotonic()
         if self.device_status is False and now - self._last_clip_slot_integrity_check >= 1.0:
             self._last_clip_slot_integrity_check = now
             self._update_clip_slots()
@@ -8549,20 +8577,49 @@ class Tap(ControlSurface):
         except Exception:
             pass
 
+    def _remove_song_listeners(self, song):
+        if song is None:
+            return
+        for listener_name, listener in (
+            ("tracks", self._on_tracks_changed),
+            ("scale_name", self._on_scale_changed),
+            ("root_note", self._on_scale_changed),
+            ("tempo", self._update_tempo),
+            ("swing_amount", self._update_swing_amount),
+            ("metronome", self._update_metronome),
+            ("session_record", self._on_session_record_changed),
+            ("re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed),
+        ):
+            self._remove_song_listener(song, listener_name, listener)
+        try:
+            if hasattr(song, 'remove_is_playing_listener') and (
+                not hasattr(song, 'is_playing_has_listener')
+                or song.is_playing_has_listener(self._on_song_is_playing_changed)
+            ):
+                song.remove_is_playing_listener(self._on_song_is_playing_changed)
+        except Exception:
+            pass
+
     def _ensure_follow_action_song_listeners(self, song):
         if self._follow_action_song_listener_subject is not None and self._follow_action_song_listener_subject != song:
             self._remove_follow_action_song_listeners()
         self._follow_action_song_listener_subject = song
-        self._ensure_song_listener(song, "tracks", self._on_follow_action_topology_changed)
-        self._ensure_song_listener(song, "scenes", self._on_follow_action_topology_changed)
+        self._ensure_song_listener(song, "tracks", self._on_follow_action_track_topology_changed)
+        self._ensure_song_listener(song, "scenes", self._on_follow_action_scene_topology_changed)
 
     def _remove_follow_action_song_listeners(self):
         song = self._follow_action_song_listener_subject
         if song is None:
             return
-        self._remove_song_listener(song, "tracks", self._on_follow_action_topology_changed)
-        self._remove_song_listener(song, "scenes", self._on_follow_action_topology_changed)
+        self._remove_song_listener(song, "tracks", self._on_follow_action_track_topology_changed)
+        self._remove_song_listener(song, "scenes", self._on_follow_action_scene_topology_changed)
         self._follow_action_song_listener_subject = None
+
+    def _on_follow_action_track_topology_changed(self):
+        self._on_follow_action_topology_changed()
+
+    def _on_follow_action_scene_topology_changed(self):
+        self._on_follow_action_topology_changed()
 
     def _on_follow_action_topology_changed(self):
         self._mutator_clip_presence_dirty = True
@@ -8574,6 +8631,7 @@ class Tap(ControlSurface):
     def _on_follow_action_name_changed(self):
         self._mutator_clip_presence_dirty = True
         self._load_follow_actions_from_names()
+        self._sync_follow_action_name_listeners()
         self._sync_follow_action_runtime_listeners()
         self._evaluate_follow_actions()
 
@@ -8608,6 +8666,16 @@ class Tap(ControlSurface):
 
     def _send_current_project_state(self):
         self.old_clips_array = []
+        self._project_snapshot_generation += 1
+        snapshot_generation = self._project_snapshot_generation
+        self._send_sys_ex_message(
+            "B|{}|{}|{}".format(
+                snapshot_generation,
+                len(self.song().tracks),
+                len(self.song().scenes),
+            ),
+            0x56,
+        )
         self._send_transport_state(force=True)
         self._send_session_record_state(force=True)
         self._update_tempo()
@@ -8622,6 +8690,7 @@ class Tap(ControlSurface):
         self._send_selected_device_state()
         self._load_follow_actions_from_names(force_send=True)
         self._update_clip_slots()
+        self._send_sys_ex_message("E|{}".format(snapshot_generation), 0x56)
         self._check_clip_playing_status(force=True)
 
     def _send_mpe_state(self):
@@ -8664,6 +8733,7 @@ class Tap(ControlSurface):
         if current_song == self.song_instance:
             return False
 
+        old_song = self.song_instance
         try:
             if self._note_repeat is not None:
                 self._note_repeat.enabled = False
@@ -8672,6 +8742,13 @@ class Tap(ControlSurface):
         self._note_repeat_last_record_quantization = None
         self._last_note_repeat_feedback = None
         self._remove_all_notes_playing_listeners()
+        self._sysex_buffers.clear()
+        self._unregister_clip_and_audio_listeners()
+        self._remove_groove_listeners()
+        self._remove_follow_action_runtime_listeners()
+        self._remove_follow_action_name_listeners()
+        self._remove_follow_action_song_listeners()
+        self._remove_song_listeners(old_song)
         self.song_instance = current_song
         self._track_list_signature = None
         self._last_group_fold_states = None
@@ -8687,8 +8764,6 @@ class Tap(ControlSurface):
         self._decoupled_automation_recording_active = False
         self._decoupled_automation_recording_snapshots = {}
         self._decoupled_automation_recording_generation += 1
-        self._remove_follow_action_runtime_listeners()
-        self._remove_follow_action_name_listeners()
         self._ensure_follow_action_song_listeners(current_song)
         self._ensure_song_listeners(current_song)
         self._on_selected_track_changed.subject = current_song.view
@@ -8713,6 +8788,7 @@ class Tap(ControlSurface):
         self._has_mutator_clips = False
         self._mutator_clip_presence_dirty = True
         self._remove_follow_action_runtime_listeners()
+        self._remove_groove_listeners()
         self._remove_follow_action_name_listeners()
         self._ensure_follow_action_song_listeners(current_song)
         self._sync_follow_action_name_listeners()
@@ -9216,6 +9292,269 @@ class Tap(ControlSurface):
     def _strip_follow_action_name_marker(self, name):
         return self.FOLLOW_ACTION_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
 
+    def _v35_checked_payload(self, payload):
+        base = str(payload)
+        return "{}|{:08X}".format(base, self._automation_payload_checksum(base))
+
+    def _groove_pool(self):
+        try:
+            return getattr(self.song(), "groove_pool", None)
+        except Exception:
+            return None
+
+    def _selected_clip_for_groove(self):
+        try:
+            slot = self.song().view.highlighted_clip_slot
+            if slot is not None and bool(getattr(slot, "has_clip", False)):
+                return slot.clip
+        except Exception:
+            pass
+        return None
+
+    def _groove_amount(self, groove, property_name):
+        try:
+            return max(0.0, min(1.0, float(getattr(groove, property_name))))
+        except Exception:
+            return 0.0
+
+    def _assigned_groove_index(self, grooves):
+        clip = self._selected_clip_for_groove()
+        if clip is None or not hasattr(clip, "groove"):
+            return None
+        try:
+            assigned = clip.groove
+        except Exception:
+            return None
+        for index, groove in enumerate(grooves):
+            if groove == assigned or self._live_object_identity(groove) == self._live_object_identity(assigned):
+                return index
+        return None
+
+    def _send_groove_pool_state(self):
+        pool = self._groove_pool()
+        if pool is None or not hasattr(pool, "grooves"):
+            header = self._v35_checked_payload("S|0|1.000000||0")
+            self._send_sys_ex_message(header, 0x60)
+            self._send_sys_ex_message("E|0|{:08X}".format(self._automation_payload_checksum(header)), 0x60)
+            return
+        try:
+            grooves = list(pool.grooves)
+            global_amount = max(0.0, min(1.0, float(getattr(pool, "global_amount", 1.0))))
+        except Exception:
+            header = self._v35_checked_payload("S|0|1.000000||0")
+            self._send_sys_ex_message(header, 0x60)
+            self._send_sys_ex_message("E|0|{:08X}".format(self._automation_payload_checksum(header)), 0x60)
+            return
+
+        assigned_index = self._assigned_groove_index(grooves)
+        header = self._v35_checked_payload(
+            "S|1|{:.6f}|{}|{}".format(
+                global_amount,
+                "" if assigned_index is None else assigned_index,
+                len(grooves)
+            )
+        )
+        self._send_sys_ex_message(header, 0x60)
+        wire_records = [header]
+        for index, groove in enumerate(grooves):
+            try:
+                base = int(getattr(groove, "base", 3))
+            except Exception:
+                base = 3
+            record = self._v35_checked_payload("|".join((
+                    "G", str(index), self._escape_sysex_string(getattr(groove, "name", "Groove {}".format(index + 1))),
+                    str(max(0, min(5, base))),
+                    "{:.6f}".format(self._groove_amount(groove, "quantization_amount")),
+                    "{:.6f}".format(self._groove_amount(groove, "random_amount")),
+                    "{:.6f}".format(self._groove_amount(groove, "timing_amount")),
+                    "{:.6f}".format(self._groove_amount(groove, "velocity_amount")),
+                )))
+            wire_records.append(record)
+            self._send_sys_ex_message(record, 0x60)
+        aggregate_checksum = self._automation_payload_checksum("\n".join(wire_records))
+        self._send_sys_ex_message("E|{}|{:08X}".format(len(grooves), aggregate_checksum), 0x60)
+
+    def _remove_groove_listener_bindings(self, bindings):
+        for owner, property_name, listener in list(bindings):
+            try:
+                has_listener = getattr(owner, "{}_has_listener".format(property_name), None)
+                remove_listener = getattr(owner, "remove_{}_listener".format(property_name), None)
+                if remove_listener and (not has_listener or has_listener(listener)):
+                    remove_listener(listener)
+            except Exception:
+                pass
+        bindings[:] = []
+
+    def _remove_groove_listeners(self):
+        self._remove_groove_listener_bindings(self._groove_pool_listener_bindings)
+        self._remove_groove_listener_bindings(self._groove_detail_listener_bindings)
+
+    def _make_groove_pool_listener(self, topology=False):
+        def listener():
+            if topology:
+                self._sync_groove_pool_listeners()
+            self._send_groove_pool_state()
+        return listener
+
+    def _sync_groove_detail_listeners(self):
+        self._remove_groove_listener_bindings(self._groove_detail_listener_bindings)
+        pool = self._groove_pool()
+        if pool is None:
+            return
+        grooves = list(getattr(pool, "grooves", ()))
+        target_index = self._actively_edited_groove_index
+        if target_index is None:
+            target_index = self._assigned_groove_index(grooves)
+        if target_index is None or not 0 <= int(target_index) < len(grooves):
+            return
+        groove = grooves[int(target_index)]
+        for property_name in (
+            "name", "base", "quantization_amount", "random_amount", "timing_amount", "velocity_amount"
+        ):
+            add_listener = getattr(groove, "add_{}_listener".format(property_name), None)
+            if not add_listener:
+                continue
+            listener = self._make_groove_pool_listener(False)
+            try:
+                add_listener(listener)
+                self._groove_detail_listener_bindings.append((groove, property_name, listener))
+            except Exception:
+                pass
+
+    def _sync_groove_pool_listeners(self):
+        self._remove_groove_listener_bindings(self._groove_pool_listener_bindings)
+        pool = self._groove_pool()
+        if pool is None:
+            self._sync_groove_detail_listeners()
+            return
+        for property_name, topology in (("grooves", True), ("global_amount", False)):
+            add_listener = getattr(pool, "add_{}_listener".format(property_name), None)
+            if not add_listener:
+                continue
+            listener = self._make_groove_pool_listener(topology)
+            try:
+                add_listener(listener)
+                self._groove_pool_listener_bindings.append((pool, property_name, listener))
+            except Exception:
+                pass
+        self._sync_groove_detail_listeners()
+
+    def _send_groove_edit_result(self, transaction_id, success, error_code):
+        self._send_sys_ex_message(
+            "{}|{}|{}".format(int(transaction_id), 1 if success else 0, int(error_code)),
+            0x61
+        )
+
+    def _handle_groove_focus(self, message):
+        try:
+            payload = bytes(message[2:-1]).decode("ascii", errors="strict")
+            fields = payload.split("|")
+            if len(fields) != 2 or fields[0] != "Q":
+                return
+            index = int(fields[1])
+            self._actively_edited_groove_index = index if index >= 0 else None
+            self._sync_groove_detail_listeners()
+            self._send_groove_pool_state()
+        except Exception:
+            pass
+
+    def _handle_groove_edit(self, message):
+        transaction_id = 0
+        try:
+            payload = bytes(message[2:-1]).decode("ascii", errors="strict")
+            fields = self._split_escaped_sysex_fields(payload, "|")
+            if len(fields) != 11:
+                self._send_groove_edit_result(0, False, 1)
+                return
+            expected_checksum = int(fields[10], 16)
+            if expected_checksum != self._automation_payload_checksum("|".join(fields[:10])):
+                self._send_groove_edit_result(0, False, 1)
+                return
+            transaction_id = int(fields[0])
+            assigned_index = None if fields[1] == "" else int(fields[1])
+            global_amount = float(fields[2])
+            edit_index = None if fields[3] == "" else int(fields[3])
+            name = self._unescape_sysex_string(fields[4]).strip()
+            base = int(fields[5])
+            amounts = tuple(float(value) for value in fields[6:10])
+        except Exception:
+            self._send_groove_edit_result(transaction_id, False, 1)
+            return
+
+        pool = self._groove_pool()
+        clip = self._selected_clip_for_groove()
+        if pool is None or clip is None or not hasattr(pool, "grooves") or not hasattr(clip, "groove"):
+            self._send_groove_edit_result(transaction_id, False, 2)
+            return
+        grooves = list(pool.grooves)
+        if assigned_index is not None and not 0 <= assigned_index < len(grooves):
+            self._send_groove_edit_result(transaction_id, False, 3)
+            return
+        if edit_index is not None and not 0 <= edit_index < len(grooves):
+            self._send_groove_edit_result(transaction_id, False, 3)
+            return
+        if not 0.0 <= global_amount <= 1.0 or not 0 <= base <= 5 or any(not 0.0 <= value <= 1.0 for value in amounts):
+            self._send_groove_edit_result(transaction_id, False, 3)
+            return
+
+        old_global = getattr(pool, "global_amount", 1.0)
+        old_assigned = getattr(clip, "groove", None)
+        edited_groove = grooves[edit_index] if edit_index is not None else None
+        old_groove_values = {}
+        if edited_groove is not None:
+            for property_name in (
+                "name", "base", "quantization_amount", "random_amount", "timing_amount", "velocity_amount"
+            ):
+                try:
+                    old_groove_values[property_name] = getattr(edited_groove, property_name)
+                except Exception:
+                    pass
+
+        song = self.song()
+        undo_started = False
+        try:
+            if hasattr(song, "begin_undo_step"):
+                song.begin_undo_step()
+                undo_started = True
+            pool.global_amount = global_amount
+            clip.groove = None if assigned_index is None else grooves[assigned_index]
+            if edited_groove is not None:
+                edited_groove.name = name
+                edited_groove.base = base
+                for property_name, value in zip(
+                    ("quantization_amount", "random_amount", "timing_amount", "velocity_amount"),
+                    amounts
+                ):
+                    if not hasattr(edited_groove, property_name):
+                        raise RuntimeError("groove property {} is unavailable".format(property_name))
+                    setattr(edited_groove, property_name, value)
+        except Exception as error:
+            try:
+                pool.global_amount = old_global
+                clip.groove = old_assigned
+            except Exception:
+                pass
+            if edited_groove is not None:
+                for property_name, old_value in old_groove_values.items():
+                    try:
+                        setattr(edited_groove, property_name, old_value)
+                    except Exception:
+                        pass
+            self._debug_log("Groove edit failed: {}".format(error))
+            self._send_groove_edit_result(transaction_id, False, 4)
+            return
+        finally:
+            if undo_started and hasattr(song, "end_undo_step"):
+                try:
+                    song.end_undo_step()
+                except Exception:
+                    pass
+
+        self._actively_edited_groove_index = edit_index
+        self._sync_groove_detail_listeners()
+        self._send_groove_pool_state()
+        self._send_groove_edit_result(transaction_id, True, 0)
+
     def _strip_decoupled_automation_name_marker(self, name):
         return self.DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE.sub("", str(name or "")).rstrip()
 
@@ -9260,10 +9599,10 @@ class Tap(ControlSurface):
                 return None
             for record in filter(None, fields["c"].split(",")):
                 parts = record.split(":")
-                if len(parts) not in (10, 11):
+                if len(parts) not in (10, 11, 12):
                     return None
-                page = int(parts[0]) if len(parts) == 11 else 0
-                offset = 1 if len(parts) == 11 else 0
+                page = int(parts[0]) if len(parts) in (11, 12) else 0
+                offset = 1 if len(parts) in (11, 12) else 0
                 info["columns"].append({
                     "page": max(-64, min(63, page)),
                     "id": max(0, min(15, int(parts[offset]))),
@@ -9276,6 +9615,7 @@ class Tap(ControlSurface):
                     "pad_offset": max(-63, min(63, int(parts[offset + 7]))),
                     "velocity": max(1, min(127, int(parts[offset + 8]))),
                     "probability": max(0, min(100, int(parts[offset + 9]))),
+                    "velocity_deviation": max(-127, min(127, int(parts[offset + 10]))) if len(parts) == 12 else 0,
                 })
             keys = [(column["page"], column["id"]) for column in info["columns"]]
             if len(keys) != len(set(keys)):
@@ -9304,10 +9644,12 @@ class Tap(ControlSurface):
             column.get("pad_offset", 0),
             column.get("velocity", 100),
             column.get("probability", 100),
+            column.get("velocity_deviation", 0),
         )) for column in info.get("columns", []) if (
             column.get("active", False)
             or int(column.get("velocity", default_velocity)) != default_velocity
             or int(column.get("probability", 100)) != 100
+            or int(column.get("velocity_deviation", 0)) != 0
         ))
         return "[TapFlin:v1|k={}|q={}|b={}|r={}|n={}|i={}|h={}|m={}|o={}|v={}|p={}|s={}|f={}|l={}|c={}]".format(
             info.get("kind", 0), info.get("quantization", 1), info.get("base_quarters", 16),
@@ -10318,21 +10660,29 @@ class Tap(ControlSurface):
         remaining = max(0.0001, info["note_length"] - base_offset)
         return max(0.0001, min(float(duration), remaining))
 
-    def _make_repeated_note_specs_from_values(self, pitch, start_time, duration, velocity, mute, probability, info):
+    def _make_repeated_note_specs_from_values(self, pitch, start_time, duration, velocity, mute, probability, info, velocity_deviation=0):
         specs = []
         base_offset = self._positive_mod(float(start_time) - info["note_start"], info["note_length"])
         clipped_duration = self._duration_inside_note_loop(start_time, duration, info)
         for repeat_index in range(self._repeat_count_for_decoupled_info(info)):
             start_time = info["note_start"] + (float(repeat_index) * info["note_length"]) + base_offset
             if start_time < info["physical_end"] - 0.000001:
-                specs.append(MidiNoteSpecification(
+                values = dict(
                     pitch=int(pitch),
                     start_time=start_time,
                     duration=clipped_duration,
                     velocity=int(velocity),
                     mute=bool(mute),
-                    probability=float(probability)
-                ))
+                    probability=float(probability),
+                )
+                try:
+                    spec = MidiNoteSpecification(
+                        velocity_deviation=max(-127, min(127, int(velocity_deviation))),
+                        **values
+                    )
+                except (TypeError, AttributeError):
+                    spec = MidiNoteSpecification(**values)
+                specs.append(spec)
         return specs
 
     def _make_repeated_note_specs(self, base_note, info):
@@ -10343,7 +10693,8 @@ class Tap(ControlSurface):
             getattr(base_note, "velocity", 100),
             getattr(base_note, "mute", False),
             getattr(base_note, "probability", 1.0),
-            info
+            info,
+            getattr(base_note, "velocity_deviation", 0),
         )
 
     def _rewrite_decoupled_note_copies(self, clip, info):
@@ -11680,6 +12031,17 @@ class Tap(ControlSurface):
                 # grid (int 1 == 1/4, 2 == 1/8, 5 == 1/16, 8 = 1/32), strength (0.50 == 50%)
                 clip.quantize(quantize_grid_value, quantize_strength_value)
 
+    def _send_note_add_result(self, transaction_id, success, error_code, note_ids):
+        self._send_sys_ex_message(
+            "{}|{}|{}|{}".format(
+                int(transaction_id),
+                1 if success else 0,
+                int(error_code),
+                ','.join(str(int(note_id)) for note_id in note_ids),
+            ),
+            0x5B,
+        )
+
     def _duplicate_button_value(self, value):
         if value != 0:
             self._duplicate_clip()
@@ -11901,8 +12263,6 @@ class Tap(ControlSurface):
                 pass
             self._remove_playing_note_cache_listener(old_clip)
             self._playing_position_listener_clips.pop(clip_index, None)
-            if clip_index < len(self.playing_position_listeners):
-                self.playing_position_listeners[clip_index] = None
 
         for clip_index, clip in desired_clips.items():
             existing = self._playing_position_listener_clips.get(clip_index)
@@ -11912,11 +12272,6 @@ class Tap(ControlSurface):
                     if not clip.playing_position_has_listener(listener):
                         clip.add_playing_position_listener(listener)
                     self._playing_position_listener_clips[clip_index] = (clip, listener)
-                    if clip_index >= len(self.playing_position_listeners):
-                        self.playing_position_listeners.extend(
-                            [None] * (clip_index + 1 - len(self.playing_position_listeners))
-                        )
-                    self.playing_position_listeners[clip_index] = listener
                 except Exception as e:
                     self._debug_log("Exception adding clip position listener: {}".format(str(e)))
 
@@ -11988,8 +12343,6 @@ class Tap(ControlSurface):
             except Exception:
                 pass
             self._remove_playing_note_cache_listener(clip)
-            if clip_index < len(self.playing_position_listeners):
-                self.playing_position_listeners[clip_index] = None
         self._playing_position_listener_clips.clear()
 
         # Normally emptied above; this also covers a note listener whose
@@ -12750,24 +13103,24 @@ class Tap(ControlSurface):
         except ValueError:
             return None
 
-    def _make_clip_has_clip_listener(self, track):
+    def _make_clip_has_clip_listener(self, track, scene_index, clip_slot):
         def listener():
-            self._on_clip_has_clip_changed(track)
+            self._on_clip_has_clip_changed(track, scene_index, clip_slot)
         return listener
 
-    def _make_clip_triggered_listener(self, track):
+    def _make_clip_triggered_listener(self, track, scene_index, clip_slot):
         def listener():
-            self._on_clip_playing_status_changed(track)
+            self._on_clip_playing_status_changed(track, scene_index, clip_slot)
         return listener
 
-    def _make_clip_playing_listener(self, track):
+    def _make_clip_playing_listener(self, track, scene_index, clip_slot):
         def listener():
-            self._on_clip_playing_status_changed(track)
+            self._on_clip_playing_status_changed(track, scene_index, clip_slot)
         return listener
 
-    def _make_clip_color_listener(self, track):
+    def _make_clip_color_listener(self, track, scene_index, clip_slot):
         def listener():
-            self._on_clip_has_clip_changed(track)
+            self._queue_clip_slot_delta(track, scene_index, clip_slot)
         return listener
 
     def _add_clip_color_listener(self, clip, listener):
@@ -12782,7 +13135,7 @@ class Tap(ControlSurface):
             return False
 
     def _sync_clip_color_listeners_for_track(self, track):
-        for clip_slot in track.clip_slots:
+        for scene_index, clip_slot in enumerate(track.clip_slots):
             if clip_slot is None:
                 continue
             if clip_slot.has_clip:
@@ -12793,7 +13146,7 @@ class Tap(ControlSurface):
                     if old_listener and liveobj_valid(previous_clip) and previous_clip.color_has_listener(old_listener):
                         previous_clip.remove_color_listener(old_listener)
                 if current_clip not in self._clip_color_listeners:
-                    listener = self._make_clip_color_listener(track)
+                    listener = self._make_clip_color_listener(track, scene_index, clip_slot)
                     if self._add_clip_color_listener(current_clip, listener):
                         self._clip_color_listeners[current_clip] = listener
                 self._clip_slot_color_map[clip_slot] = current_clip
@@ -12858,7 +13211,7 @@ class Tap(ControlSurface):
             track_id = id(track)
             current_track_ids.add(track_id)
 
-            for clip_slot in track.clip_slots:
+            for scene_index, clip_slot in enumerate(track.clip_slots):
                 if clip_slot is None:
                     continue
                 expected_clip_slots.add(clip_slot)
@@ -12866,21 +13219,21 @@ class Tap(ControlSurface):
                 listener_key = (clip_slot, 'has_clip')
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
-                    listener = self._make_clip_has_clip_listener(track)
+                    listener = self._make_clip_has_clip_listener(track, scene_index, clip_slot)
                     if self._add_clip_slot_listener(clip_slot, 'has_clip', listener):
                         self._clip_slot_listeners[listener_key] = listener
 
                 listener_key = (clip_slot, 'is_triggered')
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
-                    listener = self._make_clip_triggered_listener(track)
+                    listener = self._make_clip_triggered_listener(track, scene_index, clip_slot)
                     if self._add_clip_slot_listener(clip_slot, 'is_triggered', listener):
                         self._clip_slot_listeners[listener_key] = listener
 
                 listener_key = (clip_slot, 'is_playing')
                 expected_listener_keys.add(listener_key)
                 if listener_key not in self._clip_slot_listeners:
-                    listener = self._make_clip_playing_listener(track)
+                    listener = self._make_clip_playing_listener(track, scene_index, clip_slot)
                     if self._add_clip_slot_listener(clip_slot, 'is_playing', listener):
                         self._clip_slot_listeners[listener_key] = listener
 
@@ -12911,6 +13264,9 @@ class Tap(ControlSurface):
         self._registered_track_ids = current_track_ids
 
     def _unregister_clip_and_audio_listeners(self):
+        self._pending_clip_slot_deltas = {}
+        self._clip_slot_delta_scheduled = False
+        self._pending_note_add_transaction = None
         for (clip_slot, listener_kind), listener in list(self._clip_slot_listeners.items()):
             self._remove_clip_slot_listener(clip_slot, listener_kind, listener)
 
@@ -12944,14 +13300,17 @@ class Tap(ControlSurface):
 
         return different_indexes
 
-    def _on_clip_playing_status_changed(self, track=None):
+    def _on_clip_playing_status_changed(self, track=None, scene_index=None, clip_slot=None):
         # self.log_message("clip playing status changed")
         self._refresh_parameter_metadata_on_automation_change()
         self._send_audio_clip_state()
         if track:
             track_index = self._get_track_index(track)
             if track_index is not None:
-                self._update_clip_slots(track_index)
+                if scene_index is not None and clip_slot is not None:
+                    self._queue_clip_slot_delta(track, scene_index, clip_slot)
+                else:
+                    self._update_clip_slots(track_index)
                 self._activate_follow_actions_for_playing_clips(track_index)
                 self._evaluate_mutator_regeneration(track_index)
                 return
@@ -12960,19 +13319,26 @@ class Tap(ControlSurface):
         self._evaluate_mutator_regeneration()
 
     def _activate_follow_actions_for_playing_clips(self, only_track_index=None):
+        if not self._follow_action_rules:
+            return
         self._clear_finished_follow_action_launches()
         try:
-            for track_index, track in enumerate(self.song().tracks):
+            tracks = self.song().tracks
+            for key in tuple(self._follow_action_rules.keys()):
+                if not key or key[0] != "clip":
+                    continue
+                _, track_index, scene_index = key
                 if only_track_index is not None and track_index != only_track_index:
                     continue
-                for scene_index, clip_slot in enumerate(track.clip_slots):
-                    if not clip_slot.has_clip or not clip_slot.is_playing:
-                        continue
-                    key = self._follow_action_key("clip", track_index, scene_index)
-                    if key in self._active_follow_actions:
-                        continue
-                    if key in self._follow_action_rules:
-                        self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
+                if not 0 <= track_index < len(tracks):
+                    continue
+                track = tracks[track_index]
+                if not 0 <= scene_index < len(track.clip_slots):
+                    continue
+                clip_slot = track.clip_slots[scene_index]
+                if (key not in self._active_follow_actions
+                        and clip_slot.has_clip and clip_slot.is_playing):
+                    self._activate_follow_action_for_clip(track_index, scene_index, clip_slot)
         except Exception:
             pass
 
@@ -13090,13 +13456,17 @@ class Tap(ControlSurface):
     def _sync_follow_action_name_listeners(self):
         expected_scene_keys = set()
         expected_clip_keys = set()
-        expected_clip_slot_keys = set()
         expected_clip_timing_keys = set()
 
         try:
             scenes = self.song().scenes
-            for scene in scenes:
+            for scene_index, scene in enumerate(scenes):
                 key = self._live_object_identity(scene)
+                scene_has_marker = bool(self.FOLLOW_ACTION_NAME_MARKER_RE.search(str(getattr(scene, "name", ""))))
+                scene_has_rule = self._follow_action_key("scene", None, scene_index) in self._follow_action_rules
+                if not scene_has_marker and not scene_has_rule:
+                    self._remove_named_object_listener(self._follow_action_scene_name_listeners, key)
+                    continue
                 expected_scene_keys.add(key)
                 existing = self._follow_action_scene_name_listeners.get(key)
                 if existing and existing[0] is scene:
@@ -13114,28 +13484,19 @@ class Tap(ControlSurface):
 
             for track_index, track in enumerate(self.song().tracks):
                 for scene_index, clip_slot in enumerate(track.clip_slots):
-                    slot_key = self._live_object_identity(clip_slot)
-                    expected_clip_slot_keys.add(slot_key)
-                    existing_slot = self._follow_action_clip_has_clip_listeners.get(slot_key)
-                    if not existing_slot or existing_slot[0] is not clip_slot:
-                        self._remove_follow_action_clip_has_clip_listener(slot_key)
-                        try:
-                            listener = self._make_follow_action_clip_has_clip_listener()
-                            add_listener = getattr(clip_slot, "add_has_clip_listener", None)
-                            has_listener = getattr(clip_slot, "has_clip_has_listener", None)
-                            if add_listener and (not has_listener or not has_listener(listener)):
-                                add_listener(listener)
-                            self._follow_action_clip_has_clip_listeners[slot_key] = (clip_slot, listener)
-                        except Exception:
-                            pass
-
                     if not clip_slot.has_clip:
                         continue
                     clip = clip_slot.clip
                     clip_key = self._live_object_identity(clip)
+                    needs_timing_listener = self._clip_affects_follow_action_timing(track_index, scene_index)
+                    clip_has_marker = bool(self.FOLLOW_ACTION_NAME_MARKER_RE.search(str(getattr(clip, "name", ""))))
+                    if not clip_has_marker and not needs_timing_listener:
+                        self._remove_named_object_listener(self._follow_action_clip_name_listeners, clip_key)
+                        self._remove_follow_action_clip_timing_listeners(clip_key)
+                        continue
+
                     expected_clip_keys.add(clip_key)
                     existing_clip = self._follow_action_clip_name_listeners.get(clip_key)
-                    needs_timing_listener = self._clip_affects_follow_action_timing(track_index, scene_index)
                     if needs_timing_listener:
                         expected_clip_timing_keys.add(clip_key)
                     else:
@@ -13166,8 +13527,7 @@ class Tap(ControlSurface):
             if key not in expected_clip_keys:
                 self._remove_named_object_listener(self._follow_action_clip_name_listeners, key)
         for key in list(self._follow_action_clip_has_clip_listeners.keys()):
-            if key not in expected_clip_slot_keys:
-                self._remove_follow_action_clip_has_clip_listener(key)
+            self._remove_follow_action_clip_has_clip_listener(key)
         for key in list(self._follow_action_clip_timing_listeners.keys()):
             if key not in expected_clip_timing_keys:
                 self._remove_follow_action_clip_timing_listeners(key)
@@ -13288,19 +13648,117 @@ class Tap(ControlSurface):
             except Exception:
                 self._handled_follow_action_launches.discard(key)
 
-    def _on_clip_has_clip_changed(self, track=None):
+    def _on_clip_has_clip_changed(self, track=None, scene_index=None, clip_slot=None):
         # self.log_message("has clip status changed")
         self._mutator_clip_presence_dirty = True
+        track_index = self._get_track_index(track) if track else None
+        follow_action_metadata_changed = False
+        if track_index is not None and scene_index is not None and clip_slot is not None:
+            follow_key = self._follow_action_key("clip", track_index, scene_index)
+            follow_action_metadata_changed = follow_key in self._follow_action_rules
+            if clip_slot.has_clip:
+                clip_name = str(getattr(clip_slot.clip, "name", ""))
+                follow_action_metadata_changed = (
+                    follow_action_metadata_changed
+                    or bool(self.FOLLOW_ACTION_NAME_MARKER_RE.search(clip_name))
+                )
+        if follow_action_metadata_changed:
+            self._sync_follow_action_name_listeners()
+            self._load_follow_actions_from_names()
+            self._sync_follow_action_runtime_listeners()
         self._refresh_parameter_metadata_on_automation_change()
         if track:
-            track_index = self._get_track_index(track)
             if track_index is not None:
-                self._update_clip_slots(track_index)
+                if scene_index is not None and clip_slot is not None:
+                    self._queue_clip_slot_delta(track, scene_index, clip_slot)
+                else:
+                    self._update_clip_slots(track_index)
                 self._sync_clip_color_listeners_for_track(track)
                 self._set_up_notes_playing("clip")
                 return
         self._update_clip_slots()
         self._set_up_notes_playing("clip")
+
+    def _clip_slot_state_and_color(self, track, clip_slot):
+        try:
+            is_armed = bool(track.arm)
+            has_audio = bool(track.has_audio_input)
+        except Exception:
+            is_armed = False
+            has_audio = False
+
+        state = 0
+        try:
+            if clip_slot.is_triggered:
+                state = 4 if clip_slot.has_clip else 6
+            elif clip_slot.is_recording:
+                state = 3
+            elif clip_slot.is_playing:
+                state = 2
+            elif clip_slot.has_clip:
+                state = 1
+            elif is_armed and has_audio:
+                state = 5
+        except Exception:
+            state = 0
+
+        color = 0
+        if state in (1, 2, 3, 4):
+            try:
+                if clip_slot.has_clip and clip_slot.clip.color is not None:
+                    color = max(0, min(0xFFFFFF, int(clip_slot.clip.color)))
+            except Exception:
+                color = 0
+        return state, color
+
+    def _clip_slots_string_for_track(self, track):
+        values = []
+        for clip_slot in track.clip_slots:
+            state, color = self._clip_slot_state_and_color(track, clip_slot)
+            color_string = self._make_color_string(color) if color else "0"
+            values.append("{}:{}".format(state, color_string))
+        return "-".join(values)
+
+    def _queue_clip_slot_delta(self, track, scene_index, clip_slot):
+        track_index = self._get_track_index(track)
+        if track_index is None or scene_index < 0:
+            return
+        self._pending_clip_slot_deltas[(track_index, scene_index)] = (track, clip_slot)
+        if self._clip_slot_delta_scheduled:
+            return
+        self._clip_slot_delta_scheduled = True
+        try:
+            self.schedule_message(1, self._flush_clip_slot_deltas)
+        except Exception:
+            self._flush_clip_slot_deltas()
+
+    def _flush_clip_slot_deltas(self):
+        self._clip_slot_delta_scheduled = False
+        pending = self._pending_clip_slot_deltas
+        self._pending_clip_slot_deltas = {}
+        tracks = list(self.song().tracks)
+        changed_track_indexes = set()
+        for (track_index, scene_index), (track, clip_slot) in sorted(pending.items()):
+            if (track_index >= len(tracks) or tracks[track_index] != track
+                    or scene_index >= len(track.clip_slots)
+                    or track.clip_slots[scene_index] != clip_slot):
+                continue
+            state, color = self._clip_slot_state_and_color(track, clip_slot)
+            red = (color >> 16) & 0xFF
+            green = (color >> 8) & 0xFF
+            blue = color & 0xFF
+            data = (
+                [1]
+                + self._to_3_7bit_magnitude(track_index)
+                + self._to_3_7bit_magnitude(scene_index)
+                + [state, red >> 7, red & 0x7F, green >> 7, green & 0x7F, blue >> 7, blue & 0x7F]
+            )
+            self._send_midi(tuple([0xF0, 0x55, 0x01] + data + [0xF7]))
+            changed_track_indexes.add(track_index)
+
+        if len(self.old_clips_array) == len(tracks):
+            for track_index in changed_track_indexes:
+                self.old_clips_array[track_index] = self._clip_slots_string_for_track(tracks[track_index])
 
     def _update_clip_slots(self, only_track_index=None):
         try:
@@ -13313,52 +13771,9 @@ class Tap(ControlSurface):
                     track_clips.append(self.old_clips_array[track_index] if track_index < len(self.old_clips_array) else "")
                     continue
                 try:
-                    is_armed = track.arm
-                    has_audio = track.has_audio_input
+                    clip_slots_string = self._clip_slots_string_for_track(track)
                 except Exception:
-                    is_armed = False
-                    has_audio = False
-                # track clip slots
-                clip_slots = []
-                try:
-                    for clip_slot in track.clip_slots:
-                        clip_value = "0"
-                        try:
-                            if clip_slot.is_triggered:
-                                clip_value = "4"
-                            elif clip_slot.is_recording:
-                                clip_value = "3"
-                            elif clip_slot.is_playing:
-                                clip_value = "2"
-                            elif clip_slot.has_clip:
-                                clip_value = "1"
-                            elif is_armed and has_audio:
-                                clip_value = "5"
-                        except Exception:
-                            clip_value = "0"
-
-                        color_string_value = "0"
-                        
-                        # this could also just be made to if value == "1", but does not hurt this way
-                        if clip_value != "0" and clip_slot.has_clip:
-                            # extra test if has clip because group channels don't have a clip but might be triggered etc
-                            try:
-                                if clip_slot.clip.color is not None:
-                                    color_string_value = self._make_color_string(clip_slot.clip.color)
-                            except Exception:
-                                color_string_value = "0"
-                        #     playing_position = clip_slot.clip.playing_position
-                        #     length = clip_slot.clip.length
-                        #     self.log_message("playing: {} triggering {}".format(is_playing_value, is_triggered_value))
-                        # else:
-                        #     playing_position = 0.0
-                        #     length = 0.0
-
-                        clip_string = "{}:{}".format(clip_value, color_string_value)
-                        clip_slots.append(clip_string)
-                except Exception as e:
-                    pass
-                clip_slots_string = "-".join(clip_slots)
+                    clip_slots_string = ""
                 track_clips.append(clip_slots_string)
 
             # compare old track clips with new
@@ -13462,6 +13877,7 @@ class Tap(ControlSurface):
             bool(column.get("active", False))
             or int(column.get("velocity", default_velocity)) != default_velocity
             or int(column.get("probability", 100)) != 100
+            or int(column.get("velocity_deviation", 0)) != 0
         )
 
     def _flin_remap_density(self, info, new_mode):
@@ -13510,6 +13926,7 @@ class Tap(ControlSurface):
                     "octave_offset": 0,
                     "velocity": max(1, min(127, int(info.get("default_velocity", 100)))),
                     "probability": 100,
+                    "velocity_deviation": 0,
                 }
             column = dict(stored)
             column["id"] = column_id
@@ -13586,6 +14003,7 @@ class Tap(ControlSurface):
                     velocity=max(1, min(127, int(column.get("velocity", 100)))),
                     mute=False,
                     probability=max(0.0, min(1.0, float(column.get("probability", 100)) / 100.0)),
+                    velocity_deviation=max(-127, min(127, int(column.get("velocity_deviation", 0)))),
                 ))
                 tick += period
 
@@ -13652,7 +14070,7 @@ class Tap(ControlSurface):
                 return None
             for record in parts[15].split(","):
                 values = [int(value) for value in record.split(":")]
-                if len(values) != 10:
+                if len(values) not in (10, 11):
                     return None
                 info["columns"].append({
                     "page": info["view_page"],
@@ -13661,6 +14079,7 @@ class Tap(ControlSurface):
                     "phase_ticks": max(0, values[4]), "scale_degree": max(-63, min(63, values[5])),
                     "octave_offset": max(-8, min(8, values[6])), "pad_offset": max(-63, min(63, values[7])),
                     "velocity": max(1, min(127, values[8])), "probability": max(0, min(100, values[9])),
+                    "velocity_deviation": max(-127, min(127, values[10])) if len(values) == 11 else 0,
                 })
             if len(info["columns"]) != 16:
                 return None
@@ -13772,6 +14191,8 @@ class Tap(ControlSurface):
                     info["columns"].append(column)
                 column["velocity"] = velocity
                 column["probability"] = probability
+                if len(parts) >= 8:
+                    column["velocity_deviation"] = max(-127, min(127, int(parts[7])))
                 if duration is not None:
                     column["duration_steps"] = duration
                 if column.get("active", False):
@@ -13861,50 +14282,88 @@ class Tap(ControlSurface):
         Chunks start with '$' (more coming) or '_' (final chunk).
         Only for message ids that can be chunked by the app.
         """
-        # Ensure we have a buffer for assembling chunks
-        if not hasattr(self, "_sysex_buffer"):
-            self._sysex_buffer = []
-    
         # Basic validity check
-        if len(message) < 3:
-            self._sysex_buffer = []
+        if len(message) < 4 or message[0] != 0xF0 or message[-1] != 0xF7:
             return
-        
+
+        now = time.monotonic()
+        if not hasattr(self, "_sysex_buffers"):
+            self._sysex_buffers = {}
+        for stream_id, buffer_info in list(self._sysex_buffers.items()):
+            if now - buffer_info["last_chunk_at"] > self.SYSEX_CHUNK_INACTIVITY_TIMEOUT:
+                self._sysex_buffers.pop(stream_id, None)
+
         manufacturer_id = message[1]
         prefix = message[2]
-    
+        maximum_assembled_bytes = self.SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID.get(
+            manufacturer_id,
+            self.SYSEX_CHUNK_MAX_ASSEMBLED_BYTES
+        )
+
+        # Note add/remove/modify messages are binary records. Their first data
+        # byte can legitimately be '$' or '_' (pitch 36/95 for additions, or
+        # the low byte of a Live note ID for edits). Recognize the compact
+        # direct record shape before looking for chunk markers so those notes
+        # are never swallowed as an incomplete transfer.
+        direct_binary_record = (
+            (manufacturer_id == 14 and len(message) == 14)
+            or (manufacturer_id == 15 and len(message) >= 8 and (len(message) - 3) % 5 == 0)
+            or (manufacturer_id == 16 and len(message) == 19)
+        )
+        if direct_binary_record:
+            self._sysex_buffers.pop(manufacturer_id, None)
+            self._handle_full_sysex(message)
+            return
+
         # Check if this message is chunked. Existing Tap app -> script chunks
         # always use the prefix directly after the manufacturer id.
         if manufacturer_id in self.CHUNKED_INCOMING_SYSEX_IDS:
             if prefix == 36:
                 # Intermediate chunk
-                self._sysex_buffer.extend(message[3:-1])  # skip F0, manuf, prefix, F7
+                chunk = list(message[3:-1])
+                buffer_info = self._sysex_buffers.get(manufacturer_id, {
+                    "bytes": [],
+                    "last_chunk_at": now,
+                })
+                if len(buffer_info["bytes"]) + len(chunk) > maximum_assembled_bytes:
+                    self._sysex_buffers.pop(manufacturer_id, None)
+                    self._debug_log("Rejected oversized SysEx stream {}".format(manufacturer_id))
+                    return
+                buffer_info["bytes"].extend(chunk)
+                buffer_info["last_chunk_at"] = now
+                self._sysex_buffers[manufacturer_id] = buffer_info
                 return
-        
+
             elif prefix == 95:
-                # Final chunk — assemble full message
-                self._sysex_buffer.extend(message[3:-1])
-                full_message = [0xF0, manufacturer_id] + self._sysex_buffer + [0xF7]
-                self._sysex_buffer = []  # reset buffer
-        
+                # The committed binary-note protocol uses '_' for a complete
+                # one-packet transfer too.
+                buffer_info = self._sysex_buffers.pop(manufacturer_id, None)
+                if buffer_info is None:
+                    record_width = {14: 11, 15: 5, 16: 16}.get(manufacturer_id)
+                    final_length = len(message[3:-1])
+                    if record_width is None or final_length <= 0 or final_length % record_width != 0:
+                        return
+                    buffer_info = {"bytes": [], "last_chunk_at": now}
+                chunk = list(message[3:-1])
+                if len(buffer_info["bytes"]) + len(chunk) > maximum_assembled_bytes:
+                    self._debug_log("Rejected oversized final SysEx stream {}".format(manufacturer_id))
+                    return
+                buffer_info["bytes"].extend(chunk)
+                full_message = [0xF0, manufacturer_id] + buffer_info["bytes"] + [0xF7]
+
                 # Now call the original handler
                 self._handle_full_sysex(full_message)
                 return
-            
+
             else:
-                self._sysex_buffer = []
+                self._sysex_buffers.pop(manufacturer_id, None)
                 self._handle_full_sysex(message)
                 return
-        
+
         else:
-            if self._sysex_buffer != []:
-                # Cancel chunking, something went wrong
-                self._sysex_buffer = []
-                return
-                
-            else:
-                # Non-chunked message → handle directly
-                self._handle_full_sysex(message)
+            # Non-chunked streams never cancel an unrelated in-flight stream.
+            self._sysex_buffers.pop(manufacturer_id, None)
+            self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
         # Selected audio-clip editing, sample loading and conversion commands.
@@ -13965,19 +14424,22 @@ class Tap(ControlSurface):
             return
         # start stop clip
         if len(message) >= 2 and message[1] == 9:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 3:
-                self._fire_clip(values[0], values[1], values[2])
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=2)
+            if decoded is not None and decoded[0][0] in (0, 1):
+                self._fire_clip(decoded[0][0], decoded[1][0], decoded[1][1])
+            return
         # delete clip
         if len(message) >= 2 and message[1] == 10:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 2:
-                self._delete_clip(values[0], values[1])
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
+            if decoded is not None:
+                self._delete_clip(decoded[1][0], decoded[1][1])
+            return
         # copy paste clip
         if len(message) >= 2 and message[1] == 11:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 4:
-                self._copy_paste_clip(values[0], values[1], values[2], values[3])
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=4)
+            if decoded is not None:
+                self._copy_paste_clip(*decoded[1])
+            return
         # scale and rootnote
         if len(message) >= 2 and message[1] == 12:
             values = self.decode_sys_ex_scale_root(message)
@@ -13985,21 +14447,34 @@ class Tap(ControlSurface):
                 self._set_scale_root_note(values[0], values[1])
         # duplicate loop
         if len(message) >= 2 and message[1] == 13:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 2:
-                self._duplicate_loop(values[0], values[1])
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
+            if decoded is not None:
+                self._duplicate_loop(decoded[1][0], decoded[1][1])
+            return
         # request selected track local controls (ModWheel/Pressure)
         if len(message) >= 2 and message[1] == 59:
             self._send_track_local_control_state()
         
         # add MULTIPLE notes
         if len(message) >= 2 and message[1] == 14:
+            transaction = self._pending_note_add_transaction
+            self._pending_note_add_transaction = None
+            transaction_id = transaction[0] if transaction is not None else None
+            expected_record_count = transaction[1] if transaction is not None else (len(message) - 3) // 11
+            if (len(message) - 3) <= 0 or (len(message) - 3) % 11 != 0:
+                if transaction_id is not None:
+                    self._send_note_add_result(transaction_id, False, 1, [])
+                return
+            if (len(message) - 3) // 11 != expected_record_count:
+                if transaction_id is not None:
+                    self._send_note_add_result(transaction_id, False, 1, [])
+                return
             index = 2
             new_notes = []
             new_note_values = []
 
             # Decode all notes in the message
-            while index + 10 <= (len(message) - 1):
+            while index + 11 <= (len(message) - 1):
                 # Decode the pitch of the note
                 note_pitch = message[index]
                 index += 1
@@ -14025,6 +14500,8 @@ class Tap(ControlSurface):
                 # Probability and note/sign flags are separate SysEx7-safe bytes.
                 probability = message[index] / 127.0
                 index += 1
+                velocity_deviation_magnitude = message[index]
+                index += 1
                 note_flags = message[index]
                 index += 1
                 start_time = self._value_from_magnitude(
@@ -14038,16 +14515,28 @@ class Tap(ControlSurface):
                     2
                 )
                 mute = bool(note_flags & self.NOTE_FLAG_MUTE)
+                velocity_deviation = (
+                    -velocity_deviation_magnitude
+                    if note_flags & self.NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION
+                    else velocity_deviation_magnitude
+                )
 
                 # Create a MidiNoteSpecification object
-                note_spec = MidiNoteSpecification(
+                note_values = dict(
                     pitch=note_pitch,
                     start_time=start_time / 1000.0,
                     duration=duration / 1000.0,
                     velocity=velocity,
                     mute=mute,
-                    probability=probability
+                    probability=probability,
                 )
+                try:
+                    note_spec = MidiNoteSpecification(
+                        velocity_deviation=max(-127, min(127, velocity_deviation)),
+                        **note_values
+                    )
+                except (TypeError, AttributeError):
+                    note_spec = MidiNoteSpecification(**note_values)
 
                 new_notes.append(note_spec)
                 new_note_values.append((
@@ -14056,7 +14545,8 @@ class Tap(ControlSurface):
                     duration / 1000.0,
                     velocity,
                     mute,
-                    probability
+                    probability,
+                    velocity_deviation,
                 ))
 
             # Add all decoded notes to the current clip
@@ -14064,6 +14554,16 @@ class Tap(ControlSurface):
             clip_slot = song.view.highlighted_clip_slot
             if clip_slot is not None and clip_slot.has_clip and len(new_notes) > 0:
                 clip = clip_slot.clip
+                before_ids = None
+                clip_start = None
+                clip_length = None
+                if transaction_id is not None:
+                    clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
+                    clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
+                    before_ids = {
+                        int(note.note_id)
+                        for note in clip.get_notes_extended(0, 128, clip_start, clip_length)
+                    }
                 filtered_notes = []
                 filtered_note_values = []
                 for note_spec, note_values in zip(new_notes, new_note_values):
@@ -14073,11 +14573,13 @@ class Tap(ControlSurface):
                 new_notes = filtered_notes
                 new_note_values = filtered_note_values
                 if not new_notes:
+                    if transaction_id is not None:
+                        self._send_note_add_result(transaction_id, False, 3, [])
                     return
                 decoupled_info = self._decoupled_automation_info(clip)
                 if decoupled_info:
                     repeated_notes = []
-                    for pitch, start_time, duration, velocity, mute, probability in new_note_values:
+                    for pitch, start_time, duration, velocity, mute, probability, velocity_deviation in new_note_values:
                         repeated_notes.extend(self._make_repeated_note_specs_from_values(
                             pitch,
                             start_time,
@@ -14085,12 +14587,24 @@ class Tap(ControlSurface):
                             velocity,
                             mute,
                             probability,
-                            decoupled_info
+                            decoupled_info,
+                            velocity_deviation=velocity_deviation
                         ))
                     if repeated_notes:
                         clip.add_new_notes(repeated_notes)
                 else:
                     clip.add_new_notes(new_notes)
+                if transaction_id is not None:
+                    after_notes = list(clip.get_notes_extended(0, 128, clip_start, clip_length))
+                    added_ids = [int(note.note_id) for note in after_notes if int(note.note_id) not in before_ids]
+                    if not added_ids:
+                        self._send_note_add_result(transaction_id, False, 4, [])
+                        return
+                    self._send_note_add_result(transaction_id, True, 0, added_ids)
+            else:
+                if transaction_id is not None:
+                    self._send_note_add_result(transaction_id, False, 2, [])
+            return
         
         # remove note (also multiple)
         if len(message) >= 2 and message[1] == 15:
@@ -14143,6 +14657,8 @@ class Tap(ControlSurface):
         
         # modify MULTIPLE notes
         if len(message) >= 3 and message[1] == 16:
+            if (len(message) - 3) <= 0 or (len(message) - 3) % 16 != 0:
+                return
             index = 2
         
             # Get the selected clip
@@ -14160,9 +14676,9 @@ class Tap(ControlSurface):
         
                 # Modify the matching notes
                 while index < (len(message) - 1):
-                    # One record is 15 data bytes. Never decode across the
+                    # One v35 record is 16 data bytes. Never decode across the
                     # terminating F7 byte when a packet is truncated.
-                    if index + 15 > len(message) - 1:
+                    if index + 16 > len(message) - 1:
                         break
                     note_id = self._from_5_7bit_bytes(message, index)
                     index += 5
@@ -14180,6 +14696,8 @@ class Tap(ControlSurface):
         
                     probability = message[index] / 127.0
                     index += 1
+                    velocity_deviation_magnitude = message[index]
+                    index += 1
                     note_flags = message[index]
                     index += 1
                     start_time = self._value_from_magnitude(
@@ -14193,6 +14711,11 @@ class Tap(ControlSurface):
                         2
                     ) / 1000.0
                     mute = bool(note_flags & self.NOTE_FLAG_MUTE)
+                    velocity_deviation = (
+                        -velocity_deviation_magnitude
+                        if note_flags & self.NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION
+                        else velocity_deviation_magnitude
+                    )
 
                     if decoupled_info:
                         target_note = None
@@ -14220,6 +14743,8 @@ class Tap(ControlSurface):
                                 note.velocity = velocity
                                 note.mute = mute
                                 note.probability = probability
+                                if hasattr(note, 'velocity_deviation'):
+                                    note.velocity_deviation = velocity_deviation
                                 did_modify_notes = True
                     else:
                         for note in notes:
@@ -14234,6 +14759,8 @@ class Tap(ControlSurface):
                                 note.velocity = velocity
                                 note.mute = mute
                                 note.probability = probability
+                                if hasattr(note, 'velocity_deviation'):
+                                    note.velocity_deviation = velocity_deviation
                                 did_modify_notes = True
                                 break
         
@@ -14294,18 +14821,23 @@ class Tap(ControlSurface):
             
         # combine clips
         if len(message) >= 2 and message[1] == 19:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 4:
-                self._append_and_remove_clip(values[0], values[1], values[2], values[3])
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=4)
+            if decoded is not None:
+                self._append_and_remove_clip(*decoded[1])
+            return
         
         # toggle arm for audio tracks
-        if len(message) >= 4 and message[1] == 20:
-            track_index = message[2]
+        if len(message) >= 2 and message[1] == 20:
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
+            if decoded is None:
+                return
+            track_index = decoded[1][0]
             tracks = self.song().tracks
             if 0 <= track_index < len(tracks):
                 track = tracks[track_index]
                 if getattr(track, 'can_be_armed', True):
                     track.arm = not track.arm
+            return
         
         # select next clip
         if len(message) >= 4 and message[1] == 21:
@@ -14356,13 +14888,33 @@ class Tap(ControlSurface):
         if len(message) >= 2 and message[1] == 37:
             self._send_follow_action_state(force=True)
         if len(message) >= 2 and message[1] == 38:
-            values = self.extract_values_from_sysex_message(message)
-            if len(values) == 1:
-                self._stop_track_clips(values[0])
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
+            if decoded is not None:
+                self._stop_track_clips(decoded[1][0])
+            return
         if len(message) >= 2 and message[1] == 39:
             self._set_device_control_high_resolution(message)
-        if len(message) >= 3 and message[1] == 44:
-            self._toggle_group_fold(message[2])
+        if len(message) >= 2 and message[1] == 44:
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
+            if decoded is not None:
+                self._toggle_group_fold(decoded[1][0])
+            return
+        if len(message) >= 2 and message[1] == 0x55:
+            self._handle_wide_session_command(message)
+            return
+        if len(message) >= 2 and message[1] == 0x5A:
+            decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
+            if decoded is None or decoded[1][1] <= 0:
+                self._pending_note_add_transaction = None
+            else:
+                self._pending_note_add_transaction = (decoded[1][0], decoded[1][1])
+            return
+        if len(message) >= 2 and message[1] == 0x60:
+            self._handle_groove_edit(message)
+            return
+        if len(message) >= 2 and message[1] == 0x62:
+            self._handle_groove_focus(message)
+            return
         if len(message) >= 3 and message[1] == 45:
             self._add_random_effect_after_device(message[2])
         if len(message) >= 3 and message[1] == 46:
@@ -18189,9 +18741,87 @@ class Tap(ControlSurface):
         values = message[2:-1]
         return values
 
+    def _decode_wide_index_message(self, message, prefix_count, index_count):
+        """Decode an exact v35 record containing zero or more 21-bit indices."""
+        values = self.extract_values_from_sysex_message(message)
+        expected_count = int(prefix_count) + (int(index_count) * 3)
+        if len(values) != expected_count:
+            return None
+        if any(int(value) < 0 or int(value) > 0x7F for value in values):
+            return None
+
+        prefix = list(values[:prefix_count])
+        indexes = []
+        offset = prefix_count
+        for _ in range(index_count):
+            indexes.append(self._from_3_7bit_magnitude(values, offset))
+            offset += 3
+        return prefix, indexes
+
+    def _handle_wide_session_command(self, message):
+        values = self.extract_values_from_sysex_message(message)
+        if not values:
+            return
+
+        action = values[0]
+        if action == 0x00:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is not None:
+                self._select_track_by_index(decoded[1][0])
+            return
+        if action == 0x01:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=2)
+            if decoded is None:
+                return
+            track_index, scene_index = decoded[1]
+            tracks = list(self.song().tracks)
+            scenes = list(self.song().scenes)
+            if track_index >= len(tracks) or scene_index >= len(scenes):
+                return
+            slots = list(tracks[track_index].clip_slots)
+            if scene_index >= len(slots):
+                return
+            self.song().view.selected_track = tracks[track_index]
+            self.song().view.selected_scene = scenes[scene_index]
+            self.song().view.highlighted_clip_slot = slots[scene_index]
+            return
+        if action == 0x02:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is not None:
+                self._select_return_track_by_index(decoded[1][0])
+            return
+        if action == 0x03:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is not None:
+                self._fire_scene(decoded[1][0])
+            return
+        if action == 0x04:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is None:
+                return
+            scene_index = decoded[1][0]
+            scenes = list(self.song().scenes)
+            if 0 <= scene_index < len(scenes):
+                self.song().duplicate_scene(scene_index)
+                self._duplicate_follow_actions_for_scene(scene_index, scene_index + 1)
+            return
+        if action == 0x05:
+            decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
+            if decoded is None:
+                return
+            scene_index = decoded[1][0]
+            if 0 <= scene_index < len(self.song().scenes):
+                self.song().delete_scene(scene_index)
+                self._shift_follow_actions_after_scene_delete(scene_index)
+
     def _fire_clip(self, fire, track_index, clip_index):
-        track = self.song().tracks[track_index]
-        clip_slot = track.clip_slots[clip_index]
+        tracks = list(self.song().tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            return
+        slots = list(tracks[track_index].clip_slots)
+        if clip_index < 0 or clip_index >= len(slots):
+            return
+        clip_slot = slots[clip_index]
         if fire == 1:
             if clip_slot.is_playing:
                 clip_slot.stop()
@@ -18230,15 +18860,27 @@ class Tap(ControlSurface):
             self._send_follow_action_state()
 
     def _delete_clip(self, track_index, clip_index):
-        track = self.song().tracks[track_index]
-        clip_slot = track.clip_slots[clip_index]
+        tracks = list(self.song().tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            return
+        track = tracks[track_index]
+        slots = list(track.clip_slots)
+        if clip_index < 0 or clip_index >= len(slots):
+            return
+        clip_slot = slots[clip_index]
         self._remove_clip_follow_action_rule(track_index, clip_index)
         clip_slot.delete_clip()
         self._send_follow_action_state()
 
     def _duplicate_loop(self, track_index, clip_index):
-        track = self.song().tracks[track_index]
-        clip_slot = track.clip_slots[clip_index]
+        tracks = list(self.song().tracks)
+        if track_index < 0 or track_index >= len(tracks):
+            return
+        track = tracks[track_index]
+        slots = list(track.clip_slots)
+        if clip_index < 0 or clip_index >= len(slots):
+            return
+        clip_slot = slots[clip_index]
         if not clip_slot.has_clip:
             return
 
@@ -18266,13 +18908,20 @@ class Tap(ControlSurface):
             self.send_selected_clip_notes()
 
     def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
-        tracks = self.song().tracks
+        tracks = list(self.song().tracks)
+        if (from_track < 0 or from_track >= len(tracks)
+                or to_track < 0 or to_track >= len(tracks)):
+            return
 
         copy_track = tracks[from_track]
-        copy_clip_slot = copy_track.clip_slots[from_clip]
-
         paste_track = tracks[to_track]
-        paste_clip_slot = paste_track.clip_slots[to_clip]
+        copy_slots = list(copy_track.clip_slots)
+        paste_slots = list(paste_track.clip_slots)
+        if (from_clip < 0 or from_clip >= len(copy_slots)
+                or to_clip < 0 or to_clip >= len(paste_slots)):
+            return
+        copy_clip_slot = copy_slots[from_clip]
+        paste_clip_slot = paste_slots[to_clip]
 
         copy_clip_slot.duplicate_clip_to(paste_clip_slot)
         self._copy_clip_follow_action_rule(from_track, from_clip, to_track, to_clip)
@@ -18395,8 +19044,27 @@ class Tap(ControlSurface):
     def _fire_scene(self, value):
         scenes = self.song().scenes
         if value < len(scenes):
+            affected_slots = []
+            for track in self.song().tracks:
+                affected_indexes = {int(value)}
+                try:
+                    playing_index = int(getattr(track, "playing_slot_index", -1))
+                    if playing_index >= 0:
+                        affected_indexes.add(playing_index)
+                except Exception:
+                    pass
+                for scene_index in affected_indexes:
+                    if 0 <= scene_index < len(track.clip_slots):
+                        affected_slots.append((track, scene_index, track.clip_slots[scene_index]))
             scene = scenes[value]
             scene.fire()
+            def refresh_affected_slots():
+                for track, scene_index, clip_slot in affected_slots:
+                    self._queue_clip_slot_delta(track, scene_index, clip_slot)
+            try:
+                self.schedule_message(1, refresh_affected_slots)
+            except Exception:
+                refresh_affected_slots()
             self._handled_follow_action_launches.discard(self._follow_action_key("scene", None, value))
             self._activate_follow_action_for_scene(value)
 
@@ -19205,11 +19873,12 @@ class Tap(ControlSurface):
     def _value_from_magnitude(self, magnitude, sign_flags, value_index):
         return -magnitude if sign_flags & (1 << value_index) else magnitude
 
-    def _note_record_flags(self, mute, start_time, duration):
+    def _note_record_flags(self, mute, start_time, duration, velocity_deviation=0):
         return (
             (self.NOTE_FLAG_MUTE if mute else 0)
             | (self.NOTE_FLAG_NEGATIVE_START if start_time < 0 else 0)
             | (self.NOTE_FLAG_NEGATIVE_DURATION if duration < 0 else 0)
+            | (self.NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION if velocity_deviation < 0 else 0)
         )
 
     # MARK: - Selected audio clip
@@ -20162,6 +20831,8 @@ class Tap(ControlSurface):
                                 max(0, min(127, int(column.get("pad_offset", 0)) + 64)),
                                 max(1, min(127, int(column.get("velocity", 100)))),
                                 max(0, min(100, int(column.get("probability", 100)))),
+                                abs(max(-127, min(127, int(column.get("velocity_deviation", 0))))),
+                                1 if int(column.get("velocity_deviation", 0)) < 0 else 0,
                             ])
                     else:
                         note_data.append(0)
@@ -20182,7 +20853,7 @@ class Tap(ControlSurface):
             end_byte = 0xF7
             manufacturer_id = 0x0D
             device_id = 0x01
-            max_chunk_length = 240
+            max_chunk_length = self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH
             data = bytearray()
                 
             song = self.song()
@@ -20212,10 +20883,12 @@ class Tap(ControlSurface):
                         start_time = int(note.start_time * 1000)
                         duration = int(note.duration * 1000)
                         velocity = int(note.velocity)
+                        velocity_deviation = max(-127, min(127, int(getattr(note, 'velocity_deviation', 0))))
                         note_flags = self._note_record_flags(
                             bool(note.mute),
                             start_time,
-                            duration
+                            duration,
+                            velocity_deviation,
                         )
                         probability = int(note.probability * 127)
                     
@@ -20226,6 +20899,7 @@ class Tap(ControlSurface):
                             *self._to_3_7bit_magnitude(duration),  # 3 bytes, 7-bit encoded
                             velocity,
                             probability,
+                            abs(velocity_deviation),
                             note_flags
                         ]
                     
@@ -20250,7 +20924,10 @@ class Tap(ControlSurface):
                 chunk_data = data[start_index:end_index]
                 
                 # Add prefix and suffix to chunks
-                prefix = "_" if chunk_index == num_of_chunks - 1 else "$"
+                prefix = (
+                    "!" if num_of_chunks == 1
+                    else ("_" if chunk_index == num_of_chunks - 1 else "$")
+                )
                 chunk_data = prefix.encode('ascii') + chunk_data
             
                 # Send the SysEx message
@@ -21295,6 +21972,7 @@ class Tap(ControlSurface):
             self._periodic_timer_ref.cancel()
             self._periodic_timer_ref = None
         self._remove_follow_action_runtime_listeners()
+        self._remove_groove_listeners()
         self._remove_follow_action_name_listeners()
         self._remove_follow_action_song_listeners()
         self._remove_all_notes_playing_listeners()
@@ -21346,6 +22024,10 @@ class Tap(ControlSurface):
             self.undo_button.remove_value_listener(self._undo_button_value)
         if hasattr(self, 'transport_toggle_button'):
             self.transport_toggle_button.remove_value_listener(self._transport_toggle_value)
+        if hasattr(self, 'connection_check_button'):
+            self.connection_check_button.remove_value_listener(self._connection_established)
+        if hasattr(self, 'send_project_button'):
+            self.send_project_button.remove_value_listener(self._send_project)
         # browser buttons cleanup
         if hasattr(self, 'browser_start_button'):
             self.browser_start_button.remove_value_listener(self._start_browser)
@@ -21363,26 +22045,8 @@ class Tap(ControlSurface):
             self.remove_automation_button.remove_value_listener(self._arm_remove_automation_from_next_encoder)
         if hasattr(self, 're_enable_parameter_automation_button'):
             self.re_enable_parameter_automation_button.remove_value_listener(self._arm_re_enable_automation_from_next_encoder)
-        song = self.song()
-        # periodic_check_button.remove_value_listener(self._periodic_check)
-        self._remove_song_listener(song, "tracks", self._on_tracks_changed)
-        # self.song().view.remove_selected_track_listener(self._on_selected_track_changed)
-        # self.remove_midi_listener(self._midi_listener)
-        # self.song().view.remove_selected_scene_listener(self._on_selected_scene_changed)
-        self._remove_song_listener(song, "scale_name", self._on_scale_changed)
-        self._remove_song_listener(song, "root_note", self._on_scale_changed)
-        self._remove_song_listener(song, "swing_amount", self._update_swing_amount)
-        self._remove_song_listener(song, "metronome", self._update_metronome)
-        self._remove_song_listener(song, "session_record", self._on_session_record_changed)
-        self._remove_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
-        try:
-            if hasattr(song, 'remove_is_playing_listener') and (
-                not hasattr(song, 'is_playing_has_listener')
-                or song.is_playing_has_listener(self._on_song_is_playing_changed)
-            ):
-                song.remove_is_playing_listener(self._on_song_is_playing_changed)
-        except Exception:
-            pass
+        song = getattr(self, 'song_instance', None) or self.song()
+        self._remove_song_listeners(song)
         # Clean up level listeners
         for track, (left_listener, right_listener) in self._track_level_listeners.items():
             self._remove_output_meter_listener_pair(track, left_listener, right_listener)
