@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 35
+secret_version_number = 37
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2421,7 +2421,7 @@ class Tap(ControlSurface):
         "Messiaen 6",
         "Messiaen 7",
     )
-    DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 16
+    DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 64
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
@@ -2707,6 +2707,7 @@ class Tap(ControlSurface):
             self._automation_parameter_action = None
             self._automation_removal_suppressed_controls = set()
             self._automation_authored_steps = {}
+            self._automation_pencil_stroke = None
             self._mixer_automation_controls = []
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
@@ -3673,14 +3674,23 @@ class Tap(ControlSurface):
         return self._automation_step_id(step, fallback_index)
 
     def _automation_step_tuple(self, step, fallback_index=0):
-        return (
+        base = (
             float(step[0]),
             float(step[1]),
             max(0.0, min(1.0, float(step[2]))),
             max(-1.0, min(1.0, float(step[3]) if len(step) >= 4 else 0.0)),
             self._automation_step_id(step, fallback_index),
-            self._automation_step_order(step, fallback_index)
+            self._automation_step_order(step, fallback_index),
         )
+        if len(step) >= 11 and bool(int(step[6])):
+            return base + (
+                True,
+                float(step[7]),
+                float(step[8]),
+                float(step[9]),
+                float(step[10]),
+            )
+        return base
 
     def _automation_sort_key(self, indexed_step):
         index, step = indexed_step
@@ -3694,8 +3704,9 @@ class Tap(ControlSurface):
 
     def _automation_step_entry(self, step):
         normalized_step = self._automation_step_tuple(step)
-        time_value, duration, normalized, curve, step_id, step_order = normalized_step
-        return "{:.6f}:{:.6f}:{:.6f}:{:.6f}:{}:{}".format(
+        time_value, duration, normalized, curve, step_id, step_order = normalized_step[:6]
+        uses_exact_controls = len(normalized_step) >= 11 and normalized_step[6]
+        entry = "{:.6f}:{:.6f}:{:.6f}:{:.6f}:{}:{}".format(
             time_value,
             duration,
             normalized,
@@ -3703,6 +3714,14 @@ class Tap(ControlSurface):
             step_id,
             step_order
         )
+        if uses_exact_controls:
+            entry += ":1:{:.9f}:{:.9f}:{:.9f}:{:.9f}".format(
+                normalized_step[7],
+                normalized_step[8],
+                normalized_step[9],
+                normalized_step[10]
+            )
+        return entry
 
     def _automation_payload_checksum(self, value):
         checksum = 0
@@ -8751,6 +8770,7 @@ class Tap(ControlSurface):
         self._remove_follow_action_song_listeners()
         self._remove_song_listeners(old_song)
         self.song_instance = current_song
+        self._automation_pencil_stroke = None
         self._track_list_signature = None
         self._last_group_fold_states = None
         self._last_group_hidden_states = None
@@ -10608,11 +10628,14 @@ class Tap(ControlSurface):
             shared_ms = (note_ms * automation_ms) // math.gcd(note_ms, automation_ms)
             if max_length is not None:
                 max_ms = max(1, int(round(float(max_length) * 1000.0)))
-                shared_ms = min(shared_ms, max_ms)
+                if shared_ms > max_ms:
+                    return None
             return float(shared_ms) / 1000.0
         except Exception:
             fallback = max(float(note_length or 0.0), float(automation_length or 0.0), 0.0001)
-            return min(fallback, max_length) if max_length is not None else fallback
+            if max_length is not None and fallback > float(max_length) + 0.000001:
+                return None
+            return fallback
 
     def _decoupled_physical_length(self, note_length, automation_lengths, max_length=None):
         lengths = [max(0.0001, float(note_length or 0.0001))]
@@ -10622,20 +10645,20 @@ class Tap(ControlSurface):
             except Exception:
                 pass
 
-        if max_length is None:
-            max_length = self._decoupled_automation_max_physical_length(None, note_length)
-
         try:
             shared_ms = max(1, int(round(lengths[0] * 1000.0)))
-            max_ms = max(1, int(round(float(max_length) * 1000.0)))
             for length in lengths[1:]:
                 length_ms = max(1, int(round(length * 1000.0)))
                 shared_ms = (shared_ms * length_ms) // math.gcd(shared_ms, length_ms)
-                if shared_ms >= max_ms:
-                    return float(max_ms) / 1000.0
-            return min(float(shared_ms) / 1000.0, float(max_length))
+            shared_length = float(shared_ms) / 1000.0
+            if max_length is not None and shared_length > float(max_length) + 0.000001:
+                return None
+            return shared_length
         except Exception:
-            return min(max(lengths), float(max_length))
+            fallback = max(lengths)
+            if max_length is not None and fallback > float(max_length) + 0.000001:
+                return None
+            return fallback
 
     def _positive_mod(self, value, length):
         if length <= 0.000001:
@@ -10718,39 +10741,6 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error rewriting decoupled note copies: {}".format(str(e)))
 
-    def _double_decoupled_note_copies(self, clip, previous_info, doubled_info):
-        try:
-            previous_start = previous_info["note_start"]
-            previous_length = previous_info["note_length"]
-            base_notes = clip.get_notes_extended(0, 128, previous_start, previous_length)
-            specs = []
-            for note in base_notes:
-                for half_offset in (0.0, previous_length):
-                    specs.extend(self._make_repeated_note_specs_from_values(
-                        getattr(note, "pitch", 0),
-                        getattr(note, "start_time", previous_start) + half_offset,
-                        getattr(note, "duration", 0.0001),
-                        getattr(note, "velocity", 100),
-                        getattr(note, "mute", False),
-                        getattr(note, "probability", 1.0),
-                        doubled_info
-                    ))
-
-            if hasattr(clip, "remove_notes_extended"):
-                remove_start = float(doubled_info.get("remove_start", previous_start))
-                current_end = max(
-                    previous_info["physical_end"],
-                    doubled_info["physical_end"],
-                    float(getattr(clip, "loop_end", doubled_info["physical_end"])),
-                    float(getattr(clip, "end_marker", doubled_info["physical_end"])),
-                    float(getattr(clip, "length", doubled_info["physical_length"])),
-                )
-                clip.remove_notes_extended(0, 128, remove_start, max(doubled_info["physical_length"], current_end - remove_start))
-            if specs:
-                clip.add_new_notes(specs)
-        except Exception as e:
-            self._debug_log("Error doubling decoupled note copies: {}".format(str(e)))
-
     def _expanded_decoupled_automation_steps(self, info, logical_steps, sample_duration):
         if not info or not logical_steps:
             return tuple(logical_steps or ())
@@ -10761,7 +10751,8 @@ class Tap(ControlSurface):
         for repeat_index in range(repeat_count):
             cycle_start = info["note_start"] + (float(repeat_index) * info["automation_length"])
             for step in logical_steps:
-                time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step)
+                normalized_step = self._automation_step_tuple(step)
+                time_value, duration, normalized, curve, step_id, step_order = normalized_step[:6]
                 if time_value >= info["note_start"] + info["automation_length"] - 0.000001:
                     relative_time = info["automation_length"]
                 else:
@@ -10770,17 +10761,28 @@ class Tap(ControlSurface):
                     continue
                 expanded_time = cycle_start + relative_time
                 if expanded_time <= info["physical_end"] + 0.000001:
-                    expanded_steps.append((expanded_time, duration, normalized, curve, step_id, step_order))
+                    expanded_step = (
+                        expanded_time, duration, normalized, curve,
+                        step_id if repeat_index == 0 else 0,
+                        step_order,
+                    )
+                    if len(normalized_step) >= 11:
+                        expanded_step += normalized_step[6:]
+                    expanded_steps.append(expanded_step)
             cycle_end = cycle_start + info["automation_length"]
             if cycle_end <= info["physical_end"] + 0.000001:
-                expanded_steps.append((
+                endpoint = (
                     min(cycle_end, info["physical_end"]),
                     sample_duration,
                     loop_start_value,
                     0.0,
                     0,
-                    self.AUTOMATION_FOLDED_ENDPOINT_ORDER
-                ))
+                    self.AUTOMATION_FOLDED_ENDPOINT_ORDER,
+                )
+                first_normalized_step = self._automation_step_tuple(logical_steps[0])
+                if len(first_normalized_step) >= 11:
+                    endpoint += (True, 0.5, 0.5, 0.5, 0.5)
+                expanded_steps.append(endpoint)
         return self._automation_sorted_steps(expanded_steps)
 
     def _neutralize_decoupled_automation_points(self, envelope, device_param, info, previous_logical_steps, normalized_value, sample_duration):
@@ -10832,6 +10834,232 @@ class Tap(ControlSurface):
             (time_value, sample_duration, normalized, 0.0, 0, 0)
             for time_value, normalized in self._compress_automation_samples(samples)
         )
+
+    def _automation_envelope_supports_point_events(self, envelope):
+        return bool(
+            envelope is not None
+            and hasattr(envelope, "events_in_range")
+            and hasattr(envelope, "delete_events_in_range")
+            and hasattr(envelope, "create_event")
+            and getattr(getattr(Live, "Envelope", None), "EnvelopeEvent", None) is not None
+        )
+
+    def _automation_runtime_supports_point_events(self):
+        envelope_module = getattr(Live, "Envelope", None)
+        return bool(
+            getattr(envelope_module, "EnvelopeEvent", None) is not None
+            and getattr(envelope_module, "EnvelopeEventControlCoefficients", None) is not None
+        )
+
+    def _automation_steps_use_exact_events(self, steps):
+        steps = tuple(steps or ())
+        return bool(steps) and all(
+            len(self._automation_step_tuple(step, index)) >= 11
+            and bool(self._automation_step_tuple(step, index)[6])
+            for index, step in enumerate(steps)
+        )
+
+    def _automation_steps_from_envelope_events(self, envelope, device_param, start, length, point_duration):
+        if (envelope is None or device_param is None or not liveobj_valid(device_param)
+                or not self._automation_envelope_supports_point_events(envelope)):
+            return None
+
+        try:
+            end = start + max(0.0001, length)
+            events = tuple(envelope.events_in_range(start, end))
+            steps = []
+            for index, event in enumerate(events):
+                time_value = float(event.time)
+                raw_value = float(event.value)
+                if device_param.max != device_param.min:
+                    normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                else:
+                    normalized = self._parameter_normalized_value(device_param)
+                controls = event.control_coefficients
+                steps.append((
+                    time_value,
+                    point_duration,
+                    max(0.0, min(1.0, normalized)),
+                    0.0,
+                    0,
+                    index + 1,
+                    True,
+                    float(controls.x1),
+                    float(controls.y1),
+                    float(controls.x2),
+                    float(controls.y2),
+                ))
+            return self._automation_sorted_steps(steps)
+        except Exception as e:
+            self._debug_log("Error reading exact automation envelope events: {}".format(str(e)))
+            return None
+
+    def _automation_steps_from_envelope(self, envelope, device_param, start, length, sample_duration):
+        exact_steps = self._automation_steps_from_envelope_events(
+            envelope,
+            device_param,
+            start,
+            length,
+            sample_duration
+        )
+        if exact_steps is not None:
+            return exact_steps
+        return self._automation_steps_from_envelope_samples(
+            envelope,
+            device_param,
+            start,
+            length,
+            sample_duration
+        )
+
+    def _create_automation_event(self, envelope, time_value, raw_value, step=None):
+        event = Live.Envelope.EnvelopeEvent(
+            time=float(time_value),
+            value=float(raw_value)
+        )
+        normalized_step = self._automation_step_tuple(
+            step if step is not None else (
+                time_value, 0.0001, 0.0, 0.0, 0, 0,
+                True, 0.5, 0.5, 0.5, 0.5
+            )
+        )
+        if normalized_step[6]:
+            event.control_coefficients = Live.Envelope.EnvelopeEventControlCoefficients(
+                x1=normalized_step[7],
+                y1=normalized_step[8],
+                x2=normalized_step[9],
+                y2=normalized_step[10],
+            )
+        envelope.create_event(event)
+
+    def _create_linear_automation_event(self, envelope, time_value, raw_value):
+        self._create_automation_event(envelope, time_value, raw_value)
+
+    def _write_exact_automation_events_to_envelope(self, envelope, device_param, start, end, steps, allow_empty=False):
+        if (not self._automation_envelope_supports_point_events(envelope)
+                or device_param is None
+                or (not allow_empty and not self._automation_steps_use_exact_events(steps))):
+            return False
+
+        try:
+            start = float(start)
+            end = max(start + 0.0001, float(end))
+            envelope.delete_events_in_range(start, end + 0.0001)
+            # A point's coefficients describe its outgoing segment. Create the
+            # right-hand endpoint first so that segment already exists when
+            # Live validates and stores the left point's coefficients. Creating
+            # left-to-right can silently leave that point linear until the next
+            # full rewrite/refresh exposes the loss.
+            sorted_steps = self._automation_sorted_steps(steps)
+            time_groups = []
+            for step in sorted_steps:
+                if not time_groups or abs(float(step[0]) - float(time_groups[-1][0][0])) > 0.000001:
+                    time_groups.append([])
+                time_groups[-1].append(step)
+            # Descend by time, but retain authored order within a same-time
+            # group: those pairs encode a real vertical edge.
+            for time_group in reversed(time_groups):
+                for step in time_group:
+                    if step[0] < start - 0.000001 or step[0] > end + 0.000001:
+                        continue
+                    raw_value = self._parameter_target_value_from_normalized(
+                        device_param,
+                        step[2]
+                    )
+                    self._create_automation_event(envelope, step[0], raw_value, step)
+            return True
+        except Exception as e:
+            self._debug_log("Error writing exact automation envelope events: {}".format(str(e)))
+            return False
+
+    def _write_incremental_automation_pencil_event_interval(self, state, previous_point, point):
+        envelope = state["envelope"]
+        device_param = state["device_param"]
+        if not self._automation_envelope_supports_point_events(envelope):
+            return False
+
+        guard_duration = 0.0001
+        if previous_point is None:
+            left = point
+            right = point
+        else:
+            left, right = (previous_point, point) if previous_point[0] <= point[0] else (point, previous_point)
+
+        physical_intervals = []
+        decoupled_info = self._decoupled_automation_info(state["clip"], device_param)
+        if decoupled_info:
+            automation_length = max(0.0001, decoupled_info["automation_length"])
+            repeat_count = max(
+                1,
+                int(math.ceil(decoupled_info["physical_length"] / automation_length))
+            )
+            for repeat_index in range(repeat_count):
+                cycle_start = decoupled_info["note_start"] + (float(repeat_index) * automation_length)
+
+                def physical_time(logical_time):
+                    if logical_time >= decoupled_info["note_start"] + automation_length - 0.000001:
+                        offset = automation_length
+                    else:
+                        offset = self._positive_mod(
+                            logical_time - decoupled_info["note_start"],
+                            automation_length
+                        )
+                    return cycle_start + offset
+
+                physical_left_time = physical_time(left[0])
+                physical_right_time = physical_time(right[0])
+                if physical_left_time > decoupled_info["physical_end"] + 0.000001:
+                    continue
+                physical_left = tuple([physical_left_time] + list(left[1:]))
+                physical_right = tuple([
+                    min(physical_right_time, decoupled_info["physical_end"])
+                ] + list(right[1:]))
+                physical_intervals.append((
+                    decoupled_info["note_start"],
+                    decoupled_info["physical_end"],
+                    physical_left,
+                    physical_right,
+                ))
+        else:
+            loop_start = state.get("loop_start", 0.0)
+            loop_end = max(loop_start, state.get("loop_end", right[0]))
+            physical_intervals.append((loop_start, loop_end, left, right))
+
+        for loop_start, loop_end, physical_left, physical_right in physical_intervals:
+            interval_start = max(loop_start, physical_left[0] - guard_duration)
+            interval_end = min(loop_end, physical_right[0] + guard_duration)
+            outside_left_time = max(loop_start, interval_start - guard_duration)
+            outside_right_time = min(loop_end, interval_end + guard_duration)
+            outside_left_value = envelope.value_at_time(outside_left_time)
+            outside_right_value = envelope.value_at_time(outside_right_time)
+
+            envelope.delete_events_in_range(interval_start, interval_end)
+            if physical_left[0] > loop_start + guard_duration:
+                self._create_linear_automation_event(
+                    envelope,
+                    physical_left[0] - guard_duration,
+                    outside_left_value
+                )
+
+            self._create_linear_automation_event(
+                envelope,
+                physical_left[0],
+                self._parameter_target_value_from_normalized(device_param, physical_left[2])
+            )
+            if physical_right[0] > physical_left[0] + 0.000001:
+                self._create_linear_automation_event(
+                    envelope,
+                    physical_right[0],
+                    self._parameter_target_value_from_normalized(device_param, physical_right[2])
+                )
+
+            if physical_right[0] < loop_end - guard_duration:
+                self._create_linear_automation_event(
+                    envelope,
+                    physical_right[0] + guard_duration,
+                    outside_right_value
+                )
+        return True
 
     def _sampled_decoupled_automation_write_steps(self, info, logical_steps, sample_duration):
         expanded_steps = list(self._expanded_decoupled_automation_steps(info, logical_steps, sample_duration))
@@ -10932,7 +11160,7 @@ class Tap(ControlSurface):
         if authored_steps is not None:
             logical_steps = self._normalize_decoupled_logical_automation_steps(parameter_info, authored_steps)
         elif envelope is not None:
-            logical_steps = self._automation_steps_from_envelope_samples(
+            logical_steps = self._automation_steps_from_envelope(
                 envelope,
                 device_param,
                 parameter_info["note_start"],
@@ -10953,20 +11181,33 @@ class Tap(ControlSurface):
         if envelope is None:
             return
 
-        write_steps = self._sampled_decoupled_automation_write_steps(parameter_info, logical_steps, sample_duration)
-        if not write_steps:
-            return
-
-        self._neutralize_decoupled_automation_points(
-            envelope,
-            device_param,
-            parameter_info,
-            authored_steps or logical_steps,
-            write_steps[0][2],
-            sample_duration
-        )
-
-        self._write_automation_steps_to_envelope(envelope, device_param, parameter_info, write_steps)
+        if (self._automation_envelope_supports_point_events(envelope)
+                and self._automation_steps_use_exact_events(logical_steps)):
+            write_steps = self._expanded_decoupled_automation_steps(
+                parameter_info,
+                logical_steps,
+                sample_duration
+            )
+            if not self._write_exact_automation_events_to_envelope(
+                    envelope,
+                    device_param,
+                    parameter_info["note_start"],
+                    parameter_info["physical_end"],
+                    write_steps):
+                return
+        else:
+            write_steps = self._sampled_decoupled_automation_write_steps(parameter_info, logical_steps, sample_duration)
+            if not write_steps:
+                return
+            self._neutralize_decoupled_automation_points(
+                envelope,
+                device_param,
+                parameter_info,
+                authored_steps or logical_steps,
+                write_steps[0][2],
+                sample_duration
+            )
+            self._write_automation_steps_to_envelope(envelope, device_param, parameter_info, write_steps)
         self._store_authored_automation_steps(clip, device_param, control_index, logical_steps)
 
     def _write_automation_steps_to_envelope(self, envelope, device_param, info, write_steps):
@@ -11157,7 +11398,7 @@ class Tap(ControlSurface):
         if authored_steps is not None:
             logical_steps = self._normalize_decoupled_logical_automation_steps(source_info, authored_steps)
         elif envelope is not None:
-            logical_steps = self._automation_steps_from_envelope_samples(
+            logical_steps = self._automation_steps_from_envelope(
                 envelope,
                 device_param,
                 source_info["note_start"],
@@ -11171,12 +11412,19 @@ class Tap(ControlSurface):
             return
 
         expanded_steps = self._expanded_decoupled_automation_steps(source_info, logical_steps, sample_duration)
-        coupled_steps = self._automation_steps_from_step_source(
-            expanded_steps,
-            source_info["note_start"],
-            target_length,
-            sample_duration
-        )
+        if self._automation_steps_use_exact_events(expanded_steps):
+            coupled_steps = self._automation_sorted_steps(
+                step for step in expanded_steps
+                if step[0] >= source_info["note_start"] - 0.000001
+                and step[0] <= source_info["note_start"] + target_length + 0.000001
+            )
+        else:
+            coupled_steps = self._automation_steps_from_step_source(
+                expanded_steps,
+                source_info["note_start"],
+                target_length,
+                sample_duration
+            )
         if not coupled_steps:
             return
 
@@ -11197,19 +11445,28 @@ class Tap(ControlSurface):
             "physical_length": target_length,
             "physical_end": source_info["note_start"] + target_length,
         }
-        write_steps = self._sampled_decoupled_automation_write_steps(coupled_info, coupled_steps, sample_duration)
-        if not write_steps:
-            return
-
-        self._neutralize_decoupled_automation_points(
-            envelope,
-            device_param,
-            source_info,
-            logical_steps,
-            write_steps[0][2],
-            sample_duration
-        )
-        self._write_automation_steps_to_envelope(envelope, device_param, coupled_info, write_steps)
+        if (self._automation_envelope_supports_point_events(envelope)
+                and self._automation_steps_use_exact_events(coupled_steps)):
+            if not self._write_exact_automation_events_to_envelope(
+                    envelope,
+                    device_param,
+                    source_info["note_start"],
+                    max(source_info["physical_end"], coupled_info["physical_end"]),
+                    coupled_steps):
+                return
+        else:
+            write_steps = self._sampled_decoupled_automation_write_steps(coupled_info, coupled_steps, sample_duration)
+            if not write_steps:
+                return
+            self._neutralize_decoupled_automation_points(
+                envelope,
+                device_param,
+                source_info,
+                logical_steps,
+                write_steps[0][2],
+                sample_duration
+            )
+            self._write_automation_steps_to_envelope(envelope, device_param, coupled_info, write_steps)
         self._store_authored_automation_steps(clip, device_param, control_index, coupled_steps)
 
     def _couple_decoupled_automation_to_loop_length(self, clip, target_length):
@@ -11264,86 +11521,323 @@ class Tap(ControlSurface):
 
         return duplicated_any
 
-    def _double_decoupled_loop_automation(self, clip, previous_info, doubled_info):
-        if clip is None:
-            return False
+    def _decoupled_info_with_doubled_note_length(self, clip, previous_info):
+        if clip is None or not previous_info:
+            return None
 
-        source_start = previous_info["note_start"]
-        previous_note_length = previous_info["note_length"]
-        doubled_note_length = doubled_info["note_length"]
-        previous_lengths = previous_info.get("automation_lengths", {})
-        doubled_lengths = doubled_info.get("automation_lengths", {})
-        sample_duration = 1.0 / 128.0
-        duplicated_any = False
-
-        for control_index, device_param in enumerate(self._clip_automation_parameters(clip, previous_info)):
-            try:
-                parameter_key = self._decoupled_automation_parameter_key(device_param)
-                source_length = previous_lengths.get(parameter_key, previous_note_length)
-                target_length = doubled_lengths.get(parameter_key, doubled_note_length)
-                if self._duplicate_loop_automation_for_parameter(
-                    clip,
-                    device_param,
-                    control_index,
-                    source_start,
-                    source_length,
-                    target_length,
-                    sample_duration
-                ):
-                    duplicated_any = True
-            except Exception as e:
-                self._debug_log(
-                    "Error doubling decoupled loop automation for parameter '{}': {}".format(
-                        getattr(device_param, "name", control_index),
-                        str(e)
-                    )
-                )
-
-        self._rewrite_all_decoupled_automation_envelopes(clip, doubled_info)
-        return duplicated_any
-
-    def _double_decoupled_loop(self, clip, previous_info):
         note_start = previous_info["note_start"]
         previous_note_length = previous_info["note_length"]
         doubled_note_length = previous_note_length * 2.0
-        max_physical_length = self._decoupled_automation_max_physical_length(clip, doubled_note_length)
-        doubled_lengths = {}
-        for parameter_key, previous_length in previous_info.get("automation_lengths", {}).items():
-            try:
-                doubled_length = min(max_physical_length, max(0.0001, float(previous_length)) * 2.0)
-                if abs(doubled_length - doubled_note_length) > 0.000001:
-                    doubled_lengths[parameter_key] = doubled_length
-            except Exception:
-                pass
+        previous_physical_length = previous_info["physical_length"]
 
-        physical_length = self._decoupled_physical_length(
-            doubled_note_length,
-            doubled_lengths.values(),
-            max_physical_length
+        # Automation that previously inherited the note-loop length becomes
+        # explicitly decoupled before the note loop changes. This preserves
+        # every automation cycle exactly as it is in Live.
+        automation_lengths = dict(previous_info.get("automation_lengths", {}))
+        for device_param in self._clip_automation_parameters(clip, previous_info):
+            parameter_key = self._decoupled_automation_parameter_key(device_param)
+            if not parameter_key:
+                continue
+            automation_lengths[parameter_key] = automation_lengths.get(
+                parameter_key,
+                previous_note_length
+            )
+
+        maximum_physical_length = self._decoupled_automation_max_physical_length(
+            clip,
+            doubled_note_length
         )
+        target_physical_length = self._decoupled_physical_length(
+            doubled_note_length,
+            automation_lengths.values(),
+            maximum_physical_length
+        )
+        if target_physical_length is None:
+            return None
+        if target_physical_length + 0.000001 < previous_physical_length:
+            return None
+
         doubled_info = {
             "note_start": note_start,
             "note_length": doubled_note_length,
             "note_end": note_start + doubled_note_length,
-            "automation_lengths": doubled_lengths,
+            "automation_lengths": automation_lengths,
             "automation_length": doubled_note_length,
-            "physical_length": physical_length,
-            "physical_end": note_start + physical_length,
+            "physical_length": target_physical_length,
+            "physical_end": note_start + target_physical_length,
             "remove_start": note_start,
         }
-
-        clip.loop_start = note_start
-        clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
-        clip.loop_end = doubled_info["physical_end"]
-        clip.end_marker = doubled_info["physical_end"]
-        self._double_decoupled_note_copies(clip, previous_info, doubled_info)
-        self._double_decoupled_loop_automation(clip, previous_info, doubled_info)
-
-        if doubled_lengths:
-            self._save_decoupled_automation_info_to_name(clip, doubled_info)
-        else:
-            self._remove_decoupled_automation_info_from_name(clip)
         return doubled_info
+
+    def _expand_decoupled_notes_for_duplicate(self, clip, previous_info, target_info):
+        previous_length = max(0.0001, float(previous_info["physical_length"]))
+        target_length = max(previous_length, float(target_info["physical_length"]))
+        if target_length <= previous_length + 0.000001:
+            return True
+
+        note_start = float(previous_info["note_start"])
+        notes = list(clip.get_notes_extended(0, 128, note_start, previous_length))
+        if not notes:
+            return True
+        if not hasattr(clip, "duplicate_notes_by_id"):
+            self._debug_log("Live does not expose native note duplication for the decoupled loop.")
+            return False
+
+        note_ids = tuple(int(note.note_id) for note in notes)
+        earliest = min(float(note.start_time) for note in notes)
+        repeat_offset = previous_length
+        while repeat_offset < target_length - 0.000001:
+            clip.duplicate_notes_by_id(
+                note_ids=note_ids,
+                destination_time=earliest + repeat_offset
+            )
+            repeat_offset += previous_length
+        return True
+
+    def _double_decoupled_loop(self, clip, previous_info):
+        doubled_info = self._decoupled_info_with_doubled_note_length(clip, previous_info)
+        if doubled_info is None:
+            self._debug_log("Decoupled note loop cannot be doubled within the supported physical loop length.")
+            return None
+
+        physical_loop_grows = (
+            doubled_info["physical_length"]
+            > previous_info["physical_length"] + 0.000001
+        )
+        if physical_loop_grows:
+            previous_loop_start = float(getattr(clip, "loop_start", previous_info["note_start"]))
+            previous_start_marker = float(getattr(clip, "start_marker", previous_info["note_start"]))
+            previous_loop_end = float(getattr(clip, "loop_end", previous_info["physical_end"]))
+            previous_end_marker = float(getattr(clip, "end_marker", previous_info["physical_end"]))
+            clip.loop_start = doubled_info["note_start"]
+            clip.start_marker = min(
+                float(getattr(clip, "start_marker", doubled_info["note_start"])),
+                doubled_info["note_start"]
+            )
+            clip.end_marker = doubled_info["physical_end"]
+            clip.loop_end = doubled_info["physical_end"]
+            if not self._expand_decoupled_notes_for_duplicate(
+                clip,
+                previous_info,
+                doubled_info
+            ):
+                clip.loop_start = previous_loop_start
+                clip.start_marker = previous_start_marker
+                clip.loop_end = previous_loop_end
+                clip.end_marker = previous_end_marker
+                return None
+            # Automation lengths do not change for Duplicate Loop. Rewrite
+            # their existing logical cycles only to populate a newly grown
+            # shared Live loop.
+            self._rewrite_all_decoupled_automation_envelopes(clip, doubled_info)
+
+        # If the old shared loop already contained two logical note cycles,
+        # metadata reinterpretation alone remains sufficient.
+        self._save_decoupled_automation_info_to_name(clip, doubled_info)
+        return doubled_info
+
+    def _decoupled_info_with_stretched_lengths(self, clip, previous_info, factor):
+        if clip is None or not previous_info or factor <= 0.0:
+            return None
+
+        note_start = previous_info["note_start"]
+        target_note_length = previous_info["note_length"] * factor
+        target_automation_lengths = dict(
+            (key, max(0.0001, float(length) * factor))
+            for key, length in previous_info.get("automation_lengths", {}).items()
+        )
+        target_physical_length = previous_info["physical_length"] * factor
+        maximum_physical_length = self._decoupled_automation_max_physical_length(
+            clip,
+            target_note_length
+        )
+        if target_physical_length > maximum_physical_length + 0.000001:
+            return None
+
+        stretched_info = {
+            "note_start": note_start,
+            "note_length": target_note_length,
+            "note_end": note_start + target_note_length,
+            "automation_lengths": target_automation_lengths,
+            "automation_length": target_note_length,
+            "physical_length": target_physical_length,
+            "physical_end": note_start + target_physical_length,
+            "remove_start": note_start,
+        }
+        recomputed_length = self._decoupled_physical_length(
+            target_note_length,
+            target_automation_lengths.values(),
+            maximum_physical_length
+        )
+        if recomputed_length is None:
+            return None
+        if abs(recomputed_length - target_physical_length) > 0.000001:
+            return None
+        return stretched_info
+
+    def _scaled_automation_steps(self, steps, start, factor):
+        scaled_steps = []
+        for index, step in enumerate(self._automation_sorted_steps(steps or ())):
+            normalized_step = self._automation_step_tuple(step, index)
+            time_value, duration, normalized, curve, step_id, step_order = normalized_step[:6]
+            scaled_step = (
+                start + ((time_value - start) * factor),
+                max(0.0001, duration * factor),
+                normalized,
+                curve,
+                step_id,
+                step_order,
+            )
+            if len(normalized_step) >= 11:
+                scaled_step += normalized_step[6:]
+            scaled_steps.append(scaled_step)
+        return self._automation_sorted_steps(scaled_steps)
+
+    def _stretch_automation_for_parameter(self, clip, device_param, control_index, source_info, target_info, factor, sample_duration):
+        if clip is None or device_param is None or not liveobj_valid(device_param):
+            return False
+
+        envelope = None
+        if hasattr(clip, "automation_envelope"):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+
+        authored_steps = self._authored_automation_steps(clip, device_param, control_index)
+        if authored_steps is not None:
+            logical_steps = self._normalize_decoupled_logical_automation_steps(source_info, authored_steps)
+        elif envelope is not None:
+            logical_steps = self._automation_steps_from_envelope(
+                envelope,
+                device_param,
+                source_info["note_start"],
+                source_info["automation_length"],
+                sample_duration
+            )
+        else:
+            return False
+        if not logical_steps:
+            return False
+
+        stretched_steps = self._scaled_automation_steps(
+            logical_steps,
+            source_info["note_start"],
+            factor
+        )
+        if envelope is None and hasattr(clip, "create_automation_envelope"):
+            try:
+                envelope = clip.create_automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        if envelope is None:
+            return False
+
+        automation_should_re_enable = self._parameter_automation_is_enabled(device_param) or envelope is not None
+        if (self._automation_envelope_supports_point_events(envelope)
+                and self._automation_steps_use_exact_events(stretched_steps)):
+            write_steps = self._expanded_decoupled_automation_steps(
+                target_info,
+                stretched_steps,
+                sample_duration
+            )
+            if not self._write_exact_automation_events_to_envelope(
+                    envelope,
+                    device_param,
+                    source_info["note_start"],
+                    max(source_info["physical_end"], target_info["physical_end"]),
+                    write_steps):
+                return False
+        else:
+            write_steps = self._sampled_decoupled_automation_write_steps(
+                target_info,
+                stretched_steps,
+                sample_duration
+            )
+            if not write_steps:
+                return False
+            self._neutralize_automation_span(
+                envelope,
+                device_param,
+                source_info["note_start"],
+                target_info["physical_end"],
+                write_steps[0][2]
+            )
+            self._write_automation_steps_to_envelope(
+                envelope,
+                device_param,
+                target_info,
+                write_steps
+            )
+        self._store_authored_automation_steps(
+            clip,
+            device_param,
+            control_index,
+            stretched_steps
+        )
+        self._re_enable_after_automation_write(device_param, automation_should_re_enable)
+        return True
+
+    def _stretch_clip_automation(self, clip, source_start, source_length, target_length, source_decoupled_info=None, target_decoupled_info=None):
+        if clip is None:
+            return False
+
+        factor = target_length / max(0.0001, source_length)
+        sample_duration = 1.0 / 128.0
+        stretched_any = False
+        parameters = self._clip_automation_parameters(clip, source_decoupled_info)
+        for control_index, device_param in enumerate(parameters):
+            try:
+                if source_decoupled_info:
+                    parameter_key = self._decoupled_automation_parameter_key(device_param)
+                    if not parameter_key:
+                        continue
+                    source_info = self._decoupled_info_for_parameter_key(
+                        source_decoupled_info,
+                        parameter_key
+                    )
+                    target_info = self._decoupled_info_for_parameter_key(
+                        target_decoupled_info,
+                        parameter_key
+                    )
+                else:
+                    source_info = {
+                        "note_start": source_start,
+                        "note_length": source_length,
+                        "note_end": source_start + source_length,
+                        "automation_lengths": {},
+                        "automation_length": source_length,
+                        "physical_length": source_length,
+                        "physical_end": source_start + source_length,
+                    }
+                    target_info = {
+                        "note_start": source_start,
+                        "note_length": target_length,
+                        "note_end": source_start + target_length,
+                        "automation_lengths": {},
+                        "automation_length": target_length,
+                        "physical_length": target_length,
+                        "physical_end": source_start + target_length,
+                    }
+
+                if self._stretch_automation_for_parameter(
+                    clip,
+                    device_param,
+                    control_index,
+                    source_info,
+                    target_info,
+                    factor,
+                    sample_duration
+                ):
+                    stretched_any = True
+            except Exception as e:
+                self._debug_log(
+                    "Error stretching automation for parameter '{}': {}".format(
+                        getattr(device_param, "name", control_index),
+                        str(e)
+                    )
+                )
+        return stretched_any
 
     def _duplicate_loop_automation_for_parameter(self, clip, device_param, control_index, source_start, source_length, target_length, sample_duration):
         if clip is None or device_param is None or not liveobj_valid(device_param):
@@ -11358,14 +11852,21 @@ class Tap(ControlSurface):
 
         authored_steps = self._authored_automation_steps(clip, device_param, control_index)
         if authored_steps is not None:
-            logical_steps = self._automation_steps_from_step_source(
-                authored_steps,
-                source_start,
-                source_length,
-                sample_duration
-            )
+            if self._automation_steps_use_exact_events(authored_steps):
+                logical_steps = self._automation_sorted_steps(
+                    step for step in authored_steps
+                    if step[0] >= source_start - 0.000001
+                    and step[0] <= source_start + source_length + 0.000001
+                )
+            else:
+                logical_steps = self._automation_steps_from_step_source(
+                    authored_steps,
+                    source_start,
+                    source_length,
+                    sample_duration
+                )
         elif envelope is not None:
-            logical_steps = self._automation_steps_from_envelope_samples(
+            logical_steps = self._automation_steps_from_envelope(
                 envelope,
                 device_param,
                 source_start,
@@ -11393,12 +11894,19 @@ class Tap(ControlSurface):
             return False
 
         expanded_steps = self._expanded_decoupled_automation_steps(loop_info, logical_steps, sample_duration)
-        duplicated_steps = self._automation_steps_from_step_source(
-            expanded_steps,
-            source_start,
-            target_length,
-            sample_duration
-        )
+        if self._automation_steps_use_exact_events(expanded_steps):
+            duplicated_steps = self._automation_sorted_steps(
+                step for step in expanded_steps
+                if step[0] >= source_start - 0.000001
+                and step[0] <= source_start + target_length + 0.000001
+            )
+        else:
+            duplicated_steps = self._automation_steps_from_step_source(
+                expanded_steps,
+                source_start,
+                target_length,
+                sample_duration
+            )
         if not duplicated_steps:
             return False
 
@@ -11411,10 +11919,6 @@ class Tap(ControlSurface):
             "physical_length": target_length,
             "physical_end": source_start + target_length,
         }
-        write_steps = self._sampled_decoupled_automation_write_steps(coupled_info, duplicated_steps, sample_duration)
-        if not write_steps:
-            return False
-
         if envelope is None and hasattr(clip, "create_automation_envelope"):
             try:
                 envelope = clip.create_automation_envelope(device_param)
@@ -11424,15 +11928,28 @@ class Tap(ControlSurface):
             return False
 
         automation_should_re_enable = self._parameter_automation_is_enabled(device_param) or envelope is not None
-        self._neutralize_decoupled_automation_points(
-            envelope,
-            device_param,
-            coupled_info,
-            duplicated_steps,
-            write_steps[0][2],
-            sample_duration
-        )
-        self._write_automation_steps_to_envelope(envelope, device_param, coupled_info, write_steps)
+        if (self._automation_envelope_supports_point_events(envelope)
+                and self._automation_steps_use_exact_events(duplicated_steps)):
+            if not self._write_exact_automation_events_to_envelope(
+                    envelope,
+                    device_param,
+                    source_start,
+                    source_start + target_length,
+                    duplicated_steps):
+                return False
+        else:
+            write_steps = self._sampled_decoupled_automation_write_steps(coupled_info, duplicated_steps, sample_duration)
+            if not write_steps:
+                return False
+            self._neutralize_decoupled_automation_points(
+                envelope,
+                device_param,
+                coupled_info,
+                duplicated_steps,
+                write_steps[0][2],
+                sample_duration
+            )
+            self._write_automation_steps_to_envelope(envelope, device_param, coupled_info, write_steps)
         self._store_authored_automation_steps(clip, device_param, control_index, duplicated_steps)
         self._re_enable_after_automation_write(device_param, automation_should_re_enable)
         return True
@@ -11458,11 +11975,17 @@ class Tap(ControlSurface):
         epsilon = 0.000001
         normalized_steps = []
         for index, step in enumerate(tuple(steps or ())):
-            time_value, duration, normalized, curve, step_id, step_order = self._automation_step_tuple(step, index)
+            normalized_step = self._automation_step_tuple(step, index)
+            time_value, duration, normalized, curve, step_id, step_order = normalized_step[:6]
             if time_value < loop_start - epsilon or time_value > loop_end + epsilon:
                 continue
             folded_time = loop_end if time_value >= loop_end - epsilon else max(loop_start, time_value)
-            normalized_steps.append((folded_time, duration, normalized, curve, step_id, step_order))
+            folded_step = (
+                folded_time, duration, normalized, curve, step_id, step_order,
+            )
+            if len(normalized_step) >= 11:
+                folded_step += normalized_step[6:]
+            normalized_steps.append(folded_step)
 
         return self._automation_sorted_steps(normalized_steps)
 
@@ -18070,6 +18593,9 @@ class Tap(ControlSurface):
 
             max_physical_length = self._decoupled_automation_max_physical_length(clip, note_length)
             physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
+            if physical_length is None:
+                self._debug_log("Decoupled note-loop ratio exceeds the 64-bar shared-loop limit.")
+                return
             info = {
                 "note_start": note_start,
                 "note_length": note_length,
@@ -18163,6 +18689,9 @@ class Tap(ControlSurface):
                 return
 
             physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
+            if physical_length is None:
+                self._debug_log("Decoupled automation ratio exceeds the 64-bar shared-loop limit.")
+                return
             info = {
                 "note_start": note_start,
                 "note_length": note_length,
@@ -18211,12 +18740,13 @@ class Tap(ControlSurface):
             self._debug_log("Error unfolding decoupled automation clip: {}".format(str(e)))
 
     def _automation_clear_response(self, control_index, current_value):
-        response = "{}|{}|{:.6f}|{}|{}".format(
+        response = "{}|{}|{:.6f}|{}|{}|{}".format(
             control_index,
             0,
             current_value,
             "",
-            ""
+            "",
+            "|".join(["0", "0.000000", "0.000000", "", "", "1" if self._automation_runtime_supports_point_events() else "0"])
         )
         self._send_sys_ex_message(response, 0x31)
 
@@ -18225,8 +18755,19 @@ class Tap(ControlSurface):
         current_value = self._parameter_normalized_value(device_param)
         clip_slot = self.song().view.highlighted_clip_slot
         clip = clip_slot.clip if clip_slot is not None and clip_slot.has_clip else None
-        response_fields = self._automation_response_decoupled_fields(clip, device_param)
-        response_fields.extend([str(write_token or ""), "error"])
+        envelope = None
+        if clip is not None and device_param is not None and hasattr(clip, "automation_envelope"):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        response_fields = self._automation_response_fields(
+            clip,
+            device_param,
+            envelope,
+            write_token,
+            "error"
+        )
         response = "{}|{}|{:.6f}|{}|{}|{}".format(
             control_index,
             0,
@@ -18245,6 +18786,16 @@ class Tap(ControlSurface):
             "1" if info.get("has_parameter_length") else "0",
             "{:.6f}".format(info.get("automation_length", info.get("note_length", 0.0))),
             "{:.6f}".format(info.get("physical_end", info.get("note_end", 0.0))),
+        ]
+
+    def _automation_response_fields(self, clip, device_param, envelope=None, write_token="", status=""):
+        supports_exact_events = self._automation_envelope_supports_point_events(envelope)
+        if envelope is None:
+            supports_exact_events = self._automation_runtime_supports_point_events()
+        return self._automation_response_decoupled_fields(clip, device_param) + [
+            str(write_token or ""),
+            str(status or ""),
+            "1" if supports_exact_events else "0",
         ]
 
     def _clear_automation_envelope(self, message):
@@ -18371,17 +18922,50 @@ class Tap(ControlSurface):
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
             request_end = start + (float(count - 1) * step_duration)
             decoupled_info = self._decoupled_automation_info(clip, device_param)
-            if authored_steps is not None and decoupled_info is not None:
+            exact_envelope_steps = None
+            if self._automation_envelope_supports_point_events(envelope):
+                exact_start = decoupled_info["note_start"] if decoupled_info else float(
+                    getattr(clip, "loop_start", start)
+                )
+                exact_end = (
+                    exact_start + decoupled_info["automation_length"]
+                    if decoupled_info
+                    else float(getattr(clip, "loop_end", request_end))
+                )
+                exact_envelope_steps = self._automation_steps_from_envelope_events(
+                    envelope,
+                    device_param,
+                    exact_start,
+                    max(step_duration, exact_end - exact_start),
+                    step_duration
+                )
+                if exact_envelope_steps is not None:
+                    if decoupled_info:
+                        exact_envelope_steps = self._automation_sorted_steps(
+                            step for step in exact_envelope_steps
+                            if step[0] < exact_end - 0.000001
+                        )
+                    authored_steps = exact_envelope_steps
+                    self._store_authored_automation_steps(
+                        clip,
+                        device_param,
+                        control_index,
+                        authored_steps
+                    )
+
+            if exact_envelope_steps is None and authored_steps is not None and decoupled_info is not None:
                 authored_steps = self._normalize_decoupled_logical_automation_steps(decoupled_info, authored_steps)
                 self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
             authored_render_steps = None
-            if authored_steps is not None and decoupled_info is not None:
+            if exact_envelope_steps is None and authored_steps is not None and decoupled_info is not None:
                 authored_render_steps = self._expanded_decoupled_automation_steps(
                     decoupled_info,
                     authored_steps,
                     step_duration
                 )
-            if authored_steps is not None and decoupled_info is None and not self._authored_automation_steps_match_samples(authored_steps, samples):
+            if (exact_envelope_steps is None and authored_steps is not None
+                    and decoupled_info is None
+                    and not self._authored_automation_steps_match_samples(authored_steps, samples)):
                 points = self._compress_automation_samples(samples)
                 replacement_steps = []
                 for sample in points:
@@ -18393,10 +18977,21 @@ class Tap(ControlSurface):
                     + replacement_steps
                 )
                 self._store_authored_automation_steps(clip, device_param, control_index, authored_steps)
-            points = [] if authored_steps is not None else self._compress_automation_samples(samples)
+            if authored_steps is None:
+                exact_envelope_steps = self._automation_steps_from_envelope_events(
+                    envelope,
+                    device_param,
+                    start,
+                    max(step_duration, request_end - start),
+                    step_duration
+                )
+            points = [] if authored_steps is not None or exact_envelope_steps is not None else self._compress_automation_samples(samples)
             entries = []
             if authored_steps is not None:
                 for step in authored_steps:
+                    entries.append(self._automation_step_entry(step))
+            elif exact_envelope_steps is not None:
+                for step in exact_envelope_steps:
                     entries.append(self._automation_step_entry(step))
             else:
                 for sample in points:
@@ -18405,11 +19000,12 @@ class Tap(ControlSurface):
                         continue
                     entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
             render_entries = []
-            for sample in samples:
-                time_value, normalized = sample
-                if authored_render_steps:
-                    normalized = self._automation_value_from_steps(time_value, authored_render_steps)
-                render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
+            if exact_envelope_steps is None:
+                for sample in samples:
+                    time_value, normalized = sample
+                    if authored_render_steps:
+                        normalized = self._automation_value_from_steps(time_value, authored_render_steps)
+                    render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
 
             response = "{}|{}|{:.6f}|{}|{}|{}".format(
                 control_index,
@@ -18417,16 +19013,431 @@ class Tap(ControlSurface):
                 current_value,
                 ",".join(entries),
                 ",".join(render_entries),
-                "|".join(self._automation_response_decoupled_fields(clip, device_param))
+                "|".join(self._automation_response_fields(clip, device_param, envelope))
             )
             self._send_sys_ex_message(response, 0x31)
         except Exception as e:
             self._debug_log("Error sending automation envelope: {}".format(str(e)))
 
+    def _handle_automation_pencil_message(self, fields):
+        try:
+            if len(fields) < 3:
+                return
+
+            action = fields[1]
+            stroke_id = int(fields[2])
+            if action == "B":
+                self._begin_automation_pencil_stroke(stroke_id, fields)
+            elif action == "P":
+                self._append_automation_pencil_point(stroke_id, fields)
+            elif action == "R":
+                state = getattr(self, "_automation_pencil_stroke", None)
+                if state is not None and state.get("stroke_id") == stroke_id and len(fields) == 3:
+                    state["last_point"] = None
+            elif action == "E":
+                self._end_automation_pencil_stroke(stroke_id, fields)
+            elif action == "C":
+                state = getattr(self, "_automation_pencil_stroke", None)
+                if state is not None and state.get("stroke_id") == stroke_id:
+                    self._automation_pencil_stroke = None
+        except Exception as e:
+            self._debug_log("Error handling incremental automation pencil message: {}".format(str(e)))
+
+    def _begin_automation_pencil_stroke(self, stroke_id, fields):
+        if len(fields) != 8:
+            return
+
+        control_index = max(0, min(7, int(fields[3])))
+        loop_start = float(fields[4])
+        loop_end = max(loop_start, float(fields[5]))
+        sample_duration = max(0.0001, float(fields[6]))
+        point_duration = max(sample_duration, float(fields[7]))
+        device_param = self._current_connected_parameter_for_control(control_index)
+        clip_slot = self.song().view.highlighted_clip_slot
+        if (clip_slot is None or not clip_slot.has_clip
+                or not self._parameter_is_automatable(device_param)):
+            self._automation_write_error_response(control_index)
+            return
+
+        clip = clip_slot.clip
+        envelope = None
+        if hasattr(clip, 'automation_envelope'):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+
+        automation_was_enabled = self._parameter_automation_is_enabled(device_param)
+        if envelope is None and hasattr(clip, 'create_automation_envelope'):
+            try:
+                envelope = clip.create_automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        if envelope is None:
+            self._automation_write_error_response(control_index)
+            return
+
+        logical_steps = self._authored_automation_steps(clip, device_param, control_index)
+        if logical_steps is None:
+            # Live 12 can expose the real breakpoint events. Prefer those over
+            # compressing value_at_time samples, which invents editable dots on
+            # otherwise empty baseline spans. Older runtimes retain the proven
+            # sampled fallback.
+            logical_steps = self._automation_steps_from_envelope_events(
+                envelope,
+                device_param,
+                loop_start,
+                max(0.0001, loop_end - loop_start),
+                point_duration
+            )
+            begin_decoupled_info = self._decoupled_automation_info(clip, device_param)
+            if logical_steps is not None and begin_decoupled_info:
+                logical_end = begin_decoupled_info["note_start"] + begin_decoupled_info["automation_length"]
+                logical_steps = self._automation_sorted_steps(
+                    step for step in logical_steps
+                    if step[0] < logical_end - 0.000001
+                )
+            if logical_steps is None:
+                logical_steps = self._automation_steps_from_envelope_samples(
+                    envelope,
+                    device_param,
+                    loop_start,
+                    max(0.0001, loop_end - loop_start),
+                    sample_duration
+                )
+
+        self._automation_pencil_stroke = {
+            "stroke_id": stroke_id,
+            "control_index": control_index,
+            "clip": clip,
+            "device_param": device_param,
+            "envelope": envelope,
+            "loop_start": loop_start,
+            "loop_end": loop_end,
+            "sample_duration": sample_duration,
+            "point_duration": point_duration,
+            "logical_steps": self._automation_sorted_steps(logical_steps or ()),
+            "had_authored_steps": True,
+            "last_point": None,
+            "next_sequence": 1,
+            "entries": [],
+            "automation_should_re_enable": automation_was_enabled or envelope is not None,
+            "failed": False,
+        }
+
+    def _append_automation_pencil_point(self, stroke_id, fields):
+        state = getattr(self, "_automation_pencil_stroke", None)
+        if state is None or state.get("stroke_id") != stroke_id or len(fields) != 4:
+            return
+        if state.get("failed"):
+            return
+
+        components = fields[3].split(":")
+        if len(components) != 5:
+            self._fail_automation_pencil_stroke(state)
+            return
+        try:
+            sequence = int(components[0])
+            time_value = max(state["loop_start"], min(state["loop_end"], float(components[1])))
+            normalized = max(0.0, min(1.0, float(components[2])))
+            step_id = max(0, int(components[3]))
+            step_order = max(0, int(components[4]))
+        except Exception:
+            self._fail_automation_pencil_stroke(state)
+            return
+        if sequence != state["next_sequence"]:
+            self._fail_automation_pencil_stroke(state)
+            return
+
+        point = (
+            time_value,
+            state["point_duration"],
+            normalized,
+            0.0,
+            step_id,
+            step_order,
+            True,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+        )
+        if not self._write_incremental_automation_pencil_interval(state, state["last_point"], point):
+            self._fail_automation_pencil_stroke(state)
+            return
+
+        state["logical_steps"] = self._merge_incremental_automation_pencil_point(
+            state["logical_steps"],
+            state["last_point"],
+            point
+        )
+        state["last_point"] = point
+        state["next_sequence"] += 1
+        state["entries"].append(fields[3])
+        if state["had_authored_steps"]:
+            self._store_authored_automation_steps(
+                state["clip"],
+                state["device_param"],
+                state["control_index"],
+                state["logical_steps"]
+            )
+
+    def _merge_incremental_automation_pencil_point(self, logical_steps, previous_point, point):
+        epsilon = 0.000001
+        if previous_point is None:
+            kept_steps = [step for step in logical_steps if abs(step[0] - point[0]) > epsilon]
+            return self._automation_sorted_steps(kept_steps + [point])
+
+        interval_start = min(previous_point[0], point[0])
+        interval_end = max(previous_point[0], point[0])
+        kept_steps = [
+            step for step in logical_steps
+            if step[0] < interval_start - epsilon or step[0] > interval_end + epsilon
+        ]
+        return self._automation_sorted_steps(kept_steps + [previous_point, point])
+
+    def _write_incremental_automation_pencil_interval(self, state, previous_point, point):
+        envelope = state["envelope"]
+        device_param = state["device_param"]
+        if envelope is None or device_param is None or not liveobj_valid(device_param):
+            return False
+
+        if self._automation_envelope_supports_point_events(envelope):
+            try:
+                if self._write_incremental_automation_pencil_event_interval(
+                        state, previous_point, point):
+                    return True
+            except Exception as e:
+                # Do not make a runtime-specific event API failure fatal. The
+                # insert_step path below is supported by older Live versions
+                # and safely rewrites the same completed interval.
+                self._debug_log(
+                    "Falling back from exact Pencil envelope events: {}".format(str(e))
+                )
+
+        if previous_point is None:
+            logical_samples = [(point[0], point[2])]
+            logical_start = point[0]
+            # The first authored point has no known drawing direction yet.
+            # Touch only that instant; the next point will replace exactly the
+            # completed A -> B interval without leaking past A on reverse strokes.
+            logical_end = point[0]
+        else:
+            left, right = (previous_point, point) if previous_point[0] <= point[0] else (point, previous_point)
+            logical_start = left[0]
+            logical_end = right[0]
+            logical_samples = []
+            duration = max(0.000001, logical_end - logical_start)
+            sample_time = logical_start
+            while sample_time < logical_end - 0.000001:
+                progress = (sample_time - logical_start) / duration
+                logical_samples.append((sample_time, left[2] + ((right[2] - left[2]) * progress)))
+                sample_time += state["sample_duration"]
+            logical_samples.append((logical_end, right[2]))
+
+        decoupled_info = self._decoupled_automation_info(state["clip"], device_param)
+        physical_intervals = []
+        if decoupled_info:
+            automation_length = max(0.0001, decoupled_info["automation_length"])
+            repeat_count = max(1, int(math.ceil(decoupled_info["physical_length"] / automation_length)))
+            for repeat_index in range(repeat_count):
+                cycle_start = decoupled_info["note_start"] + (float(repeat_index) * automation_length)
+
+                def physical_time(logical_time):
+                    if logical_time >= decoupled_info["note_start"] + automation_length - 0.000001:
+                        offset = automation_length
+                    else:
+                        offset = self._positive_mod(logical_time - decoupled_info["note_start"], automation_length)
+                    return cycle_start + offset
+
+                physical_start = physical_time(logical_start)
+                physical_end = physical_time(logical_end)
+                if physical_start > decoupled_info["physical_end"] + 0.000001:
+                    continue
+                shifted_samples = [
+                    (physical_time(time_value), normalized)
+                    for time_value, normalized in logical_samples
+                    if physical_time(time_value) <= decoupled_info["physical_end"] + 0.000001
+                ]
+                if shifted_samples:
+                    physical_intervals.append((physical_start, min(physical_end, decoupled_info["physical_end"]), shifted_samples))
+        else:
+            physical_intervals.append((logical_start, logical_end, logical_samples))
+
+        minimum_duration = 0.0001
+        try:
+            for physical_start, physical_end, samples in physical_intervals:
+                if not samples:
+                    continue
+                self._neutralize_automation_span(
+                    envelope,
+                    device_param,
+                    physical_start,
+                    max(physical_start + minimum_duration, physical_end),
+                    samples[0][1]
+                )
+                for index, sample in enumerate(samples):
+                    time_value, normalized = sample
+                    next_time = samples[index + 1][0] if index + 1 < len(samples) else None
+                    duration = max(minimum_duration, next_time - time_value) if next_time is not None else minimum_duration
+                    raw_value = self._parameter_target_value_from_normalized(device_param, normalized)
+                    envelope.insert_step(time_value, duration, raw_value)
+            return True
+        except Exception as e:
+            self._debug_log("Error writing incremental automation pencil interval: {}".format(str(e)))
+            return False
+
+    def _end_automation_pencil_stroke(self, stroke_id, fields):
+        state = getattr(self, "_automation_pencil_stroke", None)
+        if state is None or state.get("stroke_id") != stroke_id or len(fields) != 8:
+            return
+
+        write_token = fields[7]
+        try:
+            expected_count = int(fields[3])
+            expected_checksum = int(fields[4], 16)
+            page_start = float(fields[5])
+            page_end = max(page_start, float(fields[6]))
+        except Exception:
+            self._automation_pencil_stroke = None
+            self._automation_write_error_response(state["control_index"], write_token)
+            return
+
+        actual_checksum = self._automation_payload_checksum(",".join(state["entries"]))
+        valid = (
+            not state.get("failed")
+            and expected_count == len(state["entries"])
+            and state["next_sequence"] == expected_count + 1
+            and expected_checksum == actual_checksum
+        )
+        self._automation_pencil_stroke = None
+        if not valid:
+            self._automation_write_error_response(state["control_index"], write_token)
+            return
+
+        if state["had_authored_steps"]:
+            self._store_authored_automation_steps(
+                state["clip"],
+                state["device_param"],
+                state["control_index"],
+                state["logical_steps"]
+            )
+        self._send_incremental_automation_pencil_response(state, page_start, page_end, write_token)
+        self._re_enable_after_automation_write(
+            state["device_param"],
+            state["automation_should_re_enable"]
+        )
+        self._refresh_parameter_metadata_on_automation_change()
+
+    def _send_incremental_automation_pencil_response(self, state, page_start, page_end, write_token):
+        logical_steps = self._automation_sorted_steps(state["logical_steps"])
+        decoupled_info = self._decoupled_automation_info(state["clip"], state["device_param"])
+        current_normalized = self._parameter_normalized_value(state["device_param"])
+
+        exact_steps = None
+        if self._automation_envelope_supports_point_events(state["envelope"]):
+            exact_start = decoupled_info["note_start"] if decoupled_info else state["loop_start"]
+            exact_length = decoupled_info["automation_length"] if decoupled_info else max(
+                0.0001,
+                state["loop_end"] - state["loop_start"]
+            )
+            exact_steps = self._automation_steps_from_envelope_events(
+                state["envelope"],
+                state["device_param"],
+                exact_start,
+                exact_length,
+                state["point_duration"]
+            )
+            if exact_steps is not None:
+                if decoupled_info:
+                    exact_end = exact_start + exact_length
+                    exact_steps = self._automation_sorted_steps(
+                        step for step in exact_steps
+                        if step[0] < exact_end - 0.000001
+                    )
+                logical_steps = exact_steps
+                self._store_authored_automation_steps(
+                    state["clip"],
+                    state["device_param"],
+                    state["control_index"],
+                    logical_steps
+                )
+
+        count = max(
+            2,
+            min(
+                self.AUTOMATION_ENVELOPE_MAX_SAMPLES,
+                int((page_end - page_start) / state["sample_duration"]) + 1
+            )
+        )
+        response_steps = self._expanded_decoupled_automation_steps(
+            decoupled_info,
+            logical_steps,
+            state["sample_duration"]
+        ) if decoupled_info else logical_steps
+        response_samples = []
+        for index in range(count):
+            time_value = page_start + (float(index) * state["sample_duration"])
+            try:
+                raw_value = state["envelope"].value_at_time(time_value)
+                if state["device_param"].max != state["device_param"].min:
+                    normalized = (
+                        (raw_value - state["device_param"].min)
+                        / (state["device_param"].max - state["device_param"].min)
+                    )
+                else:
+                    normalized = current_normalized
+            except Exception:
+                normalized = self._automation_value_from_steps(
+                    time_value,
+                    response_steps
+                ) if response_steps else current_normalized
+            response_samples.append((time_value, max(0.0, min(1.0, normalized))))
+
+        if not state["had_authored_steps"]:
+            logical_steps = self._automation_sorted_steps(
+                (time_value, state["sample_duration"], normalized, 0.0, 0, 0)
+                for time_value, normalized in self._compress_automation_samples(response_samples)
+            )
+
+        render_entries = []
+        if exact_steps is None:
+            for time_value, normalized in response_samples:
+                render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(
+                    time_value,
+                    state["sample_duration"],
+                    normalized,
+                    0.0
+                ))
+
+        response = "{}|{}|{:.6f}|{}|{}|{}".format(
+            state["control_index"],
+            1,
+            current_normalized,
+            ",".join(self._automation_step_entry(step) for step in logical_steps),
+            ",".join(render_entries),
+            "|".join(
+                self._automation_response_fields(
+                    state["clip"],
+                    state["device_param"],
+                    state["envelope"],
+                    write_token
+                )
+            )
+        )
+        self._send_sys_ex_message(response, 0x31)
+
+    def _fail_automation_pencil_stroke(self, state):
+        state["failed"] = True
+        self._automation_write_error_response(state["control_index"])
+
     def _set_automation_envelope(self, message):
         try:
             payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
             fields = self._split_escaped_sysex_fields(payload, "|")
+            if fields and fields[0] == "P":
+                self._handle_automation_pencil_message(fields)
+                return
             if len(fields) < 5:
                 return
 
@@ -18436,6 +19447,7 @@ class Tap(ControlSurface):
             sample_duration = max(0.0001, float(fields[3]))
             step_entries = self._split_escaped_sysex_fields(fields[4], ",") if fields[4] else []
             write_token = fields[7] if len(fields) >= 8 else ""
+            write_uses_exact_events = len(fields) >= 9 and fields[8] == "1"
             response_token_fields = [write_token] if write_token else []
 
             if len(fields) >= 7:
@@ -18501,7 +19513,15 @@ class Tap(ControlSurface):
                     curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
                     step_id = max(0, int(components[4])) if len(components) >= 5 else 0
                     step_order = max(0, int(components[5])) if len(components) >= 6 else step_id
-                    steps.append((time_value, duration, normalized, curve, step_id, step_order))
+                    uses_exact_controls = len(components) >= 11 and components[6] == "1"
+                    x1 = float(components[7]) if len(components) >= 11 else 0.5
+                    y1 = float(components[8]) if len(components) >= 11 else 0.5
+                    x2 = float(components[9]) if len(components) >= 11 else 0.5
+                    y2 = float(components[10]) if len(components) >= 11 else 0.5
+                    steps.append((
+                        time_value, duration, normalized, curve, step_id, step_order,
+                        uses_exact_controls, x1, y1, x2, y2
+                    ))
                 except Exception:
                     pass
 
@@ -18522,6 +19542,86 @@ class Tap(ControlSurface):
                 steps = list(self._expanded_decoupled_automation_steps(decoupled_info, steps, sample_duration))
                 clip_end = decoupled_info["physical_end"]
             response_source_steps = tuple(steps)
+
+            if write_uses_exact_events:
+                if envelope is None and hasattr(clip, 'create_automation_envelope'):
+                    try:
+                        envelope = clip.create_automation_envelope(device_param)
+                        if envelope is not None:
+                            automation_should_re_enable = True
+                    except Exception:
+                        envelope = None
+
+                exact_start = decoupled_info["note_start"] if decoupled_info else page_start
+                exact_end = decoupled_info["physical_end"] if decoupled_info else page_end
+                exact_api_available = self._automation_envelope_supports_point_events(envelope)
+                if exact_api_available and self._write_exact_automation_events_to_envelope(
+                        envelope,
+                        device_param,
+                        exact_start,
+                        exact_end,
+                        response_source_steps,
+                        allow_empty=True):
+                    read_start = decoupled_info["note_start"] if decoupled_info else page_start
+                    read_length = decoupled_info["automation_length"] if decoupled_info else max(
+                        0.0001,
+                        page_end - page_start
+                    )
+                    accepted_steps = self._automation_steps_from_envelope_events(
+                        envelope,
+                        device_param,
+                        read_start,
+                        read_length,
+                        sample_duration
+                    )
+                    if accepted_steps is None:
+                        self._debug_log("Live did not return the exact events after an exact write")
+                        self._automation_write_error_response(control_index, write_token)
+                        self._refresh_parameter_metadata_on_automation_change()
+                        return
+                    if decoupled_info:
+                        read_end = read_start + read_length
+                        accepted_steps = self._automation_sorted_steps(
+                            step for step in accepted_steps
+                            if step[0] < read_end - 0.000001
+                        )
+                    logical_steps = accepted_steps
+
+                    if logical_steps:
+                        self._store_authored_automation_steps(
+                            clip,
+                            device_param,
+                            control_index,
+                            logical_steps
+                        )
+                    else:
+                        self._clear_authored_automation_steps(clip, device_param, control_index)
+
+                    response = "{}|{}|{:.6f}|{}|{}|{}".format(
+                        control_index,
+                        1,
+                        current_normalized,
+                        ",".join(self._automation_step_entry(step) for step in logical_steps),
+                        "",
+                        "|".join(self._automation_response_fields(
+                            clip,
+                            device_param,
+                            envelope,
+                            write_token
+                        ))
+                    )
+                    self._send_sys_ex_message(response, 0x31)
+                    self._re_enable_after_automation_write(device_param, automation_should_re_enable)
+                    self._refresh_parameter_metadata_on_automation_change()
+                    return
+
+                if exact_api_available:
+                    self._debug_log("Exact automation event write failed")
+                    self._automation_write_error_response(control_index, write_token)
+                    self._refresh_parameter_metadata_on_automation_change()
+                    return
+
+                self._debug_log("Exact automation event API unavailable; using sampled compatibility path")
 
             def edited_span_value(time_value):
                 if not steps:
@@ -18637,7 +19737,12 @@ class Tap(ControlSurface):
                     current_normalized,
                     "",
                     "",
-                    "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
+                    "|".join(self._automation_response_fields(
+                        clip,
+                        device_param,
+                        envelope,
+                        write_token
+                    ))
                 )
                 self._send_sys_ex_message(response, 0x31)
                 self._refresh_parameter_metadata_on_automation_change()
@@ -18760,7 +19865,12 @@ class Tap(ControlSurface):
                 current_normalized,
                 ",".join(point_entries),
                 ",".join(render_entries),
-                "|".join(self._automation_response_decoupled_fields(clip, device_param) + response_token_fields)
+                "|".join(self._automation_response_fields(
+                    clip,
+                    device_param,
+                    envelope,
+                    write_token
+                ))
             )
             self._send_sys_ex_message(response, 0x31)
             self._re_enable_after_automation_write(device_param, automation_should_re_enable)
@@ -18836,11 +19946,46 @@ class Tap(ControlSurface):
 
             if time_value <= next_step[0]:
                 progress = max(0.0, min(1.0, (time_value - previous_step[0]) / (next_step[0] - previous_step[0])))
+                if len(previous_step) >= 11 and previous_step[6]:
+                    parameter = self._automation_bezier_parameter_for_x(
+                        progress,
+                        previous_step[7],
+                        previous_step[9]
+                    )
+                    normalized_y = self._automation_cubic_bezier(
+                        0.0,
+                        previous_step[8],
+                        previous_step[10],
+                        1.0,
+                        parameter
+                    )
+                    return max(0.0, min(1.0, previous_step[2] + ((next_step[2] - previous_step[2]) * normalized_y)))
                 return self._automation_curve_segment_value(previous_step[2], next_step[2], progress, previous_step[3] if len(previous_step) >= 4 else 0.0)
 
             previous_step = next_step
 
         return max(0.0, min(1.0, previous_step[2]))
+
+    def _automation_bezier_parameter_for_x(self, x, x1, x2):
+        lower = 0.0
+        upper = 1.0
+        for _ in range(32):
+            middle = (lower + upper) * 0.5
+            candidate = self._automation_cubic_bezier(0.0, x1, x2, 1.0, middle)
+            if candidate < x:
+                lower = middle
+            else:
+                upper = middle
+        return (lower + upper) * 0.5
+
+    def _automation_cubic_bezier(self, p0, p1, p2, p3, value):
+        inverse = 1.0 - value
+        return (
+            (inverse * inverse * inverse * p0)
+            + (3.0 * inverse * inverse * value * p1)
+            + (3.0 * inverse * value * value * p2)
+            + (value * value * value * p3)
+        )
 
     def _automation_curve_segment_value(self, start_value, end_value, progress, curve):
         progress = max(0.0, min(1.0, progress))
@@ -19114,6 +20259,10 @@ class Tap(ControlSurface):
                 self._double_decoupled_loop(clip, decoupled_info)
             else:
                 clip.duplicate_loop()
+                # Native duplication mutates Live behind the authored-event
+                # cache. The next envelope request must read the doubled Live
+                # envelope instead of treating the old-length cache as truth.
+                self._clear_authored_automation_steps_for_clip(clip)
 
         except Exception as e:
             self._debug_log("Error in _duplicate_loop: {}".format(str(e)))
@@ -19122,9 +20271,10 @@ class Tap(ControlSurface):
             self._end_undo_step(undo_step_started)
             self._end_selected_clip_update_batch()
 
-        if decoupled_info:
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+        # Listener callbacks were intentionally suppressed during the atomic
+        # operation, so publish the new loop length and notes in both modes.
+        self.send_selected_clip_metadata()
+        self.send_selected_clip_notes()
 
     def _multiply_loop_by_two(self, track_index, clip_index):
         tracks = list(self.song().tracks)
@@ -19137,13 +20287,26 @@ class Tap(ControlSurface):
         clip = slots[clip_index].clip
         if not bool(getattr(clip, 'is_midi_clip', False)):
             return
-        if self._decoupled_automation_info(clip):
-            self._debug_log("Loop multiplication is unavailable while automation is decoupled.")
-            return
 
-        loop_start = float(clip.loop_start)
-        loop_end = float(clip.loop_end)
-        loop_length = loop_end - loop_start
+        decoupled_info = self._decoupled_automation_info(clip)
+        if decoupled_info:
+            loop_start = float(decoupled_info["note_start"])
+            loop_length = float(decoupled_info["physical_length"])
+            target_decoupled_info = self._decoupled_info_with_stretched_lengths(
+                clip,
+                decoupled_info,
+                2.0
+            )
+            if target_decoupled_info is None:
+                self._debug_log("Decoupled clip cannot be stretched beyond the supported physical loop length.")
+                return
+            loop_end = float(decoupled_info["physical_end"])
+        else:
+            loop_start = float(clip.loop_start)
+            loop_end = float(clip.loop_end)
+            loop_length = loop_end - loop_start
+            target_decoupled_info = None
+
         if loop_length <= 0.000001:
             return
 
@@ -19155,6 +20318,12 @@ class Tap(ControlSurface):
         self._begin_selected_clip_update_batch()
         undo_step_started = self._begin_undo_step()
         try:
+            # Make the destination span writable before moving notes or
+            # inserting automation into the stretched second half.
+            clip.loop_start = loop_start
+            clip.end_marker = target_loop_end
+            clip.loop_end = target_loop_end
+
             changed_notes = False
             for note in notes:
                 note_start = float(note.start_time)
@@ -19167,15 +20336,30 @@ class Tap(ControlSurface):
             # existing note objects preserves note IDs and Live-owned MPE data.
             if changed_notes:
                 clip.apply_note_modifications(notes)
-            clip.loop_end = target_loop_end
-            if float(clip.end_marker) < target_loop_end:
-                clip.end_marker = target_loop_end
+
+            self._stretch_clip_automation(
+                clip,
+                loop_start,
+                loop_length,
+                loop_length * 2.0,
+                source_decoupled_info=decoupled_info,
+                target_decoupled_info=target_decoupled_info
+            )
+
+            # Stretch changes the actual Live clip span in both modes. Tap's
+            # decoupled note/automation lengths are updated only after the
+            # physical write has completed.
+            if decoupled_info:
+                self._save_decoupled_automation_info_to_name(clip, target_decoupled_info)
         except Exception as e:
             self._debug_log("Error in _multiply_loop_by_two: {}".format(str(e)))
             raise
         finally:
             self._end_undo_step(undo_step_started)
             self._end_selected_clip_update_batch()
+
+        self.send_selected_clip_metadata()
+        self.send_selected_clip_notes()
 
     def _set_midi_clip_looping(self, track_index, clip_index, looping):
         tracks = list(self.song().tracks)

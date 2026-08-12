@@ -1,4 +1,5 @@
 import ast
+import math
 import pathlib
 import re
 import time
@@ -20,7 +21,11 @@ def extracted_method(name):
     )
     module = ast.Module(body=[node], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"time": time}
+    namespace = {
+        "time": time,
+        "math": math,
+        "liveobj_valid": lambda value: value is not None,
+    }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace[name]
 
@@ -56,6 +61,38 @@ class NoteCodecHarness:
     NOTE_FLAG_NEGATIVE_DURATION = 0x04
     NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION = 0x08
     _note_record_flags = extracted_method("_note_record_flags")
+
+
+class AutomationPencilMergeHarness:
+    _automation_step_id = extracted_method("_automation_step_id")
+    _automation_step_order = extracted_method("_automation_step_order")
+    _automation_step_tuple = extracted_method("_automation_step_tuple")
+    _automation_sort_key = extracted_method("_automation_sort_key")
+    _automation_sorted_steps = extracted_method("_automation_sorted_steps")
+    _merge_incremental_automation_pencil_point = extracted_method("_merge_incremental_automation_pencil_point")
+
+
+class AutomationPencilWriterHarness:
+    _write_incremental_automation_pencil_interval = extracted_method("_write_incremental_automation_pencil_interval")
+
+    def __init__(self):
+        self.neutralized = []
+        self.logs = []
+
+    def _decoupled_automation_info(self, _clip, _parameter):
+        return None
+
+    def _automation_envelope_supports_point_events(self, _envelope):
+        return False
+
+    def _neutralize_automation_span(self, _envelope, _parameter, start, end, value):
+        self.neutralized.append((start, end, value))
+
+    def _parameter_target_value_from_normalized(self, _parameter, value):
+        return value
+
+    def _debug_log(self, message):
+        self.logs.append(message)
 
 
 class NoteTransferHarness:
@@ -135,6 +172,346 @@ class FlinColumnHarness:
 
 
 class TransportTests(unittest.TestCase):
+    def test_incremental_pencil_seeds_authored_layer_from_live_once(self):
+        parameter = object()
+        envelope = object()
+
+        class Clip:
+            def automation_envelope(self, requested_parameter):
+                self.requested_parameter = requested_parameter
+                return envelope
+
+        clip = Clip()
+        slot = type("Slot", (), {"has_clip": True, "clip": clip})()
+
+        class Harness:
+            _begin_automation_pencil_stroke = extracted_method(
+                "_begin_automation_pencil_stroke"
+            )
+
+            def song(self):
+                view = type("View", (), {"highlighted_clip_slot": slot})()
+                return type("Song", (), {"view": view})()
+
+            def _current_connected_parameter_for_control(self, _control_index):
+                return parameter
+
+            def _parameter_is_automatable(self, _parameter):
+                return True
+
+            def _parameter_automation_is_enabled(self, _parameter):
+                return True
+
+            def _authored_automation_steps(self, _clip, _parameter, _control_index):
+                return None
+
+            def _automation_steps_from_envelope_events(self, *args):
+                self.event_args = args
+                return None
+
+            def _automation_steps_from_envelope_samples(self, *args):
+                self.sample_args = args
+                return ((0.0, 0.125, 0.4, 0.0, 0, 0),)
+
+            def _decoupled_automation_info(self, _clip, _parameter):
+                return None
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+        harness = Harness()
+        harness._begin_automation_pencil_stroke(
+            7,
+            ["P", "B", "7", "3", "0.0", "4.0", "0.125", "0.03125"]
+        )
+
+        state = harness._automation_pencil_stroke
+        self.assertTrue(state["had_authored_steps"])
+        self.assertEqual(state["logical_steps"], ((0.0, 0.125, 0.4, 0.0, 0, 0),))
+        self.assertEqual(harness.event_args[2:], (0.0, 4.0, 0.125))
+        self.assertEqual(harness.sample_args[2:], (0.0, 4.0, 0.125))
+
+    def test_exact_live_event_read_does_not_invent_baseline_points(self):
+        class Envelope:
+            def events_in_range(self, start, end):
+                self.range = (start, end)
+                return ()
+
+        class Harness:
+            _automation_steps_from_envelope_events = extracted_method(
+                "_automation_steps_from_envelope_events"
+            )
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _decoupled_automation_info(self, _clip, _parameter):
+                return None
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _parameter_normalized_value(self, _parameter):
+                return 0.5
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        parameter = type("Parameter", (), {"min": 0.0, "max": 1.0})()
+        envelope = Envelope()
+        steps = Harness()._automation_steps_from_envelope_events(
+            envelope, parameter, 1.0, 3.0, 0.03125
+        )
+
+        self.assertEqual(steps, ())
+        self.assertEqual(envelope.range, (1.0, 4.0))
+
+    def test_exact_live_event_read_preserves_all_four_curve_coefficients(self):
+        controls = type("Controls", (), {
+            "x1": 0.12,
+            "y1": 0.34,
+            "x2": 0.78,
+            "y2": 0.91,
+        })()
+        event = type("Event", (), {
+            "time": 1.25,
+            "value": 0.6,
+            "control_coefficients": controls,
+        })()
+
+        class Envelope:
+            def events_in_range(self, _start, _end):
+                return (event,)
+
+        class Harness:
+            _automation_steps_from_envelope_events = extracted_method(
+                "_automation_steps_from_envelope_events"
+            )
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _parameter_normalized_value(self, _parameter):
+                return 0.5
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        parameter = type("Parameter", (), {"min": 0.0, "max": 1.0})()
+        steps = Harness()._automation_steps_from_envelope_events(
+            Envelope(), parameter, 0.0, 4.0, 0.03125
+        )
+        self.assertEqual(
+            steps,
+            ((1.25, 0.03125, 0.6, 0.0, 0, 1, True, 0.12, 0.34, 0.78, 0.91),)
+        )
+
+    def test_exact_event_writer_creates_right_to_left_so_live_retains_outgoing_curves(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
+        class Harness:
+            _write_exact_automation_events_to_envelope = extracted_method(
+                "_write_exact_automation_events_to_envelope"
+            )
+
+            def __init__(self):
+                self.created = []
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _automation_steps_use_exact_events(self, _steps):
+                return True
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(sorted(steps, key=lambda step: step[0]))
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, _envelope, time_value, _raw_value, step):
+                self.created.append((time_value, step[4]))
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        steps = (
+            (1.0, 0.1, 0.2, 0.0, 1, 1, True, 0.2, 0.8, 0.7, 0.9),
+            (1.0, 0.1, 0.4, 0.0, 3, 2, True, 0.5, 0.5, 0.5, 0.5),
+            (2.0, 0.1, 0.8, 0.0, 2, 2, True, 0.5, 0.5, 0.5, 0.5),
+        )
+        envelope = Envelope()
+        harness = Harness()
+        self.assertTrue(
+            harness._write_exact_automation_events_to_envelope(
+                envelope, object(), 0.0, 4.0, steps
+            )
+        )
+        self.assertEqual(harness.created, [(2.0, 2), (1.0, 1), (1.0, 3)])
+
+    def test_exact_pencil_events_make_linear_points_with_vertical_boundary_guards(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def value_at_time(self, _time):
+                return 0.1
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
+        class Harness:
+            _write_incremental_automation_pencil_event_interval = extracted_method(
+                "_write_incremental_automation_pencil_event_interval"
+            )
+
+            def __init__(self):
+                self.created = []
+                self.decoupled_info = None
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _decoupled_automation_info(self, _clip, _parameter):
+                return self.decoupled_info
+
+            def _positive_mod(self, value, modulus):
+                return value % modulus
+
+            def _create_linear_automation_event(self, _envelope, time_value, raw_value):
+                self.created.append((time_value, raw_value))
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+        envelope = Envelope()
+        harness = Harness()
+        state = {
+            "envelope": envelope,
+            "device_param": object(),
+            "clip": object(),
+            "loop_start": 0.0,
+            "loop_end": 4.0,
+        }
+        point_a = (1.0, 0.03125, 0.2, 0.0, 20, 20)
+        point_b = (1.5, 0.03125, 0.8, 0.0, 21, 21)
+
+        self.assertTrue(
+            harness._write_incremental_automation_pencil_event_interval(
+                state, point_a, point_b
+            )
+        )
+        self.assertEqual(envelope.deleted, [(0.9999, 1.5001)])
+        self.assertEqual(
+            harness.created,
+            [(0.9999, 0.1), (1.0, 0.2), (1.5, 0.8), (1.5001, 0.1)]
+        )
+
+        envelope.deleted = []
+        harness.created = []
+        harness.decoupled_info = {
+            "note_start": 0.0,
+            "automation_length": 1.0,
+            "physical_length": 2.0,
+            "physical_end": 2.0,
+        }
+        wrapped_a = (0.25, 0.03125, 0.2, 0.0, 20, 20)
+        wrapped_b = (0.5, 0.03125, 0.8, 0.0, 21, 21)
+        self.assertTrue(
+            harness._write_incremental_automation_pencil_event_interval(
+                state, wrapped_a, wrapped_b
+            )
+        )
+        self.assertEqual(
+            envelope.deleted,
+            [(0.2499, 0.5001), (1.2499, 1.5001)]
+        )
+        self.assertEqual(
+            [time_value for time_value, _ in harness.created],
+            [0.2499, 0.25, 0.5, 0.5001, 1.2499, 1.25, 1.5, 1.5001]
+        )
+
+    def test_incremental_pencil_writes_only_the_new_physical_interval(self):
+        class Envelope:
+            def __init__(self):
+                self.inserted = []
+
+            def insert_step(self, time_value, duration, value):
+                self.inserted.append((time_value, duration, value))
+
+        harness = AutomationPencilWriterHarness()
+        envelope = Envelope()
+        state = {
+            "envelope": envelope,
+            "device_param": object(),
+            "clip": object(),
+            "loop_end": 4.0,
+            "sample_duration": 0.25,
+            "point_duration": 0.5,
+        }
+        point_a = (1.0, 0.5, 0.2, 0.0, 20, 20)
+        point_b = (1.5, 0.5, 0.8, 0.0, 21, 21)
+
+        self.assertTrue(harness._write_incremental_automation_pencil_interval(state, None, point_a))
+        self.assertEqual([entry[0] for entry in envelope.inserted], [1.0])
+
+        envelope.inserted = []
+        self.assertTrue(harness._write_incremental_automation_pencil_interval(state, point_a, point_b))
+        self.assertEqual([entry[0] for entry in envelope.inserted], [1.0, 1.25, 1.5])
+        self.assertEqual(harness.neutralized[-1][:2], (1.0, 1.5))
+        self.assertEqual(harness.logs, [])
+
+    def test_incremental_pencil_keeps_completed_point_and_replaces_only_new_interval(self):
+        harness = AutomationPencilMergeHarness()
+        original = (
+            (0.0, 0.03125, 0.1, 0.0, 1, 1),
+            (0.5, 0.03125, 0.4, 0.0, 2, 2),
+            (1.0, 0.03125, 0.7, 0.0, 3, 3),
+            (1.5, 0.03125, 0.9, 0.0, 4, 4),
+        )
+        point_a = (0.5, 0.03125, 0.2, 0.0, 20, 20)
+        after_a = harness._merge_incremental_automation_pencil_point(original, None, point_a)
+        point_b = (1.0, 0.03125, 0.8, 0.0, 21, 21)
+        after_b = harness._merge_incremental_automation_pencil_point(after_a, point_a, point_b)
+
+        self.assertEqual([step[0] for step in after_b], [0.0, 0.5, 1.0, 1.5])
+        self.assertEqual(next(step for step in after_b if step[0] == 0.5), point_a)
+        self.assertEqual(next(step for step in after_b if step[0] == 1.0), point_b)
+        self.assertEqual(next(step for step in after_b if step[0] == 1.5), original[-1])
+
+    def test_incremental_pencil_break_preserves_entries_and_resets_interpolation(self):
+        class Harness:
+            _handle_automation_pencil_message = extracted_method(
+                "_handle_automation_pencil_message"
+            )
+
+            def __init__(self):
+                self._automation_pencil_stroke = {
+                    "stroke_id": 12,
+                    "last_point": (1.0, 0.03125, 0.5, 0.0, 9, 9),
+                    "entries": ["1:1.000000:0.500000:9:9"],
+                }
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        harness._handle_automation_pencil_message(["P", "R", "12"])
+
+        self.assertIsNone(harness._automation_pencil_stroke["last_point"])
+        self.assertEqual(
+            harness._automation_pencil_stroke["entries"],
+            ["1:1.000000:0.500000:9:9"]
+        )
+
     def test_flin_column_velocity_deviation_uses_the_eighth_wire_field(self):
         harness = FlinColumnHarness()
         payload = b"v1|column|0|3|101|82|4|-27"
@@ -463,11 +840,25 @@ class TransportTests(unittest.TestCase):
             clip_length_trick = 110.0
             _multiply_loop_by_two = extracted_method("_multiply_loop_by_two")
 
+            def __init__(self):
+                self.stretched_automation = None
+                self.sent_metadata = False
+                self.sent_notes = False
+
             def song(self):
                 return type("Song", (), {"tracks": [track]})()
 
             def _decoupled_automation_info(self, _clip):
                 return None
+
+            def _stretch_clip_automation(self, _clip, source_start, source_length, target_length, **kwargs):
+                self.stretched_automation = (
+                    source_start,
+                    source_length,
+                    target_length,
+                    kwargs.get("source_decoupled_info"),
+                    kwargs.get("target_decoupled_info"),
+                )
 
             def _begin_selected_clip_update_batch(self):
                 pass
@@ -484,7 +875,14 @@ class TransportTests(unittest.TestCase):
             def _debug_log(self, message):
                 raise AssertionError(message)
 
-        Harness()._multiply_loop_by_two(0, 0)
+            def send_selected_clip_metadata(self):
+                self.sent_metadata = True
+
+            def send_selected_clip_notes(self):
+                self.sent_notes = True
+
+        harness = Harness()
+        harness._multiply_loop_by_two(0, 0)
 
         self.assertEqual((inside.start_time, inside.duration), (2.0, 1.0))
         self.assertEqual((outside.start_time, outside.duration), (5.0, 0.25))
@@ -492,6 +890,498 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(clip.end_marker, 8.0)
         self.assertEqual(clip.applied, (inside, outside))
         self.assertIs(inside.expression, expression)
+        self.assertEqual(harness.stretched_automation, (0.0, 4.0, 8.0, None, None))
+        self.assertTrue(harness.sent_metadata)
+        self.assertTrue(harness.sent_notes)
+
+    def test_native_duplicate_loop_invalidates_authored_cache_and_publishes_new_length(self):
+        class Clip:
+            def __init__(self):
+                self.loop_end = 4.0
+                self.duplicate_count = 0
+
+            def duplicate_loop(self):
+                self.loop_end *= 2.0
+                self.duplicate_count += 1
+
+        clip = Clip()
+        slot = type("Slot", (), {"has_clip": True, "clip": clip})()
+        track = type("Track", (), {"clip_slots": [slot]})()
+
+        class Harness:
+            _duplicate_loop = extracted_method("_duplicate_loop")
+
+            def __init__(self):
+                self.cleared = False
+                self.sent_metadata = False
+                self.sent_notes = False
+
+            def song(self):
+                return type("Song", (), {"tracks": [track]})()
+
+            def _decoupled_automation_info(self, _clip):
+                return None
+
+            def _clear_authored_automation_steps_for_clip(self, _clip):
+                self.cleared = True
+
+            def _begin_selected_clip_update_batch(self):
+                pass
+
+            def _end_selected_clip_update_batch(self):
+                pass
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def send_selected_clip_metadata(self):
+                self.sent_metadata = True
+
+            def send_selected_clip_notes(self):
+                self.sent_notes = True
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        harness._duplicate_loop(0, 0)
+
+        self.assertEqual(clip.loop_end, 8.0)
+        self.assertEqual(clip.duplicate_count, 1)
+        self.assertTrue(harness.cleared)
+        self.assertTrue(harness.sent_metadata)
+        self.assertTrue(harness.sent_notes)
+
+    def test_decoupled_duplicate_doubles_only_the_logical_note_loop(self):
+        previous_info = {
+            "note_start": 0.0,
+            "note_length": 4.0,
+            "physical_length": 16.0,
+            "physical_end": 16.0,
+            "automation_lengths": {"filter": 16.0},
+        }
+        doubled_info = dict(previous_info, note_length=8.0, note_end=8.0)
+
+        class Clip:
+            loop_start = 0.0
+            loop_end = 16.0
+            start_marker = 0.0
+            end_marker = 16.0
+
+        clip = Clip()
+
+        class Harness:
+            _double_decoupled_loop = extracted_method("_double_decoupled_loop")
+
+            def _decoupled_info_with_doubled_note_length(self, _clip, _info):
+                return doubled_info
+
+            def _save_decoupled_automation_info_to_name(self, _clip, info):
+                self.saved = info
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        result = harness._double_decoupled_loop(clip, previous_info)
+
+        self.assertEqual(result, doubled_info)
+        self.assertEqual(harness.saved, doubled_info)
+        self.assertEqual((clip.loop_start, clip.loop_end), (0.0, 16.0))
+        self.assertEqual((clip.start_marker, clip.end_marker), (0.0, 16.0))
+
+    def test_decoupled_duplicate_grows_shared_loop_when_automation_is_shorter(self):
+        notes = [
+            type("Note", (), {"note_id": 11, "start_time": 1.0})(),
+            type("Note", (), {"note_id": 12, "start_time": 6.0})(),
+        ]
+        previous_info = {
+            "note_start": 0.0,
+            "note_length": 8.0,
+            "physical_length": 8.0,
+            "physical_end": 8.0,
+            "automation_lengths": {"filter": 4.0},
+        }
+        doubled_info = {
+            "note_start": 0.0,
+            "note_length": 16.0,
+            "note_end": 16.0,
+            "physical_length": 16.0,
+            "physical_end": 16.0,
+            "automation_lengths": {"filter": 4.0},
+        }
+
+        class Clip:
+            loop_start = 0.0
+            loop_end = 8.0
+            start_marker = 0.0
+            end_marker = 8.0
+
+            def get_notes_extended(self, *_args):
+                return notes
+
+            def duplicate_notes_by_id(self, note_ids, destination_time):
+                self.duplicated = (tuple(note_ids), destination_time)
+                return (21, 22)
+
+        clip = Clip()
+
+        class Harness:
+            _double_decoupled_loop = extracted_method("_double_decoupled_loop")
+            _expand_decoupled_notes_for_duplicate = extracted_method(
+                "_expand_decoupled_notes_for_duplicate"
+            )
+
+            def _decoupled_info_with_doubled_note_length(self, _clip, _info):
+                return doubled_info
+
+            def _rewrite_all_decoupled_automation_envelopes(self, _clip, info):
+                self.rewritten = info
+
+            def _save_decoupled_automation_info_to_name(self, _clip, info):
+                self.saved = info
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        result = harness._double_decoupled_loop(clip, previous_info)
+
+        self.assertEqual(result, doubled_info)
+        self.assertEqual(clip.duplicated, ((11, 12), 9.0))
+        self.assertEqual((clip.loop_start, clip.loop_end), (0.0, 16.0))
+        self.assertEqual((clip.start_marker, clip.end_marker), (0.0, 16.0))
+        self.assertEqual(harness.rewritten, doubled_info)
+        self.assertEqual(harness.saved, doubled_info)
+
+    def test_decoupled_duplicate_math_keeps_short_automation_length(self):
+        previous_info = {
+            "note_start": 0.0,
+            "note_length": 8.0,
+            "physical_length": 8.0,
+            "physical_end": 8.0,
+            "automation_lengths": {"filter": 4.0},
+        }
+
+        class Harness:
+            _decoupled_info_with_doubled_note_length = extracted_method(
+                "_decoupled_info_with_doubled_note_length"
+            )
+
+            def _clip_automation_parameters(self, _clip, _info):
+                return ()
+
+            def _decoupled_automation_max_physical_length(self, _clip, _note_length):
+                return 64.0
+
+            def _decoupled_physical_length(self, note_length, automation_lengths, _maximum):
+                self.length_inputs = (note_length, tuple(automation_lengths))
+                return 16.0
+
+        harness = Harness()
+        result = harness._decoupled_info_with_doubled_note_length(
+            object(),
+            previous_info
+        )
+
+        self.assertEqual(result["note_length"], 16.0)
+        self.assertEqual(result["automation_lengths"], {"filter": 4.0})
+        self.assertEqual(result["physical_length"], 16.0)
+        self.assertEqual(harness.length_inputs, (16.0, (4.0,)))
+
+    def test_shared_loop_lcm_handles_automation_shorter_than_notes(self):
+        class Harness:
+            _decoupled_physical_length = extracted_method(
+                "_decoupled_physical_length"
+            )
+
+        harness = Harness()
+        self.assertEqual(harness._decoupled_physical_length(8.0, (4.0,), 64.0), 8.0)
+        self.assertEqual(harness._decoupled_physical_length(16.0, (4.0,), 64.0), 16.0)
+        self.assertEqual(harness._decoupled_physical_length(16.0, (8.0,), 64.0), 16.0)
+
+    def test_shared_loop_lcm_handles_three_quarters_and_one_and_a_half(self):
+        class Harness:
+            _decoupled_physical_length = extracted_method(
+                "_decoupled_physical_length"
+            )
+
+        harness = Harness()
+        # Four-bar notes in 4/4: both 3/4 (12 beats) and 1.5x (24 beats)
+        # require a 48-beat shared loop; stretching all lengths needs 96.
+        self.assertEqual(harness._decoupled_physical_length(16.0, (12.0,), 256.0), 48.0)
+        self.assertEqual(harness._decoupled_physical_length(16.0, (24.0,), 256.0), 48.0)
+        self.assertEqual(harness._decoupled_physical_length(32.0, (24.0,), 256.0), 96.0)
+        self.assertEqual(harness._decoupled_physical_length(32.0, (48.0,), 256.0), 96.0)
+
+    def test_shared_loop_limit_refuses_inexact_clamping(self):
+        class Harness:
+            _decoupled_physical_length = extracted_method(
+                "_decoupled_physical_length"
+            )
+
+        # The exact LCM is 384 beats. Returning the 256-beat cap would not be
+        # a shared loop and would silently corrupt the decoupled ratios.
+        self.assertIsNone(
+            Harness()._decoupled_physical_length(128.0, (192.0,), 256.0)
+        )
+
+    def test_decoupled_shared_loop_cap_is_sixty_four_bars(self):
+        assignment = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS"
+                for target in node.targets
+            )
+        )
+        self.assertEqual(ast.literal_eval(assignment.value), 64)
+
+    def test_decoupled_long_press_stretches_notes_automation_and_live_loop(self):
+        expression = object()
+        first_copy = type("Note", (), {
+            "note_id": 101,
+            "start_time": 1.0,
+            "duration": 0.5,
+            "expression": expression,
+        })()
+        second_copy = type("Note", (), {
+            "note_id": 202,
+            "start_time": 5.0,
+            "duration": 0.5,
+            "expression": expression,
+        })()
+        third_copy = type("Note", (), {
+            "note_id": 303,
+            "start_time": 9.0,
+            "duration": 0.5,
+            "expression": expression,
+        })()
+        previous_info = {
+            "note_start": 0.0,
+            "note_length": 4.0,
+            "physical_length": 16.0,
+            "physical_end": 16.0,
+            "automation_lengths": {"filter": 16.0},
+        }
+        doubled_info = {
+            "note_start": 0.0,
+            "note_length": 8.0,
+            "note_end": 8.0,
+            "physical_length": 32.0,
+            "physical_end": 32.0,
+            "automation_lengths": {"filter": 32.0},
+        }
+
+        class Clip:
+            is_midi_clip = True
+            start_time = 0.0
+            start_marker = 0.0
+            loop_start = 0.0
+            length = 16.0
+
+            def __init__(self):
+                self._loop_end = 16.0
+                self._end_marker = 16.0
+
+            @property
+            def loop_end(self):
+                return self._loop_end
+
+            @loop_end.setter
+            def loop_end(self, value):
+                if value > self._end_marker:
+                    raise AssertionError("loop_end was extended before end_marker")
+                self._loop_end = value
+
+            @property
+            def end_marker(self):
+                return self._end_marker
+
+            @end_marker.setter
+            def end_marker(self, value):
+                self._end_marker = value
+
+            def get_notes_extended(self, *_args):
+                return [first_copy, second_copy, third_copy]
+
+            def apply_note_modifications(self, notes):
+                self.applied = tuple(notes)
+
+        clip = Clip()
+        slot = type("Slot", (), {"has_clip": True, "clip": clip})()
+        track = type("Track", (), {"clip_slots": [slot]})()
+
+        class Harness:
+            clip_length_trick = 110.0
+            _multiply_loop_by_two = extracted_method("_multiply_loop_by_two")
+
+            def __init__(self):
+                self.stretched_automation = None
+
+            def song(self):
+                return type("Song", (), {"tracks": [track]})()
+
+            def _decoupled_automation_info(self, _clip):
+                return previous_info
+
+            def _decoupled_info_with_stretched_lengths(self, _clip, _info, factor):
+                self.asserted_factor = factor
+                return doubled_info
+
+            def _stretch_clip_automation(self, _clip, source_start, source_length, target_length, **kwargs):
+                self.stretched_automation = (
+                    source_start,
+                    source_length,
+                    target_length,
+                    kwargs.get("source_decoupled_info"),
+                    kwargs.get("target_decoupled_info"),
+                )
+
+            def _save_decoupled_automation_info_to_name(self, _clip, info):
+                self.saved = info
+
+            def _begin_selected_clip_update_batch(self):
+                pass
+
+            def _end_selected_clip_update_batch(self):
+                pass
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def send_selected_clip_metadata(self):
+                self.sent_metadata = True
+
+            def send_selected_clip_notes(self):
+                self.sent_notes = True
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        harness._multiply_loop_by_two(0, 0)
+
+        self.assertEqual((first_copy.start_time, first_copy.duration), (2.0, 1.0))
+        self.assertEqual((second_copy.start_time, second_copy.duration), (10.0, 1.0))
+        self.assertEqual((third_copy.start_time, third_copy.duration), (18.0, 1.0))
+        self.assertEqual(clip.applied, (first_copy, second_copy, third_copy))
+        self.assertIs(first_copy.expression, expression)
+        self.assertEqual(harness.asserted_factor, 2.0)
+        self.assertEqual(harness.saved["note_length"], 8.0)
+        self.assertEqual(harness.saved["automation_lengths"], {"filter": 32.0})
+        self.assertEqual(harness.saved["physical_length"], 32.0)
+        self.assertEqual((clip.loop_start, clip.loop_end), (0.0, 32.0))
+        self.assertEqual((clip.start_marker, clip.end_marker), (0.0, 32.0))
+        self.assertEqual(
+            harness.stretched_automation,
+            (0.0, 16.0, 32.0, previous_info, doubled_info)
+        )
+        self.assertTrue(harness.sent_metadata)
+        self.assertTrue(harness.sent_notes)
+
+    def test_decoupled_stretch_doubles_each_logical_and_physical_length(self):
+        previous_info = {
+            "note_start": 2.0,
+            "note_length": 3.0,
+            "physical_length": 12.0,
+            "physical_end": 14.0,
+            "automation_lengths": {"filter": 4.0, "send": 6.0},
+        }
+
+        class Harness:
+            _decoupled_info_with_stretched_lengths = extracted_method(
+                "_decoupled_info_with_stretched_lengths"
+            )
+
+            def _decoupled_automation_max_physical_length(self, _clip, _note_length):
+                return 96.0
+
+            def _decoupled_physical_length(self, note_length, automation_lengths, _maximum):
+                self.received_lengths = (note_length, tuple(sorted(automation_lengths)))
+                return 24.0
+
+        harness = Harness()
+        result = harness._decoupled_info_with_stretched_lengths(object(), previous_info, 2.0)
+
+        self.assertEqual(result["note_start"], 2.0)
+        self.assertEqual(result["note_length"], 6.0)
+        self.assertEqual(result["automation_lengths"], {"filter": 8.0, "send": 12.0})
+        self.assertEqual(result["physical_length"], 24.0)
+        self.assertEqual(result["physical_end"], 26.0)
+        self.assertEqual(harness.received_lengths, (6.0, (8.0, 12.0)))
+
+    def test_decoupled_stretch_preserves_fractional_loop_ratios(self):
+        class Harness:
+            _decoupled_info_with_stretched_lengths = extracted_method(
+                "_decoupled_info_with_stretched_lengths"
+            )
+            _decoupled_physical_length = extracted_method(
+                "_decoupled_physical_length"
+            )
+
+            def _decoupled_automation_max_physical_length(self, _clip, _note_length):
+                return 256.0
+
+        harness = Harness()
+        for automation_length in (12.0, 24.0):
+            source = {
+                "note_start": 0.0,
+                "note_length": 16.0,
+                "physical_length": 48.0,
+                "physical_end": 48.0,
+                "automation_lengths": {"filter": automation_length},
+            }
+            result = harness._decoupled_info_with_stretched_lengths(
+                object(), source, 2.0
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result["note_length"], 32.0)
+            self.assertEqual(
+                result["automation_lengths"],
+                {"filter": automation_length * 2.0}
+            )
+            self.assertEqual(result["physical_length"], 96.0)
+
+    def test_automation_stretch_scales_time_duration_and_preserves_identity(self):
+        class Harness:
+            _scaled_automation_steps = extracted_method("_scaled_automation_steps")
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(sorted(steps, key=lambda step: step[0]))
+
+            def _automation_step_tuple(self, step, _index):
+                return step
+
+        steps = (
+            (2.5, 0.25, 0.2, -0.4, 41, 7),
+            (4.0, 0.5, 0.8, 0.6, 42, 8),
+        )
+        result = Harness()._scaled_automation_steps(steps, 2.0, 2.0)
+
+        self.assertEqual(result, (
+            (3.0, 0.5, 0.2, -0.4, 41, 7),
+            (6.0, 1.0, 0.8, 0.6, 42, 8),
+        ))
+
+        exact_steps = (
+            (2.5, 0.25, 0.2, 0.0, 41, 7, True, 0.12, 0.34, 0.78, 0.91),
+            (4.0, 0.5, 0.8, 0.0, 42, 8, True, 0.5, 0.5, 0.5, 0.5),
+        )
+        self.assertEqual(
+            Harness()._scaled_automation_steps(exact_steps, 2.0, 2.0),
+            (
+                (3.0, 0.5, 0.2, 0.0, 41, 7, True, 0.12, 0.34, 0.78, 0.91),
+                (6.0, 1.0, 0.8, 0.0, 42, 8, True, 0.5, 0.5, 0.5, 0.5),
+            )
+        )
 
     def test_track_input_state_codes_include_audio_arm_state(self):
         class Harness:
