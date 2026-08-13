@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 37
+secret_version_number = 38
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2488,6 +2488,9 @@ class Tap(ControlSurface):
     AUTOMATION_ENVELOPE_LINEAR_EPSILON = 0.0015
     AUTOMATION_ENVELOPE_JUMP_THRESHOLD = 0.1
     AUTOMATION_FOLDED_ENDPOINT_ORDER = 2147483647
+    AUTOMATION_CONTEXT_MAX_COUNT = 24
+    AUTOMATION_CONTEXT_MAX_AGE = 180.0
+    AUTOMATION_PENCIL_INACTIVITY_TIMEOUT = 8.0
     
 
     def __init__(self, c_instance):
@@ -2711,6 +2714,8 @@ class Tap(ControlSurface):
             self._automation_removal_suppressed_controls = set()
             self._automation_authored_steps = {}
             self._automation_pencil_stroke = None
+            self._automation_contexts = {}
+            self._automation_context_counter = 0
             self._mixer_automation_controls = []
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
@@ -8393,6 +8398,8 @@ class Tap(ControlSurface):
 
     def update_display(self):
         ControlSurface.update_display(self)
+        self._expire_automation_contexts()
+        self._expire_automation_pencil_stroke()
         if not self.was_initialized or not self._clip_position_feedback_enabled:
             return
 
@@ -8783,7 +8790,8 @@ class Tap(ControlSurface):
         self._remove_follow_action_song_listeners()
         self._remove_song_listeners(old_song)
         self.song_instance = current_song
-        self._automation_pencil_stroke = None
+        self._finalize_automation_pencil_stroke()
+        self._clear_automation_contexts()
         self._track_list_signature = None
         self._last_group_fold_states = None
         self._last_group_hidden_states = None
@@ -10864,6 +10872,243 @@ class Tap(ControlSurface):
             and getattr(envelope_module, "EnvelopeEventControlCoefficients", None) is not None
         )
 
+    def _automation_events_in_closed_range(self, envelope, start, end):
+        if envelope is None or not hasattr(envelope, "events_in_range"):
+            return tuple()
+        start = float(start)
+        end = max(start, float(end))
+        return tuple(
+            event for event in envelope.events_in_range(start, end + 0.0000001)
+            if float(event.time) >= start - 0.0000001
+            and float(event.time) <= end + 0.0000001
+        )
+
+    def _ordered_same_time_automation_events(
+            self, envelope, events, start, end, point_duration):
+        """Preserve Live's event order and cache both sides of verticals.
+
+        The returned equal-time order owns the control coefficients. Do not
+        infer or reverse that order from value_at_time: a steep neighbouring
+        curve can make either side sample point toward a different event.
+        Ordinary unique-time events require no value_at_time calls.
+        """
+        events = tuple(events or ())
+        same_time_samples = {}
+        self._last_same_time_automation_samples = {
+            "envelope": envelope,
+            "samples": same_time_samples,
+        }
+        if len(events) < 2:
+            return events
+        groups = []
+        for event in events:
+            if (not groups
+                    or abs(float(event.time) - float(groups[-1][-1].time)) > 0.000001):
+                groups.append([])
+            groups[-1].append(event)
+
+        epsilon = min(0.0001, max(0.0000001, float(point_duration) * 0.001))
+        for group in groups:
+            if len(group) > 1 and hasattr(envelope, "value_at_time"):
+                time_value = float(group[0].time)
+                try:
+                    before_value = float(envelope.value_at_time(time_value - epsilon))
+                    after_value = float(envelope.value_at_time(time_value + epsilon))
+                    same_time_samples[time_value] = (before_value, after_value)
+                except Exception:
+                    pass
+        return events
+
+    def _automation_live_event_fingerprint(
+            self, envelope, domain, point_duration=0.0001):
+        """Fingerprint Live's raw events without normalizing every point.
+
+        EnvelopeEvent.value is unsuitable for UI normalization on some device
+        parameters, but it is stable and ideal for detecting an external edit.
+        This keeps revision validation O(event enumeration) with zero
+        value_at_time calls for the normal unique-time case.
+        """
+        if envelope is None:
+            return "NO_ENVELOPE" if self._automation_runtime_supports_point_events() else None
+        if not self._automation_envelope_supports_point_events(envelope):
+            return None
+        try:
+            start, end = float(domain[0]), float(domain[1])
+            events = self._automation_events_in_closed_range(envelope, start, end)
+            records = self._automation_event_records(events)
+            self._remember_automation_event_read(
+                envelope, start, end, point_duration, records
+            )
+            return self._automation_event_fingerprint_from_records(records)
+        except Exception as e:
+            self._debug_log("Error fingerprinting exact automation envelope events: {}".format(str(e)))
+            return None
+
+    def _automation_event_records(self, events):
+        records = []
+        for event in events or ():
+            controls = event.control_coefficients
+            records.append((
+                float(event.time),
+                float(event.value),
+                float(controls.x1),
+                float(controls.y1),
+                float(controls.x2),
+                float(controls.y2),
+            ))
+        return tuple(records)
+
+    def _automation_event_fingerprint_from_records(self, records):
+        entries = []
+        for index, record in enumerate(records or ()):
+            entries.append(
+                "{:.9f}:{:d}:{:.12g}:{:.9f}:{:.9f}:{:.9f}:{:.9f}".format(
+                    float(record[0]),
+                    index,
+                    float(record[1]),
+                    float(record[2]),
+                    float(record[3]),
+                    float(record[4]),
+                    float(record[5]),
+                )
+            )
+        fingerprint = 1469598103934665603
+        for byte in ",".join(entries).encode("ascii", errors="ignore"):
+            fingerprint ^= byte
+            fingerprint = (fingerprint * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return "{:016X}".format(fingerprint)
+
+    def _automation_steps_preserving_unchanged_vertical_values(
+            self, steps, records, previous_steps, previous_records):
+        """Keep a vertical's known sides across coefficient-only changes.
+
+        A sample just after an exact boundary can already be deep into an
+        extreme outgoing curve, so it is not always a reliable value for the
+        boundary's outgoing event. Raw EnvelopeEvent values are reliable for
+        change detection even when they are not in the encoder's value domain.
+        If both raw values and their returned order are unchanged, retain the
+        last normalized pair while accepting the newly read coefficients.
+        """
+        steps = tuple(steps or ())
+        records = tuple(records or ())
+        previous_steps = tuple(previous_steps or ())
+        previous_records = tuple(previous_records or ())
+        if (len(steps) != len(records)
+                or not previous_steps
+                or len(previous_steps) != len(previous_records)):
+            return self._automation_sorted_steps(steps)
+
+        def grouped_indexes(items, time_index):
+            groups = []
+            for index, item in enumerate(items):
+                time_value = float(item[time_index])
+                if (not groups
+                        or abs(time_value - float(items[groups[-1][-1]][time_index])) > 0.000001):
+                    groups.append([])
+                groups[-1].append(index)
+            return groups
+
+        current_record_groups = grouped_indexes(records, 0)
+        previous_record_groups = grouped_indexes(previous_records, 0)
+        current_step_groups = grouped_indexes(steps, 0)
+        previous_step_groups = grouped_indexes(previous_steps, 0)
+        result = [self._automation_step_tuple(step, index) for index, step in enumerate(steps)]
+
+        for current_group in current_record_groups:
+            if len(current_group) != 2:
+                continue
+            group_time = float(records[current_group[0]][0])
+            previous_record_group = next((
+                group for group in previous_record_groups
+                if (len(group) == 2
+                    and abs(float(previous_records[group[0]][0]) - group_time) <= 0.000001)
+            ), None)
+            current_step_group = next((
+                group for group in current_step_groups
+                if (len(group) == 2
+                    and abs(float(steps[group[0]][0]) - group_time) <= 0.000001)
+            ), None)
+            previous_step_group = next((
+                group for group in previous_step_groups
+                if (len(group) == 2
+                    and abs(float(previous_steps[group[0]][0]) - group_time) <= 0.000001)
+            ), None)
+            if (previous_record_group is None
+                    or current_step_group is None
+                    or previous_step_group is None):
+                continue
+            raw_values_unchanged = all(
+                abs(
+                    float(records[current_index][1])
+                    - float(previous_records[previous_index][1])
+                ) <= 0.000000001
+                for current_index, previous_index in zip(
+                    current_group, previous_record_group
+                )
+            )
+            if not raw_values_unchanged:
+                continue
+            previous_values = [
+                float(self._automation_step_tuple(previous_steps[index], index)[2])
+                for index in previous_step_group
+            ]
+            if abs(previous_values[-1] - previous_values[0]) <= 0.000001:
+                continue
+            for current_index, previous_value in zip(
+                    current_step_group, previous_values):
+                updated = list(result[current_index])
+                updated[2] = previous_value
+                result[current_index] = tuple(updated)
+
+        return self._automation_sorted_steps(result)
+
+    def _remember_automation_event_read(
+            self, envelope, start, end, point_duration, records):
+        self._last_exact_automation_event_read = {
+            "envelope": envelope,
+            "start": float(start),
+            "end": float(end),
+            "point_duration": float(point_duration),
+            "records": tuple(records or ()),
+            "fingerprint": self._automation_event_fingerprint_from_records(records),
+        }
+
+    def _cached_automation_event_read(
+            self, envelope, start, end, point_duration=None):
+        cached = getattr(self, "_last_exact_automation_event_read", None)
+        if cached is None or cached.get("envelope") is not envelope:
+            return None
+        if (abs(float(cached.get("start", 0.0)) - float(start)) > 0.000001
+                or abs(float(cached.get("end", 0.0)) - float(end)) > 0.000001):
+            return None
+        if (point_duration is not None
+                and abs(float(cached.get("point_duration", 0.0)) - float(point_duration)) > 0.000001):
+            return None
+        return cached
+
+    def _merged_automation_event_records(self, records, patch_records, intervals):
+        if records is None:
+            return None
+        retained = [
+            record for record in records
+            if not any(
+                float(record[0]) >= float(interval_start) - 0.000001
+                and float(record[0]) <= float(interval_end) + 0.000001
+                for interval_start, interval_end in intervals
+            )
+        ]
+        patches = [
+            record for record in patch_records or ()
+            if any(
+                float(record[0]) >= float(interval_start) - 0.000001
+                and float(record[0]) <= float(interval_end) + 0.000001
+                for interval_start, interval_end in intervals
+            )
+        ]
+        # Python's sort is stable, retaining the audible order already resolved
+        # inside each same-time patch group.
+        return tuple(sorted(retained + patches, key=lambda record: float(record[0])))
+
     def _automation_steps_use_exact_events(self, steps):
         steps = tuple(steps or ())
         return bool(steps) and all(
@@ -10891,6 +11136,13 @@ class Tap(ControlSurface):
             groups[-1].append(index)
 
         epsilon = min(0.0001, max(0.0000001, float(point_duration) * 0.001))
+        cached_same_time = getattr(self, "_last_same_time_automation_samples", None)
+        cached_samples = (
+            cached_same_time.get("samples", {})
+            if cached_same_time is not None
+            and cached_same_time.get("envelope") is envelope
+            else {}
+        )
         for group in groups:
             time_value = float(events[group[0]].time)
             if len(group) == 1:
@@ -10902,17 +11154,22 @@ class Tap(ControlSurface):
 
             # Multiple events at one time encode a real vertical boundary.
             # Sampling just before/after retains its two sides while avoiding
-            # the incompatible EnvelopeEvent.value domain.
-            before_time = max(0.0, time_value - epsilon)
-            after_time = min(float(end), time_value + epsilon)
-            try:
-                before_value = float(envelope.value_at_time(before_time))
-            except Exception:
-                before_value = float(envelope.value_at_time(time_value))
-            try:
-                after_value = float(envelope.value_at_time(after_time))
-            except Exception:
-                after_value = float(envelope.value_at_time(time_value))
+            # the incompatible EnvelopeEvent.value domain. The ordering pass
+            # immediately before this conversion already sampled those two
+            # sides, so reuse them instead of issuing duplicate Live calls.
+            before_time = time_value - epsilon
+            cached_values = cached_samples.get(time_value)
+            if cached_values is not None:
+                before_value, after_value = cached_values
+            else:
+                try:
+                    before_value = float(envelope.value_at_time(before_time))
+                except Exception:
+                    before_value = float(envelope.value_at_time(time_value))
+                try:
+                    after_value = float(envelope.value_at_time(time_value + epsilon))
+                except Exception:
+                    after_value = float(envelope.value_at_time(time_value))
 
             divisor = max(1, len(group) - 1)
             for offset, event_index in enumerate(group):
@@ -10931,7 +11188,36 @@ class Tap(ControlSurface):
 
         try:
             end = start + max(0.0001, length)
-            events = tuple(envelope.events_in_range(start, end))
+            # Query a hair beyond the authoritative closed domain so an event
+            # exactly on its upper boundary is retained on runtimes whose
+            # range API otherwise behaves as half-open.
+            events_reader = getattr(self, "_automation_events_in_closed_range", None)
+            if events_reader is not None:
+                events = events_reader(envelope, start, end)
+            else:
+                events = tuple(
+                    event for event in envelope.events_in_range(start, end + 0.0000001)
+                    if float(event.time) <= end + 0.0000001
+                )
+            event_orderer = getattr(self, "_ordered_same_time_automation_events", None)
+            if event_orderer is not None:
+                events = event_orderer(
+                    envelope,
+                    events,
+                    start,
+                    end,
+                    point_duration
+                )
+            record_builder = getattr(self, "_automation_event_records", None)
+            remember_read = getattr(self, "_remember_automation_event_read", None)
+            if record_builder is not None and remember_read is not None:
+                remember_read(
+                    envelope,
+                    start,
+                    end,
+                    point_duration,
+                    record_builder(events)
+                )
             parameter_values = self._parameter_domain_values_from_envelope_events(
                 envelope,
                 events,
@@ -11008,7 +11294,9 @@ class Tap(ControlSurface):
     def _create_linear_automation_event(self, envelope, time_value, raw_value):
         self._create_automation_event(envelope, time_value, raw_value)
 
-    def _write_exact_automation_events_to_envelope(self, envelope, device_param, start, end, steps, allow_empty=False):
+    def _write_exact_automation_events_to_envelope(
+            self, envelope, device_param, start, end, steps, allow_empty=False,
+            endpoint_padding=0.0001):
         if (not self._automation_envelope_supports_point_events(envelope)
                 or device_param is None
                 or (not allow_empty and not self._automation_steps_use_exact_events(steps))):
@@ -11016,8 +11304,9 @@ class Tap(ControlSurface):
 
         try:
             start = float(start)
-            end = max(start + 0.0001, float(end))
-            envelope.delete_events_in_range(start, end + 0.0001)
+            minimum_span = max(0.0000001, float(endpoint_padding))
+            end = max(start + minimum_span, float(end))
+            envelope.delete_events_in_range(start, end + max(0.0000001, float(endpoint_padding)))
             # A point's coefficients describe its outgoing segment. Create the
             # right-hand endpoint first so that segment already exists when
             # Live validates and stores the left point's coefficients. Creating
@@ -11040,6 +11329,51 @@ class Tap(ControlSurface):
                         step[2]
                     )
                     self._create_automation_event(envelope, step[0], raw_value, step)
+
+            # Live versions have differed in whether consecutive same-time
+            # create_event calls append or prepend. Verify using the returned
+            # raw event order, whose value mapping is monotonic. Sampling the
+            # audible sides is unsafe here because a neighbouring exact corner
+            # can already have jumped toward another event.
+            if hasattr(envelope, "events_in_range"):
+                guard = 0.0000001
+                for time_group in time_groups:
+                    if (len(time_group) < 2
+                            or abs(float(time_group[0][2]) - float(time_group[-1][2])) <= 0.000001):
+                        continue
+                    group_time = float(time_group[0][0])
+                    try:
+                        stored_group = tuple(
+                            event for event in envelope.events_in_range(
+                                group_time - guard, group_time + guard
+                            )
+                            if abs(float(event.time) - group_time) <= 0.000001
+                        )
+                        if len(stored_group) != len(time_group):
+                            continue
+                        authored_direction = (
+                            float(time_group[-1][2]) - float(time_group[0][2])
+                        )
+                        stored_direction = (
+                            float(stored_group[-1].value)
+                            - float(stored_group[0].value)
+                        )
+                        if authored_direction * stored_direction >= 0:
+                            continue
+                        envelope.delete_events_in_range(
+                            group_time - guard, group_time + guard
+                        )
+                        for step in reversed(time_group):
+                            raw_value = self._parameter_target_value_from_normalized(
+                                device_param, step[2]
+                            )
+                            self._create_automation_event(
+                                envelope, step[0], raw_value, step
+                            )
+                    except Exception as e:
+                        self._debug_log(
+                            "Could not verify same-time automation event order: {}".format(str(e))
+                        )
             return True
         except Exception as e:
             self._debug_log("Error writing exact automation envelope events: {}".format(str(e)))
@@ -18812,6 +19146,286 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error unfolding decoupled automation clip: {}".format(str(e)))
 
+    def _automation_domain_for_clip(self, clip, device_param=None):
+        decoupled_info = self._decoupled_automation_info(clip, device_param)
+        if decoupled_info:
+            domain_start = float(decoupled_info["note_start"])
+            domain_end = domain_start + max(
+                0.0001,
+                float(decoupled_info["automation_length"])
+            )
+            return (domain_start, domain_end)
+
+        values = []
+        upper_values = []
+
+        def append_finite(target, value):
+            try:
+                number = float(value)
+                if math.isfinite(number):
+                    target.append(number)
+            except Exception:
+                pass
+
+        for property_name in ("start_time", "start_marker", "loop_start"):
+            append_finite(values, getattr(clip, property_name, None))
+        for property_name in ("length", "end_marker", "loop_end"):
+            append_finite(upper_values, getattr(clip, property_name, None))
+
+        if bool(getattr(clip, "is_audio_clip", False)):
+            append_finite(values, 0.0)
+            append_finite(upper_values, self._audio_clip_sample_end(clip))
+            try:
+                for marker in clip.warp_markers:
+                    append_finite(values, marker.beat_time)
+                    append_finite(upper_values, marker.beat_time)
+            except Exception:
+                pass
+
+        domain_start = min(values) if values else 0.0
+        domain_end = max(upper_values + [domain_start + 0.0001])
+        return (domain_start, max(domain_start + 0.0001, domain_end))
+
+    def _automation_target_identity(self, clip, device_param):
+        if clip is None or device_param is None:
+            return ""
+        return "{}:{}".format(
+            self._live_object_identity(clip),
+            self._live_object_identity(device_param)
+        )
+
+    def _automation_snapshot_revision(self, clip, device_param, domain, steps):
+        identity = self._automation_target_identity(clip, device_param)
+        canonical_steps = []
+        for index, step in enumerate(self._automation_sorted_steps(steps)):
+            normalized_step = self._automation_step_tuple(step, index)
+            coefficients = normalized_step[7:11] if len(normalized_step) >= 11 else (0.5, 0.5, 0.5, 0.5)
+            canonical_steps.append(
+                "{:.9f}:{:d}:{:.9f}:{}:{:.9f}:{:.9f}:{:.9f}:{:.9f}".format(
+                    normalized_step[0],
+                    index,
+                    normalized_step[2],
+                    1 if len(normalized_step) >= 11 and normalized_step[6] else 0,
+                    coefficients[0],
+                    coefficients[1],
+                    coefficients[2],
+                    coefficients[3],
+                )
+            )
+        payload = "{}|{:.9f}|{:.9f}|{}".format(
+            identity,
+            float(domain[0]),
+            float(domain[1]),
+            ",".join(canonical_steps)
+        )
+        fingerprint = 1469598103934665603
+        for byte in payload.encode("ascii", errors="ignore"):
+            fingerprint ^= byte
+            fingerprint = (fingerprint * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return "{:016X}".format(fingerprint)
+
+    def _expire_automation_contexts(self, now=None):
+        contexts = getattr(self, "_automation_contexts", None)
+        if not contexts:
+            return
+        now = time.monotonic() if now is None else float(now)
+        expired = [
+            token for token, context in contexts.items()
+            if now - float(context.get("last_activity", 0.0)) > self.AUTOMATION_CONTEXT_MAX_AGE
+        ]
+        for token in expired:
+            contexts.pop(token, None)
+
+    def _clear_automation_contexts(self):
+        contexts = getattr(self, "_automation_contexts", None)
+        if contexts is not None:
+            contexts.clear()
+
+    def _automation_context_for_snapshot(
+            self, control_index, clip_slot, clip, device_param, envelope,
+            domain, steps, revision, point_duration, preferred_token=""):
+        self._expire_automation_contexts()
+        contexts = self._automation_contexts
+        clip_identity = self._live_object_identity(clip)
+        parameter_identity = self._live_object_identity(device_param)
+        slot_identity = self._live_object_identity(clip_slot) if clip_slot is not None else None
+        context = contexts.get(str(preferred_token or ""))
+        if context is not None and (
+                context.get("clip_identity") != clip_identity
+                or context.get("parameter_identity") != parameter_identity
+                or context.get("clip_slot_identity") != slot_identity):
+            context = None
+
+        if context is None:
+            self._automation_context_counter = (
+                1 if self._automation_context_counter >= 0x7FFFFFFF
+                else self._automation_context_counter + 1
+            )
+            token = "{:08X}".format(self._automation_context_counter)
+            context = {"token": token}
+            contexts[token] = context
+
+        point_duration = max(0.0001, float(point_duration))
+        cached_read_method = getattr(self, "_cached_automation_event_read", None)
+        cached_read = (
+            cached_read_method(
+                envelope, float(domain[0]), float(domain[1]), point_duration
+            )
+            if cached_read_method is not None else None
+        )
+        if cached_read is not None:
+            live_fingerprint = cached_read.get("fingerprint")
+            live_event_records = cached_read.get("records")
+        else:
+            fingerprint_method = getattr(self, "_automation_live_event_fingerprint", None)
+            live_fingerprint = (
+                fingerprint_method(envelope, domain, point_duration)
+                if fingerprint_method is not None else None
+            )
+            cached_read = (
+                cached_read_method(
+                    envelope, float(domain[0]), float(domain[1]), point_duration
+                )
+                if cached_read_method is not None else None
+            )
+            live_event_records = (
+                cached_read.get("records") if cached_read is not None else None
+            )
+        context.update({
+            "control_index": int(control_index),
+            "clip_slot": clip_slot,
+            "clip_slot_identity": slot_identity,
+            "clip": clip,
+            "clip_identity": clip_identity,
+            "device_param": device_param,
+            "parameter_identity": parameter_identity,
+            "envelope": envelope,
+            "domain": (float(domain[0]), float(domain[1])),
+            "snapshot": self._automation_sorted_steps(steps),
+            "revision": str(revision),
+            "point_duration": point_duration,
+            "live_fingerprint": live_fingerprint,
+            "live_event_records": live_event_records,
+            "target_identity": self._automation_target_identity(clip, device_param),
+            "last_activity": time.monotonic(),
+        })
+        while len(contexts) > self.AUTOMATION_CONTEXT_MAX_COUNT:
+            oldest_token = min(
+                contexts,
+                key=lambda token: float(contexts[token].get("last_activity", 0.0))
+            )
+            contexts.pop(oldest_token, None)
+        return context
+
+    def _resolve_automation_context(self, token, expected_revision=""):
+        self._expire_automation_contexts()
+        context = getattr(self, "_automation_contexts", {}).get(str(token or ""))
+        if context is None:
+            return (None, None, None, "", "invalid")
+
+        clip_slot = context.get("clip_slot")
+        clip = context.get("clip")
+        device_param = context.get("device_param")
+        try:
+            if (clip_slot is None or not liveobj_valid(clip_slot)
+                    or not bool(getattr(clip_slot, "has_clip", False))
+                    or self._live_object_identity(clip_slot) != context.get("clip_slot_identity")
+                    or self._live_object_identity(clip_slot.clip) != context.get("clip_identity")
+                    or clip is None or not liveobj_valid(clip)
+                    or self._live_object_identity(clip) != context.get("clip_identity")
+                    or not self._parameter_is_automatable(device_param)
+                    or self._live_object_identity(device_param) != context.get("parameter_identity")):
+                getattr(self, "_automation_contexts", {}).pop(str(token or ""), None)
+                return (None, None, None, "", "invalid")
+        except Exception:
+            getattr(self, "_automation_contexts", {}).pop(str(token or ""), None)
+            return (None, None, None, "", "invalid")
+
+        envelope = None
+        if hasattr(clip, "automation_envelope"):
+            try:
+                envelope = clip.automation_envelope(device_param)
+            except Exception:
+                envelope = None
+        domain = self._automation_domain_for_clip(clip, device_param)
+        stored_live_fingerprint = context.get("live_fingerprint")
+        if stored_live_fingerprint is not None:
+            current_live_fingerprint = self._automation_live_event_fingerprint(
+                envelope,
+                domain,
+                context["point_duration"]
+            )
+            cached_read_method = getattr(self, "_cached_automation_event_read", None)
+            current_live_event_read = (
+                cached_read_method(
+                    envelope, float(domain[0]), float(domain[1]),
+                    context["point_duration"]
+                )
+                if cached_read_method is not None else None
+            )
+            if current_live_fingerprint is None:
+                return (context, envelope, None, "", "invalid")
+            stored_domain = context.get("domain", domain)
+            domain_changed = (
+                abs(float(stored_domain[0]) - float(domain[0])) > 0.000001
+                or abs(float(stored_domain[1]) - float(domain[1])) > 0.000001
+            )
+            revision = str(context.get("revision", ""))
+            context.update({
+                "envelope": envelope,
+                "last_activity": time.monotonic(),
+            })
+            if (domain_changed
+                    or current_live_fingerprint != stored_live_fingerprint
+                    or (expected_revision and revision != str(expected_revision))):
+                return (context, envelope, context.get("snapshot", ()), revision, "stale")
+            if current_live_event_read is not None:
+                context["live_event_records"] = current_live_event_read.get("records")
+            return (context, envelope, context.get("snapshot", ()), revision, "ok")
+
+        # Compatibility fallback for contexts created by an older runtime or
+        # restored test harness. v38 exact contexts always take the cheap raw
+        # fingerprint path above and avoid one value_at_time call per event.
+        if envelope is not None and self._automation_envelope_supports_point_events(envelope):
+            steps = self._automation_steps_from_envelope_events(
+                envelope,
+                device_param,
+                domain[0],
+                max(0.0001, domain[1] - domain[0]),
+                context["point_duration"]
+            )
+            if steps is None:
+                return (context, envelope, None, "", "invalid")
+        else:
+            steps = ()
+        revision = self._automation_snapshot_revision(clip, device_param, domain, steps)
+        fingerprint_method = getattr(self, "_automation_live_event_fingerprint", None)
+        live_fingerprint = (
+            fingerprint_method(envelope, domain, context["point_duration"])
+            if fingerprint_method is not None else None
+        )
+        cached_read_method = getattr(self, "_cached_automation_event_read", None)
+        cached_read = (
+            cached_read_method(
+                envelope, float(domain[0]), float(domain[1]),
+                context["point_duration"]
+            )
+            if cached_read_method is not None else None
+        )
+        context.update({
+            "envelope": envelope,
+            "domain": domain,
+            "snapshot": self._automation_sorted_steps(steps),
+            "revision": revision,
+            "live_fingerprint": live_fingerprint,
+            "live_event_records": (
+                cached_read.get("records") if cached_read is not None else None
+            ),
+            "last_activity": time.monotonic(),
+        })
+        status = "stale" if expected_revision and revision != str(expected_revision) else "ok"
+        return (context, envelope, context["snapshot"], revision, status)
+
     def _automation_clear_response(self, control_index, current_value):
         response = "{}|{}|{:.6f}|{}|{}|{}".format(
             control_index,
@@ -18819,15 +19433,17 @@ class Tap(ControlSurface):
             current_value,
             "",
             "",
-            "|".join(["0", "0.000000", "0.000000", "", "", "1" if self._automation_runtime_supports_point_events() else "0"])
+            "|".join(self._automation_response_fields(None, None))
         )
         self._send_sys_ex_message(response, 0x31)
 
-    def _automation_write_error_response(self, control_index, write_token=""):
-        device_param = self._current_connected_parameter_for_control(control_index)
+    def _automation_write_error_response(self, control_index, write_token="", status="error", context=None):
+        device_param = context.get("device_param") if context is not None else self._current_connected_parameter_for_control(control_index)
         current_value = self._parameter_normalized_value(device_param)
-        clip_slot = self.song().view.highlighted_clip_slot
-        clip = clip_slot.clip if clip_slot is not None and clip_slot.has_clip else None
+        clip_slot = context.get("clip_slot") if context is not None else self.song().view.highlighted_clip_slot
+        clip = context.get("clip") if context is not None else (
+            clip_slot.clip if clip_slot is not None and clip_slot.has_clip else None
+        )
         envelope = None
         if clip is not None and device_param is not None and hasattr(clip, "automation_envelope"):
             try:
@@ -18839,7 +19455,8 @@ class Tap(ControlSurface):
             device_param,
             envelope,
             write_token,
-            "error"
+            status,
+            context
         )
         response = "{}|{}|{:.6f}|{}|{}|{}".format(
             control_index,
@@ -18861,18 +19478,40 @@ class Tap(ControlSurface):
             "{:.6f}".format(info.get("physical_end", info.get("note_end", 0.0))),
         ]
 
-    def _automation_response_fields(self, clip, device_param, envelope=None, write_token="", status=""):
+    def _automation_response_fields(
+            self, clip, device_param, envelope=None, write_token="", status="",
+            context=None, revision="", domain=None, request_token=""):
         supports_exact_events = self._automation_envelope_supports_point_events(envelope)
         if envelope is None:
             supports_exact_events = self._automation_runtime_supports_point_events()
+        if context is not None:
+            revision = str(revision or context.get("revision", ""))
+            domain = domain or context.get("domain")
+            context_token = str(context.get("token", ""))
+            target_identity = str(context.get("target_identity", ""))
+        else:
+            context_token = ""
+            target_identity = self._automation_target_identity(clip, device_param)
+            domain = domain or (
+                self._automation_domain_for_clip(clip, device_param)
+                if clip is not None else (0.0, 0.0001)
+            )
         return self._automation_response_decoupled_fields(clip, device_param) + [
             str(write_token or ""),
             str(status or ""),
             "1" if supports_exact_events else "0",
+            context_token,
+            str(revision or ""),
+            "{:.6f}".format(float(domain[0])),
+            "{:.6f}".format(float(domain[1])),
+            target_identity,
+            str(request_token or ""),
         ]
 
     def _clear_automation_envelope(self, message):
         try:
+            self._finalize_automation_pencil_stroke()
+            self._clear_automation_contexts()
             control_index = max(0, min(7, int(message[2]) if len(message) >= 4 else 0))
             device_param = self._current_connected_parameter_for_control(control_index)
             current_value = self._parameter_normalized_value(device_param)
@@ -18903,6 +19542,8 @@ class Tap(ControlSurface):
 
     def _clear_all_automation_envelopes(self, message):
         try:
+            self._finalize_automation_pencil_stroke()
+            self._clear_automation_contexts()
             control_index = max(0, min(7, int(message[2]) if len(message) >= 4 else 0))
             device_param = self._current_connected_parameter_for_control(control_index)
             current_value = self._parameter_normalized_value(device_param)
@@ -18963,6 +19604,9 @@ class Tap(ControlSurface):
             start = float(fields[1])
             step_duration = max(0.0001, float(fields[2]))
             count = max(1, min(self.AUTOMATION_ENVELOPE_MAX_SAMPLES, int(fields[3])))
+            known_context_token = fields[4] if len(fields) >= 5 else ""
+            known_revision = fields[5] if len(fields) >= 6 else ""
+            request_token = fields[6] if len(fields) >= 7 else ""
             device_param = self._current_connected_parameter_for_control(control_index)
             current_value = self._parameter_normalized_value(device_param)
 
@@ -18981,16 +19625,45 @@ class Tap(ControlSurface):
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
             request_end = start + (float(count - 1) * step_duration)
             decoupled_info = self._decoupled_automation_info(clip, device_param)
+            automation_domain = self._automation_domain_for_clip(clip, device_param) if clip is not None else (start, max(start + 0.0001, request_end))
+            known_context = None
+            known_status = ""
+            if known_context_token and known_revision and clip is not None and device_param is not None:
+                known_context, known_envelope, known_steps, resolved_revision, known_status = self._resolve_automation_context(
+                    known_context_token,
+                    known_revision
+                )
+                if (known_status == "ok"
+                        and known_context is not None
+                        and known_context.get("live_fingerprint") is not None
+                        and known_context.get("clip_identity") == self._live_object_identity(clip)
+                        and known_context.get("parameter_identity") == self._live_object_identity(device_param)
+                        and known_context.get("clip_slot_identity") == self._live_object_identity(clip_slot)):
+                    # The raw Live event fingerprint is unchanged. Avoid the
+                    # expensive per-event value_at_time normalization and send
+                    # only the compact acknowledgement.
+                    response = "{}|{}|{:.6f}|{}|{}|{}".format(
+                        control_index,
+                        1 if known_steps else 0,
+                        current_value,
+                        "",
+                        "",
+                        "|".join(self._automation_response_fields(
+                            clip,
+                            device_param,
+                            known_envelope,
+                            status="unchanged",
+                            context=known_context,
+                            revision=resolved_revision,
+                            domain=known_context["domain"],
+                            request_token=request_token
+                        ))
+                    )
+                    self._send_sys_ex_message(response, 0x31)
+                    return
             exact_envelope_steps = None
             if self._automation_envelope_supports_point_events(envelope):
-                exact_start = decoupled_info["note_start"] if decoupled_info else float(
-                    getattr(clip, "loop_start", start)
-                )
-                exact_end = (
-                    exact_start + decoupled_info["automation_length"]
-                    if decoupled_info
-                    else float(getattr(clip, "loop_end", request_end))
-                )
+                exact_start, exact_end = automation_domain
                 exact_envelope_steps = self._automation_steps_from_envelope_events(
                     envelope,
                     device_param,
@@ -18999,6 +19672,27 @@ class Tap(ControlSurface):
                     step_duration
                 )
                 if exact_envelope_steps is not None:
+                    exact_read_end = float(exact_start) + max(
+                        0.0001,
+                        max(step_duration, float(exact_end) - float(exact_start))
+                    )
+                    current_event_read = self._cached_automation_event_read(
+                        envelope,
+                        float(exact_start),
+                        exact_read_end,
+                        step_duration
+                    )
+                    if (known_context is not None
+                            and known_status == "stale"
+                            and known_context.get("clip_identity") == self._live_object_identity(clip)
+                            and known_context.get("parameter_identity") == self._live_object_identity(device_param)
+                            and current_event_read is not None):
+                        exact_envelope_steps = self._automation_steps_preserving_unchanged_vertical_values(
+                            exact_envelope_steps,
+                            current_event_read.get("records"),
+                            known_context.get("snapshot"),
+                            known_context.get("live_event_records")
+                        )
                     if decoupled_info:
                         exact_envelope_steps = self._automation_sorted_steps(
                             step for step in exact_envelope_steps
@@ -19011,6 +19705,7 @@ class Tap(ControlSurface):
                         control_index,
                         authored_steps
                     )
+                    has_envelope = 1 if exact_envelope_steps else 0
 
             # Exact events already provide every editable point. The old path
             # still sampled the entire visible grid first (often hundreds of
@@ -19086,21 +19781,88 @@ class Tap(ControlSurface):
                         normalized = self._automation_value_from_steps(time_value, authored_render_steps)
                     render_entries.append("{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(time_value, step_duration, normalized, 0.0))
 
+            automation_context = None
+            envelope_revision = ""
+            response_status = ""
+            supports_exact_snapshot = exact_envelope_steps is not None or (
+                envelope is None and self._automation_runtime_supports_point_events()
+            )
+            if clip is not None and device_param is not None:
+                snapshot_steps = exact_envelope_steps if exact_envelope_steps is not None else (
+                    () if supports_exact_snapshot else (authored_steps or ())
+                )
+                if supports_exact_snapshot:
+                    envelope_revision = self._automation_snapshot_revision(
+                        clip,
+                        device_param,
+                        automation_domain,
+                        snapshot_steps
+                    )
+                automation_context = self._automation_context_for_snapshot(
+                    control_index,
+                    clip_slot,
+                    clip,
+                    device_param,
+                    envelope,
+                    automation_domain,
+                    snapshot_steps,
+                    envelope_revision,
+                    step_duration,
+                    known_context_token
+                )
+                if (supports_exact_snapshot
+                        and known_context_token == automation_context["token"]
+                        and known_revision == envelope_revision):
+                    response_status = "unchanged"
+                    entries = []
+                    render_entries = []
+
             response = "{}|{}|{:.6f}|{}|{}|{}".format(
                 control_index,
                 has_envelope,
                 current_value,
                 ",".join(entries),
                 ",".join(render_entries),
-                "|".join(self._automation_response_fields(clip, device_param, envelope))
+                "|".join(self._automation_response_fields(
+                    clip,
+                    device_param,
+                    envelope,
+                    status=response_status,
+                    context=automation_context,
+                    revision=envelope_revision,
+                    domain=automation_domain,
+                    request_token=request_token
+                ))
             )
             self._send_sys_ex_message(response, 0x31)
         except Exception as e:
             self._debug_log("Error sending automation envelope: {}".format(str(e)))
 
+    def _finalize_automation_pencil_stroke(self, state=None):
+        state = state or getattr(self, "_automation_pencil_stroke", None)
+        if state is None:
+            return
+        if getattr(self, "_automation_pencil_stroke", None) is state:
+            self._automation_pencil_stroke = None
+        undo_step_started = bool(state.get("undo_step_started", False))
+        # Clear before calling Live so a reentrant error/end packet cannot close
+        # a later transaction's undo group.
+        state["undo_step_started"] = False
+        if undo_step_started:
+            self._end_undo_step(True)
+
+    def _expire_automation_pencil_stroke(self, now=None):
+        state = getattr(self, "_automation_pencil_stroke", None)
+        if state is None:
+            return
+        now = time.monotonic() if now is None else float(now)
+        if now - float(state.get("last_activity", now)) > self.AUTOMATION_PENCIL_INACTIVITY_TIMEOUT:
+            self._finalize_automation_pencil_stroke(state)
+
     def _handle_automation_pencil_message(self, fields):
         try:
             if len(fields) < 3:
+                self._finalize_automation_pencil_stroke()
                 return
 
             action = fields[1]
@@ -19113,17 +19875,24 @@ class Tap(ControlSurface):
                 state = getattr(self, "_automation_pencil_stroke", None)
                 if state is not None and state.get("stroke_id") == stroke_id and len(fields) == 3:
                     state["last_point"] = None
+                    state["last_activity"] = time.monotonic()
+                elif state is not None and state.get("stroke_id") == stroke_id:
+                    self._fail_automation_pencil_stroke(state)
             elif action == "E":
                 self._end_automation_pencil_stroke(stroke_id, fields)
             elif action == "C":
                 state = getattr(self, "_automation_pencil_stroke", None)
                 if state is not None and state.get("stroke_id") == stroke_id:
-                    self._automation_pencil_stroke = None
+                    self._finalize_automation_pencil_stroke(state)
+            else:
+                self._finalize_automation_pencil_stroke()
         except Exception as e:
+            self._finalize_automation_pencil_stroke()
             self._debug_log("Error handling incremental automation pencil message: {}".format(str(e)))
 
     def _begin_automation_pencil_stroke(self, stroke_id, fields):
-        if len(fields) != 8:
+        self._finalize_automation_pencil_stroke()
+        if len(fields) not in (8, 10):
             return
 
         control_index = max(0, min(7, int(fields[3])))
@@ -19131,16 +19900,32 @@ class Tap(ControlSurface):
         loop_end = max(loop_start, float(fields[5]))
         sample_duration = max(0.0001, float(fields[6]))
         point_duration = max(sample_duration, float(fields[7]))
-        device_param = self._current_connected_parameter_for_control(control_index)
-        clip_slot = self.song().view.highlighted_clip_slot
+        context = None
+        if len(fields) == 10 and fields[8]:
+            context, envelope, _snapshot, _revision, status = self._resolve_automation_context(
+                fields[8],
+                fields[9]
+            )
+            if status != "ok":
+                self._automation_write_error_response(
+                    control_index,
+                    status=status,
+                    context=context
+                )
+                return
+            device_param = context["device_param"]
+            clip_slot = context["clip_slot"]
+        else:
+            device_param = self._current_connected_parameter_for_control(control_index)
+            clip_slot = self.song().view.highlighted_clip_slot
         if (clip_slot is None or not clip_slot.has_clip
                 or not self._parameter_is_automatable(device_param)):
             self._automation_write_error_response(control_index)
             return
 
         clip = clip_slot.clip
-        envelope = None
-        if hasattr(clip, 'automation_envelope'):
+        envelope = context.get("envelope") if context is not None else None
+        if envelope is None and hasattr(clip, 'automation_envelope'):
             try:
                 envelope = clip.automation_envelope(device_param)
             except Exception:
@@ -19188,6 +19973,7 @@ class Tap(ControlSurface):
         self._automation_pencil_stroke = {
             "stroke_id": stroke_id,
             "control_index": control_index,
+            "clip_slot": clip_slot,
             "clip": clip,
             "device_param": device_param,
             "envelope": envelope,
@@ -19202,14 +19988,22 @@ class Tap(ControlSurface):
             "entries": [],
             "automation_should_re_enable": automation_was_enabled or envelope is not None,
             "failed": False,
+            "context": context,
+            "undo_step_attempted": False,
+            "undo_step_started": False,
+            "last_activity": time.monotonic(),
         }
 
     def _append_automation_pencil_point(self, stroke_id, fields):
         state = getattr(self, "_automation_pencil_stroke", None)
-        if state is None or state.get("stroke_id") != stroke_id or len(fields) != 4:
+        if state is None or state.get("stroke_id") != stroke_id:
+            return
+        if len(fields) != 4:
+            self._fail_automation_pencil_stroke(state)
             return
         if state.get("failed"):
             return
+        state["last_activity"] = time.monotonic()
 
         components = fields[3].split(":")
         if len(components) != 5:
@@ -19241,6 +20035,9 @@ class Tap(ControlSurface):
             0.5,
             0.5,
         )
+        if not state.get("undo_step_attempted"):
+            state["undo_step_attempted"] = True
+            state["undo_step_started"] = self._begin_undo_step()
         if not self._write_incremental_automation_pencil_interval(state, state["last_point"], point):
             self._fail_automation_pencil_stroke(state)
             return
@@ -19368,7 +20165,10 @@ class Tap(ControlSurface):
 
     def _end_automation_pencil_stroke(self, stroke_id, fields):
         state = getattr(self, "_automation_pencil_stroke", None)
-        if state is None or state.get("stroke_id") != stroke_id or len(fields) != 8:
+        if state is None or state.get("stroke_id") != stroke_id:
+            return
+        if len(fields) != 8:
+            self._fail_automation_pencil_stroke(state)
             return
 
         write_token = fields[7]
@@ -19378,7 +20178,7 @@ class Tap(ControlSurface):
             page_start = float(fields[5])
             page_end = max(page_start, float(fields[6]))
         except Exception:
-            self._automation_pencil_stroke = None
+            self._finalize_automation_pencil_stroke(state)
             self._automation_write_error_response(state["control_index"], write_token)
             return
 
@@ -19389,24 +20189,27 @@ class Tap(ControlSurface):
             and state["next_sequence"] == expected_count + 1
             and expected_checksum == actual_checksum
         )
-        self._automation_pencil_stroke = None
         if not valid:
+            self._finalize_automation_pencil_stroke(state)
             self._automation_write_error_response(state["control_index"], write_token)
             return
 
-        if state["had_authored_steps"]:
-            self._store_authored_automation_steps(
-                state["clip"],
+        try:
+            if state["had_authored_steps"]:
+                self._store_authored_automation_steps(
+                    state["clip"],
+                    state["device_param"],
+                    state["control_index"],
+                    state["logical_steps"]
+                )
+            self._send_incremental_automation_pencil_response(state, page_start, page_end, write_token)
+            self._re_enable_after_automation_write(
                 state["device_param"],
-                state["control_index"],
-                state["logical_steps"]
+                state["automation_should_re_enable"]
             )
-        self._send_incremental_automation_pencil_response(state, page_start, page_end, write_token)
-        self._re_enable_after_automation_write(
-            state["device_param"],
-            state["automation_should_re_enable"]
-        )
-        self._refresh_parameter_metadata_on_automation_change()
+            self._refresh_parameter_metadata_on_automation_change()
+        finally:
+            self._finalize_automation_pencil_stroke(state)
 
     def _send_incremental_automation_pencil_response(self, state, page_start, page_end, write_token):
         logical_steps = self._automation_sorted_steps(state["logical_steps"])
@@ -19414,12 +20217,13 @@ class Tap(ControlSurface):
         current_normalized = self._parameter_normalized_value(state["device_param"])
 
         exact_steps = None
+        automation_domain = self._automation_domain_for_clip(
+            state["clip"],
+            state["device_param"]
+        )
         if self._automation_envelope_supports_point_events(state["envelope"]):
-            exact_start = decoupled_info["note_start"] if decoupled_info else state["loop_start"]
-            exact_length = decoupled_info["automation_length"] if decoupled_info else max(
-                0.0001,
-                state["loop_end"] - state["loop_start"]
-            )
+            exact_start = automation_domain[0]
+            exact_length = max(0.0001, automation_domain[1] - automation_domain[0])
             exact_steps = self._automation_steps_from_envelope_events(
                 state["envelope"],
                 state["device_param"],
@@ -19441,6 +20245,28 @@ class Tap(ControlSurface):
                     state["control_index"],
                     logical_steps
                 )
+
+        automation_context = state.get("context")
+        envelope_revision = ""
+        if exact_steps is not None:
+            envelope_revision = self._automation_snapshot_revision(
+                state["clip"],
+                state["device_param"],
+                automation_domain,
+                exact_steps
+            )
+            automation_context = self._automation_context_for_snapshot(
+                state["control_index"],
+                state.get("clip_slot"),
+                state["clip"],
+                state["device_param"],
+                state["envelope"],
+                automation_domain,
+                exact_steps,
+                envelope_revision,
+                state["point_duration"],
+                automation_context.get("token", "") if automation_context else ""
+            )
 
         count = max(
             2,
@@ -19501,7 +20327,10 @@ class Tap(ControlSurface):
                     state["clip"],
                     state["device_param"],
                     state["envelope"],
-                    write_token
+                    write_token,
+                    context=automation_context,
+                    revision=envelope_revision,
+                    domain=automation_domain
                 )
             )
         )
@@ -19510,6 +20339,693 @@ class Tap(ControlSurface):
     def _fail_automation_pencil_stroke(self, state):
         state["failed"] = True
         self._automation_write_error_response(state["control_index"])
+        self._finalize_automation_pencil_stroke(state)
+
+    def _automation_step_from_entry(self, entry, domain=None, fallback_order=0):
+        components = str(entry or "").split(":")
+        if len(components) < 3:
+            return None
+        try:
+            time_value = float(components[0])
+            if domain is not None:
+                time_value = max(float(domain[0]), min(float(domain[1]), time_value))
+            duration = max(0.0001, float(components[1]))
+            normalized = max(0.0, min(1.0, float(components[2])))
+            curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
+            step_id = max(0, int(components[4])) if len(components) >= 5 else 0
+            step_order = max(0, int(components[5])) if len(components) >= 6 else max(0, int(fallback_order))
+            uses_exact_controls = len(components) >= 11 and components[6] == "1"
+            x1 = float(components[7]) if len(components) >= 11 else 0.5
+            y1 = float(components[8]) if len(components) >= 11 else 0.5
+            x2 = float(components[9]) if len(components) >= 11 else 0.5
+            y2 = float(components[10]) if len(components) >= 11 else 0.5
+            coefficients = (x1, y1, x2, y2)
+            if not all(math.isfinite(value) for value in coefficients):
+                return None
+            x1 = max(0.0, min(1.0, x1))
+            x2 = max(x1, min(1.0, x2))
+            y1 = max(0.0, min(1.0, y1))
+            y2 = max(0.0, min(1.0, y2))
+            return (
+                time_value, duration, normalized, curve, step_id, step_order,
+                uses_exact_controls, x1, y1, x2, y2
+            )
+        except Exception:
+            return None
+
+    def _reconstruct_exact_automation_delta(self, baseline, operation_entries, domain):
+        baseline = list(self._automation_sorted_steps(baseline))
+        removed_ordinals = set()
+        fixed_positions = {}
+        affected_baseline_ordinals = set()
+        affected_final_positions = set()
+
+        for operation_entry in operation_entries:
+            components = operation_entry.split(":", 3)
+            action = components[0] if components else ""
+            if action == "D" and len(components) == 2:
+                ordinal = int(components[1])
+                if ordinal < 0 or ordinal >= len(baseline) or ordinal in removed_ordinals:
+                    return None
+                removed_ordinals.add(ordinal)
+                affected_baseline_ordinals.add(ordinal)
+            elif action == "R" and len(components) == 4:
+                ordinal = int(components[1])
+                final_position = int(components[2])
+                if ordinal < 0 or ordinal >= len(baseline) or ordinal in removed_ordinals:
+                    return None
+                step = self._automation_step_from_entry(
+                    components[3], domain=domain, fallback_order=final_position + 1
+                )
+                if step is None or final_position in fixed_positions:
+                    return None
+                removed_ordinals.add(ordinal)
+                affected_baseline_ordinals.add(ordinal)
+                affected_final_positions.add(final_position)
+                fixed_positions[final_position] = step
+            elif action == "I" and len(components) >= 3:
+                insertion_components = operation_entry.split(":", 2)
+                final_position = int(insertion_components[1])
+                step = self._automation_step_from_entry(
+                    insertion_components[2], domain=domain, fallback_order=final_position + 1
+                )
+                if step is None or final_position in fixed_positions:
+                    return None
+                affected_final_positions.add(final_position)
+                fixed_positions[final_position] = step
+            else:
+                return None
+
+        untouched_steps = [
+            step for ordinal, step in enumerate(baseline)
+            if ordinal not in removed_ordinals
+        ]
+        final_count = len(untouched_steps) + len(fixed_positions)
+        if any(position < 0 or position >= final_count for position in fixed_positions):
+            return None
+        final_steps = [None] * final_count
+        for position, step in fixed_positions.items():
+            final_steps[position] = step
+        untouched_iterator = iter(untouched_steps)
+        for position in range(final_count):
+            if final_steps[position] is None:
+                final_steps[position] = next(untouched_iterator)
+
+        for index in range(1, len(final_steps)):
+            if float(final_steps[index][0]) < float(final_steps[index - 1][0]) - 0.000001:
+                return None
+        # Snapshot order is authoritative for same-time groups. Live does not
+        # store this integer; it is regenerated on read and only guides the
+        # deterministic right-to-left recreation order.
+        final_steps = [
+            tuple(list(step[:5]) + [index + 1] + list(step[6:]))
+            for index, step in enumerate(final_steps)
+        ]
+
+        intervals = []
+
+        def left_boundary_preserving_incoming_curves(interval_start):
+            """Do not strand a curved owner just outside a rewrite.
+
+            Live can reset the predecessor's outgoing coefficients when its
+            endpoint is deleted, even if that endpoint is recreated a moment
+            later. Walk left through only the contiguous non-linear chain so
+            every curved owner is recreated right-to-left. Once the outside
+            predecessor is already linear, deleting its endpoint cannot alter
+            the audible envelope and the rewrite can safely stop.
+            """
+            expanded_start = float(interval_start)
+            while True:
+                predecessor = next((
+                    step for step in reversed(baseline)
+                    if float(step[0]) < expanded_start - 0.000001
+                ), None)
+                if predecessor is None:
+                    return expanded_start
+                normalized = self._automation_step_tuple(predecessor)
+                if len(normalized) >= 11 and bool(normalized[6]):
+                    is_linear = all(
+                        abs(float(value) - 0.5) <= 0.000001
+                        for value in normalized[7:11]
+                    )
+                else:
+                    is_linear = abs(float(normalized[3])) <= 0.000001
+                if is_linear:
+                    return expanded_start
+                expanded_start = float(predecessor[0])
+
+        for ordinal in affected_baseline_ordinals:
+            left_index = max(0, ordinal - 1)
+            right_index = min(len(baseline) - 1, ordinal + 1)
+            intervals.append((baseline[left_index][0], baseline[right_index][0]))
+        for position in affected_final_positions:
+            if final_steps:
+                left_index = max(0, position - 1)
+                right_index = min(len(final_steps) - 1, position + 1)
+                intervals.append((final_steps[left_index][0], final_steps[right_index][0]))
+        merged_intervals = []
+        for interval_start, interval_end in sorted(intervals):
+            interval_start = left_boundary_preserving_incoming_curves(
+                interval_start
+            )
+            interval_start = max(float(domain[0]), min(float(domain[1]), float(interval_start)))
+            interval_end = max(interval_start, min(float(domain[1]), float(interval_end)))
+            if merged_intervals and interval_start <= merged_intervals[-1][1] + 0.000001:
+                merged_intervals[-1] = (
+                    merged_intervals[-1][0],
+                    max(merged_intervals[-1][1], interval_end)
+                )
+            else:
+                merged_intervals.append((interval_start, interval_end))
+        return (tuple(final_steps), tuple(merged_intervals))
+
+    def _apply_exact_automation_delta(self, context, envelope, final_steps, intervals):
+        if not intervals:
+            return True
+        undo_step_started = self._begin_undo_step()
+        try:
+            for interval_start, interval_end in intervals:
+                interval_steps = tuple(
+                    step for step in final_steps
+                    if (step[0] >= interval_start - 0.000001
+                        and step[0] <= interval_end + 0.000001)
+                )
+                if not self._write_exact_automation_events_to_envelope(
+                        envelope,
+                        context["device_param"],
+                        interval_start,
+                        interval_end,
+                        interval_steps,
+                        allow_empty=True,
+                        endpoint_padding=0.0000001):
+                    return False
+            return True
+        finally:
+            self._end_undo_step(undo_step_started)
+
+    def _apply_direct_exact_automation_delta(
+            self, context, envelope, baseline, final_steps, operation_entries):
+        """Apply unambiguous inserts/deletes without rewriting neighbours.
+
+        Returns None when the operation needs the regular coefficient-aware
+        range writer. A pure insert can use create_event directly. A pure
+        delete can use a pin-sized range only when its timestamp owns exactly
+        one event; same-time groups remain range-rewrite territory because the
+        Live API has no durable individual event identity.
+        """
+        operation_entries = tuple(operation_entries or ())
+        if not operation_entries:
+            return True
+        actions = tuple(entry.split(":", 1)[0] for entry in operation_entries)
+        direct_steps = []
+        delete_steps = []
+
+        if all(action == "I" for action in actions):
+            try:
+                positions = tuple(
+                    int(entry.split(":", 2)[1]) for entry in operation_entries
+                )
+                direct_steps = [final_steps[position] for position in positions]
+            except Exception:
+                return False
+            for step in direct_steps:
+                baseline_group_count = sum(
+                    1 for candidate in baseline
+                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
+                )
+                final_group_count = sum(
+                    1 for candidate in final_steps
+                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
+                )
+                # Creating at an occupied timestamp is order-sensitive across
+                # Live bindings (append versus prepend), so use the verified
+                # same-time range writer for that special case.
+                if baseline_group_count != 0 or final_group_count > 1:
+                    return None
+        elif all(action == "D" for action in actions):
+            try:
+                ordinals = tuple(
+                    int(entry.split(":", 1)[1]) for entry in operation_entries
+                )
+                delete_steps = [baseline[ordinal] for ordinal in ordinals]
+            except Exception:
+                return False
+            for step in delete_steps:
+                baseline_group_count = sum(
+                    1 for candidate in baseline
+                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
+                )
+                if baseline_group_count != 1:
+                    return None
+        else:
+            return None
+
+        undo_step_started = self._begin_undo_step()
+        try:
+            if direct_steps:
+                for step in reversed(self._automation_sorted_steps(direct_steps)):
+                    raw_value = self._parameter_target_value_from_normalized(
+                        context["device_param"], step[2]
+                    )
+                    self._create_automation_event(
+                        envelope, step[0], raw_value, step
+                    )
+            else:
+                guard = 0.0000001
+                for step in sorted(
+                        delete_steps, key=lambda item: float(item[0]), reverse=True):
+                    time_value = float(step[0])
+                    envelope.delete_events_in_range(
+                        time_value - guard, time_value + guard
+                    )
+            return True
+        except Exception as e:
+            self._debug_log(
+                "Error applying direct exact automation delta: {}".format(str(e))
+            )
+            return False
+        finally:
+            self._end_undo_step(undo_step_started)
+
+    def _accepted_exact_automation_delta_snapshot(
+            self, context, envelope, intended_steps, intervals, point_duration,
+            include_live_event_records=False):
+        """Reread only Live ranges touched by a delta and merge them.
+
+        The prevalidated context snapshot is authoritative outside these
+        intervals. This avoids normalizing every event in a long clip after a
+        one-point edit while still returning Live's actually accepted values
+        and coefficients for every rewritten boundary event.
+        """
+        accepted_patch = []
+        accepted_event_records = []
+        for interval_start, interval_end in intervals:
+            read_length = max(0.0000001, interval_end - interval_start)
+            interval_steps = self._automation_steps_from_envelope_events(
+                envelope,
+                context["device_param"],
+                interval_start,
+                read_length,
+                point_duration
+            )
+            if interval_steps is None:
+                return None
+            cached_read_method = getattr(self, "_cached_automation_event_read", None)
+            cached_read = (
+                cached_read_method(
+                    envelope,
+                    float(interval_start),
+                    float(interval_start) + max(0.0001, float(read_length)),
+                    point_duration
+                )
+                if cached_read_method is not None else None
+            )
+            if cached_read is not None:
+                interval_steps = self._automation_steps_preserving_unchanged_vertical_values(
+                    interval_steps,
+                    cached_read.get("records"),
+                    context.get("snapshot"),
+                    context.get("live_event_records")
+                )
+                accepted_event_records.extend(
+                    record for record in cached_read.get("records", ())
+                    if float(record[0]) >= interval_start - 0.000001
+                    and float(record[0]) <= interval_end + 0.000001
+                )
+            accepted_patch.extend(
+                step for step in interval_steps
+                if step[0] >= interval_start - 0.000001
+                and step[0] <= interval_end + 0.000001
+            )
+
+        retained_steps = [
+            step for step in intended_steps
+            if not any(
+                step[0] >= interval_start - 0.000001
+                and step[0] <= interval_end + 0.000001
+                for interval_start, interval_end in intervals
+            )
+        ]
+        merged_steps = self._automation_sorted_steps(retained_steps + accepted_patch)
+        # Live does not persist Tap's order integer. Regenerate one global
+        # ordinal while retaining the accepted order inside same-time groups.
+        accepted_snapshot = tuple(
+            tuple(list(self._automation_step_tuple(step, index)[:5])
+                  + [index + 1]
+                  + list(self._automation_step_tuple(step, index)[6:]))
+            for index, step in enumerate(merged_steps)
+        )
+        if include_live_event_records:
+            return (accepted_snapshot, tuple(accepted_event_records))
+        return accepted_snapshot
+
+    def _send_exact_automation_delta_response(
+            self, context, envelope, accepted_steps, revision, intervals,
+            write_token, status="patch"):
+        interval_steps = tuple(
+            step for step in accepted_steps
+            if any(
+                step[0] >= interval_start - 0.000001
+                and step[0] <= interval_end + 0.000001
+                for interval_start, interval_end in intervals
+            )
+        )
+        range_payload = ";".join(
+            "{:.9f}:{:.9f}".format(interval_start, interval_end)
+            for interval_start, interval_end in intervals
+        )
+        response = "{}|{}|{:.6f}|{}|{}|{}|{}".format(
+            context["control_index"],
+            1 if accepted_steps else 0,
+            self._parameter_normalized_value(context["device_param"]),
+            ",".join(self._automation_step_entry(step) for step in interval_steps),
+            "",
+            "|".join(self._automation_response_fields(
+                context["clip"],
+                context["device_param"],
+                envelope,
+                write_token,
+                status,
+                context,
+                revision,
+                context["domain"]
+            )),
+            range_payload
+        )
+        self._send_sys_ex_message(response, 0x31)
+
+    def _handle_exact_automation_delta(self, fields):
+        if len(fields) != 9:
+            self._finalize_automation_pencil_stroke()
+            return
+        try:
+            control_index = max(0, min(7, int(fields[1])))
+            context_token = fields[2]
+            base_revision = fields[3]
+            sample_duration = max(0.0001, float(fields[4]))
+            operation_entries = fields[5].split(";") if fields[5] else []
+            expected_count = int(fields[6])
+            expected_checksum = int(fields[7], 16)
+            write_token = fields[8]
+            actual_checksum = self._automation_payload_checksum("|".join(fields[:6]))
+            if expected_count != len(operation_entries) or expected_checksum != actual_checksum:
+                self._automation_write_error_response(control_index, write_token)
+                return
+        except Exception:
+            return
+
+        context, envelope, baseline, _revision, status = self._resolve_automation_context(
+            context_token,
+            base_revision
+        )
+        if status != "ok":
+            self._automation_write_error_response(
+                control_index,
+                write_token,
+                status=status,
+                context=context
+            )
+            return
+        reconstructed = self._reconstruct_exact_automation_delta(
+            baseline,
+            operation_entries,
+            context["domain"]
+        )
+        if reconstructed is None:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+        final_steps, intervals = reconstructed
+
+        automation_was_enabled = self._parameter_automation_is_enabled(context["device_param"])
+        if envelope is None and hasattr(context["clip"], "create_automation_envelope"):
+            try:
+                envelope = context["clip"].create_automation_envelope(context["device_param"])
+            except Exception:
+                envelope = None
+        if not self._automation_envelope_supports_point_events(envelope):
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+        direct_result = self._apply_direct_exact_automation_delta(
+            context,
+            envelope,
+            baseline,
+            final_steps,
+            operation_entries
+        )
+        applied = (
+            self._apply_exact_automation_delta(
+                context, envelope, final_steps, intervals
+            )
+            if direct_result is None
+            else direct_result
+        )
+        if not applied:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+
+        accepted_result = self._accepted_exact_automation_delta_snapshot(
+            context,
+            envelope,
+            final_steps,
+            intervals,
+            sample_duration,
+            include_live_event_records=True
+        )
+        if accepted_result is None:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+        accepted_steps, accepted_event_records = accepted_result
+        accepted_revision = self._automation_snapshot_revision(
+            context["clip"],
+            context["device_param"],
+            context["domain"],
+            accepted_steps
+        )
+        merged_event_records = self._merged_automation_event_records(
+            context.get("live_event_records"),
+            accepted_event_records,
+            intervals
+        )
+        if merged_event_records is None:
+            accepted_live_fingerprint = self._automation_live_event_fingerprint(
+                envelope, context["domain"], sample_duration
+            )
+            cached_read = self._cached_automation_event_read(
+                envelope, context["domain"][0], context["domain"][1], sample_duration
+            )
+            merged_event_records = (
+                cached_read.get("records") if cached_read is not None else None
+            )
+        else:
+            accepted_live_fingerprint = self._automation_event_fingerprint_from_records(
+                merged_event_records
+            )
+        context.update({
+            "envelope": envelope,
+            "snapshot": self._automation_sorted_steps(accepted_steps),
+            "revision": accepted_revision,
+            "point_duration": sample_duration,
+            "live_fingerprint": accepted_live_fingerprint,
+            "live_event_records": merged_event_records,
+            "last_activity": time.monotonic(),
+        })
+        self._store_authored_automation_steps(
+            context["clip"],
+            context["device_param"],
+            context["control_index"],
+            accepted_steps
+        )
+        self._send_exact_automation_delta_response(
+            context,
+            envelope,
+            accepted_steps,
+            accepted_revision,
+            intervals,
+            write_token
+        )
+        self._re_enable_after_automation_write(
+            context["device_param"],
+            automation_was_enabled or envelope is not None
+        )
+        self._refresh_parameter_metadata_on_automation_change()
+
+    def _handle_exact_automation_full_write(self, fields):
+        if len(fields) != 11:
+            return
+        try:
+            control_index = max(0, min(7, int(fields[1])))
+            context_token = fields[2]
+            base_revision = fields[3]
+            requested_start = float(fields[4])
+            requested_end = max(requested_start, float(fields[5]))
+            sample_duration = max(0.0001, float(fields[6]))
+            step_entries = fields[7].split(",") if fields[7] else []
+            expected_count = int(fields[8])
+            expected_checksum = int(fields[9], 16)
+            write_token = fields[10]
+            actual_checksum = self._automation_payload_checksum("|".join(fields[:8]))
+            if expected_count != len(step_entries) or expected_checksum != actual_checksum:
+                self._automation_write_error_response(control_index, write_token)
+                return
+        except Exception:
+            return
+
+        context, envelope, _baseline, _revision, status = self._resolve_automation_context(
+            context_token,
+            base_revision
+        )
+        if status != "ok":
+            self._automation_write_error_response(
+                control_index,
+                write_token,
+                status=status,
+                context=context
+            )
+            return
+        logical_steps = []
+        for index, entry in enumerate(step_entries):
+            step = self._automation_step_from_entry(
+                entry,
+                domain=context["domain"],
+                fallback_order=index + 1
+            )
+            if step is None:
+                self._automation_write_error_response(
+                    context["control_index"], write_token, context=context
+                )
+                return
+            logical_steps.append(step)
+        logical_steps = self._automation_sorted_steps(logical_steps)
+
+        decoupled_info = self._decoupled_automation_info(
+            context["clip"], context["device_param"]
+        )
+        physical_steps = logical_steps
+        write_start = max(context["domain"][0], requested_start)
+        write_end = min(context["domain"][1], requested_end)
+        if decoupled_info:
+            logical_steps = self._normalize_decoupled_logical_automation_steps(
+                decoupled_info, logical_steps
+            )
+            physical_steps = self._expanded_decoupled_automation_steps(
+                decoupled_info, logical_steps, sample_duration
+            )
+            write_start = decoupled_info["note_start"]
+            write_end = decoupled_info["physical_end"]
+
+        automation_was_enabled = self._parameter_automation_is_enabled(context["device_param"])
+        if envelope is None and hasattr(context["clip"], "create_automation_envelope"):
+            try:
+                envelope = context["clip"].create_automation_envelope(context["device_param"])
+            except Exception:
+                envelope = None
+        if not self._automation_envelope_supports_point_events(envelope):
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+
+        undo_step_started = self._begin_undo_step()
+        try:
+            write_succeeded = self._write_exact_automation_events_to_envelope(
+                envelope,
+                context["device_param"],
+                write_start,
+                write_end,
+                physical_steps,
+                allow_empty=True
+            )
+        finally:
+            self._end_undo_step(undo_step_started)
+        if not write_succeeded:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+
+        accepted_steps = self._automation_steps_from_envelope_events(
+            envelope,
+            context["device_param"],
+            context["domain"][0],
+            max(0.0001, context["domain"][1] - context["domain"][0]),
+            sample_duration
+        )
+        if accepted_steps is None:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+        if decoupled_info:
+            accepted_steps = self._automation_sorted_steps(
+                step for step in accepted_steps
+                if step[0] < context["domain"][1] - 0.000001
+            )
+        accepted_revision = self._automation_snapshot_revision(
+            context["clip"], context["device_param"], context["domain"], accepted_steps
+        )
+        accepted_event_read = self._cached_automation_event_read(
+            envelope,
+            context["domain"][0],
+            context["domain"][1],
+            sample_duration
+        )
+        if accepted_event_read is None:
+            accepted_live_fingerprint = self._automation_live_event_fingerprint(
+                envelope, context["domain"], sample_duration
+            )
+            accepted_event_read = self._cached_automation_event_read(
+                envelope,
+                context["domain"][0],
+                context["domain"][1],
+                sample_duration
+            )
+        else:
+            accepted_live_fingerprint = accepted_event_read.get("fingerprint")
+        context.update({
+            "envelope": envelope,
+            "snapshot": self._automation_sorted_steps(accepted_steps),
+            "revision": accepted_revision,
+            "point_duration": sample_duration,
+            "live_fingerprint": accepted_live_fingerprint,
+            "live_event_records": (
+                accepted_event_read.get("records")
+                if accepted_event_read is not None else None
+            ),
+            "last_activity": time.monotonic(),
+        })
+        if accepted_steps:
+            self._store_authored_automation_steps(
+                context["clip"], context["device_param"],
+                context["control_index"], accepted_steps
+            )
+        else:
+            self._clear_authored_automation_steps(
+                context["clip"], context["device_param"], context["control_index"]
+            )
+        response = "{}|{}|{:.6f}|{}|{}|{}".format(
+            context["control_index"],
+            1 if accepted_steps else 0,
+            self._parameter_normalized_value(context["device_param"]),
+            ",".join(self._automation_step_entry(step) for step in accepted_steps),
+            "",
+            "|".join(self._automation_response_fields(
+                context["clip"], context["device_param"], envelope,
+                write_token, "full", context, accepted_revision, context["domain"]
+            ))
+        )
+        self._send_sys_ex_message(response, 0x31)
+        self._re_enable_after_automation_write(
+            context["device_param"], automation_was_enabled or envelope is not None
+        )
+        self._refresh_parameter_metadata_on_automation_change()
 
     def _set_automation_envelope(self, message):
         try:
@@ -19517,6 +21033,13 @@ class Tap(ControlSurface):
             fields = self._split_escaped_sysex_fields(payload, "|")
             if fields and fields[0] == "P":
                 self._handle_automation_pencil_message(fields)
+                return
+            self._finalize_automation_pencil_stroke()
+            if fields and fields[0] == "D":
+                self._handle_exact_automation_delta(fields)
+                return
+            if fields and fields[0] == "F":
+                self._handle_exact_automation_full_write(fields)
                 return
             if len(fields) < 5:
                 return
@@ -19528,6 +21051,7 @@ class Tap(ControlSurface):
             step_entries = self._split_escaped_sysex_fields(fields[4], ",") if fields[4] else []
             write_token = fields[7] if len(fields) >= 8 else ""
             write_uses_exact_events = len(fields) >= 9 and fields[8] == "1"
+            write_context_token = fields[9] if len(fields) >= 10 else ""
             response_token_fields = [write_token] if write_token else []
 
             if len(fields) >= 7:
@@ -19552,8 +21076,24 @@ class Tap(ControlSurface):
                     self._automation_write_error_response(control_index, write_token)
                     return
 
-            device_param = self._current_connected_parameter_for_control(control_index)
-            clip_slot = self.song().view.highlighted_clip_slot
+            write_context = None
+            if write_context_token:
+                write_context, _context_envelope, _snapshot, _revision, context_status = self._resolve_automation_context(
+                    write_context_token
+                )
+                if context_status != "ok":
+                    self._automation_write_error_response(
+                        control_index,
+                        write_token,
+                        status=context_status,
+                        context=write_context
+                    )
+                    return
+                device_param = write_context["device_param"]
+                clip_slot = write_context["clip_slot"]
+            else:
+                device_param = self._current_connected_parameter_for_control(control_index)
+                clip_slot = self.song().view.highlighted_clip_slot
             if (clip_slot is None or not clip_slot.has_clip
                     or not self._parameter_is_automatable(device_param)):
                 self._automation_write_error_response(control_index, write_token)
@@ -19687,7 +21227,8 @@ class Tap(ControlSurface):
                             clip,
                             device_param,
                             envelope,
-                            write_token
+                            write_token,
+                            context=write_context
                         ))
                     )
                     self._send_sys_ex_message(response, 0x31)
@@ -19821,7 +21362,8 @@ class Tap(ControlSurface):
                         clip,
                         device_param,
                         envelope,
-                        write_token
+                        write_token,
+                        context=write_context
                     ))
                 )
                 self._send_sys_ex_message(response, 0x31)
@@ -19949,7 +21491,8 @@ class Tap(ControlSurface):
                     clip,
                     device_param,
                     envelope,
-                    write_token
+                    write_token,
+                    context=write_context
                 ))
             )
             self._send_sys_ex_message(response, 0x31)
@@ -23559,6 +25102,8 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._finalize_automation_pencil_stroke()
+        self._clear_automation_contexts()
         self._apply_note_repeat_engine(False, self.NOTE_REPEAT_DEFAULT_INDEX)
         self._decoupled_automation_recording_active = False
         self._decoupled_automation_recording_snapshots = {}
