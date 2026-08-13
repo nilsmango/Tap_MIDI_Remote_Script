@@ -2,6 +2,7 @@ import ast
 import os
 import pathlib
 import re
+import tempfile
 import types
 import unittest
 from urllib.parse import unquote, urlparse
@@ -15,6 +16,9 @@ METHOD_NAMES = {
     "_audio_clip_sample_duration",
     "_audio_clip_sample_end",
     "_send_audio_clip_waveform",
+    "_send_audio_clip_playback_state",
+    "_request_audio_clip_waveform",
+    "_simpler_waveform_source_signature",
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
     "_send_all_drum_pad_names",
@@ -252,9 +256,12 @@ class Harness:
         self.sent = []
         self.results = []
         self._last_audio_clip_state = None
+        self._last_audio_clip_playback_state = None
         self._last_audio_clip_action_result = None
         self._audio_clip_waveform_generation = 0
         self._simpler_waveform_cache = {}
+        self._simpler_waveform_failures = {}
+        self._simpler_waveform_pending = set()
         self.browser_audio_clip_target = None
         self.browser_drum_pad_target = None
         self.browser_insert_after_device_index = None
@@ -472,6 +479,25 @@ class AudioClipSupportTests(unittest.TestCase):
         self.assertEqual(len(payload), 114)
         self.assertEqual(payload[-1], 100)
 
+    def test_playhead_feedback_uses_compact_message(self):
+        self.harness.slots[1].is_playing = True
+        self.harness.clip.playing_position = 2.75
+
+        self.harness._send_audio_clip_playback_state()
+
+        self.assertEqual(self.harness.sent[-1], (0x57, "1|0|1|1|0|2.750000"))
+
+    def test_known_waveform_failure_is_not_retried(self):
+        with tempfile.NamedTemporaryFile(suffix=".aif") as audio_file:
+            self.harness.clip.file_path = audio_file.name
+            signature = self.harness._simpler_waveform_source_signature(audio_file.name)
+            self.harness._simpler_waveform_failures[audio_file.name] = signature
+            self.harness._decode_audio_waveform = lambda *_: self.fail("decode retried")
+
+            self.harness._request_audio_clip_waveform()
+
+        self.assertEqual(self.harness._simpler_waveform_pending, set())
+
     def test_add_move_and_remove_warp_markers(self):
         self.harness.clip.warping = True
         add = [0xF0, 0x52] + list(b"addWarpMarker|2") + [0xF7]
@@ -513,6 +539,11 @@ class AudioClipSupportTests(unittest.TestCase):
     def test_state_refresh_does_not_resend_the_waveform(self):
         self.harness._send_audio_clip_state(force=True)
         self.assertFalse(hasattr(self.harness, "waveform_requested"))
+        self.harness._request_audio_clip_waveform = lambda: setattr(
+            self.harness,
+            "waveform_requested",
+            True,
+        )
         self.harness._send_audio_clip_state(force=True, request_waveform=True)
         self.assertTrue(self.harness.waveform_requested)
 

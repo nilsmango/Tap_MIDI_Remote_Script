@@ -2745,6 +2745,7 @@ class Tap(ControlSurface):
             self._audio_clip_listener_clip = None
             self._audio_clip_listener_slot = None
             self._last_audio_clip_state = None
+            self._last_audio_clip_playback_state = None
             self._last_audio_clip_position_state_time = 0.0
             self._last_audio_clip_action_result = None
             self._sysex_buffers = {}
@@ -21606,6 +21607,7 @@ class Tap(ControlSurface):
         self._remove_audio_clip_listeners()
         self._audio_clip_listener_clip = clip
         self._audio_clip_listener_slot = slot
+        self._last_audio_clip_playback_state = None
         self._audio_clip_waveform_generation += 1
         if slot is not None:
             for property_name in ('has_clip', 'is_playing', 'is_triggered'):
@@ -21635,7 +21637,30 @@ class Tap(ControlSurface):
         now = time.time()
         if now - self._last_audio_clip_position_state_time >= 0.05:
             self._last_audio_clip_position_state_time = now
-            self._send_audio_clip_state()
+            self._send_audio_clip_playback_state()
+
+    def _send_audio_clip_playback_state(self, force=False):
+        slot, clip, track_index, scene_index = self._selected_audio_clip_context()
+        if slot is None or clip is None:
+            return
+        is_playing = bool(
+            getattr(slot, 'is_playing', False)
+            or getattr(clip, 'is_playing', False)
+        )
+        is_triggered = bool(
+            getattr(slot, 'is_triggered', False)
+            or getattr(clip, 'is_triggered', False)
+        )
+        payload = '1|{}|{}|{}|{}|{:.6f}'.format(
+            track_index,
+            scene_index,
+            1 if is_playing else 0,
+            1 if is_triggered else 0,
+            self._audio_clip_float(clip, 'playing_position'),
+        )
+        if force or payload != self._last_audio_clip_playback_state:
+            self._last_audio_clip_playback_state = payload
+            self._send_sys_ex_message(payload, 0x57)
 
     def _send_audio_clip_state(self, force=False, request_waveform=False):
         slot, clip, track_index, scene_index = self._selected_audio_clip_context(include_empty=True)
@@ -21792,9 +21817,12 @@ class Tap(ControlSurface):
         if not file_path or not os.path.isfile(file_path):
             return
         generation = self._audio_clip_waveform_generation
+        source_signature = self._simpler_waveform_source_signature(file_path)
         cached = self._simpler_waveform_cache.get(file_path)
         if cached:
             self._send_audio_clip_waveform(generation, cached)
+            return
+        if self._simpler_waveform_failures.get(file_path) == source_signature:
             return
         pending_key = ('audio', generation, file_path)
         if pending_key in self._simpler_waveform_pending:
@@ -21806,6 +21834,8 @@ class Tap(ControlSurface):
             with self._simpler_waveform_lock:
                 if peaks:
                     self._cache_simpler_waveform(file_path, peaks)
+                elif generation == self._audio_clip_waveform_generation:
+                    self._cache_simpler_waveform_failure(file_path, source_signature)
                 self._simpler_waveform_pending.discard(pending_key)
 
         worker = threading.Thread(target=build, name='TapAudioClipWaveform')
