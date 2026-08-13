@@ -2438,6 +2438,7 @@ class Tap(ControlSurface):
         82: 524288, 88: 262144, 96: 65536,
     }
     SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
+    SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL = 0.05
     SYSEX_21_BIT_MAX_MAGNITUDE = 0x1FFFFF
     NOTE_FLAG_MUTE = 0x01
     NOTE_FLAG_NEGATIVE_START = 0x02
@@ -2509,6 +2510,8 @@ class Tap(ControlSurface):
             self._playing_note_cache_dirty = set()
             self.current_clip_notes = []
             self.last_selected_clip_slot = None
+            self._last_selected_clip_notes_signature = None
+            self._last_selected_clip_notes_sent_at = 0.0
             self._step_seq_listener_clip = None
             self.last_raw_notes = None
             self.currently_playing_notes = [False] * 128
@@ -3290,11 +3293,20 @@ class Tap(ControlSurface):
         try:
             if not device_param or not hasattr(device_param, 'value') or not hasattr(device_param, 'min') or not hasattr(device_param, 'max'):
                 return 0.0
+            return self._parameter_normalized_value_from_raw(
+                device_param,
+                device_param.value
+            )
+        except Exception:
+            return 0.0
+
+    def _parameter_normalized_value_from_raw(self, device_param, raw_value):
+        try:
             min_val = device_param.min
             max_val = device_param.max
             if max_val == min_val:
                 return 0.0
-            normalized = (device_param.value - min_val) / (max_val - min_val)
+            normalized = (float(raw_value) - min_val) / (max_val - min_val)
             return max(0.0, min(1.0, normalized))
         except Exception:
             return 0.0
@@ -10859,6 +10871,58 @@ class Tap(ControlSurface):
             for index, step in enumerate(steps)
         )
 
+    def _parameter_domain_values_from_envelope_events(self, envelope, events, device_param, start, end, point_duration):
+        # EnvelopeEvent.value is Live's stored automation value.  Depending on
+        # the parameter it can be a user-domain value (Hz, gain, and so on),
+        # while DeviceParameter.value/min/max use Live's control domain.
+        # value_at_time performs Live's own parameter-specific conversion.
+        # Keep event time and curve coefficients exact; only obtain each Y in
+        # the domain used by the connected encoder.
+        if not hasattr(envelope, "value_at_time"):
+            return tuple(float(event.value) for event in events)
+
+        values = [None] * len(events)
+        groups = []
+        for index, event in enumerate(events):
+            event_time = float(event.time)
+            if not groups or abs(event_time - float(events[groups[-1][-1]].time)) > 0.000001:
+                groups.append([])
+            groups[-1].append(index)
+
+        epsilon = min(0.0001, max(0.0000001, float(point_duration) * 0.001))
+        for group in groups:
+            time_value = float(events[group[0]].time)
+            if len(group) == 1:
+                try:
+                    values[group[0]] = float(envelope.value_at_time(time_value))
+                except Exception:
+                    values[group[0]] = float(events[group[0]].value)
+                continue
+
+            # Multiple events at one time encode a real vertical boundary.
+            # Sampling just before/after retains its two sides while avoiding
+            # the incompatible EnvelopeEvent.value domain.
+            before_time = max(0.0, time_value - epsilon)
+            after_time = min(float(end), time_value + epsilon)
+            try:
+                before_value = float(envelope.value_at_time(before_time))
+            except Exception:
+                before_value = float(envelope.value_at_time(time_value))
+            try:
+                after_value = float(envelope.value_at_time(after_time))
+            except Exception:
+                after_value = float(envelope.value_at_time(time_value))
+
+            divisor = max(1, len(group) - 1)
+            for offset, event_index in enumerate(group):
+                progress = float(offset) / float(divisor)
+                values[event_index] = before_value + ((after_value - before_value) * progress)
+
+        return tuple(
+            float(event.value) if value is None else value
+            for event, value in zip(events, values)
+        )
+
     def _automation_steps_from_envelope_events(self, envelope, device_param, start, length, point_duration):
         if (envelope is None or device_param is None or not liveobj_valid(device_param)
                 or not self._automation_envelope_supports_point_events(envelope)):
@@ -10867,14 +10931,22 @@ class Tap(ControlSurface):
         try:
             end = start + max(0.0001, length)
             events = tuple(envelope.events_in_range(start, end))
+            parameter_values = self._parameter_domain_values_from_envelope_events(
+                envelope,
+                events,
+                device_param,
+                start,
+                end,
+                point_duration
+            )
             steps = []
             for index, event in enumerate(events):
                 time_value = float(event.time)
-                raw_value = float(event.value)
-                if device_param.max != device_param.min:
-                    normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
-                else:
-                    normalized = self._parameter_normalized_value(device_param)
+                raw_value = parameter_values[index]
+                normalized = self._parameter_normalized_value_from_raw(
+                    device_param,
+                    raw_value
+                )
                 controls = event.control_coefficients
                 steps.append((
                     time_value,
@@ -18904,21 +18976,7 @@ class Tap(ControlSurface):
                     except Exception:
                         envelope = None
 
-            samples = []
             has_envelope = 1 if envelope is not None else 0
-            for index in range(count):
-                time_value = start + (float(index) * step_duration)
-                normalized = current_value
-                if envelope is not None:
-                    try:
-                        raw_value = envelope.value_at_time(time_value)
-                        if device_param.max != device_param.min:
-                            normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
-                    except Exception:
-                        normalized = current_value
-                normalized = max(0.0, min(1.0, normalized))
-                samples.append((time_value, normalized))
-
             authored_steps = self._authored_automation_steps(clip, device_param, control_index)
             request_end = start + (float(count - 1) * step_duration)
             decoupled_info = self._decoupled_automation_info(clip, device_param)
@@ -18952,6 +19010,26 @@ class Tap(ControlSurface):
                         control_index,
                         authored_steps
                     )
+
+            # Exact events already provide every editable point. The old path
+            # still sampled the entire visible grid first (often hundreds of
+            # synchronous Live API calls) and then discarded those samples.
+            # Only build the compatibility/render samples when the exact event
+            # API was unavailable or failed.
+            samples = []
+            if exact_envelope_steps is None:
+                for index in range(count):
+                    time_value = start + (float(index) * step_duration)
+                    normalized = current_value
+                    if envelope is not None:
+                        try:
+                            raw_value = envelope.value_at_time(time_value)
+                            if device_param.max != device_param.min:
+                                normalized = (raw_value - device_param.min) / (device_param.max - device_param.min)
+                        except Exception:
+                            normalized = current_value
+                    normalized = max(0.0, min(1.0, normalized))
+                    samples.append((time_value, normalized))
 
             if exact_envelope_steps is None and authored_steps is not None and decoupled_info is not None:
                 authored_steps = self._normalize_decoupled_logical_automation_steps(decoupled_info, authored_steps)
@@ -19376,25 +19454,26 @@ class Tap(ControlSurface):
             state["sample_duration"]
         ) if decoupled_info else logical_steps
         response_samples = []
-        for index in range(count):
-            time_value = page_start + (float(index) * state["sample_duration"])
-            try:
-                raw_value = state["envelope"].value_at_time(time_value)
-                if state["device_param"].max != state["device_param"].min:
-                    normalized = (
-                        (raw_value - state["device_param"].min)
-                        / (state["device_param"].max - state["device_param"].min)
-                    )
-                else:
-                    normalized = current_normalized
-            except Exception:
-                normalized = self._automation_value_from_steps(
-                    time_value,
-                    response_steps
-                ) if response_steps else current_normalized
-            response_samples.append((time_value, max(0.0, min(1.0, normalized))))
+        if exact_steps is None:
+            for index in range(count):
+                time_value = page_start + (float(index) * state["sample_duration"])
+                try:
+                    raw_value = state["envelope"].value_at_time(time_value)
+                    if state["device_param"].max != state["device_param"].min:
+                        normalized = (
+                            (raw_value - state["device_param"].min)
+                            / (state["device_param"].max - state["device_param"].min)
+                        )
+                    else:
+                        normalized = current_normalized
+                except Exception:
+                    normalized = self._automation_value_from_steps(
+                        time_value,
+                        response_steps
+                    ) if response_steps else current_normalized
+                response_samples.append((time_value, max(0.0, min(1.0, normalized))))
 
-        if not state["had_authored_steps"]:
+        if exact_steps is None and not state["had_authored_steps"]:
             logical_steps = self._automation_sorted_steps(
                 (time_value, state["sample_duration"], normalized, 0.0, 0, 0)
                 for time_value, normalized in self._compress_automation_samples(response_samples)
@@ -22328,6 +22407,7 @@ class Tap(ControlSurface):
             self._selected_clip_update_pending_notes = True
             return
         if self.seq_status:
+            snapshot_request_started_at = time.monotonic()
             status_byte = 0xF0
             end_byte = 0xF7
             manufacturer_id = 0x0D
@@ -22337,10 +22417,15 @@ class Tap(ControlSurface):
                 
             song = self.song()
             clip_slot = song.view.highlighted_clip_slot
+            snapshot_identity = ("none",)
             
             if clip_slot is not None:
                 if clip_slot.has_clip:
                     selected_clip = clip_slot.clip
+                    snapshot_identity = (
+                        "clip",
+                        self._live_object_identity(selected_clip),
+                    )
                 
                     # Extract clip metadata
                     clip_start = min(selected_clip.start_time, selected_clip.start_marker, selected_clip.loop_start) - self.clip_length_trick
@@ -22384,6 +22469,10 @@ class Tap(ControlSurface):
                     
                         data.extend(note_data)
                 else:
+                    snapshot_identity = (
+                        "slot",
+                        self._live_object_identity(clip_slot),
+                    )
                     # Empty highlighted slot: send the explicit no-clip marker
                     # and listen for the slot becoming populated.
                     data.extend([0x7F, 0x7F, 0x7F])
@@ -22394,6 +22483,20 @@ class Tap(ControlSurface):
                 # This also covers Live's short startup window where no
                 # highlighted slot object is available yet.
                 data.extend([0x7F, 0x7F, 0x7F])
+
+            # A Live note listener and the command that caused it can both ask
+            # for the same full snapshot. Suppress only byte-identical repeats
+            # in a tiny window, preserving deliberate refreshes and every
+            # changed-note response.
+            snapshot_signature = (snapshot_identity, bytes(data))
+            if (
+                snapshot_signature == self._last_selected_clip_notes_signature
+                and snapshot_request_started_at - self._last_selected_clip_notes_sent_at
+                    < self.SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL
+            ):
+                return
+            self._last_selected_clip_notes_signature = snapshot_signature
+            self._last_selected_clip_notes_sent_at = time.monotonic()
                 
             # Split data if it's too large for a single SysEx message
             num_of_chunks = max(1, (len(data) + max_chunk_length - 1) // max_chunk_length)

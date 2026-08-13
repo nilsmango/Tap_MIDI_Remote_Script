@@ -63,6 +63,29 @@ class NoteCodecHarness:
     _note_record_flags = extracted_method("_note_record_flags")
 
 
+class SelectedClipSnapshotHarness:
+    SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
+    SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL = 0.05
+    send_selected_clip_notes = extracted_method("send_selected_clip_notes")
+
+    def __init__(self):
+        self.seq_status = True
+        self._selected_clip_update_pending_notes = False
+        self._last_selected_clip_notes_signature = None
+        self._last_selected_clip_notes_sent_at = 0.0
+        self.sent = []
+
+    def _selected_clip_updates_are_suppressed(self):
+        return False
+
+    def song(self):
+        view = type("View", (), {"highlighted_clip_slot": None})()
+        return type("Song", (), {"view": view})()
+
+    def _send_midi(self, message):
+        self.sent.append(message)
+
+
 class AutomationPencilMergeHarness:
     _automation_step_id = extracted_method("_automation_step_id")
     _automation_step_order = extracted_method("_automation_step_order")
@@ -172,6 +195,17 @@ class FlinColumnHarness:
 
 
 class TransportTests(unittest.TestCase):
+    def test_identical_selected_clip_snapshot_is_only_suppressed_briefly(self):
+        harness = SelectedClipSnapshotHarness()
+
+        harness.send_selected_clip_notes()
+        harness.send_selected_clip_notes()
+        self.assertEqual(len(harness.sent), 1)
+
+        harness._last_selected_clip_notes_sent_at -= 1.0
+        harness.send_selected_clip_notes()
+        self.assertEqual(len(harness.sent), 2)
+
     def test_incremental_pencil_seeds_authored_layer_from_live_once(self):
         parameter = object()
         envelope = object()
@@ -241,6 +275,12 @@ class TransportTests(unittest.TestCase):
             _automation_steps_from_envelope_events = extracted_method(
                 "_automation_steps_from_envelope_events"
             )
+            _parameter_domain_values_from_envelope_events = extracted_method(
+                "_parameter_domain_values_from_envelope_events"
+            )
+            _parameter_normalized_value_from_raw = extracted_method(
+                "_parameter_normalized_value_from_raw"
+            )
 
             def _automation_envelope_supports_point_events(self, _envelope):
                 return True
@@ -257,7 +297,7 @@ class TransportTests(unittest.TestCase):
             def _debug_log(self, message):
                 raise AssertionError(message)
 
-        parameter = type("Parameter", (), {"min": 0.0, "max": 1.0})()
+        parameter = type("Parameter", (), {"min": -48.0, "max": 48.0})()
         envelope = Envelope()
         steps = Harness()._automation_steps_from_envelope_events(
             envelope, parameter, 1.0, 3.0, 0.03125
@@ -275,7 +315,7 @@ class TransportTests(unittest.TestCase):
         })()
         event = type("Event", (), {
             "time": 1.25,
-            "value": 0.6,
+            "value": 9.6,
             "control_coefficients": controls,
         })()
 
@@ -286,6 +326,12 @@ class TransportTests(unittest.TestCase):
         class Harness:
             _automation_steps_from_envelope_events = extracted_method(
                 "_automation_steps_from_envelope_events"
+            )
+            _parameter_domain_values_from_envelope_events = extracted_method(
+                "_parameter_domain_values_from_envelope_events"
+            )
+            _parameter_normalized_value_from_raw = extracted_method(
+                "_parameter_normalized_value_from_raw"
             )
 
             def _automation_envelope_supports_point_events(self, _envelope):
@@ -300,7 +346,7 @@ class TransportTests(unittest.TestCase):
             def _debug_log(self, message):
                 raise AssertionError(message)
 
-        parameter = type("Parameter", (), {"min": 0.0, "max": 1.0})()
+        parameter = type("Parameter", (), {"min": -48.0, "max": 48.0})()
         steps = Harness()._automation_steps_from_envelope_events(
             Envelope(), parameter, 0.0, 4.0, 0.03125
         )
@@ -308,6 +354,186 @@ class TransportTests(unittest.TestCase):
             steps,
             ((1.25, 0.03125, 0.6, 0.0, 0, 1, True, 0.12, 0.34, 0.78, 0.91),)
         )
+
+    def test_exact_device_event_values_use_envelope_parameter_domain_without_losing_points(self):
+        controls = type("Controls", (), {
+            "x1": 0.1,
+            "y1": 0.2,
+            "x2": 0.7,
+            "y2": 0.9,
+        })()
+        events = (
+            type("Event", (), {
+                "time": 1.0,
+                "value": 632.5,
+                "control_coefficients": controls,
+            })(),
+            type("Event", (), {
+                "time": 2.0,
+                "value": 10010.0,
+                "control_coefficients": controls,
+            })(),
+        )
+
+        class Envelope:
+            def __init__(self):
+                self.sampled_times = []
+
+            def events_in_range(self, _start, _end):
+                return events
+
+            def value_at_time(self, time_value):
+                self.sampled_times.append(time_value)
+                return {1.0: 0.25, 2.0: 0.75}[time_value]
+
+        class Harness:
+            _automation_steps_from_envelope_events = extracted_method(
+                "_automation_steps_from_envelope_events"
+            )
+            _parameter_domain_values_from_envelope_events = extracted_method(
+                "_parameter_domain_values_from_envelope_events"
+            )
+            _parameter_normalized_value_from_raw = extracted_method(
+                "_parameter_normalized_value_from_raw"
+            )
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        envelope = Envelope()
+        steps = Harness()._automation_steps_from_envelope_events(
+            envelope,
+            type("Parameter", (), {"min": 0.0, "max": 1.0})(),
+            0.0,
+            4.0,
+            0.03125
+        )
+
+        self.assertEqual([step[2] for step in steps], [0.25, 0.75])
+        self.assertEqual(envelope.sampled_times, [1.0, 2.0])
+        self.assertEqual(steps[0][7:], (0.1, 0.2, 0.7, 0.9))
+
+    def test_exact_nonlinear_volume_events_use_live_envelope_conversion(self):
+        controls = type("Controls", (), {
+            "x1": 0.14,
+            "y1": 0.28,
+            "x2": 0.72,
+            "y2": 0.86,
+        })()
+        events = tuple(
+            type("Event", (), {
+                "time": time_value,
+                "value": value,
+                "control_coefficients": controls,
+            })()
+            for time_value, value in ((1.0, 0.01), (2.0, 1.0))
+        )
+
+        class Envelope:
+            def __init__(self):
+                self.sampled_times = []
+
+            def events_in_range(self, _start, _end):
+                return events
+
+            def value_at_time(self, time_value):
+                self.sampled_times.append(time_value)
+                # Live converts the stored gain to its fader/control domain.
+                return {1.0: 0.25, 2.0: 0.85}[time_value]
+
+        class Harness:
+            _automation_steps_from_envelope_events = extracted_method(
+                "_automation_steps_from_envelope_events"
+            )
+            _parameter_domain_values_from_envelope_events = extracted_method(
+                "_parameter_domain_values_from_envelope_events"
+            )
+            _parameter_normalized_value_from_raw = extracted_method(
+                "_parameter_normalized_value_from_raw"
+            )
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        envelope = Envelope()
+        parameter = type("Parameter", (), {
+            "min": 0.0,
+            "max": 1.0,
+            "value": 1.0,
+        })()
+        steps = Harness()._automation_steps_from_envelope_events(
+            envelope, parameter, 0.0, 4.0, 0.03125
+        )
+
+        self.assertEqual([step[2] for step in steps], [0.25, 0.85])
+        self.assertEqual(envelope.sampled_times, [1.0, 2.0])
+        self.assertEqual(steps[0][7:], (0.14, 0.28, 0.72, 0.86))
+
+    def test_transformed_same_time_events_keep_both_sides_of_vertical_boundary(self):
+        controls = type("Controls", (), {
+            "x1": 0.5,
+            "y1": 0.5,
+            "x2": 0.5,
+            "y2": 0.5,
+        })()
+        events = tuple(
+            type("Event", (), {
+                "time": 1.0,
+                "value": value,
+                "control_coefficients": controls,
+            })()
+            for value in (20.0, 20000.0)
+        )
+
+        class Envelope:
+            def events_in_range(self, _start, _end):
+                return events
+
+            def value_at_time(self, time_value):
+                return 0.2 if time_value < 1.0 else 0.8
+
+        class Harness:
+            _automation_steps_from_envelope_events = extracted_method(
+                "_automation_steps_from_envelope_events"
+            )
+            _parameter_domain_values_from_envelope_events = extracted_method(
+                "_parameter_domain_values_from_envelope_events"
+            )
+            _parameter_normalized_value_from_raw = extracted_method(
+                "_parameter_normalized_value_from_raw"
+            )
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        steps = Harness()._automation_steps_from_envelope_events(
+            Envelope(),
+            type("Parameter", (), {"min": 0.0, "max": 1.0})(),
+            0.0,
+            4.0,
+            0.03125
+        )
+
+        self.assertEqual([step[2] for step in steps], [0.2, 0.8])
+        self.assertEqual([step[0] for step in steps], [1.0, 1.0])
 
     def test_exact_event_writer_creates_right_to_left_so_live_retains_outgoing_curves(self):
         class Envelope:
@@ -334,11 +560,11 @@ class TransportTests(unittest.TestCase):
             def _automation_sorted_steps(self, steps):
                 return tuple(sorted(steps, key=lambda step: step[0]))
 
-            def _parameter_target_value_from_normalized(self, _parameter, value):
-                return value
+            def _parameter_target_value_from_normalized(self, parameter, value):
+                return parameter.min + ((parameter.max - parameter.min) * value)
 
-            def _create_automation_event(self, _envelope, time_value, _raw_value, step):
-                self.created.append((time_value, step[4]))
+            def _create_automation_event(self, _envelope, time_value, raw_value, step):
+                self.created.append((time_value, raw_value, step[4]))
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -352,10 +578,19 @@ class TransportTests(unittest.TestCase):
         harness = Harness()
         self.assertTrue(
             harness._write_exact_automation_events_to_envelope(
-                envelope, object(), 0.0, 4.0, steps
+                envelope,
+                type("Parameter", (), {"min": -48.0, "max": 48.0})(),
+                0.0,
+                4.0,
+                steps
             )
         )
-        self.assertEqual(harness.created, [(2.0, 2), (1.0, 1), (1.0, 3)])
+        self.assertEqual(
+            [(time_value, step_id) for time_value, _raw_value, step_id in harness.created],
+            [(2.0, 2), (1.0, 1), (1.0, 3)]
+        )
+        for (_, actual, _), expected in zip(harness.created, (28.8, -28.8, -9.6)):
+            self.assertAlmostEqual(actual, expected)
 
     def test_exact_pencil_events_make_linear_points_with_vertical_boundary_guards(self):
         class Envelope:
@@ -363,7 +598,7 @@ class TransportTests(unittest.TestCase):
                 self.deleted = []
 
             def value_at_time(self, _time):
-                return 0.1
+                return 0.0
 
             def delete_events_in_range(self, start, end):
                 self.deleted.append((start, end))
@@ -389,14 +624,14 @@ class TransportTests(unittest.TestCase):
             def _create_linear_automation_event(self, _envelope, time_value, raw_value):
                 self.created.append((time_value, raw_value))
 
-            def _parameter_target_value_from_normalized(self, _parameter, value):
-                return value
+            def _parameter_target_value_from_normalized(self, parameter, value):
+                return parameter.min + ((parameter.max - parameter.min) * value)
 
         envelope = Envelope()
         harness = Harness()
         state = {
             "envelope": envelope,
-            "device_param": object(),
+            "device_param": type("Parameter", (), {"min": -48.0, "max": 48.0})(),
             "clip": object(),
             "loop_start": 0.0,
             "loop_end": 4.0,
@@ -411,9 +646,11 @@ class TransportTests(unittest.TestCase):
         )
         self.assertEqual(envelope.deleted, [(0.9999, 1.5001)])
         self.assertEqual(
-            harness.created,
-            [(0.9999, 0.1), (1.0, 0.2), (1.5, 0.8), (1.5001, 0.1)]
+            [time_value for time_value, _raw_value in harness.created],
+            [0.9999, 1.0, 1.5, 1.5001]
         )
+        for (_, actual), expected in zip(harness.created, (0.0, -28.8, 28.8, 0.0)):
+            self.assertAlmostEqual(actual, expected)
 
         envelope.deleted = []
         harness.created = []
