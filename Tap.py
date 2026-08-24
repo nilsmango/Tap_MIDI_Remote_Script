@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 38
+secret_version_number = 39
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -824,6 +824,13 @@ class TapDeviceComponent(DeviceComponent):
                 decorator.disconnect()
             except Exception:
                 pass
+
+    def simpler_decorator(self):
+        """Return the bank decorator so Simpler support does not create a duplicate."""
+        if not self._is_simpler() or SimplerDeviceDecorator is None:
+            return None
+        self._decorated_parameters()
+        return self._simpler_bank_decorator
 
     def _decorated_parameters(self):
         device = getattr(self, '_device', None)
@@ -2527,6 +2534,7 @@ class Tap(ControlSurface):
             session_component = SessionComponent()
             self.old_clips_array = []
             self._drum_rack_device = None
+            self._drum_rack_device_listener_owner = None
             self.was_initialized = False
             self._track_level_listeners = {}
             self._return_level_listeners = {}
@@ -2740,6 +2748,8 @@ class Tap(ControlSurface):
             self._simpler_waveform_lock = threading.Lock()
             self._simpler_waveform_pending = set()
             self._simpler_waveform_polling = set()
+            self._simpler_waveform_next_job = None
+            self._simpler_waveform_worker_running = False
             self._simpler_warp_as_beats = 2.0
             self._simpler_playhead_high = -1
             self._simpler_playhead_low = -1
@@ -4149,10 +4159,33 @@ class Tap(ControlSurface):
             self._drum_rack_device = drum_rack_device
 
         # A Tap reconnect clears its cached names while the Live object remains
-        # unchanged. Re-running the idempotent setup resends the current names
-        # as well as repairing any listeners Live may have dropped.
+        # unchanged. Resend state every time, but only sweep all 128 listener
+        # registrations when the rack changes or a sentinel listener vanished.
         if self._drum_rack_device:
-            self._setup_drum_pad_listeners()
+            needs_listener_setup = (
+                drum_rack_device != getattr(self, '_drum_rack_device_listener_owner', None)
+            )
+            if not needs_listener_setup:
+                try:
+                    view = self._drum_rack_device.view
+                    pads = self._drum_rack_device.drum_pads
+                    needs_listener_setup = not view.selected_drum_pad_has_listener(
+                        self._send_selected_drum_pad_number
+                    )
+                    if not needs_listener_setup and pads:
+                        needs_listener_setup = not pads[0].name_has_listener(
+                            self._send_all_drum_pad_names
+                        )
+                except Exception:
+                    needs_listener_setup = True
+            if needs_listener_setup:
+                self._setup_drum_pad_listeners()
+                self._drum_rack_device_listener_owner = drum_rack_device
+            else:
+                # Reconnect/device refreshes still need current names and pad,
+                # but listener attachment only needs to happen once per rack.
+                self._send_all_drum_pad_names()
+                self._send_selected_drum_pad_number()
 
     def _remove_drum_pad_name_listeners(self):
         if self._drum_rack_device:
@@ -4161,6 +4194,7 @@ class Tap(ControlSurface):
                     pad.remove_name_listener(self._send_all_drum_pad_names)
             if self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
                 self._drum_rack_device.view.remove_selected_drum_pad_listener(self._send_selected_drum_pad_number)
+        self._drum_rack_device_listener_owner = None
 
     def _send_all_drum_pad_names(self):
         if not self._drum_rack_device:
@@ -5607,12 +5641,14 @@ class Tap(ControlSurface):
             pass
         return str(getattr(device, 'class_name', '')) in ('OriginalSimpler', 'Simpler')
 
-    def _track_sliced_simpler(self, track=None):
+    def _track_sliced_simpler(self, track=None, all_devices=None):
         try:
             track = track or self.song().view.selected_track
             if not track or not hasattr(track, 'devices'):
                 return None
-            devices = self._get_all_nested_devices(track.devices)[0]
+            devices = all_devices
+            if devices is None:
+                devices = self._get_all_nested_devices(track.devices)[0]
             for device in devices:
                 if self._is_simpler_device(device) and int(device.playback_mode) == 2:
                     return device
@@ -5620,13 +5656,13 @@ class Tap(ControlSurface):
             pass
         return None
 
-    def _send_track_simpler_slice_state(self, force=False):
+    def _send_track_simpler_slice_state(self, force=False, all_devices=None):
         track = None
         try:
             track = self.song().view.selected_track
         except Exception:
             pass
-        simpler = self._track_sliced_simpler(track)
+        simpler = self._track_sliced_simpler(track, all_devices=all_devices)
         slice_count = 0
         if simpler:
             try:
@@ -5709,23 +5745,19 @@ class Tap(ControlSurface):
                 nudging.set_device(None)
             except Exception:
                 pass
-        decorator = getattr(self, '_simpler_decorator', None)
         self._simpler_decorator = None
-        if decorator:
-            try:
-                decorator.disconnect()
-            except Exception:
-                pass
 
     def _create_simpler_decorator(self):
         self._disconnect_simpler_decorator()
-        if not self._simpler_device or SimplerDeviceDecorator is None:
+        if not self._simpler_device:
             return
         try:
-            self._simpler_decorator = SimplerDeviceDecorator(
-                live_object=self._simpler_device,
-                additional_properties={}
-            )
+            component = getattr(self, '_device', None)
+            if component is None or not hasattr(component, 'simpler_decorator'):
+                return
+            self._simpler_decorator = component.simpler_decorator()
+            if self._simpler_decorator is None:
+                return
             if SimplerSliceNudging is not None:
                 if self._simpler_slice_nudging is None:
                     self._simpler_slice_nudging = SimplerSliceNudging()
@@ -6721,7 +6753,14 @@ class Tap(ControlSurface):
 
     def _send_simpler_waveform_clear(self):
         generation = self._simpler_waveform_generation & 0x7F
-        self._send_binary_sys_ex_message((0x01, generation), 0x41)
+        self._send_binary_sys_ex_message((0x02, generation, 0x00), 0x41)
+
+    def _send_simpler_waveform_unavailable(self, generation):
+        if generation != self._simpler_waveform_generation:
+            return
+        # Unavailable is terminal for the current file
+        # signature. The app keeps a slow retry so a later .asd can recover.
+        self._send_binary_sys_ex_message((0x02, generation & 0x7F, 0x02), 0x41)
 
     def _send_simpler_waveform(self, generation, peaks):
         if generation != self._simpler_waveform_generation:
@@ -6740,7 +6779,7 @@ class Tap(ControlSurface):
         peaks = [max(0, min(127, int(peak))) for peak in peaks]
         self._debug_log('Sending Simpler waveform: {} raw 7-bit points'.format(len(peaks)))
         self._send_binary_sys_ex_message(
-            (0x01, generation & 0x7F) + tuple(peaks),
+            (0x02, generation & 0x7F, 0x01) + tuple(peaks),
             0x41
         )
 
@@ -6763,6 +6802,7 @@ class Tap(ControlSurface):
             self._send_simpler_waveform(generation, cached)
             return
         if self._simpler_waveform_failures.get(file_path) == source_signature:
+            self._send_simpler_waveform_unavailable(generation)
             return
 
         pending_key = (generation, file_path)
@@ -6772,13 +6812,31 @@ class Tap(ControlSurface):
         self._simpler_waveform_polling.add(pending_key)
         self.schedule_message(5, lambda: self._poll_simpler_waveform(generation, file_path, 0))
 
-        worker = threading.Thread(
-            target=self._build_simpler_waveform,
-            args=(generation, file_path, source_signature),
-            name='TapSimplerWaveform',
-        )
-        worker.daemon = True
-        worker.start()
+        start_worker = False
+        with self._simpler_waveform_lock:
+            previous_job = self._simpler_waveform_next_job
+            if previous_job is not None:
+                previous_key = (previous_job[0], previous_job[1])
+                self._simpler_waveform_pending.discard(previous_key)
+                self._simpler_waveform_polling.discard(previous_key)
+            self._simpler_waveform_next_job = (generation, file_path, source_signature)
+            if not self._simpler_waveform_worker_running:
+                self._simpler_waveform_worker_running = True
+                start_worker = True
+        if start_worker:
+            worker = threading.Thread(
+                target=self._run_simpler_waveform_worker,
+                name='TapSimplerWaveform',
+            )
+            worker.daemon = True
+            try:
+                worker.start()
+            except Exception as error:
+                with self._simpler_waveform_lock:
+                    self._simpler_waveform_worker_running = False
+                    self._simpler_waveform_next_job = None
+                    self._simpler_waveform_pending.discard(pending_key)
+                self._debug_log('Could not start Simpler waveform worker: {}'.format(str(error)))
 
     def _poll_simpler_waveform(self, generation, file_path, attempt):
         pending_key = (generation, file_path)
@@ -6792,6 +6850,8 @@ class Tap(ControlSurface):
             return
         if pending_key not in self._simpler_waveform_pending:
             self._simpler_waveform_polling.discard(pending_key)
+            if file_path in self._simpler_waveform_failures:
+                self._send_simpler_waveform_unavailable(generation)
             return
         if attempt < 120 and pending_key in self._simpler_waveform_polling:
             self.schedule_message(5, lambda: self._poll_simpler_waveform(generation, file_path, attempt + 1))
@@ -6819,7 +6879,7 @@ class Tap(ControlSurface):
         # A Drum Rack commonly has 16 or more unique Simpler samples. Keeping
         # a full rack cached prevents repeated decode spikes when revisiting
         # pads; each entry contains at most 512 compact amplitude values.
-        while len(self._simpler_waveform_cache_order) > 64:
+        while len(self._simpler_waveform_cache_order) > 128:
             oldest = self._simpler_waveform_cache_order.pop(0)
             self._simpler_waveform_cache.pop(oldest, None)
 
@@ -6828,7 +6888,7 @@ class Tap(ControlSurface):
         if file_path in self._simpler_waveform_failure_order:
             self._simpler_waveform_failure_order.remove(file_path)
         self._simpler_waveform_failure_order.append(file_path)
-        while len(self._simpler_waveform_failure_order) > 32:
+        while len(self._simpler_waveform_failure_order) > 128:
             oldest = self._simpler_waveform_failure_order.pop(0)
             self._simpler_waveform_failures.pop(oldest, None)
 
@@ -6847,13 +6907,18 @@ class Tap(ControlSurface):
         except Exception:
             return False
 
-    def _decode_audio_waveform(self, file_path, temp_prefix):
+    def _decode_audio_waveform(self, file_path, temp_prefix, cancelled=None):
+        cancelled = cancelled or (lambda: False)
+        if cancelled():
+            return []
         # Live's analysis file is both cheaper to read and the only available
         # source for encrypted Pack samples. Trying afconvert first can leave a
         # CPU-bound child process running for minutes on those files.
-        peaks = self._simpler_waveform_from_asd(file_path)
+        peaks = self._simpler_waveform_from_asd(file_path, cancelled=cancelled)
         if peaks:
             return peaks
+        if cancelled():
+            return []
         if not self._simpler_audio_file_has_supported_header(file_path):
             self._debug_log('Skipping unsupported Simpler waveform source: {}'.format(file_path))
             return []
@@ -6862,17 +6927,36 @@ class Tap(ControlSurface):
         converted_path = os.path.join(temp_directory, 'waveform.wav')
         peaks = []
         try:
-            subprocess.run(
-                ['/usr/bin/afconvert', '-f', 'WAVE', '-d', 'LEI16@4000', '-c', '1', file_path, converted_path],
+            process = subprocess.Popen(
+                ['/usr/bin/nice', '-n', '15', '/usr/bin/afconvert', '-f', 'WAVE', '-d', 'LEI16@4000', '-c', '1', file_path, converted_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=True,
-                timeout=10,
             )
+            deadline = time.time() + 10.0
+            while process.poll() is None:
+                if cancelled() or time.time() >= deadline:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.25)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    if cancelled():
+                        return []
+                    raise subprocess.TimeoutExpired(process.args, 10)
+                time.sleep(0.05)
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, process.args)
             with wave.open(converted_path, 'rb') as audio_file:
                 frame_count = audio_file.getnframes()
                 point_count = max(1, min(512, frame_count))
                 for point_index in range(point_count):
+                    if point_index % 16 == 0:
+                        if cancelled():
+                            return []
+                        # Yield the GIL regularly so Live's control-surface
+                        # thread remains responsive during Python-side scans.
+                        time.sleep(0.001)
                     end_frame = int(round(float(point_index + 1) * frame_count / point_count))
                     frames_to_read = max(1, end_frame - audio_file.tell())
                     frame_data = audio_file.readframes(frames_to_read)
@@ -6896,72 +6980,138 @@ class Tap(ControlSurface):
         finally:
             shutil.rmtree(temp_directory, ignore_errors=True)
 
-    def _build_simpler_waveform(self, generation, file_path, source_signature):
-        pending_key = (generation, file_path)
+    def _simpler_waveform_job_is_cancelled(self, generation, file_path):
+        if generation != self._simpler_waveform_generation:
+            return True
         with self._simpler_waveform_lock:
+            next_job = self._simpler_waveform_next_job
+            return bool(next_job and next_job[:2] != (generation, file_path))
+
+    def _run_simpler_waveform_worker(self):
+        """Decode at most one current Simpler sample, keeping only the latest queued job."""
+        while True:
+            with self._simpler_waveform_lock:
+                job = self._simpler_waveform_next_job
+                self._simpler_waveform_next_job = None
+                if job is None:
+                    self._simpler_waveform_worker_running = False
+                    return
+
+            generation, file_path, source_signature = job
+            pending_key = (generation, file_path)
             if generation != self._simpler_waveform_generation:
                 self._simpler_waveform_pending.discard(pending_key)
-                return
-            peaks = self._decode_audio_waveform(file_path, 'tap-simpler-')
-            if not peaks or generation != self._simpler_waveform_generation:
-                if not peaks and generation == self._simpler_waveform_generation:
+                continue
+
+            try:
+                peaks = self._decode_audio_waveform(
+                    file_path,
+                    'tap-simpler-',
+                    cancelled=lambda: self._simpler_waveform_job_is_cancelled(generation, file_path),
+                )
+            except Exception as error:
+                self._debug_log('Simpler waveform worker failed: {}'.format(str(error)))
+                peaks = []
+
+            with self._simpler_waveform_lock:
+                next_job = self._simpler_waveform_next_job
+                is_current = (
+                    generation == self._simpler_waveform_generation and
+                    not (next_job and next_job[:2] != (generation, file_path))
+                )
+                if peaks and is_current:
+                    self._cache_simpler_waveform(file_path, peaks)
+                elif not peaks and is_current:
                     self._cache_simpler_waveform_failure(file_path, source_signature)
                 self._simpler_waveform_pending.discard(pending_key)
-                return
-            self._cache_simpler_waveform(file_path, peaks)
-            self._simpler_waveform_pending.discard(pending_key)
 
-    def _simpler_waveform_from_asd(self, file_path):
+    def _simpler_waveform_from_asd(self, file_path, cancelled=None):
         """Read Live's cached waveform overview when pack audio is encrypted."""
+        cancelled = cancelled or (lambda: False)
         analysis_path = file_path + '.asd'
         if not os.path.isfile(analysis_path):
             return []
         try:
             with open(analysis_path, 'rb') as analysis_file:
-                data = analysis_file.read()
-            tag = b'\x00\x13SampleOverViewLevel'
-            search_from = 0
-            candidates = []
-            while True:
-                offset = data.find(tag, search_from)
-                if offset < 0:
-                    break
-                search_from = offset + len(tag)
-                body = offset + len(tag)
-                if body + 8 > len(data):
-                    continue
-                version, value_count = struct.unpack_from('<II', data, body)
-                if value_count <= 0 or value_count > 65536:
-                    continue
-                if version == 0:
-                    value_size = 2
-                    value_format = 'e'
-                elif version == 2:
-                    value_size = 4
-                    value_format = 'f'
-                else:
-                    continue
-                values_start = body + 8
-                values_end = values_start + value_count * value_size
-                if values_end > len(data):
-                    continue
-                values = struct.unpack_from('<{}{}'.format(value_count, value_format), data, values_start)
-                if any(not math.isfinite(value) for value in values):
-                    continue
-                # Overview values are interleaved min/max pairs per channel.
-                # Four values collapse a stereo bin; on mono files this simply
-                # combines two adjacent bins and keeps the same envelope shape.
-                amplitudes = [
-                    max(abs(value) for value in values[index:index + 4])
-                    for index in range(0, len(values), 4)
-                    if values[index:index + 4]
-                ]
-                if amplitudes:
-                    candidates.append(amplitudes)
-            if not candidates:
-                return []
+                if os.fstat(analysis_file.fileno()).st_size <= 0:
+                    return []
+                tag = b'\x00\x13SampleOverViewLevel'
+                scan_chunk_size = 256 * 1024
+                overlap = b''
+                amplitudes = []
+                while not cancelled():
+                    chunk = analysis_file.read(scan_chunk_size)
+                    if not chunk:
+                        break
+                    data = overlap + chunk
+                    data_start = analysis_file.tell() - len(data)
+                    search_from = 0
+                    while not cancelled():
+                        offset = data.find(tag, search_from)
+                        if offset < 0:
+                            break
+                        search_from = offset + len(tag)
+                        body_position = data_start + offset + len(tag)
+                        resume_position = analysis_file.tell()
+                        try:
+                            analysis_file.seek(body_position)
+                            header = analysis_file.read(8)
+                            if len(header) != 8:
+                                continue
+                            version, value_count = struct.unpack('<II', header)
+                            if value_count <= 0 or value_count > 65536:
+                                continue
+                            if version == 0:
+                                value_size = 2
+                                value_format = 'e'
+                            elif version == 2:
+                                value_size = 4
+                                value_format = 'f'
+                            else:
+                                continue
+                            raw_values = analysis_file.read(value_count * value_size)
+                        finally:
+                            analysis_file.seek(resume_position)
+                        if len(raw_values) != value_count * value_size:
+                            continue
 
-            amplitudes = max(candidates, key=len)
+                        candidate = []
+                        group = []
+                        invalid = False
+                        for value_index, value_tuple in enumerate(
+                                struct.iter_unpack('<{}'.format(value_format), raw_values)):
+                            if value_index % 2048 == 0:
+                                if cancelled():
+                                    return []
+                                # Keep analysis parsing cooperative. This is
+                                # effectively low-priority background work,
+                                # without touching any Live object off-thread.
+                                time.sleep(0.001)
+                            value = value_tuple[0]
+                            if not math.isfinite(value):
+                                invalid = True
+                                break
+                            group.append(abs(value))
+                            if len(group) == 4:
+                                candidate.append(max(group))
+                                group = []
+                        if invalid:
+                            continue
+                        if group:
+                            candidate.append(max(group))
+                        if len(candidate) > len(amplitudes):
+                            amplitudes = candidate
+                        # 512 bins are the most Tap can retain. Stop after the
+                        # first overview at that resolution instead of scanning
+                        # every finer analysis level in a large .asd file.
+                        if len(amplitudes) >= 512:
+                            break
+                    if len(amplitudes) >= 512:
+                        break
+                    overlap = data[-(len(tag) - 1):]
+                    time.sleep(0.001)
+            if cancelled() or not amplitudes:
+                return []
             if len(amplitudes) > 512:
                 reduced = []
                 for point_index in range(512):
@@ -6977,10 +7127,12 @@ class Tap(ControlSurface):
             self._debug_log('Simpler ASD waveform decode failed for {}: {}'.format(analysis_path, str(error)))
             return []
 
-    def _send_custom_device_navigation_state(self, selected_track, selected_device):
+    def _send_custom_device_navigation_state(self, selected_track, selected_device, device_tree=None):
         if not selected_track:
             return
-        all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+        if device_tree is None:
+            device_tree = self._get_all_nested_devices(selected_track.devices)
+        all_devices, chain_info = device_tree
         starts_by_index = {}
         ends_by_index = {}
         for info in chain_info:
@@ -7020,7 +7172,17 @@ class Tap(ControlSurface):
                 selected_device = getattr(self._device, '_device', None)
                 if not liveobj_valid(selected_device) and selected_track:
                     selected_device = selected_track.view.selected_device
-            self._send_track_simpler_slice_state(force=True)
+            device_tree = ([], [])
+            if selected_track and hasattr(selected_track, 'devices'):
+                try:
+                    device_tree = self._get_all_nested_devices(selected_track.devices)
+                except Exception:
+                    device_tree = ([], [])
+            all_selected_track_devices, _ = device_tree
+            self._send_track_simpler_slice_state(
+                force=True,
+                all_devices=all_selected_track_devices,
+            )
             self._set_simpler_device(None if track_device_selected else selected_device)
             if track_device_selected:
                 self._setup_meld_engine_listener(None)
@@ -7033,7 +7195,15 @@ class Tap(ControlSurface):
             track_has_drums = 0
             drum_rack_device = None if track_device_selected else self._find_drum_rack_for_device(selected_device)
             if drum_rack_device is None and selected_track:
-                drum_rack_device = self._find_drum_rack_in_track(selected_track)
+                drum_rack_device = next(
+                    (
+                        device for device in all_selected_track_devices
+                        if bool(getattr(device, 'can_have_drum_pads', False))
+                    ),
+                    None,
+                )
+                if drum_rack_device is None:
+                    drum_rack_device = self._find_drum_rack_in_track(selected_track)
             if drum_rack_device is not None:
                 track_has_drums = 1
 
@@ -7057,7 +7227,7 @@ class Tap(ControlSurface):
                 all_devices = []
                 chain_info = []
                 if send_device_navigation and selected_track and hasattr(selected_track, "devices"):
-                    all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+                    all_devices, chain_info = device_tree
                     all_device_names = [self._escape_sysex_string(self.TRACK_DEVICE_NAV_NAME)]
                     starts_by_index = {}
                     ends_by_index = {}
@@ -7106,7 +7276,11 @@ class Tap(ControlSurface):
                 self._simpler_warp_active()
             )
             if send_device_navigation and has_early_custom_surface:
-                self._send_custom_device_navigation_state(selected_track, selected_device)
+                self._send_custom_device_navigation_state(
+                    selected_track,
+                    selected_device,
+                    device_tree=device_tree,
+                )
             if self._active_wavetable_virtual_specs():
                 self._remove_parameter_value_listeners()
                 self._remove_parameter_name_listeners()
@@ -7150,7 +7324,7 @@ class Tap(ControlSurface):
             available_devices_string = ""
             if send_device_navigation:
                 # Get all available devices of the selected track, including nested devices
-                all_devices, chain_info = self._get_all_nested_devices(selected_track.devices)
+                all_devices, chain_info = device_tree
                 starts_by_index = {}
                 ends_by_index = {}
                 for info in chain_info:

@@ -1,8 +1,12 @@
 import ast
+import math
 import os
 import pathlib
 import re
 import tempfile
+import struct
+import threading
+import time
 import types
 import unittest
 from urllib.parse import unquote, urlparse
@@ -19,6 +23,12 @@ METHOD_NAMES = {
     "_send_audio_clip_playback_state",
     "_request_audio_clip_waveform",
     "_simpler_waveform_source_signature",
+    "_simpler_waveform_from_asd",
+    "_send_simpler_waveform_clear",
+    "_send_simpler_waveform",
+    "_send_simpler_waveform_unavailable",
+    "_simpler_waveform_job_is_cancelled",
+    "_run_simpler_waveform_worker",
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
     "_send_all_drum_pad_names",
@@ -104,8 +114,12 @@ def extracted_methods():
     namespace = {
         "Live": Live,
         "liveobj_valid": lambda value: value is not None,
+        "math": math,
         "os": os,
         "re": re,
+        "struct": struct,
+        "threading": threading,
+        "time": time,
         "unquote": unquote,
         "urlparse": urlparse,
     }
@@ -262,6 +276,10 @@ class Harness:
         self._simpler_waveform_cache = {}
         self._simpler_waveform_failures = {}
         self._simpler_waveform_pending = set()
+        self._simpler_waveform_polling = set()
+        self._simpler_waveform_lock = threading.Lock()
+        self._simpler_waveform_next_job = None
+        self._simpler_waveform_worker_running = False
         self.browser_audio_clip_target = None
         self.browser_drum_pad_target = None
         self.browser_insert_after_device_index = None
@@ -376,8 +394,14 @@ class Harness:
     def _remove_audio_clip_listeners(self):
         self.audio_clip_listener_removals += 1
 
-    def _send_simpler_waveform_clear(self):
+    def _debug_log(self, _):
         pass
+
+    def _cache_simpler_waveform(self, file_path, peaks):
+        self._simpler_waveform_cache[file_path] = tuple(peaks)
+
+    def _cache_simpler_waveform_failure(self, file_path, source_signature):
+        self._simpler_waveform_failures[file_path] = source_signature
 
     def _send_simpler_playhead(self, **_):
         pass
@@ -390,6 +414,12 @@ class Harness:
 
     def _setup_drum_pad_listeners(self):
         self.drum_listener_setups = getattr(self, "drum_listener_setups", 0) + 1
+
+    def _send_all_drum_pad_names(self):
+        self.drum_name_sends = getattr(self, "drum_name_sends", 0) + 1
+
+    def _send_selected_drum_pad_number(self):
+        self.drum_selection_sends = getattr(self, "drum_selection_sends", 0) + 1
 
 
 for method_name, method in extracted_methods().items():
@@ -426,12 +456,31 @@ class AudioClipSupportTests(unittest.TestCase):
         self.harness._set_simpler_device(object())
         self.assertEqual(self.harness.audio_clip_listener_removals, 0)
 
-    def test_unchanged_drum_rack_is_resent_on_reconnect_refresh(self):
-        rack = object()
+    def test_unchanged_drum_rack_resends_state_without_listener_sweep(self):
+        pad = types.SimpleNamespace(
+            chains=(object(),),
+            name="Kick",
+            note=36,
+            name_has_listener=lambda _: True,
+        )
+        view = types.SimpleNamespace(selected_drum_pad_has_listener=lambda _: True)
+        rack = types.SimpleNamespace(drum_pads=[pad], view=view)
         self.harness._drum_rack_device = rack
+        self.harness._drum_rack_device_listener_owner = rack
+        self.harness._sync_drum_rack_device(rack)
+        self.assertEqual(getattr(self.harness, "drum_listener_setups", 0), 0)
+        self.assertIn((0x11, "36,Kick"), self.harness.sent)
+        self.assertEqual(self.harness.drum_selection_sends, 1)
+        self.assertEqual(getattr(self.harness, "drum_listener_removals", 0), 0)
+
+    def test_unchanged_drum_rack_repairs_missing_sentinel_listener(self):
+        pad = types.SimpleNamespace(name_has_listener=lambda _: False)
+        view = types.SimpleNamespace(selected_drum_pad_has_listener=lambda _: True)
+        rack = types.SimpleNamespace(drum_pads=[pad], view=view)
+        self.harness._drum_rack_device = rack
+        self.harness._drum_rack_device_listener_owner = rack
         self.harness._sync_drum_rack_device(rack)
         self.assertEqual(self.harness.drum_listener_setups, 1)
-        self.assertEqual(getattr(self.harness, "drum_listener_removals", 0), 0)
 
     def test_accelerated_browser_hold_requests_only_the_final_clamped_page(self):
         self.harness.browser_pages_count = 1_250
@@ -497,6 +546,75 @@ class AudioClipSupportTests(unittest.TestCase):
             self.harness._request_audio_clip_waveform()
 
         self.assertEqual(self.harness._simpler_waveform_pending, set())
+
+    def test_simpler_waveform_protocol_has_explicit_statuses(self):
+        self.harness._simpler_waveform_generation = 7
+        self.harness._send_simpler_waveform_clear()
+        self.assertEqual(self.harness.sent[-1], (0x41, (0x02, 7, 0x00)))
+
+        self.harness._send_simpler_waveform(7, (3, 9))
+        self.assertEqual(self.harness.sent[-1], (0x41, (0x02, 7, 0x01, 3, 9)))
+
+        self.harness._send_simpler_waveform_unavailable(7)
+        self.assertEqual(self.harness.sent[-1], (0x41, (0x02, 7, 0x02)))
+
+        sent_count = len(self.harness.sent)
+        self.harness._send_simpler_waveform_unavailable(6)
+        self.assertEqual(len(self.harness.sent), sent_count)
+
+    def test_live_runtime_does_not_require_mmap(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        imported_modules = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        self.assertNotIn("mmap", imported_modules)
+
+    def test_simpler_worker_stops_stale_work_and_processes_latest_job(self):
+        self.harness._simpler_waveform_generation = 7
+        self.harness._simpler_waveform_worker_running = True
+        self.harness._simpler_waveform_next_job = (7, "stale.aif", (1, 2))
+        self.harness._simpler_waveform_pending.add((7, "stale.aif"))
+        self.harness._simpler_waveform_pending.add((7, "latest.aif"))
+
+        def decode(file_path, *_args, **_kwargs):
+            if file_path == "stale.aif":
+                self.harness._simpler_waveform_next_job = (7, "latest.aif", (3, 4))
+                return ()
+            return (4, 12, 27)
+
+        self.harness._decode_audio_waveform = decode
+
+        self.harness._run_simpler_waveform_worker()
+
+        self.assertNotIn("stale.aif", self.harness._simpler_waveform_failures)
+        self.assertEqual(self.harness._simpler_waveform_cache["latest.aif"], (4, 12, 27))
+        self.assertEqual(self.harness._simpler_waveform_pending, set())
+        self.assertFalse(self.harness._simpler_waveform_worker_running)
+
+        self.harness._simpler_waveform_next_job = (8, "newer.aif", (3, 4))
+        self.assertTrue(self.harness._simpler_waveform_job_is_cancelled(7, "latest.aif"))
+
+    def test_asd_waveform_uses_first_complete_512_bin_overview(self):
+        values = [float((index % 17) + 1) / 17.0 for index in range(2_048)]
+        tag = b"\x00\x13SampleOverViewLevel"
+        overview = (
+            tag
+            + struct.pack("<II", 2, len(values))
+            + struct.pack("<{}f".format(len(values)), *values)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = os.path.join(directory, "protected.aif")
+            with open(audio_path + ".asd", "wb") as analysis_file:
+                # Put the tag across the stream scanner's chunk boundary.
+                analysis_file.write(b"x" * (256 * 1024 - len(tag) // 2))
+                analysis_file.write(overview)
+            peaks = self.harness._simpler_waveform_from_asd(audio_path)
+
+        self.assertEqual(len(peaks), 512)
+        self.assertEqual(max(peaks), 127)
 
     def test_add_move_and_remove_warp_markers(self):
         self.harness.clip.warping = True
