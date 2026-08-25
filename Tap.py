@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 39
+secret_version_number = 41
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2360,7 +2360,7 @@ class Tap(ControlSurface):
     DECOUPLED_AUTOMATION_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapAuto:v[0-9]+\|([^\]]*)\]")
     MUTATOR_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v1\|([^\]]*)\]")
     MUTATOR_ANY_NAME_MARKER_RE = re.compile(r"\s*\[(?:TapComp|TapMut):v[0-9]+\|([^\]]*)\]")
-    FLIN_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v1\|([^\]]*)\]")
+    FLIN_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v2\|([^\]]*)\]")
     FLIN_ANY_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v[0-9]+\|([^\]]*)\]")
     SYSEX_TEXT_SYMBOL_REPLACEMENTS = (
         ('♭', 'b'),
@@ -9791,34 +9791,37 @@ class Tap(ControlSurface):
                 if "=" in item:
                     key, value = item.split("=", 1)
                     fields[key] = value
-            required = ("k", "q", "b", "r", "h", "m", "o", "p", "s", "l", "c")
-            if any(key not in fields for key in required):
+            required = ("k", "q", "a", "b", "r", "h", "m", "o", "v", "p", "s", "f", "l", "c")
+            if set(fields) != set(required):
+                return None
+            quantize_all = int(fields["a"])
+            limited = int(fields["l"])
+            if quantize_all not in (0, 1) or limited not in (0, 1):
                 return None
             info = {
                 "kind": max(0, min(1, int(fields["k"]))),
-                "quantization": max(0, min(3, int(fields["q"]))),
+                "quantization": max(0, min(5, int(fields["q"]))),
+                "quantize_all": quantize_all == 1,
                 "base_quarters": max(1, min(64, int(fields["b"]))),
-                "rate_mode": max(0, min(5, int(fields["r"]))),
-                "bottom_rate": max(0, min(3, int(fields.get("n", 1)))),
-                "row_interval": max(0, min(5, int(fields.get("i", 4)))),
+                "rate_mode": max(0, min(3, int(fields["r"]))),
                 "horizon_bars": int(fields["h"]),
                 "mapping_mode": max(0, min(3, int(fields["m"]))),
                 "global_offset": max(-64, min(63, int(fields["o"]))),
-                "view_page": max(-64, min(63, int(fields.get("v", 0)))),
+                "view_page": max(-64, min(63, int(fields["v"]))),
                 "base_pitch": max(0, min(127, int(fields["p"]))),
                 "seed": max(1, min(2000000, int(fields["s"]))),
-                "default_velocity": max(1, min(127, int(fields.get("f", 100)))),
-                "limited": int(fields["l"]) == 1,
+                "default_velocity": max(1, min(127, int(fields["f"]))),
+                "limited": limited == 1,
                 "columns": [],
             }
             if info["horizon_bars"] not in (4, 8, 16, 32, 64, 96):
                 return None
             for record in filter(None, fields["c"].split(",")):
                 parts = record.split(":")
-                if len(parts) not in (10, 11, 12):
+                if len(parts) != 12:
                     return None
-                page = int(parts[0]) if len(parts) in (11, 12) else 0
-                offset = 1 if len(parts) in (11, 12) else 0
+                page = int(parts[0])
+                offset = 1
                 info["columns"].append({
                     "page": max(-64, min(63, page)),
                     "id": max(0, min(15, int(parts[offset]))),
@@ -9831,7 +9834,7 @@ class Tap(ControlSurface):
                     "pad_offset": max(-63, min(63, int(parts[offset + 7]))),
                     "velocity": max(1, min(127, int(parts[offset + 8]))),
                     "probability": max(0, min(100, int(parts[offset + 9]))),
-                    "velocity_deviation": max(-127, min(127, int(parts[offset + 10]))) if len(parts) == 12 else 0,
+                    "velocity_deviation": max(-127, min(127, int(parts[offset + 10]))),
                 })
             keys = [(column["page"], column["id"]) for column in info["columns"]]
             if len(keys) != len(set(keys)):
@@ -9867,10 +9870,10 @@ class Tap(ControlSurface):
             or int(column.get("probability", 100)) != 100
             or int(column.get("velocity_deviation", 0)) != 0
         ))
-        return "[TapFlin:v1|k={}|q={}|b={}|r={}|n={}|i={}|h={}|m={}|o={}|v={}|p={}|s={}|f={}|l={}|c={}]".format(
-            info.get("kind", 0), info.get("quantization", 1), info.get("base_quarters", 16),
-            info.get("rate_mode", 0), info.get("bottom_rate", 1), info.get("row_interval", 4),
-            info.get("horizon_bars", 64), info.get("mapping_mode", 0),
+        return "[TapFlin:v2|k={}|q={}|a={}|b={}|r={}|h={}|m={}|o={}|v={}|p={}|s={}|f={}|l={}|c={}]".format(
+            info.get("kind", 0), info.get("quantization", 0), 1 if info.get("quantize_all", False) else 0,
+            info.get("base_quarters", 16),
+            info.get("rate_mode", 0), info.get("horizon_bars", 64), info.get("mapping_mode", 0),
             info.get("global_offset", 0), info.get("view_page", 0), info.get("base_pitch", 60), info.get("seed", 1),
             info.get("default_velocity", 100),
             1 if info.get("limited", False) else 0, columns,
@@ -15115,50 +15118,116 @@ class Tap(ControlSurface):
                 pass
 
     def _flin_quantum_beats(self, info):
-        return (0.125, 0.25, 0.5, 1.0)[max(0, min(3, int(info.get("quantization", 1))))]
+        # Ableton uses quarter-note beats, so this is always one 1/64 note.
+        return 1.0 / 16.0
+
+    def _flin_note_quantization_beats(self, info):
+        return (None, 0.125, 0.25, 0.5, 1.0, 2.0)[
+            max(0, min(5, int(info.get("quantization", 0))))
+        ]
+
+    def _flin_quantized_note_start(self, info, relative_start, loop_length):
+        loop_length = max(self._flin_quantum_beats(info), float(loop_length))
+        relative_start = float(relative_start) % loop_length
+        note_grid = self._flin_note_quantization_beats(info)
+        if note_grid is None:
+            return relative_start
+        snapped = math.floor((relative_start / note_grid) + 0.5) * note_grid
+        return snapped % loop_length
+
+    def _flin_note_starts(self, info, phase_ticks, period_ticks, loop_ticks):
+        quantum = self._flin_quantum_beats(info)
+        loop_ticks = max(1, int(loop_ticks))
+        period_ticks = max(1, int(period_ticks))
+        loop_length = float(loop_ticks) * quantum
+        raw_tick = int(phase_ticks) % period_ticks
+        starts = []
+        authored_starts = set()
+
+        if info.get("quantize_all", False):
+            while raw_tick < loop_ticks:
+                relative_start = self._flin_quantized_note_start(
+                    info, float(raw_tick) * quantum, loop_length
+                )
+                start_key = int(round(relative_start * 1000000.0))
+                if start_key not in authored_starts:
+                    authored_starts.add(start_key)
+                    starts.append(relative_start)
+                raw_tick += period_ticks
+        else:
+            relative_start = self._flin_quantized_note_start(
+                info, float(raw_tick) * quantum, loop_length
+            )
+            period_beats = float(period_ticks) * quantum
+            while relative_start < loop_length - 0.0000001:
+                start_key = int(round(relative_start * 1000000.0))
+                if start_key not in authored_starts:
+                    authored_starts.add(start_key)
+                    starts.append(relative_start)
+                relative_start += period_beats
+
+        return tuple(starts)
 
     def _flin_beats_per_bar(self, clip):
         numerator = max(1, int(getattr(clip, "signature_numerator", 4)))
         denominator = max(1, int(getattr(clip, "signature_denominator", 4)))
         return float(numerator) * 4.0 / float(denominator)
 
-    def _flin_period_ticks(self, info, clip, row):
+    def _flin_period_ticks_for_rows(self, info, clip):
         quantum = self._flin_quantum_beats(info)
         base_bars = float(info.get("base_quarters", 16)) / 4.0
-        base_ticks = max(1, int(round(base_bars * self._flin_beats_per_bar(clip) / quantum)))
-        row = max(0, min(15, int(row)))
-        mode = max(0, min(5, int(info.get("rate_mode", 0))))
-        primes = (1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
-        if mode == 1:
-            raw = float(base_ticks) / float(row + 1)
-        elif mode == 2:
-            raw = float(base_ticks) / float(2 ** row)
-        elif mode == 3:
-            raw = float(base_ticks) * ((1.0 / float(base_ticks)) ** (float(row) / 15.0))
-        elif mode == 4:
-            raw = float(base_ticks) / float(primes[row])
-        elif mode == 5:
-            bottom_beats = (0.125, 0.25, 0.5, 1.0)[max(0, min(3, int(info.get("bottom_rate", 1))))]
-            row_step = (2.0, 4.0 / 3.0, 1.0, 0.5, 0.25, 0.125)[max(0, min(5, int(info.get("row_interval", 4))))]
-            raw = (bottom_beats + float(15 - row) * row_step) / quantum
-        else:
-            raw = float(base_ticks) * float(16 - row) / 16.0
-        return max(1, int(math.floor(raw + 0.5)))
+        selected_base_ticks = int(round(base_bars * self._flin_beats_per_bar(clip) / quantum))
+        base_ticks = max(16, selected_base_ticks)
+        available_slots = max(16, base_ticks)
+        mode = max(0, min(3, int(info.get("rate_mode", 0))))
+        primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53)
+        periods = []
+        previous_slot = 0
 
-    def _flin_loop_ticks(self, info, clip):
+        for row in range(16):
+            progress = float(row) / 15.0
+            if mode == 1:
+                fraction = float((row * 2) + 1) / 31.0
+            elif mode == 2:
+                fraction = (16.0 ** progress) / 16.0
+            elif mode == 3:
+                fraction = float(primes[row]) / float(primes[-1])
+            else:
+                # Original 8-row Flin used 1x...8x periods from top to bottom.
+                # Tap extends the identical rule to its sixteen rows.
+                fraction = float(row + 1) / 16.0
+
+            proposed_slot = int(math.floor(fraction * float(available_slots) + 0.5))
+            lower_bound = previous_slot + 1
+            upper_bound = available_slots - (15 - row)
+            slot = min(upper_bound, max(lower_bound, proposed_slot))
+            periods.append(slot)
+            previous_slot = slot
+        return tuple(periods)
+
+    def _flin_period_ticks(self, info, clip, row):
+        return self._flin_period_ticks_for_rows(info, clip)[max(0, min(15, int(row)))]
+
+    def _flin_loop_ticks(self, info, clip, periods=None):
         quantum = self._flin_quantum_beats(info)
         beats_per_bar = self._flin_beats_per_bar(clip)
-        base_ticks = max(1, int(round((float(info.get("base_quarters", 16)) / 4.0) * beats_per_bar / quantum)))
+        selected_base_ticks = int(round((float(info.get("base_quarters", 16)) / 4.0) * beats_per_bar / quantum))
+        base_ticks = max(16, selected_base_ticks)
         horizon_ticks = max(1, int(round(float(info.get("horizon_bars", 64)) * beats_per_bar / quantum)))
+        periods = periods or self._flin_period_ticks_for_rows(info, clip)
         common = base_ticks
+        if common > horizon_ticks:
+            info["limited"] = True
+            return horizon_ticks
         for column in info.get("columns", []):
             if not column.get("active", False):
                 continue
-            period = self._flin_period_ticks(info, clip, column.get("rate_row", 0))
-            common = (common * period) // math.gcd(common, period)
-            if common > horizon_ticks:
+            period = periods[max(0, min(15, int(column.get("rate_row", 0))))]
+            reduced = common // math.gcd(common, period)
+            if reduced > horizon_ticks // max(1, period):
                 info["limited"] = True
                 return horizon_ticks
+            common = reduced * period
         info["limited"] = common > horizon_ticks
         return min(horizon_ticks, max(base_ticks, common))
 
@@ -15284,30 +15353,31 @@ class Tap(ControlSurface):
         if clip is None or not getattr(clip, "is_midi_clip", False):
             return False
         quantum = self._flin_quantum_beats(info)
-        loop_ticks = self._flin_loop_ticks(info, clip)
+        periods = self._flin_period_ticks_for_rows(info, clip)
+        loop_ticks = self._flin_loop_ticks(info, clip, periods=periods)
         loop_start = float(getattr(clip, "loop_start", 0.0))
         loop_length = max(quantum, float(loop_ticks) * quantum)
         specs = []
         for column in info.get("columns", []):
             if not column.get("active", False):
                 continue
-            period = self._flin_period_ticks(info, clip, column.get("rate_row", 0))
+            period = periods[max(0, min(15, int(column.get("rate_row", 0))))]
             phase = int(column.get("phase_ticks", 0)) % max(1, period)
             duration_sixteenths = max(1, min(16, int(column.get("duration_steps", 1))))
             repeat_distance_ticks = max(1, min(period, loop_ticks))
             duration_beats = float(repeat_distance_ticks) * quantum * float(duration_sixteenths) / 16.0
-            tick = phase
-            while tick < loop_ticks:
+            pitch = self._flin_pitch(info, column)
+            for relative_start in self._flin_note_starts(info, phase, period, loop_ticks):
+                start_time = loop_start + relative_start
                 specs.append(MidiNoteSpecification(
-                    pitch=self._flin_pitch(info, column),
-                    start_time=loop_start + float(tick) * quantum,
-                    duration=max(0.0001, duration_beats),
+                    pitch=pitch,
+                    start_time=start_time,
+                    duration=max(quantum, duration_beats),
                     velocity=max(1, min(127, int(column.get("velocity", 100)))),
                     mute=False,
                     probability=max(0.0, min(1.0, float(column.get("probability", 100)) / 100.0)),
                     velocity_deviation=max(-127, min(127, int(column.get("velocity_deviation", 0)))),
                 ))
-                tick += period
 
         remove_start = min(
             loop_start,
@@ -15349,30 +15419,32 @@ class Tap(ControlSurface):
 
     def _flin_settings_from_payload(self, parts):
         try:
-            if len(parts) < 16:
+            if len(parts) != 15:
+                return None
+            quantize_all = int(parts[4])
+            if quantize_all not in (0, 1):
                 return None
             info = {
                 "kind": max(0, min(1, int(parts[2]))),
-                "quantization": max(0, min(3, int(parts[3]))),
-                "base_quarters": max(1, min(64, int(parts[4]))),
-                "rate_mode": max(0, min(5, int(parts[5]))),
-                "bottom_rate": max(0, min(3, int(parts[6]))),
-                "row_interval": max(0, min(5, int(parts[7]))),
-                "horizon_bars": int(parts[8]),
-                "mapping_mode": max(0, min(3, int(parts[9]))),
-                "global_offset": max(-64, min(63, int(parts[10]))),
-                "view_page": max(-64, min(63, int(parts[11]))),
-                "base_pitch": max(0, min(127, int(parts[12]))),
-                "seed": max(1, min(2000000, int(parts[13]))),
-                "default_velocity": max(1, min(127, int(parts[14]))),
+                "quantization": max(0, min(5, int(parts[3]))),
+                "quantize_all": quantize_all == 1,
+                "base_quarters": max(1, min(64, int(parts[5]))),
+                "rate_mode": max(0, min(3, int(parts[6]))),
+                "horizon_bars": int(parts[7]),
+                "mapping_mode": max(0, min(3, int(parts[8]))),
+                "global_offset": max(-64, min(63, int(parts[9]))),
+                "view_page": max(-64, min(63, int(parts[10]))),
+                "base_pitch": max(0, min(127, int(parts[11]))),
+                "seed": max(1, min(2000000, int(parts[12]))),
+                "default_velocity": max(1, min(127, int(parts[13]))),
                 "limited": False,
                 "columns": [],
             }
             if info["horizon_bars"] not in (4, 8, 16, 32, 64, 96):
                 return None
-            for record in parts[15].split(","):
+            for record in parts[14].split(","):
                 values = [int(value) for value in record.split(":")]
-                if len(values) not in (10, 11):
+                if len(values) != 11:
                     return None
                 info["columns"].append({
                     "page": info["view_page"],
@@ -15381,7 +15453,7 @@ class Tap(ControlSurface):
                     "phase_ticks": max(0, values[4]), "scale_degree": max(-63, min(63, values[5])),
                     "octave_offset": max(-8, min(8, values[6])), "pad_offset": max(-63, min(63, values[7])),
                     "velocity": max(1, min(127, values[8])), "probability": max(0, min(100, values[9])),
-                    "velocity_deviation": max(-127, min(127, values[10])) if len(values) == 11 else 0,
+                    "velocity_deviation": max(-127, min(127, values[10])),
                 })
             if len(info["columns"]) != 16:
                 return None
@@ -15394,7 +15466,7 @@ class Tap(ControlSurface):
         try:
             payload = bytes(message[2:-1]).decode("ascii")
             parts = payload.split("|")
-            if len(parts) < 2 or parts[0] != "v1":
+            if len(parts) < 2 or parts[0] != "v2":
                 return
             slot = self.song().view.highlighted_clip_slot
             if slot is None or not slot.has_clip or not getattr(slot.clip, "is_midi_clip", False):
@@ -15416,7 +15488,7 @@ class Tap(ControlSurface):
                     if not info:
                         return
                     for key in (
-                        "kind", "quantization", "base_quarters", "rate_mode", "bottom_rate", "row_interval", "horizon_bars",
+                        "kind", "quantization", "quantize_all", "base_quarters", "rate_mode", "horizon_bars",
                         "mapping_mode", "global_offset", "view_page", "base_pitch", "seed",
                         "default_velocity",
                     ):
@@ -24099,11 +24171,10 @@ class Tap(ControlSurface):
                         note_data.extend([
                             1,
                             int(flin_info.get("kind", 0)) & 0x7F,
-                            int(flin_info.get("quantization", 1)) & 0x7F,
+                            int(flin_info.get("quantization", 0)) & 0x7F,
+                            1 if flin_info.get("quantize_all", False) else 0,
                             int(flin_info.get("base_quarters", 16)) & 0x7F,
                             int(flin_info.get("rate_mode", 0)) & 0x7F,
-                            int(flin_info.get("bottom_rate", 1)) & 0x7F,
-                            int(flin_info.get("row_interval", 4)) & 0x7F,
                             int(flin_info.get("horizon_bars", 64)) & 0x7F,
                             int(flin_info.get("mapping_mode", 0)) & 0x7F,
                             max(0, min(127, int(flin_info.get("global_offset", 0)) + 64)),

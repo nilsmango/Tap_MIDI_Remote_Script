@@ -194,7 +194,106 @@ class FlinColumnHarness:
         raise AssertionError(message)
 
 
+class FlinTimingHarness:
+    _flin_quantum_beats = extracted_method("_flin_quantum_beats")
+    _flin_note_quantization_beats = extracted_method("_flin_note_quantization_beats")
+    _flin_quantized_note_start = extracted_method("_flin_quantized_note_start")
+    _flin_note_starts = extracted_method("_flin_note_starts")
+    _flin_beats_per_bar = extracted_method("_flin_beats_per_bar")
+    _flin_period_ticks_for_rows = extracted_method("_flin_period_ticks_for_rows")
+
+
+class FlinProtocolHarness:
+    FLIN_NAME_MARKER_RE = re.compile(r"\s*\[TapFlin:v2\|([^\]]*)\]")
+    _flin_info_from_name = extracted_method("_flin_info_from_name")
+    _flin_marker = extracted_method("_flin_marker")
+    _flin_settings_from_payload = extracted_method("_flin_settings_from_payload")
+
+
 class TransportTests(unittest.TestCase):
+    def test_flin_rate_curves_never_duplicate_and_ignore_note_quantization(self):
+        harness = FlinTimingHarness()
+        clip = type("Clip", (), {"signature_numerator": 4, "signature_denominator": 4})()
+
+        for base_quarters in (1, 2, 4, 8, 12, 16, 32, 64):
+            for mode in range(4):
+                baseline = None
+                for quantization in range(6):
+                    periods = harness._flin_period_ticks_for_rows({
+                        "base_quarters": base_quarters,
+                        "rate_mode": mode,
+                        "quantization": quantization,
+                    }, clip)
+                    self.assertEqual(len(set(periods)), 16)
+                    self.assertTrue(all(left < right for left, right in zip(periods, periods[1:])))
+                    if baseline is None:
+                        baseline = periods
+                    self.assertEqual(periods, baseline)
+
+        self.assertEqual(
+            harness._flin_period_ticks_for_rows({"base_quarters": 16, "rate_mode": 0}, clip),
+            tuple(range(16, 257, 16)),
+        )
+
+    def test_flin_note_quantization_snaps_only_onsets_and_wraps_loop_end(self):
+        harness = FlinTimingHarness()
+        self.assertEqual(harness._flin_quantized_note_start({"quantization": 0}, 0.1875, 4.0), 0.1875)
+        self.assertEqual(harness._flin_quantized_note_start({"quantization": 2}, 0.1875, 4.0), 0.25)
+        self.assertEqual(harness._flin_quantized_note_start({"quantization": 4}, 3.75, 4.0), 0.0)
+
+    def test_flin_quantization_defaults_to_first_placement_only(self):
+        harness = FlinTimingHarness()
+        first_only = harness._flin_note_starts(
+            {"quantization": 2}, phase_ticks=1, period_ticks=3, loop_ticks=16
+        )
+        quantize_all = harness._flin_note_starts(
+            {"quantization": 2, "quantize_all": True},
+            phase_ticks=1,
+            period_ticks=3,
+            loop_ticks=16,
+        )
+
+        self.assertEqual(first_only, (0.0, 0.1875, 0.375, 0.5625, 0.75, 0.9375))
+        self.assertEqual(quantize_all, (0.0, 0.25, 0.5, 0.75))
+
+    def test_flin_v2_protocol_requires_quantize_all_and_rejects_legacy_shapes(self):
+        harness = FlinProtocolHarness()
+        marker = harness._flin_marker({
+            "kind": 0,
+            "quantization": 2,
+            "quantize_all": True,
+            "base_quarters": 8,
+            "rate_mode": 1,
+            "horizon_bars": 32,
+            "mapping_mode": 0,
+            "global_offset": 0,
+            "view_page": 0,
+            "base_pitch": 60,
+            "seed": 7,
+            "default_velocity": 100,
+            "limited": False,
+            "columns": [],
+        })
+        parsed = harness._flin_info_from_name(marker)
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed["quantize_all"])
+        self.assertIsNone(harness._flin_info_from_name(marker.replace("|a=1|", "|a=2|")))
+        self.assertIsNone(harness._flin_info_from_name(marker.replace("TapFlin:v2", "TapFlin:v1")))
+
+        columns = ",".join(
+            "{}:0:0:1:0:{}:0:{}:100:100:0".format(index, index, index)
+            for index in range(16)
+        )
+        payload = [
+            "v2", "settings", "0", "2", "0", "8", "1", "32", "0",
+            "0", "0", "60", "7", "100", columns,
+        ]
+        self.assertFalse(harness._flin_settings_from_payload(payload)["quantize_all"])
+        malformed_boolean = list(payload)
+        malformed_boolean[4] = "2"
+        self.assertIsNone(harness._flin_settings_from_payload(malformed_boolean))
+        self.assertIsNone(harness._flin_settings_from_payload(payload[:-1]))
+
     def test_identical_selected_clip_snapshot_is_only_suppressed_briefly(self):
         harness = SelectedClipSnapshotHarness()
 
@@ -1930,7 +2029,7 @@ class TransportTests(unittest.TestCase):
 
     def test_flin_column_velocity_deviation_uses_the_eighth_wire_field(self):
         harness = FlinColumnHarness()
-        payload = b"v1|column|0|3|101|82|4|-27"
+        payload = b"v2|column|0|3|101|82|4|-27"
         harness._handle_flin_command([0xF0, 0x3E, *payload, 0xF7])
 
         self.assertEqual(harness.column["velocity"], 101)
