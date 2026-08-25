@@ -6895,7 +6895,21 @@ class Tap(ControlSurface):
     def _simpler_audio_file_has_supported_header(self, file_path):
         try:
             with open(file_path, 'rb') as audio_file:
-                header = audio_file.read(12)
+                header = audio_file.read(28)
+            is_aifc = header[:4] == b'FORM' and header[8:12] == b'AIFC'
+            # Encrypted Ableton Pack samples use an AIFC wrapper whose first
+            # two chunks are FVER and "able".  They look like ordinary AIFC
+            # files from the 12-byte container header, but macOS afconvert
+            # cannot decode their protected payload.  Avoid launching a
+            # CPU-heavy converter that is guaranteed to fail; a usable .asd
+            # overview has already been tried before reaching this check.
+            is_protected_ableton_aifc = (
+                is_aifc and
+                header[12:16] == b'FVER' and
+                header[24:28] == b'able'
+            )
+            if is_protected_ableton_aifc:
+                return False
             return (
                 (header[:4] in (b'RIFF', b'RF64', b'BW64') and header[8:12] == b'WAVE')
                 or (header[:4] == b'FORM' and header[8:12] in (b'AIFF', b'AIFC'))

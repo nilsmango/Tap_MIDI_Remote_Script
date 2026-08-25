@@ -24,6 +24,7 @@ METHOD_NAMES = {
     "_request_audio_clip_waveform",
     "_simpler_waveform_source_signature",
     "_simpler_waveform_from_asd",
+    "_simpler_audio_file_has_supported_header",
     "_send_simpler_waveform_clear",
     "_send_simpler_waveform",
     "_send_simpler_waveform_unavailable",
@@ -571,6 +572,32 @@ class AudioClipSupportTests(unittest.TestCase):
             for alias in node.names
         }
         self.assertNotIn("mmap", imported_modules)
+
+    def test_protected_ableton_aifc_is_not_sent_to_system_decoder(self):
+        protected_header = (
+            b"FORM" + struct.pack(">I", 64) + b"AIFC"
+            + b"FVER" + struct.pack(">I", 4) + b"\xA2\x80\x51\x40"
+            + b"able" + struct.pack(">I", 32)
+        )
+        with tempfile.NamedTemporaryFile(suffix=".aif") as audio_file:
+            audio_file.write(protected_header)
+            audio_file.flush()
+            self.assertFalse(
+                self.harness._simpler_audio_file_has_supported_header(audio_file.name)
+            )
+
+    def test_standard_aifc_remains_available_to_system_decoder(self):
+        standard_header = (
+            b"FORM" + struct.pack(">I", 64) + b"AIFC"
+            + b"FVER" + struct.pack(">I", 4) + b"\xA2\x80\x51\x40"
+            + b"COMM" + struct.pack(">I", 18)
+        )
+        with tempfile.NamedTemporaryFile(suffix=".aif") as audio_file:
+            audio_file.write(standard_header)
+            audio_file.flush()
+            self.assertTrue(
+                self.harness._simpler_audio_file_has_supported_header(audio_file.name)
+            )
 
     def test_simpler_worker_stops_stale_work_and_processes_latest_job(self):
         self.harness._simpler_waveform_generation = 7
