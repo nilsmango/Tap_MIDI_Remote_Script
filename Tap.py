@@ -1,4 +1,4 @@
-# 7III Tap 2.0.3
+# 7III Tap 2.1
 
 from __future__ import with_statement
 import Live
@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 41
+secret_version_number = 54
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2498,6 +2498,19 @@ class Tap(ControlSurface):
     AUTOMATION_CONTEXT_MAX_COUNT = 24
     AUTOMATION_CONTEXT_MAX_AGE = 180.0
     AUTOMATION_PENCIL_INACTIVITY_TIMEOUT = 8.0
+    AUTOMATION_EXACT_STREAM_INACTIVITY_TIMEOUT = 8.0
+    AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
+    AUTOMATION_EXACT_EVENT_TIME_TOLERANCE = 0.00001
+    # Keep each Live mutation callback deliberately small, but do not spend a
+    # complete callback on every ordinary point. Groups are authored right to
+    # left, and an equal-time vertical pair always remains atomic.
+    AUTOMATION_EXACT_EVENT_BATCH_SIZE = 4
+    AUTOMATION_EXACT_EVENT_BATCH_MAX_SETTLE_POLLS = 2
+    AUTOMATION_EXACT_STREAM_MAX_SETTLE_POLLS = 2
+    AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS = 3
+    AUTOMATION_EXACT_MAX_FULL_REPLAYS = 3
+    AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS = 2
+    AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
     
 
     def __init__(self, c_instance):
@@ -2722,6 +2735,7 @@ class Tap(ControlSurface):
             self._automation_removal_suppressed_controls = set()
             self._automation_authored_steps = {}
             self._automation_pencil_stroke = None
+            self._automation_exact_stream = None
             self._automation_contexts = {}
             self._automation_context_counter = 0
             self._mixer_automation_controls = []
@@ -2764,6 +2778,7 @@ class Tap(ControlSurface):
             self._last_audio_clip_position_state_time = 0.0
             self._last_audio_clip_action_result = None
             self._sysex_buffers = {}
+            self._automation_trace_pending_transfer = None
             self._last_periodic_integrity_check = 0.0
             self.periodic_timer = 1
             # connection check button
@@ -5496,6 +5511,21 @@ class Tap(ControlSurface):
     def _debug_log(self, message):
         if self._debug_mode:
             self.log_message(message)
+
+    def _automation_trace(self, transaction, stage, details=""):
+        """Always-visible envelope trace written to Ableton's Log.txt."""
+        try:
+            safe_details = str(details or "").replace("\n", " ").replace("\r", " ")
+            self.log_message(
+                "TapAutoTrace v{} tx={} stage={}{}".format(
+                    secret_version_number,
+                    str(transaction or "?"),
+                    str(stage or "unknown"),
+                    " " + safe_details if safe_details else ""
+                )
+            )
+        except Exception:
+            pass
 
     def _get_device_cache_key(self, device):
         if not device:
@@ -8588,6 +8618,7 @@ class Tap(ControlSurface):
         ControlSurface.update_display(self)
         self._expire_automation_contexts()
         self._expire_automation_pencil_stroke()
+        self._expire_exact_automation_stream()
         if not self.was_initialized or not self._clip_position_feedback_enabled:
             return
 
@@ -8706,6 +8737,24 @@ class Tap(ControlSurface):
         if any(value < 0 or value > 127 for value in values):
             return
         self._send_midi((0xF0, manufacturer_id, 0x01) + values + (0xF7,))
+
+    def _send_chunked_binary_sys_ex_message(self, values, manufacturer_id):
+        values = tuple(int(value) for value in values)
+        if any(value < 0 or value > 127 for value in values):
+            return
+        maximum = self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH
+        chunks = tuple(
+            values[offset:offset + maximum]
+            for offset in range(0, len(values), maximum)
+        ) or ((),)
+        for index, chunk in enumerate(chunks):
+            marker = (
+                ord("!") if len(chunks) == 1
+                else (ord("_") if index == len(chunks) - 1 else ord("$"))
+            )
+            self._send_midi(
+                (0xF0, manufacturer_id, 0x01, marker) + chunk + (0xF7,)
+            )
 
     def _send_visual_feedback_frame(self):
         clip_bytes = self._visible_clip_position_bytes() if self._clip_position_feedback_enabled else []
@@ -8979,6 +9028,7 @@ class Tap(ControlSurface):
         self._remove_song_listeners(old_song)
         self.song_instance = current_song
         self._finalize_automation_pencil_stroke()
+        self._finalize_exact_automation_stream()
         self._clear_automation_contexts()
         self._track_list_signature = None
         self._last_group_fold_states = None
@@ -11527,29 +11577,39 @@ class Tap(ControlSurface):
             # audible sides is unsafe here because a neighbouring exact corner
             # can already have jumped toward another event.
             if hasattr(envelope, "events_in_range"):
-                guard = 0.0000001
+                # Live may retain a free-time point a few sub-microbeats away
+                # from the requested double. The verification and corrective
+                # delete must use the same tolerance as the settled writer or
+                # a retry adds another pair beside the original one.
+                guard = getattr(
+                    self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+                )
                 for time_group in time_groups:
                     if (len(time_group) < 2
                             or abs(float(time_group[0][2]) - float(time_group[-1][2])) <= 0.000001):
                         continue
                     group_time = float(time_group[0][0])
                     try:
-                        stored_group = tuple(
-                            event for event in envelope.events_in_range(
-                                group_time - guard, group_time + guard
+                        def stored_group():
+                            return tuple(
+                                event for event in envelope.events_in_range(
+                                    group_time - guard, group_time + guard
+                                )
+                                if abs(float(event.time) - group_time) <= guard
                             )
-                            if abs(float(event.time) - group_time) <= 0.000001
-                        )
-                        if len(stored_group) != len(time_group):
-                            continue
-                        authored_direction = (
-                            float(time_group[-1][2]) - float(time_group[0][2])
-                        )
-                        stored_direction = (
-                            float(stored_group[-1].value)
-                            - float(stored_group[0].value)
-                        )
-                        if authored_direction * stored_direction >= 0:
+
+                        def direction_matches(events):
+                            if len(events) != len(time_group):
+                                return False
+                            authored_direction = (
+                                float(time_group[-1][2]) - float(time_group[0][2])
+                            )
+                            stored_direction = (
+                                float(events[-1].value) - float(events[0].value)
+                            )
+                            return authored_direction * stored_direction >= 0
+
+                        if direction_matches(stored_group()):
                             continue
                         envelope.delete_events_in_range(
                             group_time - guard, group_time + guard
@@ -11561,6 +11621,11 @@ class Tap(ControlSurface):
                             self._create_automation_event(
                                 envelope, step[0], raw_value, step
                             )
+                        # Do not report success merely because the corrective
+                        # calls completed. Some device envelopes expose their
+                        # final equal-time order only on the following read.
+                        if not direction_matches(stored_group()):
+                            return False
                     except Exception as e:
                         self._debug_log(
                             "Could not verify same-time automation event order: {}".format(str(e))
@@ -15680,6 +15745,18 @@ class Tap(ControlSurface):
         for stream_id, buffer_info in list(self._sysex_buffers.items()):
             if now - buffer_info["last_chunk_at"] > self.SYSEX_CHUNK_INACTIVITY_TIMEOUT:
                 self._sysex_buffers.pop(stream_id, None)
+                if stream_id == 0x32:
+                    trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                    self._automation_trace(
+                        trace.get("token", "?"),
+                        "transfer_timeout",
+                        "packets={} bytes={} expected_packets={} expected_bytes={}".format(
+                            buffer_info.get("chunk_count", 0),
+                            len(buffer_info.get("bytes", ())),
+                            trace.get("packet_count", "?"),
+                            trace.get("payload_bytes", "?")
+                        )
+                    )
 
         manufacturer_id = message[1]
         prefix = message[2]
@@ -15709,17 +15786,51 @@ class Tap(ControlSurface):
             if prefix == 36:
                 # Intermediate chunk
                 chunk = list(message[3:-1])
+                is_first_chunk = manufacturer_id not in self._sysex_buffers
                 buffer_info = self._sysex_buffers.get(manufacturer_id, {
                     "bytes": [],
                     "last_chunk_at": now,
+                    "chunk_count": 0,
                 })
                 if len(buffer_info["bytes"]) + len(chunk) > maximum_assembled_bytes:
                     self._sysex_buffers.pop(manufacturer_id, None)
                     self._debug_log("Rejected oversized SysEx stream {}".format(manufacturer_id))
+                    if manufacturer_id == 0x32:
+                        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                        self._automation_trace(
+                            trace.get("token", "?"),
+                            "transfer_reject",
+                            "reason=oversized_intermediate packets={} bytes={}".format(
+                                buffer_info.get("chunk_count", 0),
+                                len(buffer_info.get("bytes", ())) + len(chunk)
+                            )
+                        )
                     return
                 buffer_info["bytes"].extend(chunk)
+                buffer_info["chunk_count"] = buffer_info.get("chunk_count", 0) + 1
                 buffer_info["last_chunk_at"] = now
                 self._sysex_buffers[manufacturer_id] = buffer_info
+                if manufacturer_id == 0x32:
+                    trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                    if is_first_chunk:
+                        self._automation_trace(
+                            trace.get("token", "?"),
+                            "chunk_start",
+                            "packet=1 bytes={} expected_packets={} expected_bytes={}".format(
+                                len(chunk),
+                                trace.get("packet_count", "?"),
+                                trace.get("payload_bytes", "?")
+                            )
+                        )
+                    elif buffer_info["chunk_count"] % 64 == 0:
+                        self._automation_trace(
+                            trace.get("token", "?"),
+                            "chunk_progress",
+                            "packets={} bytes={}".format(
+                                buffer_info["chunk_count"],
+                                len(buffer_info["bytes"])
+                            )
+                        )
                 return
 
             elif prefix == 95:
@@ -15727,6 +15838,16 @@ class Tap(ControlSurface):
                 # one-packet transfer too.
                 buffer_info = self._sysex_buffers.pop(manufacturer_id, None)
                 if buffer_info is None:
+                    if manufacturer_id == 0x32:
+                        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                        self._automation_trace(
+                            trace.get("token", "?"),
+                            "transfer_reject",
+                            "reason=final_without_start final_bytes={}".format(
+                                len(message[3:-1])
+                            )
+                        )
+                        return
                     record_width = {14: 11, 15: 5, 16: 16}.get(manufacturer_id)
                     final_length = len(message[3:-1])
                     if manufacturer_id == 92:
@@ -15738,8 +15859,33 @@ class Tap(ControlSurface):
                 chunk = list(message[3:-1])
                 if len(buffer_info["bytes"]) + len(chunk) > maximum_assembled_bytes:
                     self._debug_log("Rejected oversized final SysEx stream {}".format(manufacturer_id))
+                    if manufacturer_id == 0x32:
+                        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                        self._automation_trace(
+                            trace.get("token", "?"),
+                            "transfer_reject",
+                            "reason=oversized_final packets={} bytes={}".format(
+                                buffer_info.get("chunk_count", 0) + 1,
+                                len(buffer_info.get("bytes", ())) + len(chunk)
+                            )
+                        )
                     return
                 buffer_info["bytes"].extend(chunk)
+                buffer_info["chunk_count"] = buffer_info.get("chunk_count", 0) + 1
+                if manufacturer_id == 0x32:
+                    trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                    actual_packets = buffer_info["chunk_count"]
+                    actual_bytes = len(buffer_info["bytes"])
+                    self._automation_trace(
+                        trace.get("token", "?"),
+                        "chunk_final",
+                        "packets={} bytes={} packet_match={} byte_match={}".format(
+                            actual_packets,
+                            actual_bytes,
+                            1 if actual_packets == trace.get("packet_count") else 0,
+                            1 if actual_bytes == trace.get("payload_bytes") else 0
+                        )
+                    )
                 full_message = [0xF0, manufacturer_id] + buffer_info["bytes"] + [0xF7]
 
                 # Now call the original handler
@@ -15747,7 +15893,25 @@ class Tap(ControlSurface):
                 return
 
             else:
-                self._sysex_buffers.pop(manufacturer_id, None)
+                interrupted = self._sysex_buffers.pop(manufacturer_id, None)
+                if manufacturer_id == 0x32 and interrupted is not None:
+                    trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                    self._automation_trace(
+                        trace.get("token", "?"),
+                        "transfer_interrupted",
+                        "packets={} bytes={} next_prefix={}".format(
+                            interrupted.get("chunk_count", 0),
+                            len(interrupted.get("bytes", ())),
+                            prefix
+                        )
+                    )
+                if manufacturer_id == 0x32 and prefix == ord("S"):
+                    trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+                    self._automation_trace(
+                        trace.get("token", "?"),
+                        "transfer_direct",
+                        "bytes={}".format(len(message[2:-1]))
+                    )
                 self._handle_full_sysex(message)
                 return
 
@@ -20759,7 +20923,9 @@ class Tap(ControlSurface):
                 merged_intervals.append((interval_start, interval_end))
         return (tuple(final_steps), tuple(merged_intervals))
 
-    def _apply_exact_automation_delta(self, context, envelope, final_steps, intervals):
+    def _apply_exact_automation_delta(
+            self, context, envelope, final_steps, intervals,
+            automation_should_re_enable=False):
         if not intervals:
             return True
         undo_step_started = self._begin_undo_step()
@@ -20779,12 +20945,18 @@ class Tap(ControlSurface):
                         allow_empty=True,
                         endpoint_padding=0.0000001):
                     return False
+            if (automation_should_re_enable
+                    and not self._parameter_automation_is_enabled(
+                        context["device_param"]
+                    )):
+                self._re_enable_parameter_automation(context["device_param"])
             return True
         finally:
             self._end_undo_step(undo_step_started)
 
     def _apply_direct_exact_automation_delta(
-            self, context, envelope, baseline, final_steps, operation_entries):
+            self, context, envelope, baseline, final_steps, operation_entries,
+            automation_should_re_enable=False):
         """Apply unambiguous inserts/deletes without rewriting neighbours.
 
         Returns None when the operation needs the regular coefficient-aware
@@ -20851,13 +21023,20 @@ class Tap(ControlSurface):
                         envelope, step[0], raw_value, step
                     )
             else:
-                guard = 0.0000001
+                guard = getattr(
+                    self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+                )
                 for step in sorted(
                         delete_steps, key=lambda item: float(item[0]), reverse=True):
                     time_value = float(step[0])
                     envelope.delete_events_in_range(
                         time_value - guard, time_value + guard
                     )
+            if (automation_should_re_enable
+                    and not self._parameter_automation_is_enabled(
+                        context["device_param"]
+                    )):
+                self._re_enable_parameter_automation(context["device_param"])
             return True
         except Exception as e:
             self._debug_log(
@@ -20975,7 +21154,13 @@ class Tap(ControlSurface):
         self._send_sys_ex_message(response, 0x31)
 
     def _handle_exact_automation_delta(self, fields):
+        transaction = fields[8] if len(fields) > 8 else "?"
         if len(fields) != 9:
+            self._automation_trace(
+                transaction,
+                "delta_reject",
+                "reason=field_count actual={} expected=9".format(len(fields))
+            )
             self._finalize_automation_pencil_stroke()
             return
         try:
@@ -20989,16 +21174,41 @@ class Tap(ControlSurface):
             write_token = fields[8]
             actual_checksum = self._automation_payload_checksum("|".join(fields[:6]))
             if expected_count != len(operation_entries) or expected_checksum != actual_checksum:
+                self._automation_trace(
+                    write_token,
+                    "delta_reject",
+                    "reason=integrity operations={}/{} checksum={:08X}/{:08X}".format(
+                        len(operation_entries), expected_count,
+                        actual_checksum, expected_checksum
+                    )
+                )
                 self._automation_write_error_response(control_index, write_token)
                 return
-        except Exception:
+        except Exception as e:
+            self._automation_trace(
+                transaction, "delta_reject", "reason=parse error={}".format(str(e))
+            )
             return
+
+        self._automation_trace(
+            write_token,
+            "delta_intent",
+            "dial={} operations={} bytes={} checksum={:08X}".format(
+                control_index,
+                len(operation_entries),
+                len("|".join(fields)),
+                actual_checksum
+            )
+        )
 
         context, envelope, baseline, _revision, status = self._resolve_automation_context(
             context_token,
             base_revision
         )
         if status != "ok":
+            self._automation_trace(
+                write_token, "delta_reject", "reason=context status={}".format(status)
+            )
             self._automation_write_error_response(
                 control_index,
                 write_token,
@@ -21012,112 +21222,1784 @@ class Tap(ControlSurface):
             context["domain"]
         )
         if reconstructed is None:
+            self._automation_trace(
+                write_token, "delta_reject", "reason=reconstruct"
+            )
             self._automation_write_error_response(
                 context["control_index"], write_token, context=context
             )
             return
         final_steps, intervals = reconstructed
+        self._automation_trace(
+            write_token,
+            "delta_ready",
+            "baseline={} final={} ranges={}".format(
+                len(baseline),
+                len(final_steps),
+                ";".join(
+                    "{:.6f}:{:.6f}".format(start, end)
+                    for start, end in intervals
+                ) or "none"
+            )
+        )
+
+        # A delta is a compact description, not a separate Live-writing
+        # algorithm. Reconstruct the authoritative final snapshot here, then
+        # feed it to the same paced, settled, read-back-verified writer used by
+        # generated and streamed envelopes. The former synchronous range path
+        # could run an entire move/duplicate/scale inside one MIDI callback;
+        # Live silently dropped those mutations, especially while stopped.
+        full_fields = [
+            "F",
+            str(context["control_index"]),
+            context_token,
+            base_revision,
+            "{:.9f}".format(float(context["domain"][0])),
+            "{:.9f}".format(float(context["domain"][1])),
+            "{:.9f}".format(sample_duration),
+            ",".join(self._automation_step_entry(step) for step in final_steps),
+        ]
+        checksum = self._automation_payload_checksum("|".join(full_fields))
+        self._automation_trace(
+            write_token,
+            "delta_write_scheduled",
+            "writer=verified_full entries={}".format(len(final_steps))
+        )
+        self._handle_exact_automation_full_write(
+            full_fields + [
+                str(len(final_steps)),
+                "{:08X}".format(checksum),
+                write_token,
+            ],
+            compact_response=True
+        )
+
+    def _exact_automation_final_event_status(self, state):
+        """Audit the final full-range event representation returned by Live.
+
+        A narrow events_in_range read can expose an equal-time pair in a
+        different order than Live's later complete enumeration. The complete
+        physical range is what subsequent reads (and the app) observe, so it
+        is the only read that may authorize a successful full-write response.
+        """
+        envelope = state["envelope"]
+        epsilon = getattr(
+            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        try:
+            events = self._automation_events_in_closed_range(
+                envelope, state["write_start"], state["write_end"]
+            )
+        except Exception:
+            return {
+                "exact": False,
+                "structural": True,
+                "mismatch_groups": (),
+                "reversed_times": (),
+                "reason": "unreadable",
+            }
+
+        # Live normally enumerates by time. Sort only the time axis and retain
+        # the returned ordinal inside equal-time groups.
+        indexed_events = tuple(sorted(
+            enumerate(events),
+            key=lambda item: (float(item[1].time), item[0])
+        ))
+        stored_groups = []
+        for _index, event in indexed_events:
+            if (not stored_groups
+                    or abs(float(event.time) - float(stored_groups[-1][0].time))
+                        > epsilon):
+                stored_groups.append([])
+            stored_groups[-1].append(event)
+
+        intended_groups = tuple(sorted(
+            state["time_groups"], key=lambda group: float(group[0][0])
+        ))
+        mismatch_groups = []
+        reversed_times = []
+        reasons = []
+        structural = False
+        intended_index = 0
+        stored_index = 0
+        coefficient_tolerance = 0.000002
+        device_param = state.get("context", {}).get("device_param")
+        raw_span = max(
+            1.0,
+            abs(
+                float(getattr(device_param, "max", 1.0))
+                - float(getattr(device_param, "min", 0.0))
+            )
+        )
+        value_tolerance = raw_span * coefficient_tolerance
+
+        while intended_index < len(intended_groups) or stored_index < len(stored_groups):
+            if intended_index >= len(intended_groups):
+                structural = True
+                reasons.append("extra")
+                stored_index += 1
+                continue
+            intended_group = intended_groups[intended_index]
+            intended_time = float(intended_group[0][0])
+            if stored_index >= len(stored_groups):
+                mismatch_groups.append(intended_group)
+                reasons.append("missing")
+                intended_index += 1
+                continue
+
+            stored_group = stored_groups[stored_index]
+            stored_time = float(stored_group[0].time)
+            if stored_time < intended_time - epsilon:
+                structural = True
+                reasons.append("extra")
+                stored_index += 1
+                continue
+            if intended_time < stored_time - epsilon:
+                mismatch_groups.append(intended_group)
+                reasons.append("missing")
+                intended_index += 1
+                continue
+
+            group_reason = None
+            stored_values = None
+            if len(stored_group) != len(intended_group):
+                group_reason = "count"
+            elif len(intended_group) > 1:
+                authored_direction = (
+                    float(intended_group[-1][2]) - float(intended_group[0][2])
+                )
+                # Live's enumeration order is the fact being audited here.
+                # value_at_time samples describe the audible sides of the
+                # boundary, but cannot tell which stored event owns which
+                # outgoing coefficients. EnvelopeEvent.value may use another
+                # domain for devices, but its monotonic direction is stable.
+                stored_direction = (
+                    float(stored_group[-1].value)
+                    - float(stored_group[0].value)
+                )
+                if authored_direction * stored_direction < 0:
+                    group_reason = "order"
+                    reversed_times.append(intended_time)
+            else:
+                value_reader = getattr(
+                    self, "_parameter_domain_values_from_envelope_events", None
+                )
+                stored_values = (
+                    value_reader(
+                        envelope,
+                        tuple(stored_group),
+                        device_param,
+                        state["write_start"],
+                        state["write_end"],
+                        state.get("sample_duration", 0.0001)
+                    )
+                    if value_reader is not None
+                    else tuple(float(event.value) for event in stored_group)
+                )
+
+            if group_reason is None and len(stored_group) == len(intended_group):
+                for event_index, (event, step) in enumerate(zip(
+                        stored_group, intended_group)):
+                    try:
+                        # Equal-time values are represented by event order.
+                        # Sampling beside a ramp is intentionally close to,
+                        # but not exactly at, its endpoint and must not cause
+                        # a correct envelope to be replayed.
+                        if device_param is not None and stored_values is not None:
+                            expected_raw = self._parameter_target_value_from_normalized(
+                                device_param, step[2]
+                            )
+                            if (abs(float(stored_values[event_index]) - float(expected_raw))
+                                    > value_tolerance):
+                                group_reason = "value"
+                                break
+                        controls = event.control_coefficients
+                        actual = (controls.x1, controls.y1, controls.x2, controls.y2)
+                        expected = step[7:11]
+                        if any(
+                                abs(float(current) - float(target))
+                                    > coefficient_tolerance
+                                for current, target in zip(actual, expected)):
+                            group_reason = "coefficients"
+                            break
+                    except Exception:
+                        group_reason = "unreadable"
+                        break
+
+            if group_reason is not None:
+                mismatch_groups.append(intended_group)
+                reasons.append(group_reason)
+            intended_index += 1
+            stored_index += 1
+
+        return {
+            "exact": not structural and not mismatch_groups,
+            "structural": structural,
+            "mismatch_groups": tuple(mismatch_groups),
+            "reversed_times": tuple(reversed_times),
+            "reason": ",".join(reasons) if reasons else "ok",
+        }
+
+    def _close_exact_automation_write_attempt(self, state):
+        undo_step_started = bool(state.get("undo_step_started", False))
+        state["undo_step_started"] = False
+        state["undo_step_attempted"] = False
+        if undo_step_started:
+            self._end_undo_step(True)
+
+    def _retry_exact_automation_full_write(self, state, status):
+        if not state.get("allow_full_replay", True):
+            self._debug_log(
+                "Streamed exact automation audit failed: {}".format(
+                    status.get("reason", "mismatch")
+                )
+            )
+            self._automation_trace(
+                state.get("stream_id", state.get("write_token", "?")),
+                "final_audit_reject",
+                "reason={} mismatch_groups={}".format(
+                    status.get("reason", "mismatch"),
+                    ",".join(
+                        "{:.6f}".format(float(group[0][0]))
+                        for group in tuple(status.get("mismatch_groups", ()))[:16]
+                    ) or "none"
+                )
+            )
+            self._fail_exact_automation_full_write(state)
+            return
+        if state["full_replays"] >= self.AUTOMATION_EXACT_MAX_FULL_REPLAYS:
+            self._debug_log(
+                "Exact automation final audit did not settle: {}".format(
+                    status.get("reason", "mismatch")
+                )
+            )
+            self._fail_exact_automation_full_write(state)
+            return
+
+        # A replay before the committed final audit is still part of the same
+        # user action. Keep its undo group open while clearing and rebuilding;
+        # closing here made every recovered vertical edge another Undo entry.
+        state["full_replays"] += 1
+        reversed_times = tuple(status.get("reversed_times", ()))
+        for time_value in reversed_times:
+            state["group_creation_reversed"][time_value] = not state[
+                "group_creation_reversed"
+            ].get(time_value, False)
+
+        # Never edit one point/group after the complete envelope exists:
+        # deleting its endpoint can reset the predecessor's outgoing Bezier.
+        # Any committed mismatch replays the complete right-to-left intent.
+        # This remains local; no new SysEx request or response is needed.
+        try:
+            device_param = state["context"]["device_param"]
+            if (state.get("automation_should_re_enable", False)
+                    and not self._parameter_automation_is_enabled(device_param)):
+                self._re_enable_parameter_automation(device_param)
+        except Exception:
+            pass
+        envelope_refresher = getattr(
+            self, "_refresh_exact_automation_write_envelope", None
+        )
+        if envelope_refresher is not None:
+            envelope_refresher(state, allow_create=True)
+        state["next_group_index"] = 0
+        state["active_batch"] = ()
+        state["batch_settle_polls"] = 0
+        state["cleared"] = False
+        state["awaiting_final_audit"] = False
+        self.schedule_message(
+            self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
+            lambda state=state: self._perform_exact_automation_full_write(state)
+        )
+
+    def _finalize_exact_automation_stream(self, state=None):
+        state = state or getattr(self, "_automation_exact_stream", None)
+        if state is None:
+            return
+        if getattr(self, "_automation_exact_stream", None) is state:
+            self._automation_exact_stream = None
+        if not state.get("completed", False):
+            state["completed"] = True
+            if (state.get("automation_should_re_enable", False)
+                    and not self._parameter_automation_is_enabled(
+                        state["context"]["device_param"]
+                    )):
+                self._re_enable_parameter_automation(
+                    state["context"]["device_param"]
+                )
+            self._close_exact_automation_write_attempt(state)
+
+    def _expire_exact_automation_stream(self, now=None):
+        state = getattr(self, "_automation_exact_stream", None)
+        if (state is None
+                or state.get("completed", False)
+                or state.get("stream_processing", False)
+                or state.get("awaiting_final_audit", False)):
+            return
+        now = time.monotonic() if now is None else float(now)
+        if (now - float(state.get("last_activity", now))
+                > self.AUTOMATION_EXACT_STREAM_INACTIVITY_TIMEOUT):
+            self._fail_exact_automation_full_write(state)
+
+    def _handle_automation_diagnostic_trace(self, fields):
+        transaction = fields[1] if len(fields) > 1 else "?"
+        try:
+            if len(fields) != 9:
+                raise ValueError("field_count={}".format(len(fields)))
+            trace = {
+                "token": str(int(fields[1])),
+                "dial": max(0, min(7, int(fields[2]))),
+                "entry_count": int(fields[3]),
+                "group_count": int(fields[4]),
+                "curve_group_count": int(fields[5]),
+                "payload_bytes": int(fields[6]),
+                "packet_count": int(fields[7]),
+                "checksum": int(fields[8], 16),
+            }
+            if (trace["entry_count"] <= 0
+                    or trace["group_count"] <= 0
+                    or trace["curve_group_count"] < 0
+                    or trace["payload_bytes"] <= 0
+                    or trace["packet_count"] <= 0):
+                raise ValueError("non_positive_counts")
+        except Exception as e:
+            self._automation_trace(
+                transaction, "app_intent_reject", "reason={}".format(str(e))
+            )
+            return
+
+        self._automation_trace_pending_transfer = trace
+        self._automation_trace(
+            trace["token"],
+            "app_intent",
+            "dial={} entries={} groups={} curves={} bytes={} packets={} checksum={:08X}".format(
+                trace["dial"],
+                trace["entry_count"],
+                trace["group_count"],
+                trace["curve_group_count"],
+                trace["payload_bytes"],
+                trace["packet_count"],
+                trace["checksum"]
+            )
+        )
+
+    def _automation_trace_expected_group(self, time_group):
+        try:
+            return ";".join(
+                "{:.6f}:{:.6f}:{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(
+                    float(step[0]), float(step[2]),
+                    float(step[7]), float(step[8]),
+                    float(step[9]), float(step[10])
+                )
+                for step in time_group
+            )
+        except Exception:
+            return "unreadable"
+
+    def _automation_trace_stored_group(self, state, time_group):
+        group_time = float(time_group[0][0])
+        guard = getattr(
+            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        try:
+            events = state["envelope"].events_in_range(
+                max(state["write_start"], group_time - guard),
+                max(
+                    max(state["write_start"], group_time - guard) + 0.000000001,
+                    min(state["write_end"] + guard, group_time + guard)
+                )
+            )
+            stored = tuple(
+                event for event in events
+                if abs(float(event.time) - group_time) <= guard
+            )
+            entries = []
+            for event in stored:
+                controls = event.control_coefficients
+                entries.append(
+                    "{:.6f}:{:.6f}:{:.6f}:{:.6f}:{:.6f}:{:.6f}".format(
+                        float(event.time), float(event.value),
+                        float(controls.x1), float(controls.y1),
+                        float(controls.x2), float(controls.y2)
+                    )
+                )
+            return "count={} values={}".format(len(stored), ";".join(entries))
+        except Exception as e:
+            return "unreadable={}".format(str(e))
+
+    # V54 generated-shape wire format. Swift's
+    # TapAutomationGeneratedShapeWire uses these exact offsets and shape codes.
+    # The 79-byte command crosses as two short reassembled SysEx chunks; only
+    # the compact parameters cross MIDI and this side rebuilds the exact point
+    # timeline after the complete checksummed command has arrived.
+    def _generated_automation_uint7_le(self, payload, start, width):
+        return sum(
+            (int(payload[start + offset]) & 0x7f) << (offset * 7)
+            for offset in range(width)
+        )
+
+    def _generated_automation_double(self, payload, start):
+        bits = self._generated_automation_uint7_le(payload, start, 10)
+        return struct.unpack(">d", struct.pack(">Q", bits))[0]
+
+    def _generated_automation_wire_checksum(self, payload):
+        checksum = 0
+        for value in payload:
+            checksum = ((checksum * 31) + (int(value) & 0x7f)) & 0x7fffffff
+        return checksum
+
+    def _generated_automation_append_node(self, nodes, node):
+        epsilon = 0.000001
+        node = list(node)
+        if nodes and abs(float(nodes[-1][0]) - float(node[0])) <= epsilon:
+            node[0] = nodes[-1][0]
+            if abs(float(nodes[-1][1]) - float(node[1])) <= epsilon:
+                nodes[-1] = node
+            else:
+                nodes.append(node)
+        else:
+            nodes.append(node)
+
+    def _generated_automation_append_cycle(
+            self, shape, start, period, shape_parameter, nodes):
+        linear = (0.5, 0.5, 0.5, 0.5)
+        smooth = (1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0)
+        sine_out = (1.0 / 3.0, math.pi / 6.0, 2.0 / 3.0, 1.0)
+        sine_in = (1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0 - math.pi / 6.0)
+        slow_attack = (0.55, 0.0, 0.88, 0.32)
+        fast_decay = (0.12, 0.68, 0.45, 1.0)
+        quarter = period * 0.25
+        half = period * 0.5
+        end = start + period
+
+        def append(time_value, value, controls):
+            self._generated_automation_append_node(
+                nodes, (time_value, value) + tuple(controls)
+            )
+
+        if shape == 0:  # sine
+            append(start, 0.5, sine_out)
+            append(start + quarter, 1.0, sine_in)
+            append(start + half, 0.5, sine_out)
+            append(start + (quarter * 3.0), 0.0, sine_in)
+            append(end, 0.5, sine_out)
+        elif shape == 4:  # saw up
+            append(start, 0.0, linear)
+            append(end, 1.0, linear)
+            append(end, 0.0, linear)
+        elif shape == 5:  # saw down
+            append(start, 1.0, linear)
+            append(end, 0.0, linear)
+            append(end, 1.0, linear)
+        elif shape == 2:  # triangle up
+            append(start, 0.0, linear)
+            append(start + half, 1.0, linear)
+            append(end, 0.0, linear)
+        elif shape == 3:  # square
+            append(start, 0.0, linear)
+            append(start + half, 0.0, linear)
+            append(start + half, 1.0, linear)
+            append(end, 1.0, linear)
+            append(end, 0.0, linear)
+        elif shape == 6:  # envelope up
+            append(start, 0.0, slow_attack)
+            append(end, 1.0, linear)
+            append(end, 0.0, slow_attack)
+        elif shape == 7:  # envelope down
+            append(start, 1.0, fast_decay)
+            append(end, 0.0, linear)
+            append(end, 1.0, fast_decay)
+        elif shape == 8:  # S ramp up
+            append(start, 0.0, smooth)
+            append(end, 1.0, linear)
+            append(end, 0.0, smooth)
+        elif shape == 9:  # S ramp down
+            append(start, 1.0, smooth)
+            append(end, 0.0, linear)
+            append(end, 1.0, smooth)
+        elif shape == 1:  # dropping ball
+            bounce = max(0.0, min(1.0, float(shape_parameter)))
+            bounce_count = 3 + int(math.floor((bounce * 7.0) + 0.5))
+            amplitude_ratio = 0.32 + (bounce * 0.5)
+            time_ratio = 0.52 + (bounce * 0.3)
+            rise = (1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 1.0)
+            fall = (1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0 / 3.0)
+
+            weight = time_ratio
+            bounce_weight = 0.0
+            for _index in range(bounce_count):
+                bounce_weight += weight
+                weight *= time_ratio
+            time_unit = period / max(0.000001, 1.0 + (2.0 * bounce_weight))
+
+            time_value = start
+            append(time_value, 1.0, fall)
+            time_value += time_unit
+            append(time_value, 0.0, rise)
+
+            height = amplitude_ratio
+            weight = time_ratio
+            for _index in range(bounce_count):
+                half_flight = time_unit * weight
+                time_value += half_flight
+                append(time_value, height, fall)
+                time_value += half_flight
+                append(time_value, 0.0, rise)
+                height *= amplitude_ratio
+                weight *= time_ratio
+            append(end, 0.0, linear)
+
+    def _generated_automation_random_value(self, index, variation):
+        mask = 0xffffffffffffffff
+        value = int(index) & mask
+        value ^= ((int(variation) & mask) * 0x9E3779B97F4A7C15) & mask
+        value = (value + 0x9E3779B97F4A7C15) & mask
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+        value ^= value >> 31
+        return float(value & 0x00ffffff) / float(0x00ffffff)
+
+    def _generated_automation_cubic(self, p0, p1, p2, p3, amount):
+        inverse = 1.0 - amount
+        return (
+            (inverse * inverse * inverse * p0)
+            + (3.0 * inverse * inverse * amount * p1)
+            + (3.0 * inverse * amount * amount * p2)
+            + (amount * amount * amount * p3)
+        )
+
+    def _generated_automation_split(self, left, right, time_value):
+        epsilon = 0.000001
+        duration = float(right[0]) - float(left[0])
+        if (duration <= epsilon
+                or time_value <= float(left[0]) + epsilon
+                or time_value >= float(right[0]) - epsilon):
+            return None
+        progress = (time_value - float(left[0])) / duration
+        controls = tuple(float(value) for value in left[2:6])
+        if (abs(controls[0] - controls[1]) <= epsilon
+                and abs(controls[2] - controls[3]) <= epsilon):
+            return (
+                float(left[1]) + ((float(right[1]) - float(left[1])) * progress),
+                controls,
+                (0.5, 0.5, 0.5, 0.5),
+            )
+
+        lower = 0.0
+        upper = 1.0
+        for _index in range(32):
+            middle = (lower + upper) * 0.5
+            candidate = self._generated_automation_cubic(
+                0.0, controls[0], controls[2], 1.0, middle
+            )
+            if candidate < progress:
+                lower = middle
+            else:
+                upper = middle
+        amount = (lower + upper) * 0.5
+
+        def interpolate(left_point, right_point):
+            return (
+                left_point[0] + ((right_point[0] - left_point[0]) * amount),
+                left_point[1] + ((right_point[1] - left_point[1]) * amount),
+            )
+
+        p0 = (0.0, 0.0)
+        p1 = (controls[0], controls[1])
+        p2 = (controls[2], controls[3])
+        p3 = (1.0, 1.0)
+        a = interpolate(p0, p1)
+        b = interpolate(p1, p2)
+        c = interpolate(p2, p3)
+        d = interpolate(a, b)
+        e = interpolate(b, c)
+        split = interpolate(d, e)
+
+        def normalized(value, start, end, fallback):
+            difference = end - start
+            return fallback if abs(difference) <= epsilon else (value - start) / difference
+
+        left_controls = (
+            normalized(a[0], p0[0], split[0], 0.5),
+            normalized(a[1], p0[1], split[1], 0.5),
+            normalized(d[0], p0[0], split[0], 0.5),
+            normalized(d[1], p0[1], split[1], 0.5),
+        )
+        right_controls = (
+            normalized(e[0], split[0], p3[0], 0.5),
+            normalized(e[1], split[1], p3[1], 0.5),
+            normalized(c[0], split[0], p3[0], 0.5),
+            normalized(c[1], split[1], p3[1], 0.5),
+        )
+        value = float(left[1]) + ((float(right[1]) - float(left[1])) * split[1])
+        return (value, left_controls, right_controls)
+
+    def _generated_automation_clip_nodes(self, nodes, start, end):
+        epsilon = 0.000001
+        # The serial is Swift's temporary AutomationStep order and preserves
+        # authored order within real vertical groups.
+        steps = [
+            [float(node[0]), float(node[1])] + list(node[2:6]) + [index]
+            for index, node in enumerate(nodes)
+        ]
+        steps = sorted(steps, key=lambda step: (step[0], step[6]))
+
+        if not any(abs(step[0] - start) <= epsilon for step in steps):
+            lefts = [step for step in steps if step[0] < start - epsilon]
+            rights = [step for step in steps if step[0] > start + epsilon]
+            if lefts and rights:
+                left = lefts[-1]
+                right = rights[0]
+                boundary = list(right)
+                boundary[0] = start
+                split = self._generated_automation_split(left, right, start)
+                if split is not None:
+                    boundary[1] = split[0]
+                    boundary[2:6] = list(split[2])
+                else:
+                    progress = (start - left[0]) / max(epsilon, right[0] - left[0])
+                    boundary[1] = left[1] + ((right[1] - left[1]) * progress)
+                    boundary[2:6] = [0.5, 0.5, 0.5, 0.5]
+                steps = [boundary] + [
+                    step for step in steps if step[0] > start + epsilon
+                ]
+        else:
+            steps = [step for step in steps if step[0] >= start - epsilon]
+
+        if any(step[0] > end + epsilon for step in steps):
+            source = list(steps)
+            clipped = [step for step in source if step[0] <= end + epsilon]
+            if not any(abs(step[0] - end) <= epsilon for step in clipped):
+                lefts = [step for step in source if step[0] < end - epsilon]
+                rights = [step for step in source if step[0] > end + epsilon]
+                if lefts and rights:
+                    left = lefts[-1]
+                    boundary = list(rights[0])
+                    adjusted_left = list(left)
+                    split = self._generated_automation_split(left, boundary, end)
+                    if split is not None:
+                        adjusted_left[2:6] = list(split[1])
+                        boundary[1] = split[0]
+                    else:
+                        progress = (end - left[0]) / max(epsilon, boundary[0] - left[0])
+                        boundary[1] = left[1] + ((boundary[1] - left[1]) * progress)
+                    boundary[0] = end
+                    boundary[2:6] = [0.5, 0.5, 0.5, 0.5]
+                    for index, step in enumerate(clipped):
+                        if step[6] == adjusted_left[6]:
+                            clipped[index] = adjusted_left
+                            break
+                    clipped.append(boundary)
+            steps = clipped
+
+        return [
+            step[:6] for step in sorted(steps, key=lambda step: (step[0], step[6]))
+        ]
+
+    def _generated_automation_nodes(self, shape, start, end, period, shape_parameter,
+                                    top_padding, bottom_padding, variation,
+                                    is_decoupled):
+        period = max(0.0001, float(period))
+        base = (
+            float(start)
+            if shape == 1
+            else float(start) - (period * float(shape_parameter))
+        )
+        first_cycle = int(math.floor((float(start) - base) / period)) - 2
+        last_cycle = int(math.ceil((float(end) - base) / period)) + 2
+        nodes = []
+        if shape == 10:  # wander
+            smooth = (1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0)
+            for cycle in range(first_cycle, last_cycle + 1):
+                nodes.append([
+                    base + (float(cycle) * period),
+                    self._generated_automation_random_value(cycle, variation),
+                ] + list(smooth))
+        elif shape == 11:  # sample and hold
+            linear = (0.5, 0.5, 0.5, 0.5)
+            previous = self._generated_automation_random_value(first_cycle, variation)
+            self._generated_automation_append_node(
+                nodes,
+                [base + (float(first_cycle) * period), previous] + list(linear)
+            )
+            for cycle in range(first_cycle + 1, last_cycle + 1):
+                time_value = base + (float(cycle) * period)
+                self._generated_automation_append_node(
+                    nodes, [time_value, previous] + list(linear)
+                )
+                previous = self._generated_automation_random_value(cycle, variation)
+                self._generated_automation_append_node(
+                    nodes, [time_value, previous] + list(linear)
+                )
+        else:
+            for cycle in range(first_cycle, last_cycle + 1):
+                self._generated_automation_append_cycle(
+                    shape,
+                    base + (float(cycle) * period),
+                    period,
+                    shape_parameter,
+                    nodes
+                )
+
+        nodes = self._generated_automation_clip_nodes(nodes, start, end)
+        available = max(0.02, 1.0 - top_padding - bottom_padding)
+        for node in nodes:
+            node[1] = bottom_padding + (max(0.0, min(1.0, node[1])) * available)
+
+        if nodes:
+            terminal = max(float(node[0]) for node in nodes)
+            for node in nodes:
+                if abs(float(node[0]) - terminal) <= 0.000001:
+                    node[2:6] = [0.5, 0.5, 0.5, 0.5]
+
+        if is_decoupled and nodes:
+            end_indexes = [
+                index for index, node in enumerate(nodes)
+                if abs(float(node[0]) - float(end)) <= 0.000001
+            ]
+            if end_indexes:
+                last_end = end_indexes[-1]
+                if (len(end_indexes) >= 2
+                        or abs(float(nodes[last_end][1]) - float(nodes[0][1]))
+                            <= 0.000001):
+                    nodes.pop(last_end)
+        return nodes
+
+    def _generated_automation_compact_entry(self, node):
+        fields = ["{:.6f}".format(node[0]), "{:.6f}".format(node[1])]
+        if any(abs(float(value) - 0.5) > 0.000000001 for value in node[2:6]):
+            fields.extend("{:.9f}".format(value) for value in node[2:6])
+        return ":".join(fields)
+
+    def _handle_generated_automation_shape(self, payload):
+        control_index = int(payload[6]) if len(payload) > 6 else 0
+        write_token = str(
+            self._from_3_7bit_magnitude(payload, 3)
+        ) if len(payload) >= 6 else ""
+        try:
+            if len(payload) != 79 or payload[0] != 0x47 or payload[1] != 1:
+                raise ValueError("width_or_version")
+            flags = int(payload[2])
+            if flags & ~0x01:
+                raise ValueError("flags")
+            control_index = int(payload[6])
+            shape = int(payload[7])
+            context_token = "{:08X}".format(
+                self._generated_automation_uint7_le(payload, 8, 5)
+            )
+            base_revision = "{:016X}".format(
+                self._generated_automation_uint7_le(payload, 13, 10)
+            )
+            period = self._generated_automation_double(payload, 23)
+            shape_parameter = self._generated_automation_double(payload, 33)
+            top_padding = self._generated_automation_double(payload, 43)
+            bottom_padding = self._generated_automation_double(payload, 53)
+            variation = self._from_3_7bit_magnitude(payload, 63)
+            expected_count = self._from_3_7bit_magnitude(payload, 66)
+            expected_logical_checksum = self._generated_automation_uint7_le(
+                payload, 69, 5
+            )
+            expected_wire_checksum = self._generated_automation_uint7_le(
+                payload, 74, 5
+            )
+            actual_wire_checksum = self._generated_automation_wire_checksum(
+                payload[:74]
+            )
+            valid = (
+                0 <= control_index <= 7
+                and 0 <= shape <= 11
+                and math.isfinite(period) and period >= 0.0001
+                and math.isfinite(shape_parameter)
+                and (
+                    0.0 <= shape_parameter <= 1.0
+                    if shape == 1
+                    else 0.0 <= shape_parameter < 1.0
+                )
+                and math.isfinite(top_padding) and 0.0 <= top_padding <= 0.98
+                and math.isfinite(bottom_padding) and 0.0 <= bottom_padding <= 0.98
+                and top_padding + bottom_padding <= 0.980000001
+                and 0 < expected_count
+                and expected_count <= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS
+                and expected_wire_checksum == actual_wire_checksum
+            )
+            if not valid:
+                raise ValueError("invalid_header")
+        except Exception as e:
+            self._automation_trace(
+                write_token or "?", "compact_shape_reject",
+                "reason={}".format(str(e))
+            )
+            self._automation_write_error_response(control_index, write_token)
+            return
+
+        self._automation_trace(
+            write_token, "compact_shape_intent",
+            "dial={} shape={} period={:.9f} shape_parameter={:.9f} bytes={} count={} checksum={:08X}".format(
+                control_index, shape, period, shape_parameter, len(payload),
+                expected_count, expected_logical_checksum
+            )
+        )
+        context, _envelope, _baseline, _revision, status = self._resolve_automation_context(
+            context_token, base_revision
+        )
+        if status != "ok":
+            self._automation_trace(
+                write_token, "compact_shape_reject",
+                "reason=context status={}".format(status)
+            )
+            self._automation_write_error_response(
+                control_index, write_token, status=status, context=context
+            )
+            return
+        if int(context.get("control_index", -1)) != control_index:
+            self._automation_write_error_response(
+                control_index, write_token, context=context
+            )
+            return
+
+        decoupled_info = self._decoupled_automation_info(
+            context["clip"], context["device_param"]
+        )
+        is_decoupled = bool(flags & 0x01)
+        parameter_has_custom_cycle = bool(
+            decoupled_info and decoupled_info.get("has_parameter_length", False)
+        )
+        if parameter_has_custom_cycle != is_decoupled:
+            self._automation_write_error_response(
+                control_index, write_token, context=context
+            )
+            return
+        domain_start, domain_end = context["domain"]
+        nodes = self._generated_automation_nodes(
+            shape, domain_start, domain_end, period, shape_parameter,
+            top_padding, bottom_padding, variation, is_decoupled
+        )
+        entries = [
+            self._generated_automation_compact_entry(node) for node in nodes
+        ]
+        logical_payload = ",".join(entries)
+        logical_checksum = self._automation_payload_checksum(logical_payload)
+        if (len(entries) != expected_count
+                or logical_checksum != expected_logical_checksum):
+            self._automation_trace(
+                write_token, "compact_shape_reject",
+                "reason=generator count={}/{} checksum={:08X}/{:08X}".format(
+                    len(entries), expected_count, logical_checksum,
+                    expected_logical_checksum
+                )
+            )
+            self._automation_write_error_response(
+                control_index, write_token, context=context
+            )
+            return
+
+        sample_duration = max(0.0001, float(context["point_duration"]))
+        logical_steps = tuple(
+            (
+                float(node[0]), sample_duration, float(node[1]), 0.0, 0,
+                index + 1, True,
+                float(node[2]), float(node[3]), float(node[4]), float(node[5]),
+            )
+            for index, node in enumerate(nodes)
+        )
+        full_base_fields = [
+            "F", str(control_index), context_token, base_revision,
+            "{:.6f}".format(domain_start), "{:.6f}".format(domain_end),
+            "{:.6f}".format(sample_duration),
+            ",".join(
+                self._automation_step_entry(step) for step in logical_steps
+            ),
+        ]
+        full_checksum = self._automation_payload_checksum(
+            "|".join(full_base_fields)
+        )
+        self._automation_trace(
+            write_token, "compact_shape_valid",
+            "entries={} checksum={:08X} writer=direct_rtl".format(
+                len(entries), logical_checksum
+            )
+        )
+        previous = getattr(self, "_automation_exact_stream", None)
+        if previous is not None:
+            self._fail_exact_automation_full_write(previous)
+        self._finalize_automation_pencil_stroke()
+        self._handle_exact_automation_full_write(
+            full_base_fields + [
+                str(len(logical_steps)),
+                "{:08X}".format(full_checksum),
+                write_token,
+            ],
+            compact_response=True
+        )
+
+    def _handle_exact_automation_stream(self, fields):
+        transaction = fields[1] if len(fields) > 1 else (
+            (getattr(self, "_automation_trace_pending_transfer", None) or {})
+            .get("token", "?")
+        )
+        previous = getattr(self, "_automation_exact_stream", None)
+        if previous is not None:
+            self._fail_exact_automation_full_write(previous)
+        self._finalize_automation_pencil_stroke()
+        if len(fields) != 13:
+            self._automation_trace(
+                transaction,
+                "payload_reject",
+                "reason=field_count actual={} expected=13".format(len(fields))
+            )
+            return
+
+        try:
+            stream_id = str(int(fields[1]))
+            control_index = max(0, min(7, int(fields[2])))
+            context_token = fields[3]
+            base_revision = fields[4]
+            requested_start = float(fields[5])
+            requested_end = float(fields[6])
+            sample_duration = max(0.0001, float(fields[7]))
+            expected_count = int(fields[8])
+            expected_group_count = int(fields[9])
+            expected_curve_group_count = int(fields[10])
+            expected_checksum = int(fields[11], 16)
+            entries = fields[12].split(",") if fields[12] else []
+        except Exception as e:
+            self._automation_trace(
+                transaction, "payload_reject", "reason=parse error={}".format(str(e))
+            )
+            return
+
+        actual_checksum = self._automation_payload_checksum(
+            "|".join(fields[:11] + [fields[12]])
+        )
+        header_reasons = []
+        if expected_checksum != actual_checksum:
+            header_reasons.append("checksum")
+        if not math.isfinite(requested_start) or not math.isfinite(requested_end):
+            header_reasons.append("range_finite")
+        if not math.isfinite(sample_duration):
+            header_reasons.append("sample_finite")
+        if requested_end <= requested_start:
+            header_reasons.append("range_order")
+        if (expected_count <= 0
+                or expected_count > self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS):
+            header_reasons.append("entry_count")
+        if expected_group_count <= 0 or expected_group_count > expected_count:
+            header_reasons.append("group_count")
+        if (expected_curve_group_count < 0
+                or expected_curve_group_count > expected_group_count):
+            header_reasons.append("curve_group_count")
+        if expected_count != len(entries):
+            header_reasons.append("entry_payload_count")
+        if header_reasons:
+            self._automation_trace(
+                stream_id,
+                "payload_reject",
+                "reason={} entries={}/{} checksum={:08X}/{:08X}".format(
+                    ",".join(header_reasons),
+                    len(entries), expected_count,
+                    actual_checksum, expected_checksum
+                )
+            )
+            self._automation_write_error_response(control_index, stream_id)
+            return
+
+        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+        self._automation_trace(
+            stream_id,
+            "payload_valid",
+            "dial={} entries={} groups={} curves={} checksum={:08X} preflight_match={}".format(
+                control_index,
+                expected_count,
+                expected_group_count,
+                expected_curve_group_count,
+                actual_checksum,
+                1 if (
+                    trace.get("token") == stream_id
+                    and trace.get("entry_count") == expected_count
+                    and trace.get("group_count") == expected_group_count
+                    and trace.get("curve_group_count") == expected_curve_group_count
+                    and trace.get("checksum") == expected_checksum
+                ) else 0
+            )
+        )
+
+        context, envelope, _baseline, _revision, status = self._resolve_automation_context(
+            context_token, base_revision
+        )
+        if status != "ok":
+            self._automation_trace(
+                stream_id, "context_reject", "status={}".format(status)
+            )
+            self._automation_write_error_response(
+                control_index, stream_id, status=status, context=context
+            )
+            return
+
+        device_param = context["device_param"]
+        clip = context["clip"]
+        self._automation_trace(
+            stream_id,
+            "target",
+            "parameter={} min={} max={} quantized={} automation_state={} clip={} song_playing={} clip_playing={}".format(
+                getattr(device_param, "name", "?"),
+                getattr(device_param, "min", "?"),
+                getattr(device_param, "max", "?"),
+                1 if getattr(device_param, "is_quantized", False) else 0,
+                getattr(device_param, "automation_state", "?"),
+                getattr(clip, "name", "?"),
+                1 if getattr(self.song(), "is_playing", False) else 0,
+                1 if getattr(clip, "is_playing", False) else 0
+            )
+        )
 
         automation_was_enabled = self._parameter_automation_is_enabled(context["device_param"])
+        created_envelope = False
         if envelope is None and hasattr(context["clip"], "create_automation_envelope"):
             try:
-                envelope = context["clip"].create_automation_envelope(context["device_param"])
+                envelope = context["clip"].create_automation_envelope(
+                    context["device_param"]
+                )
+                created_envelope = envelope is not None
             except Exception:
                 envelope = None
         if not self._automation_envelope_supports_point_events(envelope):
+            self._automation_trace(
+                stream_id,
+                "envelope_reject",
+                "created={} available={}".format(
+                    1 if created_envelope else 0, 1 if envelope is not None else 0
+                )
+            )
             self._automation_write_error_response(
-                context["control_index"], write_token, context=context
+                context["control_index"], stream_id, context=context
             )
             return
-        direct_result = self._apply_direct_exact_automation_delta(
-            context,
-            envelope,
-            baseline,
-            final_steps,
-            operation_entries
-        )
-        applied = (
-            self._apply_exact_automation_delta(
-                context, envelope, final_steps, intervals
+        self._automation_trace(
+            stream_id,
+            "envelope_ready",
+            "created={} prior_automation_enabled={}".format(
+                1 if created_envelope else 0,
+                1 if automation_was_enabled else 0
             )
-            if direct_result is None
-            else direct_result
         )
-        if not applied:
+
+        decoupled_info = self._decoupled_automation_info(
+            context["clip"], context["device_param"]
+        )
+        write_start = max(context["domain"][0], requested_start)
+        write_end = min(context["domain"][1], requested_end)
+        if decoupled_info:
+            write_start = decoupled_info["note_start"]
+            write_end = decoupled_info["physical_end"]
+
+        parse_state = {"sample_duration": sample_duration}
+        logical_steps = tuple(
+            self._automation_step_from_compact_stream_entry(
+                entry, parse_state, index + 1
+            )
+            for index, entry in enumerate(entries)
+        )
+        domain_start, domain_end = context["domain"]
+        epsilon = 0.000001
+        valid_steps = (
+            all(step is not None and bool(step[6]) for step in logical_steps)
+            and all(
+                float(step[0]) >= float(domain_start) - epsilon
+                and float(step[0]) <= float(domain_end) + epsilon
+                for step in logical_steps
+            )
+        )
+        time_groups = []
+        if valid_steps:
+            for step in logical_steps:
+                if (not time_groups
+                        or abs(float(step[0]) - float(time_groups[-1][0][0]))
+                            > epsilon):
+                    if (time_groups
+                            and float(step[0])
+                                <= float(time_groups[-1][0][0]) + epsilon):
+                        valid_steps = False
+                        break
+                    time_groups.append([])
+                time_groups[-1].append(step)
+        time_groups = tuple(tuple(group) for group in time_groups)
+        curved_group_indexes = tuple(
+            index for index, group in enumerate(time_groups)
+            if self._automation_group_has_non_linear_controls(group)
+        )
+        valid_steps = (
+            valid_steps
+            and len(time_groups) == expected_group_count
+            and len(curved_group_indexes) == expected_curve_group_count
+        )
+        if not valid_steps:
+            self._automation_trace(
+                stream_id,
+                "steps_reject",
+                "parsed={} groups={}/{} curves={}/{} domain={:.6f}:{:.6f}".format(
+                    sum(1 for step in logical_steps if step is not None),
+                    len(time_groups), expected_group_count,
+                    len(curved_group_indexes), expected_curve_group_count,
+                    float(domain_start), float(domain_end)
+                )
+            )
             self._automation_write_error_response(
-                context["control_index"], write_token, context=context
+                context["control_index"], stream_id, context=context
             )
             return
 
-        accepted_result = self._accepted_exact_automation_delta_snapshot(
-            context,
-            envelope,
-            final_steps,
-            intervals,
-            sample_duration,
-            include_live_event_records=True
-        )
-        if accepted_result is None:
-            self._automation_write_error_response(
-                context["control_index"], write_token, context=context
-            )
-            return
-        accepted_steps, accepted_event_records = accepted_result
-        accepted_revision = self._automation_snapshot_revision(
-            context["clip"],
-            context["device_param"],
-            context["domain"],
-            accepted_steps
-        )
-        merged_event_records = self._merged_automation_event_records(
-            context.get("live_event_records"),
-            accepted_event_records,
-            intervals
-        )
-        if merged_event_records is None:
-            accepted_live_fingerprint = self._automation_live_event_fingerprint(
-                envelope, context["domain"], sample_duration
-            )
-            cached_read = self._cached_automation_event_read(
-                envelope, context["domain"][0], context["domain"][1], sample_duration
-            )
-            merged_event_records = (
-                cached_read.get("records") if cached_read is not None else None
-            )
-        else:
-            accepted_live_fingerprint = self._automation_event_fingerprint_from_records(
-                merged_event_records
-            )
-        context.update({
+        state = {
+            "stream_id": stream_id,
+            "context": context,
             "envelope": envelope,
-            "snapshot": self._automation_sorted_steps(accepted_steps),
-            "revision": accepted_revision,
-            "point_duration": sample_duration,
-            "live_fingerprint": accepted_live_fingerprint,
-            "live_event_records": merged_event_records,
+            "logical_steps": logical_steps,
+            "write_start": write_start,
+            "write_end": write_end,
+            "sample_duration": sample_duration,
+            "decoupled_info": decoupled_info,
+            "write_token": stream_id,
+            "compact_response": False,
+            "automation_should_re_enable": automation_was_enabled or envelope is not None,
+            "time_groups": time_groups,
+            "curve_group_indexes": tuple(reversed(curved_group_indexes)),
+            "point_group_index": 0,
+            "curve_group_index": 0,
+            "stream_phase": "points",
+            "pending_group": None,
+            "pending_phase": "",
+            "pending_group_index": -1,
+            "pending_settle_polls": 0,
+            "pending_write_attempts": 0,
+            "clear_settle_polls": 0,
+            "clear_write_attempts": 0,
+            "next_group_index": 0,
+            "active_batch": (),
+            "batch_settle_polls": 0,
+            "full_replays": 0,
+            # Live prepends a second event at an occupied timestamp. Author
+            # vertical pairs in reverse so their first settled enumeration is
+            # already the app's authored order instead of requiring a replay.
+            "group_creation_reversed": {
+                float(group[0][0]): True
+                for group in time_groups if len(group) > 1
+            },
+            "cleared": False,
+            "undo_step_attempted": False,
+            "undo_step_started": False,
+            "awaiting_final_audit": False,
+            "allow_full_replay": False,
+            "stream_processing": True,
+            "completed": False,
             "last_activity": time.monotonic(),
-        })
-        self._store_authored_automation_steps(
-            context["clip"],
-            context["device_param"],
-            context["control_index"],
-            accepted_steps
+        }
+        context["envelope"] = envelope
+        self._automation_exact_stream = state
+        self._automation_trace(
+            stream_id,
+            "steps_ready",
+            "write_range={:.6f}:{:.6f} groups={} curves={} first={} last={}".format(
+                float(write_start), float(write_end),
+                len(time_groups), len(curved_group_indexes),
+                self._automation_trace_expected_group(time_groups[0]),
+                self._automation_trace_expected_group(time_groups[-1])
+            )
         )
-        self._send_exact_automation_delta_response(
-            context,
-            envelope,
-            accepted_steps,
-            accepted_revision,
-            intervals,
-            write_token
-        )
-        self._re_enable_after_automation_write(
-            context["device_param"],
-            automation_was_enabled or envelope is not None
-        )
-        self._refresh_parameter_metadata_on_automation_change()
 
-    def _handle_exact_automation_full_write(self, fields):
+        if decoupled_info:
+            normalized_steps = self._normalize_decoupled_logical_automation_steps(
+                decoupled_info, logical_steps
+            )
+            state["logical_steps"] = normalized_steps
+            physical_steps = self._expanded_decoupled_automation_steps(
+                decoupled_info, normalized_steps, sample_duration
+            )
+            state["time_groups"] = tuple(reversed(
+                self._exact_automation_time_groups(
+                    physical_steps, write_start, write_end
+                )
+            ))
+            state["group_creation_reversed"] = {
+                float(group[0][0]): True
+                for group in state["time_groups"] if len(group) > 1
+            }
+            self.schedule_message(
+                self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
+                    if created_envelope else 1,
+                lambda state=state: self._perform_exact_automation_full_write(state)
+            )
+            self._automation_trace(
+                stream_id, "write_scheduled", "mode=decoupled ticks={}".format(
+                    self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
+                        if created_envelope else 1
+                )
+            )
+            return
+
+        self._automation_trace(
+            stream_id, "write_scheduled", "mode=streamed ticks={}".format(
+                self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
+                    if created_envelope else 1
+            )
+        )
+        self.schedule_message(
+            self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
+                if created_envelope else 1,
+            lambda state=state: self._perform_streamed_exact_automation_step(state)
+        )
+
+    def _automation_step_from_compact_stream_entry(self, entry, state, order):
+        components = str(entry or "").split(":")
+        if len(components) not in (2, 6):
+            return None
+        try:
+            time_value = float(components[0])
+            normalized = float(components[1])
+            if not math.isfinite(time_value) or not math.isfinite(normalized):
+                return None
+            normalized = max(0.0, min(1.0, normalized))
+            if len(components) == 6:
+                coefficients = tuple(float(value) for value in components[2:6])
+                if not all(math.isfinite(value) for value in coefficients):
+                    return None
+                x1 = max(0.0, min(1.0, coefficients[0]))
+                y1 = max(0.0, min(1.0, coefficients[1]))
+                x2 = max(x1, min(1.0, coefficients[2]))
+                y2 = max(0.0, min(1.0, coefficients[3]))
+            else:
+                x1 = y1 = x2 = y2 = 0.5
+            return (
+                time_value, state["sample_duration"], normalized, 0.0, 0,
+                int(order), True, x1, y1, x2, y2,
+            )
+        except Exception:
+            return None
+
+    def _automation_group_has_non_linear_controls(self, time_group):
+        return any(
+            any(abs(float(value) - 0.5) > 0.000000001 for value in step[7:11])
+            for step in time_group
+        )
+
+    def _linear_exact_automation_group(self, time_group):
+        return tuple(
+            tuple(list(step[:7]) + [0.5, 0.5, 0.5, 0.5])
+            for step in time_group
+        )
+
+    def _delete_streamed_exact_automation_group(self, state, time_group):
+        group_time = float(time_group[0][0])
+        # Live can store a created free-time point a few sub-microbeats away
+        # from the requested double. Use the same tolerance as event read-back
+        # or a retry misses the old pair and accumulates phantom duplicates.
+        guard = getattr(
+            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        delete_start = max(state["write_start"], group_time - guard)
+        delete_end = max(
+            delete_start + 0.000000001,
+            min(state["write_end"] + guard, group_time + guard)
+        )
+        state["envelope"].delete_events_in_range(delete_start, delete_end)
+
+    def _streamed_exact_automation_range_is_empty(self, state):
+        epsilon = 0.000001
+        try:
+            events = state["envelope"].events_in_range(
+                state["write_start"],
+                max(
+                    state["write_start"] + 0.000000001,
+                    state["write_end"] + 0.0000001
+                )
+            )
+            stored = tuple(
+                event for event in events
+                if float(event.time) >= state["write_start"] - epsilon
+                and float(event.time) <= state["write_end"] + epsilon
+            )
+            state["trace_clear_event_count"] = len(stored)
+            return not stored
+        except Exception as e:
+            state["trace_clear_event_count"] = "unreadable:{}".format(str(e))
+            return None
+
+    def _verify_streamed_exact_automation_clear(self, state):
+        if (not state
+                or state.get("completed", False)
+                or getattr(self, "_automation_exact_stream", None) is not state):
+            return
+        try:
+            self._refresh_exact_automation_write_envelope(state, allow_create=False)
+            clear_status = self._streamed_exact_automation_range_is_empty(state)
+            state["last_activity"] = time.monotonic()
+            self._automation_trace(
+                state["stream_id"],
+                "clear_read",
+                "status={} events={} attempt={} settle_poll={}".format(
+                    "empty" if clear_status is True else (
+                        "not_empty" if clear_status is False else "unreadable"
+                    ),
+                    state.get("trace_clear_event_count", "?"),
+                    state["clear_write_attempts"],
+                    state["clear_settle_polls"]
+                )
+            )
+            if clear_status is True:
+                state["clear_settle_polls"] = 0
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._perform_streamed_exact_automation_step(state)
+                )
+                return
+            if (state["clear_settle_polls"]
+                    < self.AUTOMATION_EXACT_STREAM_MAX_SETTLE_POLLS):
+                state["clear_settle_polls"] += 1
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._verify_streamed_exact_automation_clear(state)
+                )
+                return
+            if (state["clear_write_attempts"]
+                    >= self.AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS):
+                raise RuntimeError("automation range did not clear")
+            state["envelope"].delete_events_in_range(
+                state["write_start"],
+                max(state["write_start"] + 0.0000001, state["write_end"])
+                    + 0.0000001
+            )
+            state["clear_write_attempts"] += 1
+            state["clear_settle_polls"] = 0
+            self._automation_trace(
+                state["stream_id"],
+                "clear_retry",
+                "attempt={}".format(state["clear_write_attempts"])
+            )
+            self.schedule_message(
+                1,
+                lambda state=state:
+                    self._verify_streamed_exact_automation_clear(state)
+            )
+        except Exception as e:
+            self._debug_log(
+                "Error verifying cleared automation range: {}".format(str(e))
+            )
+            self._automation_trace(
+                state.get("stream_id", "?"),
+                "clear_exception",
+                "error={}".format(str(e))
+            )
+            self._fail_exact_automation_full_write(state)
+
+    def _perform_streamed_exact_automation_step(self, state):
+        if (not state
+                or state.get("completed", False)
+                or getattr(self, "_automation_exact_stream", None) is not state):
+            return
+        context = state["context"]
+        if (not liveobj_valid(context.get("clip"))
+                or not liveobj_valid(context.get("device_param"))):
+            self._fail_exact_automation_full_write(state)
+            return
+        if state.get("pending_group") is not None:
+            self._fail_exact_automation_full_write(state)
+            return
+
+        try:
+            self._refresh_exact_automation_write_envelope(state, allow_create=False)
+            envelope = state["envelope"]
+            if not self._automation_envelope_supports_point_events(envelope):
+                raise RuntimeError("automation envelope unavailable")
+
+            if not state["cleared"]:
+                state["undo_step_attempted"] = True
+                state["undo_step_started"] = self._begin_undo_step()
+                minimum_span = 0.0000001
+                self._automation_trace(
+                    state["stream_id"],
+                    "clear_write",
+                    "attempt=1 range={:.6f}:{:.6f}".format(
+                        float(state["write_start"]), float(state["write_end"])
+                    )
+                )
+                envelope.delete_events_in_range(
+                    state["write_start"],
+                    max(state["write_start"] + minimum_span, state["write_end"])
+                        + minimum_span
+                )
+                state["cleared"] = True
+                state["clear_write_attempts"] = 1
+                state["clear_settle_polls"] = 0
+                state["last_activity"] = time.monotonic()
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._verify_streamed_exact_automation_clear(state)
+                )
+                return
+
+            if state["stream_phase"] == "points":
+                index = state["point_group_index"]
+                if index < len(state["time_groups"]):
+                    linear_group = self._linear_exact_automation_group(
+                        state["time_groups"][index]
+                    )
+                    self._automation_trace(
+                        state["stream_id"],
+                        "point_write",
+                        "index={}/{} attempt=1 reverse={} expected={}".format(
+                            index + 1,
+                            len(state["time_groups"]),
+                            1 if state["group_creation_reversed"].get(
+                                float(linear_group[0][0]), False
+                            ) else 0,
+                            self._automation_trace_expected_group(linear_group)
+                        )
+                    )
+                    self._create_exact_automation_group(
+                        state,
+                        linear_group
+                    )
+                    state["pending_group"] = linear_group
+                    state["pending_phase"] = "points"
+                    state["pending_group_index"] = index
+                    state["pending_settle_polls"] = 0
+                    state["pending_write_attempts"] = 1
+                    state["last_activity"] = time.monotonic()
+                    self.schedule_message(
+                        1,
+                        lambda state=state:
+                            self._verify_streamed_exact_automation_step(state)
+                    )
+                    return
+                state["stream_phase"] = "curves"
+
+            curve_index = state["curve_group_index"]
+            if curve_index < len(state["curve_group_indexes"]):
+                point_group_index = state["curve_group_indexes"][curve_index]
+                time_group = state["time_groups"][point_group_index]
+                self._automation_trace(
+                    state["stream_id"],
+                    "curve_write",
+                    "index={}/{} point_group={} attempt=1 reverse={} expected={}".format(
+                        curve_index + 1,
+                        len(state["curve_group_indexes"]),
+                        point_group_index + 1,
+                        1 if state["group_creation_reversed"].get(
+                            float(time_group[0][0]), False
+                        ) else 0,
+                        self._automation_trace_expected_group(time_group)
+                    )
+                )
+                self._delete_streamed_exact_automation_group(state, time_group)
+                self._create_exact_automation_group(state, time_group)
+                state["pending_group"] = time_group
+                state["pending_phase"] = "curves"
+                state["pending_group_index"] = curve_index
+                state["pending_settle_polls"] = 0
+                state["pending_write_attempts"] = 1
+                state["last_activity"] = time.monotonic()
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._verify_streamed_exact_automation_step(state)
+                )
+                return
+
+            if (state.get("automation_should_re_enable", False)
+                    and not self._parameter_automation_is_enabled(
+                        context["device_param"]
+                    )):
+                self._re_enable_parameter_automation(
+                    context["device_param"]
+                )
+            self._close_exact_automation_write_attempt(state)
+            state["stream_processing"] = False
+            state["awaiting_final_audit"] = True
+            state["last_activity"] = time.monotonic()
+            self._automation_trace(
+                state["stream_id"], "write_passes_complete", "final_audit_ticks={}".format(
+                    self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS
+                )
+            )
+            self.schedule_message(
+                self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
+                lambda state=state: self._verify_exact_automation_full_write(state)
+            )
+        except Exception as e:
+            self._debug_log(
+                "Error applying scheduled exact automation step: {}".format(str(e))
+            )
+            self._automation_trace(
+                state.get("stream_id", "?"),
+                "write_exception",
+                "phase={} error={}".format(
+                    state.get("stream_phase", "?"), str(e)
+                )
+            )
+            self._fail_exact_automation_full_write(state)
+
+    def _verify_streamed_exact_automation_step(self, state):
+        if (not state
+                or state.get("completed", False)
+                or getattr(self, "_automation_exact_stream", None) is not state):
+            return
+        pending_group = state.get("pending_group")
+        if pending_group is None:
+            self._fail_exact_automation_full_write(state)
+            return
+        try:
+            self._refresh_exact_automation_write_envelope(state, allow_create=False)
+            status = self._exact_automation_group_status(
+                state["envelope"],
+                pending_group,
+                state["write_start"],
+                state["write_end"],
+                state["context"]["device_param"]
+            )
+            state["last_activity"] = time.monotonic()
+            pending_phase = state.get("pending_phase", "unknown")
+            pending_index = int(state.get("pending_group_index", -1))
+            phase_label = "point" if pending_phase == "points" else (
+                "curve" if pending_phase == "curves" else "unknown"
+            )
+            self._automation_trace(
+                state["stream_id"],
+                "{}_read".format(phase_label),
+                "index={} status={} attempt={} settle_poll={} actual={}".format(
+                    pending_index + 1,
+                    status,
+                    state.get("pending_write_attempts", 0),
+                    state.get("pending_settle_polls", 0),
+                    self._automation_trace_stored_group(state, pending_group)
+                )
+            )
+            if status == "ok":
+                if pending_phase == "points":
+                    state["point_group_index"] = pending_index + 1
+                    if state["point_group_index"] >= len(state["time_groups"]):
+                        state["stream_phase"] = "curves"
+                elif pending_phase == "curves":
+                    state["curve_group_index"] = pending_index + 1
+                else:
+                    raise RuntimeError("invalid pending automation phase")
+                state["pending_group"] = None
+                state["pending_phase"] = ""
+                state["pending_group_index"] = -1
+                state["pending_settle_polls"] = 0
+                state["pending_write_attempts"] = 0
+                # Keep an empty Live tick between the successful read-back and
+                # the following mutation. Device parameters settle less
+                # reliably than rack macros when transport is stopped.
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._perform_streamed_exact_automation_step(state)
+                )
+                return
+
+            if (state["pending_settle_polls"]
+                    < self.AUTOMATION_EXACT_STREAM_MAX_SETTLE_POLLS):
+                state["pending_settle_polls"] += 1
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._verify_streamed_exact_automation_step(state)
+                )
+                return
+            if (state["pending_write_attempts"]
+                    >= self.AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS):
+                raise RuntimeError(
+                    "automation group did not settle ({})".format(status)
+                )
+
+            group_time = float(pending_group[0][0])
+            if status == "order" and len(pending_group) > 1:
+                state["group_creation_reversed"][group_time] = not state[
+                    "group_creation_reversed"
+                ].get(group_time, False)
+            next_attempt = state["pending_write_attempts"] + 1
+            self._automation_trace(
+                state["stream_id"],
+                "{}_retry".format(phase_label),
+                "index={} reason={} attempt={} reverse={}".format(
+                    pending_index + 1,
+                    status,
+                    next_attempt,
+                    1 if state["group_creation_reversed"].get(
+                        group_time, False
+                    ) else 0
+                )
+            )
+            self._delete_streamed_exact_automation_group(state, pending_group)
+            self._create_exact_automation_group(state, pending_group)
+            state["pending_write_attempts"] = next_attempt
+            state["pending_settle_polls"] = 0
+            self.schedule_message(
+                1,
+                lambda state=state:
+                    self._verify_streamed_exact_automation_step(state)
+            )
+        except Exception as e:
+            self._debug_log(
+                "Error verifying scheduled exact automation step: {}".format(str(e))
+            )
+            self._automation_trace(
+                state.get("stream_id", "?"),
+                "read_exception",
+                "phase={} index={} error={}".format(
+                    state.get("pending_phase", "?"),
+                    int(state.get("pending_group_index", -1)) + 1,
+                    str(e)
+                )
+            )
+            self._fail_exact_automation_full_write(state)
+
+    def _handle_repeating_exact_automation_full_write(self, fields):
+        # V43 `R` field order and suffix semantics mirror
+        # `repeatingFullPayload` in TapProtocol.swift.
+        if len(fields) != 18:
+            return
+        try:
+            control_index = max(0, min(7, int(fields[1])))
+            context_token = fields[2]
+            base_revision = fields[3]
+            requested_start = float(fields[4])
+            requested_end = float(fields[5])
+            sample_duration = max(0.0001, float(fields[6]))
+            origin = float(fields[7])
+            period = float(fields[8])
+            start_entries = fields[9].split(",") if fields[9] else []
+            cycle_entries = fields[10].split(",") if fields[10] else []
+            end_entries = fields[11].split(",") if fields[11] else []
+            expected_start_count = int(fields[12])
+            expected_cycle_count = int(fields[13])
+            expected_end_count = int(fields[14])
+            expected_expanded_count = int(fields[15])
+            expected_checksum = int(fields[16], 16)
+            write_token = fields[17]
+            actual_checksum = self._automation_payload_checksum("|".join(fields[:12]))
+        except Exception:
+            return
+
+        valid_header = (
+            math.isfinite(requested_start)
+            and math.isfinite(requested_end)
+            and math.isfinite(sample_duration)
+            and math.isfinite(origin)
+            and math.isfinite(period)
+            and requested_end > requested_start
+            and period >= 0.0001
+            and expected_start_count == len(start_entries)
+            and expected_cycle_count == len(cycle_entries)
+            and expected_end_count == len(end_entries)
+            and expected_expanded_count >= 0
+            and expected_expanded_count <= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS
+            and expected_start_count + expected_cycle_count + expected_end_count
+                <= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS
+            and expected_checksum == actual_checksum
+            and bool(cycle_entries)
+        )
+        if not valid_header:
+            self._automation_write_error_response(control_index, write_token)
+            return
+
+        start_steps = [
+            self._automation_step_from_entry(entry, fallback_order=index + 1)
+            for index, entry in enumerate(start_entries)
+        ]
+        cycle_steps = [
+            self._automation_step_from_entry(entry, fallback_order=index + 1)
+            for index, entry in enumerate(cycle_entries)
+        ]
+        end_steps = [
+            self._automation_step_from_entry(entry, fallback_order=index + 1)
+            for index, entry in enumerate(end_entries)
+        ]
+        all_steps = start_steps + cycle_steps + end_steps
+        epsilon = 0.000001
+        valid_steps = (
+            all(step is not None for step in all_steps)
+            and all(bool(step[6]) for step in all_steps)
+            and all(abs(float(step[0]) - requested_start) <= epsilon for step in start_steps)
+            and all(
+                float(step[0]) >= -epsilon and float(step[0]) < period - epsilon
+                for step in cycle_steps
+            )
+            and bool(end_steps)
+            and all(
+                float(step[0]) >= requested_start - epsilon
+                and float(step[0]) <= requested_end + epsilon
+                for step in end_steps
+            )
+            and any(
+                abs(float(step[0]) - requested_end) <= epsilon
+                for step in end_steps
+            )
+        )
+        if not valid_steps:
+            self._automation_write_error_response(control_index, write_token)
+            return
+
+        end_replacement_start = min(float(step[0]) for step in end_steps)
+        first_cycle = int(math.floor((requested_start - origin) / period)) - 1
+        last_cycle = int(math.ceil((requested_end - origin) / period)) + 1
+        if last_cycle < first_cycle or last_cycle - first_cycle > 1000000:
+            self._automation_write_error_response(control_index, write_token)
+            return
+
+        expanded_steps = list(start_steps)
+        for cycle_index in range(first_cycle, last_cycle + 1):
+            cycle_start = origin + (float(cycle_index) * period)
+            for relative_step in cycle_steps:
+                time_value = cycle_start + float(relative_step[0])
+                if (time_value <= requested_start + epsilon
+                        or time_value >= end_replacement_start - epsilon):
+                    continue
+                if len(expanded_steps) >= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS:
+                    self._automation_write_error_response(control_index, write_token)
+                    return
+                expanded_steps.append(tuple(
+                    [time_value]
+                    + list(relative_step[1:4])
+                    + [0, int(relative_step[5])]
+                    + list(relative_step[6:])
+                ))
+        if (len(expanded_steps) + len(end_steps)
+                > self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS):
+            self._automation_write_error_response(control_index, write_token)
+            return
+        expanded_steps.extend(end_steps)
+        expanded_steps = self._automation_sorted_steps(expanded_steps)
+        expanded_steps = tuple(
+            tuple(list(step[:4]) + [0, index + 1] + list(step[6:]))
+            for index, step in enumerate(expanded_steps)
+        )
+        if len(expanded_steps) != expected_expanded_count:
+            self._automation_write_error_response(control_index, write_token)
+            return
+
+        full_base_fields = [
+            "F",
+            str(control_index),
+            context_token,
+            base_revision,
+            "{:.6f}".format(requested_start),
+            "{:.6f}".format(requested_end),
+            "{:.6f}".format(sample_duration),
+            ",".join(self._automation_step_entry(step) for step in expanded_steps),
+        ]
+        full_checksum = self._automation_payload_checksum("|".join(full_base_fields))
+        self._handle_exact_automation_full_write(
+            full_base_fields + [
+                str(len(expanded_steps)),
+                "{:08X}".format(full_checksum),
+                write_token,
+            ],
+            compact_response=True
+        )
+
+    def _handle_exact_automation_full_write(self, fields, compact_response=False):
         if len(fields) != 11:
             return
         try:
@@ -21137,6 +23019,10 @@ class Tap(ControlSurface):
                 return
         except Exception:
             return
+
+        previous = getattr(self, "_automation_exact_stream", None)
+        if previous is not None:
+            self._fail_exact_automation_full_write(previous)
 
         context, envelope, _baseline, _revision, status = self._resolve_automation_context(
             context_token,
@@ -21182,33 +23068,449 @@ class Tap(ControlSurface):
             write_end = decoupled_info["physical_end"]
 
         automation_was_enabled = self._parameter_automation_is_enabled(context["device_param"])
+        created_envelope = False
+        undo_step_attempted = False
+        undo_step_started = False
         if envelope is None and hasattr(context["clip"], "create_automation_envelope"):
+            # Creating the envelope is itself an undoable Live mutation. Open
+            # the transaction before it so a generated shape on a previously
+            # untouched parameter is still exactly one Undo/Redo item.
+            undo_step_attempted = True
+            undo_step_started = self._begin_undo_step()
             try:
                 envelope = context["clip"].create_automation_envelope(context["device_param"])
+                created_envelope = envelope is not None
             except Exception:
                 envelope = None
         if not self._automation_envelope_supports_point_events(envelope):
+            if undo_step_started:
+                self._end_undo_step(True)
             self._automation_write_error_response(
                 context["control_index"], write_token, context=context
             )
             return
 
-        undo_step_started = self._begin_undo_step()
+        physical_time_groups = tuple(reversed(self._exact_automation_time_groups(
+            physical_steps, write_start, write_end
+        )))
+        state = {
+            "context": context,
+            "envelope": envelope,
+            "logical_steps": logical_steps,
+            "write_start": write_start,
+            "write_end": write_end,
+            "sample_duration": sample_duration,
+            "decoupled_info": decoupled_info,
+            "write_token": write_token,
+            "compact_response": compact_response,
+            "automation_should_re_enable": automation_was_enabled or envelope is not None,
+            "time_groups": physical_time_groups,
+            "next_group_index": 0,
+            "active_batch": (),
+            "batch_settle_polls": 0,
+            "batch_write_attempts": 0,
+            "full_replays": 0,
+            # Live 12 may prepend one equal-time creation and append another
+            # even in the same envelope, especially at free-time/phase-shifted
+            # positions. Each vertical therefore owns its settled direction.
+            "group_creation_reversed": {},
+            "cleared": False,
+            "undo_step_attempted": undo_step_attempted,
+            "undo_step_started": undo_step_started,
+            "awaiting_final_audit": False,
+            # Each batch is read back before the writer advances. A committed
+            # whole-envelope replay would create another Undo item, so fail
+            # closed instead of mutating again after the transaction closes.
+            "allow_full_replay": False,
+            "completed": False,
+        }
+        self._automation_exact_stream = state
+        # Pencil edits reach Live as small writes on separate MIDI callbacks.
+        # Do the same locally for a generated shape: no extra wire traffic, but
+        # no thousands-of-events burst in one Live callback either.
+        self.schedule_message(
+            self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS if created_envelope else 1,
+            lambda state=state: self._perform_exact_automation_full_write(state)
+        )
+
+    def _exact_automation_time_groups(self, steps, start, end):
+        groups = []
+        for step in self._automation_sorted_steps(steps):
+            if step[0] < start - 0.000001 or step[0] > end + 0.000001:
+                continue
+            if (not groups
+                    or abs(float(step[0]) - float(groups[-1][0][0])) > 0.000001):
+                groups.append([])
+            groups[-1].append(step)
+        return tuple(tuple(group) for group in groups)
+
+    def _refresh_exact_automation_write_envelope(self, state, allow_create=False):
+        context = state["context"]
+        clip = context.get("clip")
+        device_param = context.get("device_param")
+        candidate = None
+        if clip is not None and hasattr(clip, "automation_envelope"):
+            try:
+                candidate = clip.automation_envelope(device_param)
+            except Exception:
+                candidate = None
+        if (not self._automation_envelope_supports_point_events(candidate)
+                and allow_create
+                and clip is not None
+                and hasattr(clip, "create_automation_envelope")):
+            try:
+                candidate = clip.create_automation_envelope(device_param)
+            except Exception:
+                candidate = None
+        if self._automation_envelope_supports_point_events(candidate):
+            state["envelope"] = candidate
+            context["envelope"] = candidate
+        return state.get("envelope")
+
+    def _create_exact_automation_group(self, state, time_group):
+        group_time = float(time_group[0][0])
+        directions = state["group_creation_reversed"]
+        if group_time not in directions:
+            directions[group_time] = len(time_group) > 1
+        reverse_creation = directions[group_time]
+        creation_steps = reversed(time_group) if reverse_creation else time_group
+        for step in creation_steps:
+            raw_value = self._parameter_target_value_from_normalized(
+                state["context"]["device_param"], step[2]
+            )
+            self._create_automation_event(
+                state["envelope"], step[0], raw_value, step
+            )
+
+    def _exact_automation_group_status(
+            self, envelope, time_group, write_start=None, write_end=None,
+            device_param=None, verify_values=True):
+        group_time = float(time_group[0][0])
+        guard = getattr(
+            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        query_start = (
+            max(float(write_start), group_time - guard)
+            if write_start is not None
+            else group_time - guard
+        )
+        query_end = (
+            min(float(write_end) + guard, group_time + guard)
+            if write_end is not None
+            else group_time + guard
+        )
         try:
-            write_succeeded = self._write_exact_automation_events_to_envelope(
+            stored_group = tuple(
+                event for event in envelope.events_in_range(
+                    query_start, max(query_start + 0.000000001, query_end)
+                )
+                if abs(float(event.time) - group_time) <= guard
+            )
+            if len(stored_group) != len(time_group):
+                return "count"
+            if len(time_group) > 1:
+                authored_direction = (
+                    float(time_group[-1][2]) - float(time_group[0][2])
+                )
+                stored_direction = (
+                    float(stored_group[-1].value)
+                    - float(stored_group[0].value)
+                )
+                if authored_direction * stored_direction < 0:
+                    return "order"
+            tolerance = 0.000002
+            raw_span = max(
+                1.0,
+                abs(
+                    float(getattr(device_param, "max", 1.0))
+                    - float(getattr(device_param, "min", 0.0))
+                )
+            )
+            value_tolerance = raw_span * tolerance
+            stored_values = None
+            if verify_values:
+                value_reader = getattr(
+                    self, "_parameter_domain_values_from_envelope_events", None
+                )
+                stored_values = (
+                    value_reader(
+                        envelope,
+                        stored_group,
+                        device_param,
+                        query_start,
+                        query_end,
+                        max(0.0001, query_end - query_start)
+                    )
+                    if value_reader is not None
+                    else tuple(float(event.value) for event in stored_group)
+                )
+            for index, (event, step) in enumerate(zip(stored_group, time_group)):
+                if verify_values and device_param is not None:
+                    expected_raw = self._parameter_target_value_from_normalized(
+                        device_param, step[2]
+                    )
+                    if (abs(float(stored_values[index]) - float(expected_raw))
+                            > value_tolerance):
+                        return "value"
+                controls = event.control_coefficients
+                if any(
+                        abs(float(actual) - float(expected)) > tolerance
+                        for actual, expected in zip(
+                            (controls.x1, controls.y1, controls.x2, controls.y2),
+                            step[7:11]
+                        )):
+                    return "coefficients"
+            return "ok"
+        except Exception:
+            return "unreadable"
+
+    def _perform_exact_automation_full_write(self, state):
+        if not state or state.get("completed"):
+            return
+        context = state["context"]
+        envelope_refresher = getattr(
+            self, "_refresh_exact_automation_write_envelope", None
+        )
+        envelope = (
+            envelope_refresher(state, allow_create=True)
+            if envelope_refresher is not None
+            else state["envelope"]
+        )
+        if (not liveobj_valid(context.get("clip"))
+                or not liveobj_valid(context.get("device_param"))):
+            self._fail_exact_automation_full_write(state)
+            return
+        if not self._automation_envelope_supports_point_events(envelope):
+            self._retry_exact_automation_full_write(state, {
+                "exact": False,
+                "structural": True,
+                "mismatch_groups": (),
+                "reversed_times": (),
+                "reason": "envelope",
+            })
+            return
+
+        try:
+            if not state["cleared"]:
+                if not state.get("undo_step_attempted", False):
+                    state["undo_step_attempted"] = True
+                    state["undo_step_started"] = self._begin_undo_step()
+                minimum_span = 0.0000001
+                envelope.delete_events_in_range(
+                    state["write_start"],
+                    max(state["write_start"] + minimum_span, state["write_end"])
+                    + minimum_span
+                )
+                state["cleared"] = True
+
+            groups = state["time_groups"]
+            index = state["next_group_index"]
+            if index >= len(groups):
+                if state.get("awaiting_final_audit", False):
+                    return
+                # Live can finalize an envelope or reset a point's outgoing
+                # coefficients only when the undo transaction closes. Audit
+                # that committed state on a later callback, never the transient
+                # in-transaction representation.
+                if (state.get("automation_should_re_enable", False)
+                        and not self._parameter_automation_is_enabled(
+                            context["device_param"]
+                        )):
+                    self._re_enable_parameter_automation(
+                        context["device_param"]
+                    )
+                self._close_exact_automation_write_attempt(state)
+                state["awaiting_final_audit"] = True
+                self.schedule_message(
+                    self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
+                    lambda state=state: self._verify_exact_automation_full_write(state)
+                )
+                return
+
+            batch = []
+            event_count = 0
+            while index < len(groups):
+                time_group = groups[index]
+                # A same-time pair is one semantic vertical edge. Give Live a
+                # callback containing only that edge, especially after a
+                # phase-generated endpoint; mixing both in one callback was
+                # observed to drop the pair while retaining the endpoint.
+                if batch and len(time_group) > 1:
+                    break
+                if (batch
+                        and event_count + len(time_group)
+                            > self.AUTOMATION_EXACT_EVENT_BATCH_SIZE):
+                    break
+                batch.append(time_group)
+                event_count += len(time_group)
+                index += 1
+                if len(time_group) > 1:
+                    break
+            for time_group in batch:
+                self._create_exact_automation_group(state, time_group)
+            state["next_group_index"] = index
+            state["active_batch"] = tuple(batch)
+            state["batch_settle_polls"] = 0
+            state["batch_write_attempts"] = 1
+            self.schedule_message(
+                1, lambda state=state: self._verify_exact_automation_full_batch(state)
+            )
+        except Exception as e:
+            self._debug_log(
+                "Error writing exact automation event batch: {}".format(str(e))
+            )
+            self._retry_exact_automation_full_write(state, {
+                "exact": False,
+                "structural": True,
+                "mismatch_groups": (),
+                "reversed_times": (),
+                "reason": "write",
+            })
+
+    def _verify_exact_automation_full_batch(self, state):
+        if not state or state.get("completed"):
+            return
+        envelope = state["envelope"]
+        mismatches = [
+            (time_group, self._exact_automation_group_status(
                 envelope,
-                context["device_param"],
-                write_start,
-                write_end,
-                physical_steps,
-                allow_empty=True
+                time_group,
+                state["write_start"],
+                state["write_end"],
+                state["context"]["device_param"],
+                False
+            ))
+            for time_group in state["active_batch"]
+        ]
+        mismatches = [item for item in mismatches if item[1] != "ok"]
+        if mismatches:
+            has_order_mismatch = any(
+                status == "order" for _group, status in mismatches
             )
-        finally:
-            self._end_undo_step(undo_step_started)
-        if not write_succeeded:
-            self._automation_write_error_response(
-                context["control_index"], write_token, context=context
+            if (has_order_mismatch
+                    or state["batch_settle_polls"]
+                        >= self.AUTOMATION_EXACT_EVENT_BATCH_MAX_SETTLE_POLLS):
+                attempts = int(state.get("batch_write_attempts", 1))
+                tracer = getattr(self, "_automation_trace", None)
+                expected_tracer = getattr(
+                    self, "_automation_trace_expected_group", None
+                )
+                stored_tracer = getattr(
+                    self, "_automation_trace_stored_group", None
+                )
+                if attempts >= self.AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS:
+                    self._debug_log(
+                        "Exact automation batch did not settle: {}".format(
+                            ",".join(status for _group, status in mismatches)
+                        )
+                    )
+                    if (tracer is not None
+                            and expected_tracer is not None
+                            and stored_tracer is not None):
+                        tracer(
+                            state.get("stream_id", state.get("write_token", "?")),
+                            "batch_reject",
+                            "next_group={} attempts={} statuses={} expected={} actual={}".format(
+                                state.get("next_group_index", 0),
+                                attempts,
+                                ",".join(status for _group, status in mismatches),
+                                ";".join(
+                                    expected_tracer(group)
+                                    for group, _status in mismatches[:4]
+                                ),
+                                ";".join(
+                                    stored_tracer(state, group)
+                                    for group, _status in mismatches[:4]
+                                )
+                            )
+                        )
+                    self._fail_exact_automation_full_write(state)
+                    return
+
+                order_mismatches = tuple(
+                    group for group, status in mismatches if status == "order"
+                )
+                for group in order_mismatches:
+                    group_time = float(group[0][0])
+                    state["group_creation_reversed"][group_time] = not state[
+                        "group_creation_reversed"
+                    ].get(group_time, True)
+
+                # This batch was authored right-to-left and no earlier batch
+                # can own a curve into it yet. Recreate the complete active
+                # batch locally, still inside the original undo transaction.
+                # Rewriting the complete batch also restores any predecessor
+                # coefficient reset by deleting a later endpoint.
+                for time_group in state["active_batch"]:
+                    self._delete_streamed_exact_automation_group(
+                        state, time_group
+                    )
+                for time_group in state["active_batch"]:
+                    self._create_exact_automation_group(state, time_group)
+                state["batch_write_attempts"] = attempts + 1
+                state["batch_settle_polls"] = 0
+                if tracer is not None:
+                    tracer(
+                        state.get("stream_id", state.get("write_token", "?")),
+                        "batch_retry",
+                        "next_group={} attempt={} statuses={} reversed_times={}".format(
+                            state.get("next_group_index", 0),
+                            state["batch_write_attempts"],
+                            ",".join(status for _group, status in mismatches),
+                            ",".join(
+                                "{:.6f}:{}".format(
+                                    float(group[0][0]),
+                                    1 if state["group_creation_reversed"].get(
+                                        float(group[0][0]), False
+                                    ) else 0
+                                )
+                                for group in order_mismatches
+                            ) or "none"
+                        )
+                    )
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._verify_exact_automation_full_batch(state)
+                )
+                return
+            state["batch_settle_polls"] += 1
+            # Count/coefficients can settle on the next callback. Equal-time
+            # order cannot, and is handled immediately above.
+            self.schedule_message(
+                1,
+                lambda state=state: self._verify_exact_automation_full_batch(state)
             )
+            return
+
+        state["active_batch"] = ()
+        state["batch_write_attempts"] = 0
+        # The verification callback itself is the next settled Live tick, so
+        # it can safely enqueue the following batch without adding an empty
+        # tick between every pair of batches.
+        self._perform_exact_automation_full_write(state)
+
+    def _verify_exact_automation_full_write(self, state):
+        if not state or state.get("completed"):
+            return
+        state["awaiting_final_audit"] = False
+        context = state["context"]
+        envelope = state["envelope"]
+        sample_duration = state["sample_duration"]
+        final_status = self._exact_automation_final_event_status(state)
+        self._automation_trace(
+            state.get("stream_id", state.get("write_token", "?")),
+            "final_audit",
+            "exact={} structural={} reason={} mismatch_count={} reversed_count={}".format(
+                1 if final_status.get("exact", False) else 0,
+                1 if final_status.get("structural", False) else 0,
+                final_status.get("reason", "?"),
+                len(final_status.get("mismatch_groups", ())),
+                len(final_status.get("reversed_times", ()))
+            )
+        )
+        if not final_status["exact"]:
+            self._retry_exact_automation_full_write(state, final_status)
             return
 
         accepted_steps = self._automation_steps_from_envelope_events(
@@ -21219,15 +23521,25 @@ class Tap(ControlSurface):
             sample_duration
         )
         if accepted_steps is None:
-            self._automation_write_error_response(
-                context["control_index"], write_token, context=context
+            self._automation_trace(
+                state.get("stream_id", state.get("write_token", "?")),
+                "final_read_reject",
+                "reason=events_unreadable"
             )
+            self._retry_exact_automation_full_write(state, {
+                "exact": False,
+                "structural": True,
+                "mismatch_groups": (),
+                "reversed_times": (),
+                "reason": "read",
+            })
             return
-        if decoupled_info:
+        if state["decoupled_info"]:
             accepted_steps = self._automation_sorted_steps(
                 step for step in accepted_steps
                 if step[0] < context["domain"][1] - 0.000001
             )
+
         accepted_revision = self._automation_snapshot_revision(
             context["clip"], context["device_param"], context["domain"], accepted_steps
         )
@@ -21270,36 +23582,103 @@ class Tap(ControlSurface):
             self._clear_authored_automation_steps(
                 context["clip"], context["device_param"], context["control_index"]
             )
+        # The full physical event audit above verified every time, raw value,
+        # equal-time direction, and outgoing coefficient. It is more exact than
+        # comparing normalized samples around a steep/vertical corner.
+        compact_response = state["compact_response"]
         response = "{}|{}|{:.6f}|{}|{}|{}".format(
             context["control_index"],
             1 if accepted_steps else 0,
             self._parameter_normalized_value(context["device_param"]),
-            ",".join(self._automation_step_entry(step) for step in accepted_steps),
+            "" if compact_response else ",".join(
+                self._automation_step_entry(step) for step in accepted_steps
+            ),
             "",
             "|".join(self._automation_response_fields(
                 context["clip"], context["device_param"], envelope,
-                write_token, "full", context, accepted_revision, context["domain"]
+                state["write_token"],
+                "pattern" if compact_response else "full",
+                context,
+                accepted_revision,
+                context["domain"]
             ))
         )
+        self._automation_trace(
+            state.get("stream_id", state.get("write_token", "?")),
+            "complete",
+            "accepted_steps={} revision={}".format(
+                len(accepted_steps), accepted_revision
+            )
+        )
+        self._complete_exact_automation_full_write(state)
         self._send_sys_ex_message(response, 0x31)
         self._re_enable_after_automation_write(
-            context["device_param"], automation_was_enabled or envelope is not None
+            context["device_param"], state["automation_should_re_enable"]
         )
         self._refresh_parameter_metadata_on_automation_change()
 
+    def _complete_exact_automation_full_write(self, state):
+        if not state or state.get("completed"):
+            return
+        state["completed"] = True
+        if getattr(self, "_automation_exact_stream", None) is state:
+            self._automation_exact_stream = None
+        self._close_exact_automation_write_attempt(state)
+
+    def _fail_exact_automation_full_write(self, state):
+        if not state or state.get("completed"):
+            return
+        context = state["context"]
+        self._automation_trace(
+            state.get("stream_id", state.get("write_token", "?")),
+            "failed",
+            "phase={} groups={}/{} curves={}/{} pending_phase={} pending_index={} clear_attempts={}".format(
+                state.get("stream_phase", "?"),
+                state.get("next_group_index", state.get("point_group_index", 0)),
+                len(state.get("time_groups", ())),
+                state.get("curve_group_index", 0),
+                len(state.get("curve_group_indexes", ())),
+                state.get("pending_phase", "none") or "none",
+                int(state.get("pending_group_index", -1)) + 1,
+                state.get("clear_write_attempts", 0)
+            )
+        )
+        self._complete_exact_automation_full_write(state)
+        self._automation_write_error_response(
+            context["control_index"], state["write_token"], context=context
+        )
+        self._re_enable_after_automation_write(
+            context["device_param"], state.get("automation_should_re_enable", False)
+        )
+
     def _set_automation_envelope(self, message):
         try:
+            binary_payload = tuple(int(value) & 0x7f for value in message[2:-1])
+            if binary_payload and binary_payload[0] == 0x47:
+                self._handle_generated_automation_shape(binary_payload)
+                return
             payload = bytes(message[2:-1]).decode('ascii', errors='ignore')
             fields = self._split_escaped_sysex_fields(payload, "|")
+            if fields and fields[0] == "T":
+                self._handle_automation_diagnostic_trace(fields)
+                return
+            if fields and fields[0] == "S":
+                self._automation_trace(
+                    fields[1] if len(fields) > 1 else "?",
+                    "payload_dispatch",
+                    "fields={} bytes={}".format(len(fields), len(payload))
+                )
+                self._handle_exact_automation_stream(fields)
+                return
+            active_stream = getattr(self, "_automation_exact_stream", None)
+            if active_stream is not None:
+                self._fail_exact_automation_full_write(active_stream)
             if fields and fields[0] == "P":
                 self._handle_automation_pencil_message(fields)
                 return
             self._finalize_automation_pencil_stroke()
             if fields and fields[0] == "D":
                 self._handle_exact_automation_delta(fields)
-                return
-            if fields and fields[0] == "F":
-                self._handle_exact_automation_full_write(fields)
                 return
             if len(fields) < 5:
                 return
@@ -21772,6 +24151,12 @@ class Tap(ControlSurface):
             if not should_re_enable or not device_param or not liveobj_valid(device_param):
                 return
 
+            # Exact writers re-enable inside their open undo transaction. Do
+            # not create a second user-visible Undo item by invoking Live's
+            # re-enable commands again when the parameter is already enabled.
+            if self._parameter_automation_is_enabled(device_param):
+                self._send_re_enable_automation_enabled(force=True)
+                return
             self._re_enable_parameter_automation(device_param)
             self.schedule_message(1, lambda: self._re_enable_written_automation_if_needed(device_param))
             self.schedule_message(3, lambda: self._re_enable_written_automation_if_needed(device_param))
@@ -24024,10 +26409,7 @@ class Tap(ControlSurface):
             return
         if self.seq_status:
             # self.log_message("sending clip metadata")
-            status_byte = 0xF0
-            end_byte = 0xF7
             manufacturer_id = 0x0E
-            device_id = 0x01
             
             song = self.song()
             clip_slot = song.view.highlighted_clip_slot
@@ -24227,9 +26609,12 @@ class Tap(ControlSurface):
                     # Flin record so every earlier field keeps its v35 offset.
                     note_data.append(1 if bool(getattr(selected_clip, 'looping', True)) else 0)
                     
-                    # Send the SysEx message
-                    sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(note_data) + (end_byte,)
-                    self._send_midi(sys_ex_message)
+                    # Mutator/Flin metadata can exceed one safe Remote -> app
+                    # packet. Use the same strict binary framing as clip-note
+                    # snapshots instead of relying on one oversized SysEx.
+                    self._send_chunked_binary_sys_ex_message(
+                        tuple(note_data), manufacturer_id
+                    )
     
     def send_selected_clip_notes(self):
         """
@@ -25362,6 +27747,7 @@ class Tap(ControlSurface):
     def disconnect(self):
         # Cancel all pending timers
         self._finalize_automation_pencil_stroke()
+        self._finalize_exact_automation_stream()
         self._clear_automation_contexts()
         self._apply_note_repeat_engine(False, self.NOTE_REPEAT_DEFAULT_INDEX)
         self._decoupled_automation_recording_active = False
