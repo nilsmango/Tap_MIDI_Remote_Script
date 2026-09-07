@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 54
+secret_version_number = 57
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -20869,14 +20869,12 @@ class Tap(ControlSurface):
         intervals = []
 
         def left_boundary_preserving_incoming_curves(interval_start):
-            """Do not strand a curved owner just outside a rewrite.
+            """Include only the connected curved owners Live can flatten.
 
-            Live can reset the predecessor's outgoing coefficients when its
-            endpoint is deleted, even if that endpoint is recreated a moment
-            later. Walk left through only the contiguous non-linear chain so
-            every curved owner is recreated right-to-left. Once the outside
-            predecessor is already linear, deleting its endpoint cannot alter
-            the audible envelope and the rewrite can safely stop.
+            Deleting and recreating an endpoint can reset the point before it.
+            Continue left while that outgoing segment is curved, then stop at
+            the first linear boundary. This is the smallest independently
+            writable span exposed by Live's event API.
             """
             expanded_start = float(interval_start)
             while True:
@@ -20912,9 +20910,14 @@ class Tap(ControlSurface):
             interval_start = left_boundary_preserving_incoming_curves(
                 interval_start
             )
-            interval_start = max(float(domain[0]), min(float(domain[1]), float(interval_start)))
-            interval_end = max(interval_start, min(float(domain[1]), float(interval_end)))
-            if merged_intervals and interval_start <= merged_intervals[-1][1] + 0.000001:
+            interval_start = max(
+                float(domain[0]), min(float(domain[1]), float(interval_start))
+            )
+            interval_end = max(
+                interval_start, min(float(domain[1]), float(interval_end))
+            )
+            if (merged_intervals
+                    and interval_start <= merged_intervals[-1][1] + 0.000001):
                 merged_intervals[-1] = (
                     merged_intervals[-1][0],
                     max(merged_intervals[-1][1], interval_end)
@@ -21154,7 +21157,9 @@ class Tap(ControlSurface):
         self._send_sys_ex_message(response, 0x31)
 
     def _handle_exact_automation_delta(self, fields):
-        transaction = fields[8] if len(fields) > 8 else "?"
+        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+        self._automation_trace_pending_transfer = None
+        transaction = fields[8] if len(fields) > 8 else trace.get("token", "?")
         if len(fields) != 9:
             self._automation_trace(
                 transaction,
@@ -21162,6 +21167,10 @@ class Tap(ControlSurface):
                 "reason=field_count actual={} expected=9".format(len(fields))
             )
             self._finalize_automation_pencil_stroke()
+            if trace.get("token") is not None and trace.get("dial") is not None:
+                self._automation_write_error_response(
+                    trace["dial"], trace["token"], status="transport"
+                )
             return
         try:
             control_index = max(0, min(7, int(fields[1])))
@@ -21182,22 +21191,35 @@ class Tap(ControlSurface):
                         actual_checksum, expected_checksum
                     )
                 )
-                self._automation_write_error_response(control_index, write_token)
+                self._automation_write_error_response(
+                    control_index, write_token, status="transport"
+                )
                 return
         except Exception as e:
             self._automation_trace(
                 transaction, "delta_reject", "reason=parse error={}".format(str(e))
             )
+            if trace.get("token") is not None and trace.get("dial") is not None:
+                self._automation_write_error_response(
+                    trace["dial"], trace["token"], status="transport"
+                )
             return
 
         self._automation_trace(
             write_token,
             "delta_intent",
-            "dial={} operations={} bytes={} checksum={:08X}".format(
+            "dial={} operations={} bytes={} checksum={:08X} preflight_match={}".format(
                 control_index,
                 len(operation_entries),
                 len("|".join(fields)),
-                actual_checksum
+                actual_checksum,
+                1 if (
+                    trace.get("token") == str(write_token)
+                    and trace.get("dial") == control_index
+                    and trace.get("kind") == "D"
+                    and trace.get("count1") == expected_count
+                    and trace.get("checksum") == expected_checksum
+                ) else 0
             )
         )
 
@@ -21243,12 +21265,29 @@ class Tap(ControlSurface):
             )
         )
 
-        # A delta is a compact description, not a separate Live-writing
-        # algorithm. Reconstruct the authoritative final snapshot here, then
-        # feed it to the same paced, settled, read-back-verified writer used by
-        # generated and streamed envelopes. The former synchronous range path
-        # could run an entire move/duplicate/scale inside one MIDI callback;
-        # Live silently dropped those mutations, especially while stopped.
+        # Live's API can flatten the owner immediately left of a deleted event.
+        # Recreate each compact, merged interval computed above right-to-left.
+        # The interval walks left only through a connected curved chain and
+        # therefore avoids a full-envelope redraw whenever a linear boundary
+        # makes the edit independent.
+        patch_steps = tuple(
+            step for step in final_steps
+            if any(
+                float(step[0]) >= float(interval_start) - 0.000001
+                and float(step[0]) <= float(interval_end) + 0.000001
+                for interval_start, interval_end in intervals
+            )
+        )
+        guard = getattr(
+            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        clear_intervals = tuple(
+            (
+                max(float(context["domain"][0]), float(interval_start) - guard),
+                min(float(context["domain"][1]), float(interval_end) + guard)
+            )
+            for interval_start, interval_end in intervals
+        )
         full_fields = [
             "F",
             str(context["control_index"]),
@@ -21257,21 +21296,25 @@ class Tap(ControlSurface):
             "{:.9f}".format(float(context["domain"][0])),
             "{:.9f}".format(float(context["domain"][1])),
             "{:.9f}".format(sample_duration),
-            ",".join(self._automation_step_entry(step) for step in final_steps),
+            ",".join(self._automation_step_entry(step) for step in patch_steps),
         ]
         checksum = self._automation_payload_checksum("|".join(full_fields))
         self._automation_trace(
             write_token,
             "delta_write_scheduled",
-            "writer=verified_full entries={}".format(len(final_steps))
+            "writer=verified_ranges entries={} ranges={}".format(
+                len(patch_steps), len(clear_intervals)
+            )
         )
         self._handle_exact_automation_full_write(
             full_fields + [
-                str(len(final_steps)),
+                str(len(patch_steps)),
                 "{:08X}".format(checksum),
                 write_token,
             ],
-            compact_response=True
+            compact_response=True,
+            write_intervals=clear_intervals,
+            audit_steps=final_steps
         )
 
     def _exact_automation_final_event_status(self, state):
@@ -21287,8 +21330,10 @@ class Tap(ControlSurface):
             self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
         )
         try:
-            events = self._automation_events_in_closed_range(
-                envelope, state["write_start"], state["write_end"]
+            events = tuple(
+                self._automation_events_in_closed_range(
+                    envelope, state["write_start"], state["write_end"]
+                )
             )
         except Exception:
             return {
@@ -21314,7 +21359,8 @@ class Tap(ControlSurface):
             stored_groups[-1].append(event)
 
         intended_groups = tuple(sorted(
-            state["time_groups"], key=lambda group: float(group[0][0])
+            state.get("audit_time_groups", state["time_groups"]),
+            key=lambda group: float(group[0][0])
         ))
         mismatch_groups = []
         reversed_times = []
@@ -21486,10 +21532,9 @@ class Tap(ControlSurface):
                 "group_creation_reversed"
             ].get(time_value, False)
 
-        # Never edit one point/group after the complete envelope exists:
-        # deleting its endpoint can reset the predecessor's outgoing Bezier.
-        # Any committed mismatch replays the complete right-to-left intent.
-        # This remains local; no new SysEx request or response is needed.
+        # Replay the complete right-to-left write scope. For a delta this is
+        # only its affected intervals; generated/full writes use their complete
+        # domain. No new SysEx request or response is needed.
         try:
             device_param = state["context"]["device_param"]
             if (state.get("automation_should_re_enable", False)
@@ -21544,24 +21589,34 @@ class Tap(ControlSurface):
     def _handle_automation_diagnostic_trace(self, fields):
         transaction = fields[1] if len(fields) > 1 else "?"
         try:
-            if len(fields) != 9:
+            if len(fields) != 10:
                 raise ValueError("field_count={}".format(len(fields)))
             trace = {
                 "token": str(int(fields[1])),
                 "dial": max(0, min(7, int(fields[2]))),
-                "entry_count": int(fields[3]),
-                "group_count": int(fields[4]),
-                "curve_group_count": int(fields[5]),
-                "payload_bytes": int(fields[6]),
-                "packet_count": int(fields[7]),
-                "checksum": int(fields[8], 16),
+                "kind": str(fields[3]),
+                "count1": int(fields[4]),
+                "count2": int(fields[5]),
+                "count3": int(fields[6]),
+                "payload_bytes": int(fields[7]),
+                "packet_count": int(fields[8]),
+                "checksum": int(fields[9], 16),
             }
-            if (trace["entry_count"] <= 0
-                    or trace["group_count"] <= 0
-                    or trace["curve_group_count"] < 0
+            if (trace["kind"] not in ("S", "D")
+                    or trace["count1"] <= 0
+                    or trace["count2"] < 0
+                    or trace["count3"] < 0
                     or trace["payload_bytes"] <= 0
                     or trace["packet_count"] <= 0):
                 raise ValueError("non_positive_counts")
+            if (trace["kind"] == "S"
+                    and (trace["count2"] <= 0
+                         or trace["count2"] > trace["count1"]
+                         or trace["count3"] > trace["count2"])):
+                raise ValueError("shape_counts")
+            if (trace["kind"] == "D"
+                    and (trace["count2"] != 0 or trace["count3"] != 0)):
+                raise ValueError("delta_counts")
         except Exception as e:
             self._automation_trace(
                 transaction, "app_intent_reject", "reason={}".format(str(e))
@@ -21572,11 +21627,12 @@ class Tap(ControlSurface):
         self._automation_trace(
             trace["token"],
             "app_intent",
-            "dial={} entries={} groups={} curves={} bytes={} packets={} checksum={:08X}".format(
+            "dial={} kind={} counts={}/{}/{} bytes={} packets={} checksum={:08X}".format(
                 trace["dial"],
-                trace["entry_count"],
-                trace["group_count"],
-                trace["curve_group_count"],
+                trace["kind"],
+                trace["count1"],
+                trace["count2"],
+                trace["count3"],
                 trace["payload_bytes"],
                 trace["packet_count"],
                 trace["checksum"]
@@ -22133,10 +22189,9 @@ class Tap(ControlSurface):
         )
 
     def _handle_exact_automation_stream(self, fields):
-        transaction = fields[1] if len(fields) > 1 else (
-            (getattr(self, "_automation_trace_pending_transfer", None) or {})
-            .get("token", "?")
-        )
+        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
+        self._automation_trace_pending_transfer = None
+        transaction = fields[1] if len(fields) > 1 else trace.get("token", "?")
         previous = getattr(self, "_automation_exact_stream", None)
         if previous is not None:
             self._fail_exact_automation_full_write(previous)
@@ -22147,6 +22202,10 @@ class Tap(ControlSurface):
                 "payload_reject",
                 "reason=field_count actual={} expected=13".format(len(fields))
             )
+            if trace.get("token") is not None and trace.get("dial") is not None:
+                self._automation_write_error_response(
+                    trace["dial"], trace["token"], status="transport"
+                )
             return
 
         try:
@@ -22166,6 +22225,10 @@ class Tap(ControlSurface):
             self._automation_trace(
                 transaction, "payload_reject", "reason=parse error={}".format(str(e))
             )
+            if trace.get("token") is not None and trace.get("dial") is not None:
+                self._automation_write_error_response(
+                    trace["dial"], trace["token"], status="transport"
+                )
             return
 
         actual_checksum = self._automation_payload_checksum(
@@ -22200,10 +22263,11 @@ class Tap(ControlSurface):
                     actual_checksum, expected_checksum
                 )
             )
-            self._automation_write_error_response(control_index, stream_id)
+            self._automation_write_error_response(
+                control_index, stream_id, status="transport"
+            )
             return
 
-        trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
         self._automation_trace(
             stream_id,
             "payload_valid",
@@ -22215,9 +22279,11 @@ class Tap(ControlSurface):
                 actual_checksum,
                 1 if (
                     trace.get("token") == stream_id
-                    and trace.get("entry_count") == expected_count
-                    and trace.get("group_count") == expected_group_count
-                    and trace.get("curve_group_count") == expected_curve_group_count
+                    and trace.get("dial") == control_index
+                    and trace.get("kind") == "S"
+                    and trace.get("count1") == expected_count
+                    and trace.get("count2") == expected_group_count
+                    and trace.get("count3") == expected_curve_group_count
                     and trace.get("checksum") == expected_checksum
                 ) else 0
             )
@@ -22999,7 +23065,9 @@ class Tap(ControlSurface):
             compact_response=True
         )
 
-    def _handle_exact_automation_full_write(self, fields, compact_response=False):
+    def _handle_exact_automation_full_write(
+            self, fields, compact_response=False, write_intervals=None,
+            audit_steps=None):
         if len(fields) != 11:
             return
         try:
@@ -23050,11 +23118,15 @@ class Tap(ControlSurface):
                 return
             logical_steps.append(step)
         logical_steps = self._automation_sorted_steps(logical_steps)
-
+        audit_logical_steps = (
+            self._automation_sorted_steps(audit_steps)
+            if audit_steps is not None else logical_steps
+        )
         decoupled_info = self._decoupled_automation_info(
             context["clip"], context["device_param"]
         )
         physical_steps = logical_steps
+        physical_audit_steps = audit_logical_steps
         write_start = max(context["domain"][0], requested_start)
         write_end = min(context["domain"][1], requested_end)
         if decoupled_info:
@@ -23064,8 +23136,24 @@ class Tap(ControlSurface):
             physical_steps = self._expanded_decoupled_automation_steps(
                 decoupled_info, logical_steps, sample_duration
             )
+            audit_logical_steps = logical_steps
+            physical_audit_steps = physical_steps
             write_start = decoupled_info["note_start"]
             write_end = decoupled_info["physical_end"]
+
+        if write_intervals is None or decoupled_info:
+            normalized_write_intervals = ((write_start, write_end),)
+        else:
+            normalized_write_intervals = tuple(
+                (
+                    max(write_start, float(interval_start)),
+                    min(write_end, max(float(interval_start), float(interval_end)))
+                )
+                for interval_start, interval_end in write_intervals
+                if float(interval_end) >= float(interval_start)
+            )
+            if not normalized_write_intervals:
+                normalized_write_intervals = ((write_start, write_end),)
 
         automation_was_enabled = self._parameter_automation_is_enabled(context["device_param"])
         created_envelope = False
@@ -23093,18 +23181,23 @@ class Tap(ControlSurface):
         physical_time_groups = tuple(reversed(self._exact_automation_time_groups(
             physical_steps, write_start, write_end
         )))
+        audit_time_groups = tuple(reversed(self._exact_automation_time_groups(
+            physical_audit_steps, write_start, write_end
+        )))
         state = {
             "context": context,
             "envelope": envelope,
-            "logical_steps": logical_steps,
+            "logical_steps": audit_logical_steps,
             "write_start": write_start,
             "write_end": write_end,
+            "write_intervals": normalized_write_intervals,
             "sample_duration": sample_duration,
             "decoupled_info": decoupled_info,
             "write_token": write_token,
             "compact_response": compact_response,
             "automation_should_re_enable": automation_was_enabled or envelope is not None,
             "time_groups": physical_time_groups,
+            "audit_time_groups": audit_time_groups,
             "next_group_index": 0,
             "active_batch": (),
             "batch_settle_polls": 0,
@@ -23296,11 +23389,14 @@ class Tap(ControlSurface):
                     state["undo_step_attempted"] = True
                     state["undo_step_started"] = self._begin_undo_step()
                 minimum_span = 0.0000001
-                envelope.delete_events_in_range(
-                    state["write_start"],
-                    max(state["write_start"] + minimum_span, state["write_end"])
-                    + minimum_span
-                )
+                for interval_start, interval_end in state.get(
+                        "write_intervals",
+                        ((state["write_start"], state["write_end"]),)):
+                    envelope.delete_events_in_range(
+                        interval_start,
+                        max(interval_start + minimum_span, interval_end)
+                        + minimum_span
+                    )
                 state["cleared"] = True
 
             groups = state["time_groups"]
