@@ -2501,6 +2501,11 @@ class Tap(ControlSurface):
     AUTOMATION_EXACT_STREAM_INACTIVITY_TIMEOUT = 8.0
     AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
     AUTOMATION_EXACT_EVENT_TIME_TOLERANCE = 0.00001
+    # Keep False for normal use. To restore the complete automation transport
+    # trace, set this to True and also set
+    # TapAutomationExactWire.diagnosticTracingEnabled = true in TapProtocol.swift,
+    # then rebuild the app, install this script, and reload Ableton Live.
+    AUTOMATION_TRACE_LOGGING_ENABLED = False
     # Keep each Live mutation callback deliberately small, but do not spend a
     # complete callback on every ordinary point. Groups are authored right to
     # left, and an equal-time vertical pair always remains atomic.
@@ -5513,7 +5518,9 @@ class Tap(ControlSurface):
             self.log_message(message)
 
     def _automation_trace(self, transaction, stage, details=""):
-        """Always-visible envelope trace written to Ableton's Log.txt."""
+        """Optional envelope trace written to Ableton's Log.txt."""
+        if not getattr(self, "AUTOMATION_TRACE_LOGGING_ENABLED", False):
+            return
         try:
             safe_details = str(details or "").replace("\n", " ").replace("\r", " ")
             self.log_message(
@@ -20960,80 +20967,73 @@ class Tap(ControlSurface):
     def _apply_direct_exact_automation_delta(
             self, context, envelope, baseline, final_steps, operation_entries,
             automation_should_re_enable=False):
-        """Apply unambiguous inserts/deletes without rewriting neighbours.
+        """Apply a delta only at event timestamps named by the delta.
 
-        Returns None when the operation needs the regular coefficient-aware
-        range writer. A pure insert can use create_event directly. A pure
-        delete can use a pin-sized range only when its timestamp owns exactly
-        one event; same-time groups remain range-rewrite territory because the
-        Live API has no durable individual event identity.
+        Generated shapes deliberately replace a complete envelope. Point
+        edits do not: rebuild only the old/new same-time groups containing a
+        changed event. In particular, never clear the continuous range between
+        moved or scaled points; doing so made an ordinary edit destructive if
+        a later create_event call did not settle.
         """
         operation_entries = tuple(operation_entries or ())
         if not operation_entries:
             return True
-        actions = tuple(entry.split(":", 1)[0] for entry in operation_entries)
-        direct_steps = []
-        delete_steps = []
+        # Reconstruction already returns authoritative timeline order. Keep
+        # it intact so equal-time groups retain their authored direction.
+        baseline = tuple(baseline)
+        final_steps = tuple(final_steps)
+        touched_times = set()
+        try:
+            for operation_entry in operation_entries:
+                components = operation_entry.split(":", 3)
+                action = components[0] if components else ""
+                if action == "D" and len(components) == 2:
+                    ordinal = int(components[1])
+                    touched_times.add(float(baseline[ordinal][0]))
+                elif action == "R" and len(components) == 4:
+                    ordinal = int(components[1])
+                    final_position = int(components[2])
+                    touched_times.add(float(baseline[ordinal][0]))
+                    touched_times.add(float(final_steps[final_position][0]))
+                elif action == "I" and len(components) >= 3:
+                    final_position = int(operation_entry.split(":", 2)[1])
+                    touched_times.add(float(final_steps[final_position][0]))
+                else:
+                    return False
+        except Exception:
+            return False
 
-        if all(action == "I" for action in actions):
-            try:
-                positions = tuple(
-                    int(entry.split(":", 2)[1]) for entry in operation_entries
-                )
-                direct_steps = [final_steps[position] for position in positions]
-            except Exception:
-                return False
-            for step in direct_steps:
-                baseline_group_count = sum(
-                    1 for candidate in baseline
-                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
-                )
-                final_group_count = sum(
-                    1 for candidate in final_steps
-                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
-                )
-                # Creating at an occupied timestamp is order-sensitive across
-                # Live bindings (append versus prepend), so use the verified
-                # same-time range writer for that special case.
-                if baseline_group_count != 0 or final_group_count > 1:
-                    return None
-        elif all(action == "D" for action in actions):
-            try:
-                ordinals = tuple(
-                    int(entry.split(":", 1)[1]) for entry in operation_entries
-                )
-                delete_steps = [baseline[ordinal] for ordinal in ordinals]
-            except Exception:
-                return False
-            for step in delete_steps:
-                baseline_group_count = sum(
-                    1 for candidate in baseline
-                    if abs(float(candidate[0]) - float(step[0])) <= 0.000001
-                )
-                if baseline_group_count != 1:
-                    return None
-        else:
-            return None
+        transitions = []
+        for time_value in sorted(touched_times, reverse=True):
+            baseline_group = tuple(
+                step for step in baseline
+                if abs(float(step[0]) - time_value) <= 0.000001
+            )
+            final_group = tuple(
+                step for step in final_steps
+                if abs(float(step[0]) - time_value) <= 0.000001
+            )
+            transitions.append((time_value, baseline_group, final_group))
 
         undo_step_started = self._begin_undo_step()
         try:
-            if direct_steps:
-                for step in reversed(self._automation_sorted_steps(direct_steps)):
+            guard = getattr(
+                self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+            )
+            for time_value, baseline_group, final_group in transitions:
+                if baseline_group:
+                    envelope.delete_events_in_range(
+                        time_value - guard, time_value + guard
+                    )
+                # Descend by timestamp, but retain the authored order within a
+                # vertical. This is the same ordering used by the established
+                # exact-event range writer and matches current Live bindings.
+                for step in final_group:
                     raw_value = self._parameter_target_value_from_normalized(
                         context["device_param"], step[2]
                     )
                     self._create_automation_event(
                         envelope, step[0], raw_value, step
-                    )
-            else:
-                guard = getattr(
-                    self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
-                )
-                for step in sorted(
-                        delete_steps, key=lambda item: float(item[0]), reverse=True):
-                    time_value = float(step[0])
-                    envelope.delete_events_in_range(
-                        time_value - guard, time_value + guard
                     )
             if (automation_should_re_enable
                     and not self._parameter_automation_is_enabled(
@@ -21265,57 +21265,131 @@ class Tap(ControlSurface):
             )
         )
 
-        # Live's API can flatten the owner immediately left of a deleted event.
-        # Recreate each compact, merged interval computed above right-to-left.
-        # The interval walks left only through a connected curved chain and
-        # therefore avoids a full-envelope redraw whenever a linear boundary
-        # makes the edit independent.
-        patch_steps = tuple(
-            step for step in final_steps
-            if any(
-                float(step[0]) >= float(interval_start) - 0.000001
-                and float(step[0]) <= float(interval_end) + 0.000001
-                for interval_start, interval_end in intervals
+        automation_was_enabled = self._parameter_automation_is_enabled(
+            context["device_param"]
+        )
+        if envelope is None and hasattr(context["clip"], "create_automation_envelope"):
+            try:
+                envelope = context["clip"].create_automation_envelope(
+                    context["device_param"]
+                )
+            except Exception:
+                envelope = None
+        if not self._automation_envelope_supports_point_events(envelope):
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
             )
+            return
+
+        applied = self._apply_direct_exact_automation_delta(
+            context,
+            envelope,
+            baseline,
+            final_steps,
+            operation_entries,
+            automation_was_enabled or envelope is not None
         )
-        guard = getattr(
-            self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
-        )
-        clear_intervals = tuple(
-            (
-                max(float(context["domain"][0]), float(interval_start) - guard),
-                min(float(context["domain"][1]), float(interval_end) + guard)
+        if not applied:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
             )
-            for interval_start, interval_end in intervals
-        )
-        full_fields = [
-            "F",
-            str(context["control_index"]),
-            context_token,
-            base_revision,
-            "{:.9f}".format(float(context["domain"][0])),
-            "{:.9f}".format(float(context["domain"][1])),
-            "{:.9f}".format(sample_duration),
-            ",".join(self._automation_step_entry(step) for step in patch_steps),
-        ]
-        checksum = self._automation_payload_checksum("|".join(full_fields))
+            return
+
         self._automation_trace(
             write_token,
-            "delta_write_scheduled",
-            "writer=verified_ranges entries={} ranges={}".format(
-                len(patch_steps), len(clear_intervals)
+            "delta_write_direct",
+            "operations={} touched_ranges={}".format(
+                len(operation_entries), len(intervals)
             )
         )
-        self._handle_exact_automation_full_write(
-            full_fields + [
-                str(len(patch_steps)),
-                "{:08X}".format(checksum),
-                write_token,
-            ],
-            compact_response=True,
-            write_intervals=clear_intervals,
-            audit_steps=final_steps
+
+        accepted_result = self._accepted_exact_automation_delta_snapshot(
+            context,
+            envelope,
+            final_steps,
+            intervals,
+            sample_duration,
+            include_live_event_records=True
         )
+        if accepted_result is None:
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+            return
+        accepted_steps, accepted_event_records = accepted_result
+        accepted_revision = self._automation_snapshot_revision(
+            context["clip"],
+            context["device_param"],
+            context["domain"],
+            accepted_steps
+        )
+        intended_revision = self._automation_snapshot_revision(
+            context["clip"],
+            context["device_param"],
+            context["domain"],
+            final_steps
+        )
+        self._automation_trace(
+            write_token,
+            "delta_audit",
+            "exact={} accepted_steps={} intended_steps={}".format(
+                1 if accepted_revision == intended_revision else 0,
+                len(accepted_steps),
+                len(final_steps)
+            )
+        )
+        merged_event_records = self._merged_automation_event_records(
+            context.get("live_event_records"),
+            accepted_event_records,
+            intervals
+        )
+        if merged_event_records is None:
+            accepted_live_fingerprint = self._automation_live_event_fingerprint(
+                envelope, context["domain"], sample_duration
+            )
+            cached_read = self._cached_automation_event_read(
+                envelope,
+                context["domain"][0],
+                context["domain"][1],
+                sample_duration
+            )
+            merged_event_records = (
+                cached_read.get("records") if cached_read is not None else None
+            )
+        else:
+            accepted_live_fingerprint = self._automation_event_fingerprint_from_records(
+                merged_event_records
+            )
+        context.update({
+            "envelope": envelope,
+            "snapshot": self._automation_sorted_steps(accepted_steps),
+            "revision": accepted_revision,
+            "point_duration": sample_duration,
+            "live_fingerprint": accepted_live_fingerprint,
+            "live_event_records": merged_event_records,
+            "last_activity": time.monotonic(),
+        })
+        if accepted_steps:
+            self._store_authored_automation_steps(
+                context["clip"], context["device_param"],
+                context["control_index"], accepted_steps
+            )
+        else:
+            self._clear_authored_automation_steps(
+                context["clip"], context["device_param"], context["control_index"]
+            )
+        self._send_exact_automation_delta_response(
+            context,
+            envelope,
+            accepted_steps,
+            accepted_revision,
+            intervals,
+            write_token
+        )
+        self._re_enable_after_automation_write(
+            context["device_param"], automation_was_enabled or envelope is not None
+        )
+        self._refresh_parameter_metadata_on_automation_change()
 
     def _exact_automation_final_event_status(self, state):
         """Audit the final full-range event representation returned by Live.

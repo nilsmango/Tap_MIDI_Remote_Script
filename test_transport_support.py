@@ -79,6 +79,7 @@ class SysExHarness(AutomationTraceSupport):
 
 
 class AutomationTransferTraceHarness:
+    AUTOMATION_TRACE_LOGGING_ENABLED = True
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     CHUNKED_INCOMING_SYSEX_IDS = (0x32,)
     SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
@@ -3330,22 +3331,103 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(envelope.deleted[0][0], 3.0 - 0.00001)
         self.assertAlmostEqual(envelope.deleted[0][1], 3.0 + 0.00001)
 
-    def test_exact_delta_does_not_direct_delete_one_side_of_a_vertical(self):
+    def test_exact_delta_rebuilds_only_the_touched_vertical_group(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
         class Harness:
             _apply_direct_exact_automation_delta = extracted_method(
                 "_apply_direct_exact_automation_delta"
             )
 
+            def __init__(self):
+                self.created = []
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, _envelope, time_value, value, step):
+                self.created.append((time_value, value, step[4]))
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
         baseline = (
             (1.0, 0.125, 0.2, 0.0, 1, 1, True, 0.5, 0.5, 0.5, 0.5),
             (1.0, 0.125, 0.8, 0.0, 2, 2, True, 0.5, 0.5, 0.5, 0.5),
         )
-        self.assertIsNone(
-            Harness()._apply_direct_exact_automation_delta(
-                {"device_param": object()}, object(), baseline,
+        envelope = Envelope()
+        harness = Harness()
+        self.assertTrue(
+            harness._apply_direct_exact_automation_delta(
+                {"device_param": object()}, envelope, baseline,
                 baseline[1:], ["D:0"]
             )
         )
+        self.assertEqual(len(envelope.deleted), 1)
+        self.assertEqual(harness.created, [(1.0, 0.8, 2)])
+
+    def test_exact_delta_move_rewrites_only_its_old_and_new_event_groups(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
+        class Harness:
+            _apply_direct_exact_automation_delta = extracted_method(
+                "_apply_direct_exact_automation_delta"
+            )
+
+            def __init__(self):
+                self.created = []
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, _envelope, time_value, value, step):
+                self.created.append((time_value, value, step[4]))
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        baseline = (
+            (0.0, 0.125, 0.2, 0.0, 1, 1, True, 0.1, 0.2, 0.8, 0.9),
+            (1.0, 0.125, 0.5, 0.0, 2, 2, True, 0.2, 0.3, 0.7, 0.8),
+            (3.0, 0.125, 0.8, 0.0, 3, 3, True, 0.3, 0.4, 0.6, 0.7),
+        )
+        moved = tuple(list(baseline[1][:1]) + list(baseline[1][1:]))
+        moved = tuple([2.0] + list(moved[1:]))
+        final_steps = (baseline[0], moved, baseline[2])
+        envelope = Envelope()
+        harness = Harness()
+
+        self.assertTrue(
+            harness._apply_direct_exact_automation_delta(
+                {"device_param": object()}, envelope, baseline, final_steps,
+                ["R:1:1:ignored"]
+            )
+        )
+        self.assertEqual(len(envelope.deleted), 1)
+        self.assertAlmostEqual(envelope.deleted[0][0], 1.0 - 0.00001)
+        self.assertEqual(harness.created, [(2.0, 0.5, 2)])
 
     def test_exact_delta_acceptance_rereads_only_the_changed_range(self):
         class Harness:
@@ -3581,20 +3663,18 @@ class TransportTests(unittest.TestCase):
         self.assertIsNone(harness._automation_trace_pending_transfer)
         self.assertEqual(harness.errors, [((4, "19"), {"status": "transport"})])
 
-    def test_exact_delta_reuses_the_paced_verified_full_writer(self):
+    def test_exact_delta_uses_only_the_pointwise_writer(self):
         class Harness:
             _handle_exact_automation_delta = extracted_method(
                 "_handle_exact_automation_delta"
             )
-            _automation_step_id = extracted_method("_automation_step_id")
-            _automation_step_order = extracted_method("_automation_step_order")
-            _automation_step_tuple = extracted_method("_automation_step_tuple")
-            _automation_sort_key = extracted_method("_automation_sort_key")
-            _automation_sorted_steps = extracted_method("_automation_sorted_steps")
 
             def __init__(self):
-                self.full_write = None
+                self._automation_trace_pending_transfer = None
+                self.direct_write = None
+                self.response = None
                 self.traces = []
+                self.stored = None
 
             def _automation_payload_checksum(self, value):
                 checksum = 0
@@ -3609,6 +3689,9 @@ class TransportTests(unittest.TestCase):
                 return ({
                     "control_index": 2,
                     "domain": (0.0, 4.0),
+                    "clip": object(),
+                    "device_param": object(),
+                    "live_event_records": (),
                 }, object(), ("baseline",), "OLD", "ok")
 
             def _reconstruct_exact_automation_delta(
@@ -3624,16 +3707,55 @@ class TransportTests(unittest.TestCase):
                      0.5, 0.5, 0.5, 0.5),
                 ), ((0.0, 2.0),))
 
-            def _automation_step_entry(self, step):
-                return ":".join(str(value) for value in step)
+            def _parameter_automation_is_enabled(self, _parameter):
+                return False
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _apply_direct_exact_automation_delta(
+                    self, context, envelope, baseline, final_steps, entries,
+                    automation_should_re_enable=False):
+                self.direct_write = (
+                    context, envelope, baseline, final_steps, tuple(entries),
+                    automation_should_re_enable
+                )
+                return True
+
+            def _accepted_exact_automation_delta_snapshot(
+                    self, _context, _envelope, final_steps, _intervals,
+                    _duration, include_live_event_records=False):
+                self.assert_live_records = include_live_event_records
+                return (tuple(final_steps), ((0.0, "event"),))
+
+            def _automation_snapshot_revision(self, *_args):
+                return "NEW"
+
+            def _merged_automation_event_records(self, *_args):
+                return ((0.0, "event"),)
+
+            def _automation_event_fingerprint_from_records(self, records):
+                return ("fingerprint", tuple(records))
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(steps)
+
+            def _store_authored_automation_steps(self, *_args):
+                self.stored = _args[-1]
+
+            def _send_exact_automation_delta_response(self, *args):
+                self.response = args
+
+            def _re_enable_after_automation_write(self, *_args):
+                pass
+
+            def _refresh_parameter_metadata_on_automation_change(self):
+                pass
 
             def _handle_exact_automation_full_write(
                     self, fields, compact_response=False, write_intervals=None,
                     audit_steps=None):
-                self.full_write = (
-                    tuple(fields), compact_response, tuple(write_intervals or ()),
-                    tuple(audit_steps or ())
-                )
+                raise AssertionError("a point edit must not use the shape writer")
 
             def _automation_write_error_response(self, *_args, **_kwargs):
                 raise AssertionError("valid delta must not be rejected")
@@ -3644,30 +3766,16 @@ class TransportTests(unittest.TestCase):
         harness = Harness()
         harness._handle_exact_automation_delta(fields)
 
-        self.assertIsNotNone(harness.full_write)
-        (full_fields, compact_response, write_intervals,
-         audit_steps) = harness.full_write
-        self.assertTrue(compact_response)
-        self.assertEqual(full_fields[0], "F")
-        self.assertEqual(full_fields[1:4], ("2", "CTX", "OLD"))
-        self.assertEqual(tuple(map(float, full_fields[4:6])), (0.0, 4.0))
-        self.assertEqual(full_fields[8], "3")
-        self.assertEqual(full_fields[10], "44")
-        self.assertEqual(len(write_intervals), 1)
-        self.assertAlmostEqual(write_intervals[0][0], 0.0)
-        self.assertAlmostEqual(write_intervals[0][1], 2.00001)
-        self.assertIn("0.0:0.125", full_fields[7])
-        self.assertIn("1.0:0.125", full_fields[7])
-        self.assertIn("2.0:0.125", full_fields[7])
-        self.assertNotIn("4.0:0.125", full_fields[7])
-        self.assertEqual(audit_steps[0][0], 0.0)
-        self.assertEqual(audit_steps[-1][0], 4.0)
-        self.assertEqual(
-            int(full_fields[9], 16),
-            harness._automation_payload_checksum("|".join(full_fields[:8]))
-        )
+        self.assertIsNotNone(harness.direct_write)
+        self.assertEqual(harness.direct_write[2], ("baseline",))
+        self.assertEqual(harness.direct_write[4], ("R:0:0:entry",))
+        self.assertTrue(harness.direct_write[5])
+        self.assertTrue(harness.assert_live_records)
+        self.assertEqual(harness.stored[-1][0], 4.0)
+        self.assertEqual(harness.response[3], "NEW")
+        self.assertEqual(harness.response[-1], "44")
         self.assertIn(
-            "delta_write_scheduled",
+            "delta_write_direct",
             [stage for _transaction, stage, _details in harness.traces]
         )
 
@@ -4170,6 +4278,20 @@ class TransportTests(unittest.TestCase):
                 [0xF0, 35, 10, 11, 12, 0xF7],
             ],
         )
+
+    def test_automation_trace_is_quiet_without_the_diagnostic_switch(self):
+        class Harness:
+            _automation_trace = extracted_method("_automation_trace")
+
+            def __init__(self):
+                self.logs = []
+
+            def log_message(self, message):
+                self.logs.append(message)
+
+        harness = Harness()
+        harness._automation_trace("77", "delta_audit", "exact=1")
+        self.assertEqual(harness.logs, [])
 
     def test_automation_trace_correlates_app_intent_with_received_chunk_counts(self):
         harness = AutomationTransferTraceHarness()
