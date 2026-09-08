@@ -34,6 +34,7 @@ def extracted_method(name):
     namespace = {
         "time": time,
         "math": math,
+        "re": re,
         "struct": struct,
         "liveobj_valid": lambda value: value is not None,
         "secret_version_number": SECRET_VERSION_NUMBER,
@@ -315,8 +316,144 @@ class FlinProtocolHarness:
     _flin_settings_from_payload = extracted_method("_flin_settings_from_payload")
 
 
+class EQ8VisualizationHarness:
+    _selected_eq8_visualization_channel = extracted_method(
+        "_selected_eq8_visualization_channel"
+    )
+    _eq8_visualization_parameter = extracted_method(
+        "_eq8_visualization_parameter"
+    )
+    _eq8_visualization_byte = extracted_method("_eq8_visualization_byte")
+    _eq8_visualization_payload = extracted_method("_eq8_visualization_payload")
+    _finish_eq8_visualization_edit = extracted_method(
+        "_finish_eq8_visualization_edit"
+    )
+    _handle_eq8_visualization_edit = extracted_method(
+        "_handle_eq8_visualization_edit"
+    )
+
+    def __init__(self, channel="B"):
+        class Parameter:
+            def __init__(self, name, value):
+                self.name = name
+                self.value = value
+                self.min = 0.0
+                self.max = 1.0
+
+        parameters = []
+        for band in range(1, 9):
+            parameters.extend((
+                Parameter("{} Filter On {}".format(band, channel), 0.0 if band == 5 else 1.0),
+                Parameter("{} Filter Type {}".format(band, channel), float(band - 1) / 7.0),
+                Parameter("{} Frequency {}".format(band, channel), float(band) / 10.0),
+                Parameter("{} Gain {}".format(band, channel), 0.5),
+                Parameter("{} Q {}".format(band, channel), 0.25),
+            ))
+        parameters.append(Parameter("Scale", 0.75))
+
+        self.selected_device = type(
+            "Device", (), {"class_name": "Eq8", "parameters": tuple(parameters)}
+        )()
+
+        class Component:
+            def __init__(self, device):
+                self.device = device
+
+            def _parameter_by_names(self, *names):
+                return next(
+                    (parameter for parameter in self.device.parameters if parameter.name in names),
+                    None,
+                )
+
+        self._device = Component(self.selected_device)
+        self.parameters = parameters
+        self.current_parameters = [
+            next(parameter for parameter in parameters if parameter.name == "1 Frequency {}".format(channel))
+        ] + [None] * 7
+        self._eq8_visualization_channel = None
+        self._eq8_visualization_edit_keys = set()
+        self._eq8_visualization_edit_undo_started = False
+        self.undo_begins = 0
+        self.undo_ends = 0
+
+    def _selected_device(self):
+        return self.selected_device
+
+    def _current_connected_parameter_for_control(self, control_index, _selected_device):
+        return self.current_parameters[control_index]
+
+    def _parameter_normalized_value(self, parameter):
+        return (parameter.value - parameter.min) / (parameter.max - parameter.min)
+
+    def _parameter_target_value_from_normalized(self, parameter, normalized):
+        return parameter.min + normalized * (parameter.max - parameter.min)
+
+    def extract_values_from_sysex_message(self, message):
+        return list(message[2:-1])
+
+    def _begin_undo_step(self):
+        self.undo_begins += 1
+        return True
+
+    def _end_undo_step(self, started):
+        if started:
+            self.undo_ends += 1
+
+
 class TransportTests(unittest.TestCase):
-    def test_v54_generated_writer_batches_four_events_per_live_callback(self):
+    def test_v58_eq8_visualization_payload_has_fixed_compact_band_order_and_scale(self):
+        payload = EQ8VisualizationHarness()._eq8_visualization_payload()
+        self.assertEqual(len(payload), 43)
+        self.assertEqual(payload[:3], (1, 1, 95))
+        self.assertEqual(payload[3:8], (1, 0, 13, 64, 32))
+        self.assertEqual(payload[23], 0)  # Band 5 disabled flag.
+        self.assertEqual(payload[-5:], (1, 127, 102, 64, 32))
+
+    def test_v58_eq8_overview_drag_edits_frequency_and_gain_in_one_undo(self):
+        harness = EQ8VisualizationHarness()
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 2, 0, 64, 96, 0, 0xF7]
+        )
+        frequency = next(
+            parameter for parameter in harness.parameters
+            if parameter.name == "2 Frequency B"
+        )
+        gain = next(
+            parameter for parameter in harness.parameters
+            if parameter.name == "2 Gain B"
+        )
+        self.assertAlmostEqual(frequency.value, 64.0 / 127.0)
+        self.assertAlmostEqual(gain.value, 96.0 / 127.0)
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 0))
+
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 2, 0, 80, 100, 2, 0xF7]
+        )
+        self.assertAlmostEqual(frequency.value, 80.0 / 127.0)
+        self.assertAlmostEqual(gain.value, 100.0 / 127.0)
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 1))
+
+    def test_v58_eq8_overview_multitouch_waits_for_last_band_before_closing_undo(self):
+        harness = EQ8VisualizationHarness()
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 2, 0, 64, 96, 0, 0xF7]
+        )
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 3, 0, 72, 88, 0, 0xF7]
+        )
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 0))
+
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 2, 0, 80, 100, 2, 0xF7]
+        )
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 0))
+
+        harness._handle_eq8_visualization_edit(
+            [0xF0, 0x65, 1, 1, 3, 0, 76, 92, 2, 0xF7]
+        )
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 1))
+
+    def test_v55_generated_writer_batches_four_events_per_live_callback(self):
         assignment = next(
             node for node in tap_class_node().body
             if isinstance(node, ast.Assign)

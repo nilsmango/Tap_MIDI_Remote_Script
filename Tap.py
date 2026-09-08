@@ -78,7 +78,7 @@ except ImportError:
 from itertools import zip_longest
 import time
 
-secret_version_number = 57
+secret_version_number = 58
 
 mixer, transport, session_component = None, None, None
 quantize_grid_value = 5
@@ -2648,6 +2648,12 @@ class Tap(ControlSurface):
             self._active_high_resolution_gestures = set()
             self._active_high_resolution_undo_steps = set()
             self._parameter_value_listeners = {}
+            self._eq8_visualization_value_listeners = {}
+            self._eq8_visualization_send_pending = False
+            self._last_sent_eq8_visualization_state = None
+            self._eq8_visualization_channel = None
+            self._eq8_visualization_edit_keys = set()
+            self._eq8_visualization_edit_undo_started = False
             self._parameter_name_listeners = {}
             self._parameter_name_update_timer = None
             self._active_bank_parameter_refresh_pending = False
@@ -2863,7 +2869,9 @@ class Tap(ControlSurface):
     def _disconnect_device_controls(self):
         if hasattr(self, '_device'):
             self._device.set_parameter_controls([])
+        self._finish_eq8_visualization_edit()
         self._remove_parameter_value_listeners()
+        self._remove_eq8_visualization_listeners()
         self._remove_parameter_name_listeners()
         self._remove_disabled_parameter_listeners()
         self._remove_automation_state_listeners()
@@ -8203,6 +8211,175 @@ class Tap(ControlSurface):
         except Exception as e:
             self._debug_log("Error refreshing active bank after parameter metadata change: {}".format(str(e)))
 
+    def _selected_eq8_visualization_channel(self, selected_device):
+        if selected_device is None or str(getattr(selected_device, 'class_name', '')) != 'Eq8':
+            self._eq8_visualization_channel = None
+            return None
+
+        for control_index in range(8):
+            parameter = self._current_connected_parameter_for_control(control_index, selected_device)
+            name = str(getattr(parameter, 'name', ''))
+            match = re.match(r'^[1-8] (?:Filter On|Filter Type|Frequency|Gain|Q|Resonance) ([AB])$', name)
+            if match:
+                self._eq8_visualization_channel = match.group(1)
+                return self._eq8_visualization_channel
+        return self._eq8_visualization_channel or 'A'
+
+    def _eq8_visualization_parameter(self, band, property_names, channel):
+        names = tuple('{} {} {}'.format(band, property_name, channel) for property_name in property_names)
+        try:
+            return self._device._parameter_by_names(*names)
+        except Exception:
+            return None
+
+    def _eq8_visualization_byte(self, parameter, default=0):
+        if parameter is None or not liveobj_valid(parameter):
+            return int(default) & 0x7F
+        return max(0, min(127, int(round(self._parameter_normalized_value(parameter) * 127.0))))
+
+    def _eq8_visualization_payload(self, selected_device=None):
+        selected_device = selected_device or self._selected_device()
+        channel = self._selected_eq8_visualization_channel(selected_device)
+        if channel is None:
+            return (1, 0x7F)
+
+        scale = self._device._parameter_by_names('Scale')
+        values = [
+            1,
+            0 if channel == 'A' else 1,
+            self._eq8_visualization_byte(scale, default=64),
+        ]
+        for band in range(1, 9):
+            enabled = self._eq8_visualization_parameter(band, ('Filter On',), channel)
+            filter_type = self._eq8_visualization_parameter(band, ('Filter Type',), channel)
+            frequency = self._eq8_visualization_parameter(band, ('Frequency',), channel)
+            gain = self._eq8_visualization_parameter(band, ('Gain',), channel)
+            resonance = self._eq8_visualization_parameter(band, ('Q', 'Resonance'), channel)
+            values.extend((
+                1 if self._eq8_visualization_byte(enabled, default=127) > 0 else 0,
+                self._eq8_visualization_byte(filter_type),
+                self._eq8_visualization_byte(frequency),
+                self._eq8_visualization_byte(gain, default=64),
+                self._eq8_visualization_byte(resonance),
+            ))
+        return tuple(values)
+
+    def _send_eq8_visualization_state(self, force=False):
+        self._eq8_visualization_send_pending = False
+        payload = self._eq8_visualization_payload()
+        if force or payload != self._last_sent_eq8_visualization_state:
+            self._last_sent_eq8_visualization_state = payload
+            self._send_binary_sys_ex_message(payload, 0x64)
+
+    def _schedule_eq8_visualization_state(self):
+        if self._eq8_visualization_send_pending:
+            return
+        self._eq8_visualization_send_pending = True
+        self.schedule_message(1, self._send_eq8_visualization_state)
+
+    def _create_eq8_visualization_listener(self):
+        def listener():
+            self._schedule_eq8_visualization_state()
+        return listener
+
+    def _remove_eq8_visualization_listeners(self):
+        for parameter, listener in list(getattr(self, '_eq8_visualization_value_listeners', {}).items()):
+            if liveobj_valid(parameter) and hasattr(parameter, 'remove_value_listener'):
+                try:
+                    if parameter.value_has_listener(listener):
+                        parameter.remove_value_listener(listener)
+                except Exception:
+                    pass
+        self._eq8_visualization_value_listeners.clear()
+        self._eq8_visualization_send_pending = False
+
+    def _refresh_eq8_visualization_listeners(self, send_current_values=False):
+        self._remove_eq8_visualization_listeners()
+        selected_device = self._selected_device()
+        channel = self._selected_eq8_visualization_channel(selected_device)
+        if channel is None:
+            self._send_eq8_visualization_state(force=send_current_values)
+            return
+
+        for band in range(1, 9):
+            for property_names in (
+                    ('Filter On',), ('Filter Type',), ('Frequency',), ('Gain',), ('Q', 'Resonance')):
+                parameter = self._eq8_visualization_parameter(band, property_names, channel)
+                if parameter is None or not liveobj_valid(parameter) or not hasattr(parameter, 'add_value_listener'):
+                    continue
+                listener = self._create_eq8_visualization_listener()
+                self._eq8_visualization_value_listeners[parameter] = listener
+                try:
+                    if not parameter.value_has_listener(listener):
+                        parameter.add_value_listener(listener)
+                except Exception:
+                    pass
+        scale = self._device._parameter_by_names('Scale')
+        if scale is not None and liveobj_valid(scale) and hasattr(scale, 'add_value_listener'):
+            listener = self._create_eq8_visualization_listener()
+            self._eq8_visualization_value_listeners[scale] = listener
+            try:
+                if not scale.value_has_listener(listener):
+                    scale.add_value_listener(listener)
+            except Exception:
+                pass
+        if send_current_values:
+            self._send_eq8_visualization_state(force=True)
+
+    def _finish_eq8_visualization_edit(self):
+        self._end_undo_step(getattr(self, '_eq8_visualization_edit_undo_started', False))
+        self._eq8_visualization_edit_keys.clear()
+        self._eq8_visualization_edit_undo_started = False
+
+    def _handle_eq8_visualization_edit(self, message):
+        values = self.extract_values_from_sysex_message(message)
+        if len(values) != 7 or values[0] != 1:
+            self._finish_eq8_visualization_edit()
+            return
+        channel_value, band, property_code, frequency, vertical_value, phase = values[1:]
+        if channel_value not in (0, 1) or not 1 <= band <= 8 or property_code not in (0, 1) or phase not in (0, 1, 2):
+            self._finish_eq8_visualization_edit()
+            return
+
+        selected_device = self._selected_device()
+        channel = self._selected_eq8_visualization_channel(selected_device)
+        requested_channel = 'A' if channel_value == 0 else 'B'
+        if channel != requested_channel:
+            self._finish_eq8_visualization_edit()
+            return
+
+        frequency_parameter = self._eq8_visualization_parameter(band, ('Frequency',), channel)
+        vertical_names = ('Gain',) if property_code == 0 else ('Q', 'Resonance')
+        vertical_parameter = self._eq8_visualization_parameter(band, vertical_names, channel)
+        if not liveobj_valid(frequency_parameter) or not liveobj_valid(vertical_parameter):
+            self._finish_eq8_visualization_edit()
+            return
+
+        edit_key = (channel_value, band, property_code)
+        if phase == 0:
+            if not self._eq8_visualization_edit_keys:
+                self._eq8_visualization_edit_undo_started = self._begin_undo_step()
+            self._eq8_visualization_edit_keys.add(edit_key)
+        elif edit_key not in self._eq8_visualization_edit_keys:
+            return
+
+        try:
+            frequency_parameter.value = self._parameter_target_value_from_normalized(
+                frequency_parameter, frequency / 127.0
+            )
+            vertical_parameter.value = self._parameter_target_value_from_normalized(
+                vertical_parameter, vertical_value / 127.0
+            )
+        except Exception:
+            self._finish_eq8_visualization_edit()
+            return
+
+        if phase == 2:
+            self._eq8_visualization_edit_keys.discard(edit_key)
+            if not self._eq8_visualization_edit_keys:
+                self._end_undo_step(self._eq8_visualization_edit_undo_started)
+                self._eq8_visualization_edit_undo_started = False
+
     def _remove_parameter_value_listeners(self):
         for (param, control_index), listener in list(getattr(self, '_parameter_value_listeners', {}).items()):
             if liveobj_valid(param) and hasattr(param, 'remove_value_listener'):
@@ -8286,6 +8463,7 @@ class Tap(ControlSurface):
 
     def _refresh_parameter_value_listeners_current_bank(self, send_current_values=False):
         self._remove_parameter_value_listeners()
+        self._refresh_eq8_visualization_listeners(send_current_values=send_current_values)
         if not hasattr(self, '_device') or not liveobj_valid(self._device):
             return
         if not hasattr(self._device, '_parameter_controls'):
@@ -15928,6 +16106,11 @@ class Tap(ControlSurface):
             self._handle_full_sysex(message)
 
     def _handle_full_sysex(self, message):
+        # Direct manipulation from Tap's synthetic EQ Eight overview bank.
+        if len(message) >= 3 and message[1] == 0x65:
+            self._handle_eq8_visualization_edit(message)
+            return
+
         # Selected audio-clip editing, sample loading and conversion commands.
         if len(message) >= 3 and message[1] == 0x52:
             self._handle_audio_clip_command(message)
@@ -27973,7 +28156,9 @@ class Tap(ControlSurface):
         for control_index in list(getattr(self, '_active_high_resolution_undo_steps', set())):
             self._end_high_resolution_undo_step(control_index)
         
+        self._finish_eq8_visualization_edit()
         self._remove_parameter_value_listeners()
+        self._remove_eq8_visualization_listeners()
         self._remove_parameter_name_listeners()
         self._remove_parameter_source_listener()
         self._remove_wavetable_virtual_property_listeners()
