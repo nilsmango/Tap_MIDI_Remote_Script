@@ -9736,6 +9736,8 @@ class Tap(ControlSurface):
 
     def _on_song_is_playing_changed(self):
         self._send_transport_state()
+        if not self._song_is_playing():
+            self._flush_playing_note_feedback()
         self._sync_follow_actions_to_transport()
 
     def _normalize_follow_action(self, action_name):
@@ -13695,6 +13697,7 @@ class Tap(ControlSurface):
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
         if self.was_initialized:
+            self._flush_playing_note_feedback()
             selected_track = self.song().view.selected_track
             track_control_selected = self._track_device_is_selected(selected_track)
             self._track_device_selected = track_control_selected
@@ -13848,6 +13851,18 @@ class Tap(ControlSurface):
         for clip in list(self._playing_note_cache_listeners.keys()):
             self._remove_playing_note_cache_listener(clip)
 
+    def _flush_playing_note_feedback(self):
+        active_notes = tuple(
+            note_index
+            for note_index, is_playing in enumerate(self.currently_playing_notes)
+            if is_playing
+        )
+        self.currently_playing_notes = [False] * 128
+        self.current_clip_notes = []
+        self.last_playing_position = 0.0
+        for note_index in active_notes:
+            self.send_note_off(note_index, 0, 0)
+
     def _check_clip_playing_status(self, force=False):
         try:
             song = self.song()
@@ -13863,6 +13878,9 @@ class Tap(ControlSurface):
                 new_status = 1 if another_clip_playing else 2
         except Exception:
             return
+
+        if new_status == 2:
+            self._flush_playing_note_feedback()
         
         # Update status only if it has changed
         if force or self.seq_clip_playing_status != new_status:
@@ -13879,6 +13897,10 @@ class Tap(ControlSurface):
                 clip_slot = selected_track.clip_slots[clip_index]
 
                 if clip_slot is not None and clip_slot.has_clip:
+                    if not getattr(clip_slot, 'is_playing', False):
+                        self._check_clip_playing_status()
+                        self._flush_playing_note_feedback()
+                        return
                     clip_playing = clip_slot.clip
                     
                     loop_start = clip_playing.loop_start
@@ -25753,9 +25775,11 @@ class Tap(ControlSurface):
                 self._send_selected_device_state()
         else:
             self.device_status = False
+            self._flush_playing_note_feedback()
     
     def _update_step_seq(self, value):
         if value:
+            self._flush_playing_note_feedback()
             self.seq_status = True
             self.start_step_seq()
         else:
@@ -28099,6 +28123,7 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._flush_playing_note_feedback()
         self._finalize_automation_pencil_stroke()
         self._finalize_exact_automation_stream()
         self._clear_automation_contexts()

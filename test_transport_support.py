@@ -192,6 +192,37 @@ class SelectedClipSnapshotHarness:
         self.sent.append(message)
 
 
+class PlayingNoteFeedbackHarness:
+    CLIP_PLAYING_STATUS_CC = 70
+    CLIP_PLAYING_STATUS_CHANNEL = 11
+    _flush_playing_note_feedback = extracted_method("_flush_playing_note_feedback")
+    _check_clip_playing_status = extracted_method("_check_clip_playing_status")
+
+    def __init__(self, slots=()):
+        self.currently_playing_notes = [False] * 128
+        self.current_clip_notes = [(36, 0.0, 1.0)]
+        self.last_playing_position = 1.0
+        self.seq_clip_playing_status = 0
+        self.note_offs = []
+        self.cc_messages = []
+        highlighted = slots[0] if slots else type("Slot", (), {"is_playing": False})()
+        selected_track = type("Track", (), {"clip_slots": list(slots)})()
+        view = type("View", (), {
+            "selected_track": selected_track,
+            "highlighted_clip_slot": highlighted,
+        })()
+        self._song = type("Song", (), {"view": view})()
+
+    def song(self):
+        return self._song
+
+    def send_note_off(self, note_number, channel, velocity):
+        self.note_offs.append((note_number, channel, velocity))
+
+    def send_cc(self, cc_number, channel, value):
+        self.cc_messages.append((cc_number, channel, value))
+
+
 class AutomationPencilMergeHarness:
     _automation_step_id = extracted_method("_automation_step_id")
     _automation_step_order = extracted_method("_automation_step_order")
@@ -401,6 +432,41 @@ class EQ8VisualizationHarness:
 
 
 class TransportTests(unittest.TestCase):
+    def test_playing_note_feedback_flushes_each_active_pitch_once(self):
+        harness = PlayingNoteFeedbackHarness()
+        harness.currently_playing_notes[36] = True
+        harness.currently_playing_notes[42] = True
+
+        harness._flush_playing_note_feedback()
+        harness._flush_playing_note_feedback()
+
+        self.assertEqual(harness.note_offs, [(36, 0, 0), (42, 0, 0)])
+        self.assertFalse(any(harness.currently_playing_notes))
+        self.assertEqual(harness.current_clip_notes, [])
+        self.assertEqual(harness.last_playing_position, 0.0)
+
+    def test_idle_clip_status_flushes_stale_playing_note_feedback(self):
+        stopped_slot = type("Slot", (), {"has_clip": True, "is_playing": False})()
+        harness = PlayingNoteFeedbackHarness((stopped_slot,))
+        harness.currently_playing_notes[38] = True
+
+        harness._check_clip_playing_status()
+
+        self.assertEqual(harness.note_offs, [(38, 0, 0)])
+        self.assertEqual(harness.seq_clip_playing_status, 2)
+        self.assertEqual(harness.cc_messages, [(70, 11, 2)])
+
+    def test_playing_clip_status_keeps_active_note_feedback(self):
+        playing_slot = type("Slot", (), {"has_clip": True, "is_playing": True})()
+        harness = PlayingNoteFeedbackHarness((playing_slot,))
+        harness.currently_playing_notes[38] = True
+
+        harness._check_clip_playing_status()
+
+        self.assertEqual(harness.note_offs, [])
+        self.assertTrue(harness.currently_playing_notes[38])
+        self.assertEqual(harness.seq_clip_playing_status, 0)
+
     def test_v58_eq8_visualization_payload_has_fixed_compact_band_order_and_scale(self):
         payload = EQ8VisualizationHarness()._eq8_visualization_payload()
         self.assertEqual(len(payload), 43)
