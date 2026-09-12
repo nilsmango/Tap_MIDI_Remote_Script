@@ -33,6 +33,9 @@ METHOD_NAMES = {
     "_audio_clip_navigation_availability",
     "_select_adjacent_audio_clip",
     "_send_all_drum_pad_names",
+    "_on_drum_pad_name_changed",
+    "_on_drum_pad_chains_changed",
+    "_queue_drum_pad_names_refresh",
     "_find_drum_rack_for_device",
     "_sync_drum_rack_device",
     "_set_simpler_device",
@@ -296,6 +299,12 @@ class Harness:
         self._simpler_device = None
         self._simpler_waveform_generation = 0
         self.audio_clip_listener_removals = 0
+        self._drum_pad_chain_listeners = {}
+        self._drum_pad_names_refresh_scheduled = False
+        self._last_drum_pad_names_payload = None
+        self._remote_refresh_generation = 0
+        self._drum_rack_device = None
+        self._drum_rack_device_listener_owner = None
 
     def song(self):
         return self.song_state
@@ -548,6 +557,16 @@ class AudioClipSupportTests(unittest.TestCase):
 
         self.assertEqual(self.harness._simpler_waveform_pending, set())
 
+    def test_missing_waveform_files_have_no_signature_or_supported_header(self):
+        missing_path = os.path.join(tempfile.gettempdir(), "tap-no-such-sample.aif")
+        self.assertEqual(
+            self.harness._simpler_waveform_source_signature(missing_path),
+            (None, None),
+        )
+        self.assertFalse(
+            self.harness._simpler_audio_file_has_supported_header(missing_path)
+        )
+
     def test_simpler_waveform_protocol_has_explicit_statuses(self):
         self.harness._simpler_waveform_generation = 7
         self.harness._send_simpler_waveform_clear()
@@ -642,6 +661,13 @@ class AudioClipSupportTests(unittest.TestCase):
 
         self.assertEqual(len(peaks), 512)
         self.assertEqual(max(peaks), 127)
+
+    def test_malformed_asd_waveform_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = os.path.join(directory, "malformed.aif")
+            with open(audio_path + ".asd", "wb") as analysis_file:
+                analysis_file.write(b"\x00\x13SampleOverViewLevel" + b"\x01")
+            self.assertEqual(self.harness._simpler_waveform_from_asd(audio_path), [])
 
     def test_add_move_and_remove_warp_markers(self):
         self.harness.clip.warping = True

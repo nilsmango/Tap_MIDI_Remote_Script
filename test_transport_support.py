@@ -5,9 +5,14 @@ import re
 import struct
 import time
 import unittest
+from collections import namedtuple
+from types import MappingProxyType
 
 
 SOURCE = pathlib.Path(__file__).with_name("Tap.py")
+PROTOCOL_SOURCE = pathlib.Path(__file__).with_name("tap_protocol.py")
+RUNTIME_SOURCE = pathlib.Path(__file__).with_name("tap_runtime.py")
+AUTOMATION_SOURCE = pathlib.Path(__file__).with_name("automation.py")
 SECRET_VERSION_NUMBER = next(
     ast.literal_eval(node.value)
     for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body
@@ -17,6 +22,92 @@ SECRET_VERSION_NUMBER = next(
         for target in node.targets
     )
 )
+
+
+def protocol_registry_namespace():
+    wanted_assignments = {
+        "TapSysExMessageSpec",
+        "TAP_SYSEX_APP_TO_REMOTE_SPECS",
+        "TAP_SYSEX_APP_TO_REMOTE",
+        "TAP_SYSEX_REMOTE_TO_APP_SPECS",
+        "TAP_SYSEX_REMOTE_TO_APP",
+    }
+    wanted_functions = {"_tap_sysex_spec", "_tap_sysex_registry"}
+    body = []
+    for node in ast.parse(PROTOCOL_SOURCE.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted_functions:
+            body.append(node)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in wanted_assignments
+                for target in node.targets):
+            body.append(node)
+    module = ast.Module(body=body, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"namedtuple": namedtuple, "MappingProxyType": MappingProxyType}
+    exec(compile(module, str(PROTOCOL_SOURCE), "exec"), namespace)
+    return namespace
+
+
+PROTOCOL_REGISTRY = protocol_registry_namespace()
+
+
+def automation_state_namespace():
+    wanted = {
+        "AutomationEvent",
+        "AutomationTargetContext",
+        "AutomationContextRegistry",
+        "AutomationUndoLease",
+        "AutomationPencilTransaction",
+        "ExactAutomationWriteMode",
+        "ExactAutomationWritePhase",
+        "ExactAutomationWriteTransaction",
+        "LiveAutomationWriter",
+        "AutomationTransferCoordinator",
+    }
+    body = [
+        node for node in ast.parse(AUTOMATION_SOURCE.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.ClassDef) and node.name in wanted
+    ]
+    module = ast.Module(body=body, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {}
+    exec(compile(module, str(AUTOMATION_SOURCE), "exec"), namespace)
+    return namespace
+
+
+AUTOMATION_STATE = automation_state_namespace()
+
+
+def protocol_registry_constants():
+    wanted = {
+        "SYSEX_APP_TO_REMOTE",
+        "SYSEX_REMOTE_TO_APP",
+        "CHUNKED_INCOMING_SYSEX_IDS",
+        "SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID",
+    }
+    assignments = [
+        node for node in tap_class_node().body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in wanted
+            for target in node.targets
+        )
+    ]
+    class_node = ast.ClassDef(
+        name="ProtocolRegistryConstants",
+        bases=[],
+        keywords=[],
+        body=assignments,
+        decorator_list=[],
+    )
+    module = ast.Module(body=[class_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "MappingProxyType": MappingProxyType,
+        **PROTOCOL_REGISTRY,
+    }
+    exec(compile(module, str(SOURCE), "exec"), namespace)
+    return namespace["ProtocolRegistryConstants"]
 
 
 def tap_class_node():
@@ -38,9 +129,31 @@ def extracted_method(name):
         "struct": struct,
         "liveobj_valid": lambda value: value is not None,
         "secret_version_number": SECRET_VERSION_NUMBER,
+        "PERFORMANCE_DIAGNOSTICS_ENABLED": False,
     }
+    namespace.update(PROTOCOL_REGISTRY)
+    namespace.update(AUTOMATION_STATE)
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace[name]
+
+
+def performance_diagnostics_class():
+    tree = ast.parse(RUNTIME_SOURCE.read_text(encoding="utf-8"))
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TapPerformanceDiagnostics"
+    )
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "time": time,
+        "PERFORMANCE_DIAGNOSTICS_ENABLED": False,
+    }
+    exec(compile(module, str(RUNTIME_SOURCE), "exec"), namespace)
+    return namespace["TapPerformanceDiagnostics"]
+
+
+TapPerformanceDiagnostics = performance_diagnostics_class()
 
 
 class AutomationTraceSupport:
@@ -61,7 +174,8 @@ class AutomationTraceSupport:
 
 
 class SysExHarness(AutomationTraceSupport):
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 88, 92, 96)
+    SYSEX_APP_TO_REMOTE = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 92, 96)
     SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
     SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 32
     SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {}
@@ -72,7 +186,7 @@ class SysExHarness(AutomationTraceSupport):
         self.received = []
         self.logs = []
 
-    def _handle_full_sysex(self, message):
+    def _handle_full_sysex(self, message, _message_spec=None):
         self.received.append(message)
 
     def _debug_log(self, message):
@@ -80,6 +194,7 @@ class SysExHarness(AutomationTraceSupport):
 
 
 class AutomationTransferTraceHarness:
+    SYSEX_APP_TO_REMOTE = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
     AUTOMATION_TRACE_LOGGING_ENABLED = True
     SYSEX_STRING_ESCAPE_CHAR = "\\"
     CHUNKED_INCOMING_SYSEX_IDS = (0x32,)
@@ -100,7 +215,7 @@ class AutomationTransferTraceHarness:
         self.received = []
         self.logs = []
 
-    def _handle_full_sysex(self, message):
+    def _handle_full_sysex(self, message, _message_spec=None):
         self.received.append(message)
 
     def log_message(self, message):
@@ -172,7 +287,7 @@ class NoteCodecHarness:
 class SelectedClipSnapshotHarness:
     SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
     SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL = 0.05
-    send_selected_clip_notes = extracted_method("send_selected_clip_notes")
+    send_selected_clip_notes = extracted_method("_send_selected_clip_notes_now")
 
     def __init__(self):
         self.seq_status = True
@@ -190,6 +305,140 @@ class SelectedClipSnapshotHarness:
 
     def _send_midi(self, message):
         self.sent.append(message)
+
+    def _send_tap_midi(self, message):
+        self._send_midi(message)
+
+
+class SelectedClipInvalidationHarness:
+    _invalidate_selected_clip = extracted_method("_invalidate_selected_clip")
+    _flush_selected_clip_updates = extracted_method("_flush_selected_clip_updates")
+    _begin_selected_clip_update_batch = extracted_method("_begin_selected_clip_update_batch")
+    _end_selected_clip_update_batch = extracted_method("_end_selected_clip_update_batch")
+    _invalidate_deferred_remote_refreshes = extracted_method(
+        "_invalidate_deferred_remote_refreshes"
+    )
+
+    def __init__(self):
+        self._selected_clip_dirty_fields = set()
+        self._selected_clip_flush_scheduled = False
+        self._selected_clip_update_suppression_depth = 0
+        self._selected_clip_update_pending_metadata = False
+        self._selected_clip_update_pending_notes = False
+        self._remote_refresh_generation = 0
+        self._remote_state_flush_scheduled = False
+        self.scheduled = []
+        self.sent = []
+
+    def schedule_message(self, ticks, callback):
+        self.scheduled.append((ticks, callback))
+
+    def _selected_clip_updates_are_suppressed(self):
+        return self._selected_clip_update_suppression_depth > 0
+
+    def _send_audio_clip_state(self):
+        self.sent.append("audio")
+
+    def _send_selected_clip_metadata_now(self):
+        self.sent.append("metadata")
+
+    def _send_selected_clip_notes_now(self):
+        self.sent.append("notes")
+
+
+class RemoteStateInvalidationHarness:
+    _queue_remote_state_flush = extracted_method("_queue_remote_state_flush")
+    _flush_remote_state_updates = extracted_method("_flush_remote_state_updates")
+    _mark_group_state_dirty = extracted_method("_mark_group_state_dirty")
+    _invalidate_deferred_remote_refreshes = extracted_method(
+        "_invalidate_deferred_remote_refreshes"
+    )
+
+    def __init__(self):
+        self._remote_state_flush_scheduled = False
+        self._remote_refresh_generation = 0
+        self._track_simpler_slice_dirty = True
+        self._group_state_dirty = False
+        self.mixer_status = False
+        self.scheduled = []
+        self.sent = []
+
+    def schedule_message(self, ticks, callback):
+        self.scheduled.append((ticks, callback))
+
+    def _send_track_simpler_slice_state(self):
+        self._track_simpler_slice_dirty = False
+        self.sent.append("simpler")
+
+    def _send_group_fold_states_if_changed(self):
+        self.sent.append("groups")
+
+    def _set_up_mixer_controls(self):
+        self.sent.append("mixer")
+
+
+class NestedTopologyHarness:
+    _sync_selected_track_device_topology_listener = extracted_method(
+        "_sync_selected_track_device_topology_listener"
+    )
+    _remove_selected_track_device_topology_listener = extracted_method(
+        "_remove_selected_track_device_topology_listener"
+    )
+    _on_selected_track_device_topology_changed = extracted_method(
+        "_on_selected_track_device_topology_changed"
+    )
+    _queue_selected_track_device_topology_refresh = extracted_method(
+        "_queue_selected_track_device_topology_refresh"
+    )
+
+    class Subject:
+        def __init__(self, **values):
+            self.listeners = {}
+            for key, value in values.items():
+                setattr(self, key, value)
+
+        def __getattr__(self, name):
+            if name.startswith("add_") and name.endswith("_listener"):
+                property_name = name[4:-9]
+                return lambda listener: self.listeners.__setitem__(property_name, listener)
+            if name.startswith("remove_") and name.endswith("_listener"):
+                property_name = name[7:-9]
+                return lambda _listener: self.listeners.pop(property_name, None)
+            if name.endswith("_has_listener"):
+                property_name = name[:-13]
+                return lambda listener: self.listeners.get(property_name) == listener
+            raise AttributeError(name)
+
+    def __init__(self):
+        simpler = self.Subject(chains=())
+        self.chain = self.Subject(devices=(simpler,))
+        self.rack = self.Subject(chains=(self.chain,), can_have_drum_pads=False)
+        self.track = self.Subject(devices=(self.rack,))
+        self._song = type("Song", (), {
+            "view": type("View", (), {"selected_track": self.track})()
+        })()
+        self._selected_track_device_topology_track = None
+        self._selected_track_device_topology_listener = None
+        self._selected_track_device_topology_bindings = []
+        self._selected_track_device_topology_refresh_scheduled = False
+        self.invalidated = 0
+        self.queued = 0
+        self.topology_queued = 0
+
+    def song(self):
+        return self._song
+
+    def _get_selected_drum_pad(self, _device):
+        return None
+
+    def _invalidate_track_sliced_simpler(self):
+        self.invalidated += 1
+
+    def _queue_remote_state_flush(self):
+        self.queued += 1
+
+    def _queue_selected_track_device_topology_refresh(self):
+        self.topology_queued += 1
 
 
 class PlayingNoteFeedbackHarness:
@@ -432,6 +681,399 @@ class EQ8VisualizationHarness:
 
 
 class TransportTests(unittest.TestCase):
+    def test_automation_event_is_tuple_compatible_and_named(self):
+        event_type = AUTOMATION_STATE["AutomationEvent"]
+        legacy = event_type(1.0, 0.125, 0.4, 0.0, 7, 2)
+        exact = event_type(
+            1.0, 0.125, 0.4, 0.0, 7, 2, True,
+            0.1, 0.2, 0.8, 0.9
+        )
+
+        self.assertIsInstance(legacy, tuple)
+        self.assertEqual(len(legacy), 6)
+        self.assertEqual(legacy.event_id, 7)
+        self.assertFalse(legacy.uses_exact_controls)
+        self.assertEqual(legacy.control_x1, 0.5)
+        self.assertEqual(len(exact), 11)
+        self.assertTrue(exact.uses_exact_controls)
+        self.assertEqual(exact[7:11], (0.1, 0.2, 0.8, 0.9))
+
+    def test_automation_context_registry_owns_tokens_expiry_and_limit(self):
+        registry_type = AUTOMATION_STATE["AutomationContextRegistry"]
+        context_type = AUTOMATION_STATE["AutomationTargetContext"]
+        registry = registry_type()
+        first = registry.create()
+        second = registry.create()
+        self.assertIsInstance(first, context_type)
+        self.assertEqual(first["token"], "00000001")
+        self.assertEqual(second["token"], "00000002")
+
+        first["last_activity"] = 1.0
+        second["last_activity"] = 9.0
+        registry.expire(now=10.0, maximum_age=5.0)
+        self.assertNotIn("00000001", registry)
+        self.assertIn("00000002", registry)
+
+        third = registry.create()
+        third["last_activity"] = 10.0
+        registry.trim(1)
+        self.assertEqual(tuple(registry), (third["token"],))
+
+    def test_automation_writer_keeps_the_two_settle_modes_distinct(self):
+        transaction_type = AUTOMATION_STATE["ExactAutomationWriteTransaction"]
+        mode = AUTOMATION_STATE["ExactAutomationWriteMode"]
+        phase = AUTOMATION_STATE["ExactAutomationWritePhase"]
+        writer = AUTOMATION_STATE["LiveAutomationWriter"]()
+        streamed = transaction_type(mode.STREAMED_TWO_PASS, {})
+        batched = transaction_type(mode.BATCHED_FULL, {})
+
+        self.assertNotEqual(streamed.mode, batched.mode)
+        self.assertEqual(streamed.phase, phase.WRITING)
+        writer.begin(streamed)
+        writer.finish(streamed)
+        self.assertEqual(streamed.phase, phase.COMPLETED)
+        writer.begin(batched)
+        writer.finish(batched, failed=True)
+        self.assertEqual(batched.phase, phase.FAILED)
+
+    def test_automation_undo_lease_closes_once(self):
+        lease_type = AUTOMATION_STATE["AutomationUndoLease"]
+
+        class Owner:
+            def __init__(self):
+                self.begin_count = 0
+                self.end_count = 0
+
+            def _begin_undo_step(self):
+                self.begin_count += 1
+                return True
+
+            def _end_undo_step(self, started):
+                if started:
+                    self.end_count += 1
+
+        owner = Owner()
+        lease = lease_type()
+        self.assertTrue(lease.begin(owner))
+        self.assertTrue(lease.begin(owner))
+        lease.close(owner)
+        lease.close(owner)
+        self.assertEqual(owner.begin_count, 1)
+        self.assertEqual(owner.end_count, 1)
+
+    def test_direction_specific_sysex_registries_are_complete_unique_and_immutable(self):
+        app_specs = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE_SPECS"]
+        app_registry = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+        remote_specs = PROTOCOL_REGISTRY["TAP_SYSEX_REMOTE_TO_APP_SPECS"]
+        remote_registry = PROTOCOL_REGISTRY["TAP_SYSEX_REMOTE_TO_APP"]
+        expected_app_ids = {
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x23,
+            0x24, 0x25, 0x26, 0x27, 0x2B, 0x2C, 0x2D, 0x2E,
+            0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+            0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+            0x43, 0x45, 0x46, 0x47, 0x4B, 0x4F, 0x52, 0x54,
+            0x55, 0x5A, 0x5C, 0x60, 0x62, 0x65,
+        }
+        expected_remote_ids = {
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11,
+            0x12, 0x13, 0x17, 0x18, 0x28, 0x29, 0x2A, 0x2B,
+            0x2D, 0x30, 0x31, 0x3B, 0x3E, 0x41, 0x42, 0x44,
+            0x47, 0x48, 0x49, 0x4A, 0x4C, 0x4D, 0x4E, 0x50,
+            0x51, 0x53, 0x55, 0x56, 0x57, 0x5B, 0x5D, 0x60,
+            0x61, 0x64, 0x6D, 0x7D,
+        }
+
+        self.assertEqual(len(app_specs), len(app_registry))
+        self.assertEqual(len(remote_specs), len(remote_registry))
+        self.assertEqual(set(app_registry), expected_app_ids)
+        self.assertEqual(set(remote_registry), expected_remote_ids)
+        self.assertEqual(
+            {spec.route for spec in app_specs},
+            {spec.route for spec in app_registry.values()},
+        )
+        self.assertEqual(len({spec.route for spec in app_specs}), len(app_specs))
+        self.assertEqual(len({spec.route for spec in remote_specs}), len(remote_specs))
+        self.assertTrue(all(
+            key == spec.manufacturer_id
+            for key, spec in app_registry.items()
+        ))
+        self.assertTrue(all(not spec.includes_remote_device_byte for spec in app_specs))
+        self.assertTrue(all(spec.includes_remote_device_byte for spec in remote_specs))
+        with self.assertRaises(TypeError):
+            app_registry[0x7F] = app_specs[0]
+
+    def test_sysex_chunking_and_assembled_limits_are_derived_from_registry(self):
+        constants = protocol_registry_constants()
+        specs = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE_SPECS"]
+        expected_chunked = tuple(
+            spec.manufacturer_id for spec in specs
+            if spec.framing in ("chunkedText", "chunkedBinary", "chunkedMixed")
+        )
+        expected_limits = {
+            spec.manufacturer_id: spec.maximum_assembled_bytes
+            for spec in specs
+            if spec.framing in ("chunkedText", "chunkedBinary", "chunkedMixed")
+            and spec.maximum_assembled_bytes is not None
+        }
+
+        self.assertEqual(constants.CHUNKED_INCOMING_SYSEX_IDS, expected_chunked)
+        self.assertEqual(dict(constants.SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID), expected_limits)
+        self.assertEqual(set(expected_chunked), {
+            0x0E, 0x0F, 0x10, 0x23, 0x24, 0x31, 0x32, 0x33,
+            0x37, 0x39, 0x3A, 0x3C, 0x3E, 0x52, 0x5C, 0x60,
+        })
+        self.assertNotIn(0x58, expected_chunked)
+        self.assertEqual(expected_limits[0x32], 1048576)
+        self.assertEqual(expected_limits[0x5C], 524288)
+
+    def test_overloaded_sysex_ids_remain_direction_specific(self):
+        app = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+        remote = PROTOCOL_REGISTRY["TAP_SYSEX_REMOTE_TO_APP"]
+        expected = {
+            0x0E: ("addNotes", "selectedClipMetadata"),
+            0x0F: ("removeNotes", "selectedClipPlayingPosition"),
+            0x10: ("modifyNotes", "selectedClip"),
+            0x31: ("requestAutomationEnvelope", "automationEnvelope"),
+            0x3E: ("flin", "browserSearchProgress"),
+            0x47: ("setClipPositionFeedback", "clipPlayingPositions"),
+            0x55: ("wideSession", "clipSlotDelta"),
+            0x60: ("grooveEdit", "groovePool"),
+        }
+        for manufacturer_id, routes in expected.items():
+            self.assertEqual(app[manufacturer_id].route, routes[0])
+            self.assertEqual(remote[manufacturer_id].route, routes[1])
+
+    def test_every_registered_app_route_is_present_in_semantic_dispatch(self):
+        full_handler = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_handle_full_sysex"
+        )
+        dispatched_routes = {
+            comparison.comparators[0].value
+            for comparison in ast.walk(full_handler)
+            if isinstance(comparison, ast.Compare)
+            and len(comparison.ops) == 1
+            and isinstance(comparison.ops[0], ast.Eq)
+            and isinstance(comparison.left, ast.Name)
+            and comparison.left.id == "route"
+            and isinstance(comparison.comparators[0], ast.Constant)
+            and isinstance(comparison.comparators[0].value, str)
+        }
+        registered_routes = {
+            spec.route
+            for spec in PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE_SPECS"]
+        }
+        self.assertEqual(dispatched_routes, registered_routes)
+
+    def test_literal_remote_sysex_senders_are_covered_by_remote_registry(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        literal_sender_ids = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {
+                    "_send_sys_ex_message",
+                    "_send_binary_sys_ex_message",
+                    "_send_chunked_binary_sys_ex_message",
+                }
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, int)
+            ):
+                literal_sender_ids.add(node.args[1].value)
+            if (
+                isinstance(node, (ast.Tuple, ast.List))
+                and len(node.elts) >= 2
+                and isinstance(node.elts[0], ast.Constant)
+                and node.elts[0].value == 0xF0
+                and isinstance(node.elts[1], ast.Constant)
+                and isinstance(node.elts[1].value, int)
+            ):
+                literal_sender_ids.add(node.elts[1].value)
+
+        remote_registry = PROTOCOL_REGISTRY["TAP_SYSEX_REMOTE_TO_APP"]
+        self.assertTrue(literal_sender_ids)
+        self.assertEqual(literal_sender_ids - set(remote_registry), set())
+
+    def test_handle_sysex_passes_registry_route_and_rejects_reserved_ids(self):
+        class Harness(SysExHarness):
+            def __init__(self):
+                super().__init__()
+                self.routes = []
+
+            def _handle_full_sysex(self, message, message_spec=None):
+                self.received.append(message)
+                self.routes.append(message_spec.route)
+
+        harness = Harness()
+        harness.handle_sysex([0xF0, 0x09, 0x01, 0xF7])
+        harness.handle_sysex([0xF0, 0x58, ord("$"), 0x01, 0xF7])
+        harness.handle_sysex([0xF0, 0x7F, 0x01, 0xF7])
+
+        self.assertEqual(harness.received, [[0xF0, 0x09, 0x01, 0xF7]])
+        self.assertEqual(harness.routes, ["fireClip"])
+        self.assertNotIn(0x58, harness._sysex_buffers)
+
+    def test_performance_diagnostics_disabled_path_is_quiet_and_empty(self):
+        class FailingClock:
+            def __call__(self):
+                raise AssertionError("disabled diagnostics must not read the clock")
+
+        emitted = []
+        diagnostics = TapPerformanceDiagnostics(
+            enabled=False,
+            clock=FailingClock(),
+            emit=emitted.append,
+        )
+
+        diagnostics.record_incoming_sysex(49, 12)
+        diagnostics.record_outgoing_sysex((0xF0, 49, 0x01, 0xF7))
+        diagnostics.record_selected_clip_notes_call()
+        diagnostics.record_selected_clip_metadata_call()
+        diagnostics.record_listener_binding("song", 1)
+
+        self.assertEqual(diagnostics.snapshot(), {"enabled": False})
+        self.assertIsNone(diagnostics.emit_summary("test"))
+        diagnostics.maybe_emit_summary()
+        self.assertEqual(emitted, [])
+
+    def test_performance_diagnostics_aggregates_and_emits_one_compact_summary(self):
+        now = [10.0]
+        emitted = []
+
+        def clock():
+            return now[0]
+
+        diagnostics = TapPerformanceDiagnostics(
+            enabled=True,
+            clock=clock,
+            emit=emitted.append,
+        )
+        started_at = diagnostics.start_operation()
+        now[0] = 10.25
+        self.assertAlmostEqual(
+            diagnostics.finish_operation("periodic", started_at),
+            0.25,
+        )
+        diagnostics.record_traversal("tracks", 3)
+        diagnostics.record_incoming_sysex(49, 10)
+        diagnostics.record_outgoing_sysex((0xF0, 49, 0x01, 1, 0xF7))
+        diagnostics.record_selected_clip_notes_call()
+        diagnostics.record_selected_clip_notes_fetch(0.125, 24)
+        diagnostics.record_selected_clip_notes_payload(120, 2)
+        diagnostics.record_selected_clip_notes_suppression()
+        diagnostics.record_selected_clip_metadata_call()
+        diagnostics.record_selected_clip_metadata_payload(80, 1)
+        diagnostics.record_selected_clip_metadata_coalesced()
+        diagnostics.record_listener_binding("song", 2)
+
+        snapshot = diagnostics.snapshot()
+        self.assertEqual(snapshot["operations"]["periodic"], (1, 0.25, 0.25))
+        self.assertEqual(snapshot["traversals"], {"tracks": 3})
+        self.assertEqual(snapshot["incoming_sysex_packets"], {"49": 1})
+        self.assertEqual(snapshot["incoming_sysex_bytes"], {"49": 10})
+        self.assertEqual(snapshot["outgoing_sysex_bytes"], {"49": 5})
+        self.assertEqual(snapshot["selected_clip_notes_fetched"], 24)
+        self.assertEqual(snapshot["selected_clip_notes_payload_bytes"], 120)
+        self.assertEqual(snapshot["selected_clip_notes_chunks"], 2)
+        self.assertEqual(snapshot["selected_clip_notes_suppressions"], 1)
+        self.assertEqual(snapshot["selected_clip_metadata_payload_bytes"], 80)
+        self.assertEqual(snapshot["selected_clip_metadata_coalesced"], 1)
+        self.assertEqual(snapshot["listener_totals"], {"song": 2})
+
+        summary = diagnostics.emit_summary("baseline")
+        self.assertEqual(emitted, [summary])
+        self.assertTrue(summary.startswith("TapPerf reason=baseline "))
+        self.assertIn("inBytes=49=10", summary)
+        self.assertNotIn("event=", summary)
+
+    def test_outgoing_diagnostics_fast_path_does_not_inspect_the_message(self):
+        class Harness:
+            _send_tap_midi = extracted_method("_send_tap_midi")
+
+            def __init__(self):
+                self.sent = []
+
+            def _send_midi(self, message):
+                self.sent.append(message)
+
+            @property
+            def _performance_diagnostics(self):
+                raise AssertionError("disabled path must not inspect diagnostics")
+
+        harness = Harness()
+        message = object()
+        harness._send_tap_midi(message)
+        self.assertEqual(harness.sent, [message])
+
+    def test_incoming_diagnostics_count_only_framed_dispatches(self):
+        class Harness:
+            SYSEX_APP_TO_REMOTE = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+            SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
+            SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 4096
+            SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {}
+            CHUNKED_INCOMING_SYSEX_IDS = ()
+            handle_sysex = extracted_method("handle_sysex")
+
+            def __init__(self):
+                self._sysex_buffers = {}
+                self._performance_diagnostics = TapPerformanceDiagnostics(enabled=True)
+                self.dispatched = []
+
+            def _handle_full_sysex(self, message, _message_spec=None):
+                self.dispatched.append(message)
+
+        harness = Harness()
+        globals_map = Harness.handle_sysex.__globals__
+        previous = globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"]
+        globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"] = True
+        try:
+            harness.handle_sysex([0xF0, 9, 0xF7])
+            harness.handle_sysex([0xF0, 9, 1, 0xF7])
+        finally:
+            globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"] = previous
+
+        self.assertEqual(harness.dispatched, [[0xF0, 9, 1, 0xF7]])
+        self.assertEqual(
+            harness._performance_diagnostics.snapshot()["incoming_sysex_packets"],
+            {"9": 1},
+        )
+
+    def test_incoming_diagnostics_count_accepted_physical_chunks_not_reconstruction(self):
+        class Harness:
+            SYSEX_APP_TO_REMOTE = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+            SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
+            SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 4096
+            SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {}
+            CHUNKED_INCOMING_SYSEX_IDS = (60,)
+            handle_sysex = extracted_method("handle_sysex")
+
+            def __init__(self):
+                self._sysex_buffers = {}
+                self._performance_diagnostics = TapPerformanceDiagnostics(enabled=True)
+                self.dispatched = []
+
+            def _handle_full_sysex(self, message, _message_spec=None):
+                self.dispatched.append(message)
+
+        harness = Harness()
+        globals_map = Harness.handle_sysex.__globals__
+        previous = globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"]
+        globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"] = True
+        try:
+            harness.handle_sysex([0xF0, 60, ord("$"), 1, 0xF7])
+            harness.handle_sysex([0xF0, 60, ord("_"), 2, 0xF7])
+        finally:
+            globals_map["PERFORMANCE_DIAGNOSTICS_ENABLED"] = previous
+
+        snapshot = harness._performance_diagnostics.snapshot()
+        self.assertEqual(harness.dispatched, [[0xF0, 60, 1, 2, 0xF7]])
+        self.assertEqual(snapshot["incoming_sysex_packets"], {"60": 2})
+        self.assertEqual(snapshot["incoming_sysex_bytes"], {"60": 10})
+
     def test_playing_note_feedback_flushes_each_active_pitch_once(self):
         harness = PlayingNoteFeedbackHarness()
         harness.currently_playing_notes[36] = True
@@ -783,6 +1425,583 @@ class TransportTests(unittest.TestCase):
         harness._last_selected_clip_notes_sent_at -= 1.0
         harness.send_selected_clip_notes()
         self.assertEqual(len(harness.sent), 2)
+
+    def test_selected_clip_invalidations_fetch_each_family_once_per_tick(self):
+        harness = SelectedClipInvalidationHarness()
+
+        harness._invalidate_selected_clip("metadata", "audio")
+        harness._invalidate_selected_clip("metadata", "notes")
+
+        self.assertEqual(len(harness.scheduled), 1)
+        self.assertEqual(harness.sent, [])
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.sent, ["audio", "metadata", "notes"])
+
+    def test_selected_clip_batch_defers_and_flushes_the_authoritative_snapshot(self):
+        harness = SelectedClipInvalidationHarness()
+        harness._begin_selected_clip_update_batch()
+        harness._invalidate_selected_clip("metadata", "audio")
+        harness._invalidate_selected_clip("notes")
+        self.assertEqual(harness.scheduled, [])
+
+        harness._end_selected_clip_update_batch()
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.sent, ["audio", "metadata", "notes"])
+
+    def test_remote_state_invalidations_coalesce_simpler_and_group_updates(self):
+        harness = RemoteStateInvalidationHarness()
+        harness._queue_remote_state_flush()
+        harness._mark_group_state_dirty()
+        harness._mark_group_state_dirty()
+
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.sent, ["simpler", "groups"])
+
+    def test_stale_remote_and_selected_clip_flushes_are_inert_after_lifecycle_reset(self):
+        remote = RemoteStateInvalidationHarness()
+        remote._queue_remote_state_flush()
+        remote_callback = remote.scheduled[0][1]
+        remote._invalidate_deferred_remote_refreshes()
+        remote_callback()
+        self.assertEqual(remote.sent, [])
+        self.assertFalse(remote._remote_state_flush_scheduled)
+
+        selected_clip = SelectedClipInvalidationHarness()
+        selected_clip._invalidate_selected_clip("metadata", "audio", "notes")
+        selected_callback = selected_clip.scheduled[0][1]
+        selected_clip._invalidate_deferred_remote_refreshes()
+        selected_callback()
+        self.assertEqual(selected_clip.sent, [])
+        self.assertFalse(selected_clip._selected_clip_flush_scheduled)
+
+    def test_nested_rack_device_topology_invalidates_selected_simpler_cache(self):
+        harness = NestedTopologyHarness()
+        harness._sync_selected_track_device_topology_listener()
+
+        self.assertIn("devices", harness.track.listeners)
+        self.assertIn("chains", harness.rack.listeners)
+        self.assertIn("devices", harness.chain.listeners)
+
+        harness.chain.listeners["devices"]()
+        self.assertEqual(harness.invalidated, 1)
+        self.assertEqual(harness.queued, 1)
+
+        harness._remove_selected_track_device_topology_listener()
+        self.assertEqual(harness._selected_track_device_topology_bindings, [])
+        self.assertEqual(harness.chain.listeners, {})
+
+    def test_disconnect_and_set_replacement_invalidate_deferred_refreshes(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        disconnect = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "disconnect"
+        )
+        replacement = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_for_new_song"
+        )
+        disconnect_calls = [
+            child.func.attr for child in ast.walk(disconnect)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+        replacement_calls = [
+            child.func.attr for child in ast.walk(replacement)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+        self.assertIn("_invalidate_deferred_remote_refreshes", disconnect_calls)
+        self.assertIn("_remove_selected_track_device_topology_listener", disconnect_calls)
+        self.assertIn("_remove_group_fold_state_listeners", disconnect_calls)
+        self.assertIn("_remove_drum_pad_name_listeners", disconnect_calls)
+        self.assertIn("_invalidate_deferred_remote_refreshes", replacement_calls)
+        self.assertIn("_remove_drum_pad_name_listeners", replacement_calls)
+
+    def test_scene_topology_refresh_coalesces_and_respects_lifecycle_generation(self):
+        class Harness:
+            _on_scenes_changed = extracted_method("_on_scenes_changed")
+
+            def __init__(self):
+                self._scene_topology_refresh_scheduled = False
+                self._remote_refresh_generation = 3
+                self.seq_status = True
+                self.scheduled = []
+                self.calls = []
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _register_clip_listeners(self):
+                self.calls.append("listeners")
+
+            def _update_clip_slots(self):
+                self.calls.append("grid")
+
+            def start_step_seq(self):
+                self.calls.append("sequencer")
+
+        harness = Harness()
+        harness._on_scenes_changed()
+        harness._on_scenes_changed()
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.calls, ["listeners", "grid", "sequencer"])
+
+        stale = Harness()
+        stale._on_scenes_changed()
+        stale._remote_refresh_generation += 1
+        stale.scheduled[0][1]()
+        self.assertEqual(stale.calls, [])
+
+    def test_scene_and_sequencer_lifecycle_hooks_are_registered_and_rebound(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        ensure = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_ensure_song_listeners"
+        )
+        remove = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_remove_song_listeners"
+        )
+        replacement = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_for_new_song"
+        )
+        snapshot = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_send_current_project_state"
+        )
+        ensure_source = ast.get_source_segment(source, ensure)
+        remove_source = ast.get_source_segment(source, remove)
+        replacement_source = ast.get_source_segment(source, replacement)
+        snapshot_source = ast.get_source_segment(source, snapshot)
+        self.assertIn('"scenes", self._on_scenes_changed', ensure_source)
+        self.assertIn('("scenes", self._on_scenes_changed)', remove_source)
+        self.assertIn("self.stop_step_seq()", replacement_source)
+        self.assertIn("self.start_step_seq()", snapshot_source)
+        self.assertNotIn("self._invalidate_selected_clip(", snapshot_source)
+
+        start = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "start_step_seq"
+        )
+        start_calls = [
+            child.func.attr for child in ast.walk(start)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+        self.assertEqual(start_calls.count("send_selected_clip_metadata"), 1)
+        self.assertEqual(start_calls.count("send_selected_clip_notes"), 1)
+        self.assertEqual(start_calls.count("_flush_selected_clip_updates"), 1)
+
+    def test_same_slot_clip_replacement_rebinds_listeners_and_sends_one_snapshot(self):
+        class Clip:
+            def __init__(self, midi):
+                self.is_midi_clip = midi
+                self.notes_listener = None
+
+            def notes_has_listener(self, listener):
+                return self.notes_listener == listener
+
+            def add_notes_listener(self, listener):
+                self.notes_listener = listener
+
+            def remove_notes_listener(self, listener):
+                if self.notes_listener == listener:
+                    self.notes_listener = None
+
+        class Slot:
+            def __init__(self, clip):
+                self.clip = clip
+                self.has_listener = None
+
+            @property
+            def has_clip(self):
+                return self.clip is not None
+
+            def has_clip_has_listener(self, listener):
+                return self.has_listener == listener
+
+            def add_has_clip_listener(self, listener):
+                self.has_listener = listener
+
+            def remove_has_clip_listener(self, listener):
+                if self.has_listener == listener:
+                    self.has_listener = None
+
+        class Harness:
+            start_step_seq = extracted_method("start_step_seq")
+
+            def __init__(self, slot, previous_clip):
+                self._song = type("Song", (), {
+                    "view": type("View", (), {"highlighted_clip_slot": slot})()
+                })()
+                self.last_selected_clip_slot = slot
+                self._step_seq_listener_clip = previous_clip
+                # Simulate a new clip whose serialized notes would produce the
+                # same signature as the old one.  The rebind must clear this
+                # before the initial selected-clip snapshot is generated.
+                self._last_selected_clip_notes_signature = ("identical",)
+                self._last_selected_clip_notes_sent_at = 1.0
+                self.last_raw_notes = ("old",)
+                self.sent = []
+                self.metadata_removed = []
+                self.metadata_added = []
+
+            def song(self):
+                return self._song
+
+            def send_selected_clip_metadata(self):
+                current_clip = self._song.view.highlighted_clip_slot.clip
+                if self._step_seq_listener_clip is not current_clip:
+                    raise AssertionError("metadata sent before the current clip was rebound")
+                if current_clip is not None and self.metadata_added != [current_clip]:
+                    raise AssertionError("metadata sent before current clip metadata listeners")
+                self.sent.append("metadata")
+
+            def send_selected_clip_notes(self):
+                if self._last_selected_clip_notes_signature == ("identical",):
+                    return
+                if self._step_seq_listener_clip is not self._song.view.highlighted_clip_slot.clip:
+                    raise AssertionError("notes sent before the current clip was rebound")
+                self.sent.append("notes")
+
+            def _flush_selected_clip_updates(self):
+                self.sent.append("flush")
+
+            def _check_clip_playing_status(self, force=False):
+                pass
+
+            def remove_clip_metadata_listeners(self, clip):
+                self.metadata_removed.append(clip)
+
+            def add_clip_metadata_listeners(self, clip):
+                self.metadata_added.append(clip)
+
+            def on_highlighted_slot_changed(self):
+                pass
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        old_clip = Clip(midi=True)
+        slot = Slot(old_clip)
+        new_clip = Clip(midi=True)
+        slot.clip = new_clip
+        harness = Harness(slot, old_clip)
+        old_clip.notes_listener = harness.send_selected_clip_notes
+        harness.start_step_seq()
+
+        self.assertIsNone(old_clip.notes_listener)
+        self.assertIs(new_clip.notes_listener.__self__, harness)
+        self.assertEqual(harness.metadata_removed, [old_clip])
+        self.assertEqual(harness.metadata_added, [new_clip])
+        self.assertEqual(harness.sent, ["metadata", "notes", "flush"])
+        self.assertIs(harness._step_seq_listener_clip, new_clip)
+        self.assertIsNone(harness._last_selected_clip_notes_signature)
+
+        slot.clip = None
+        harness.sent = []
+        harness.start_step_seq()
+        self.assertEqual(harness.sent, ["metadata", "notes", "flush"])
+        self.assertIsNone(harness._step_seq_listener_clip)
+        self.assertIsNotNone(slot.has_listener)
+
+    def test_drum_pad_listener_totals_are_balanced_and_disconnect_cleans_them(self):
+        class Pad:
+            def __init__(self):
+                self.listener = None
+                self.chains_listener = None
+
+            def name_has_listener(self, listener):
+                return self.listener == listener
+
+            def add_name_listener(self, listener):
+                self.listener = listener
+
+            def remove_name_listener(self, listener):
+                if self.listener == listener:
+                    self.listener = None
+
+            def chains_has_listener(self, listener):
+                return self.chains_listener == listener
+
+            def add_chains_listener(self, listener):
+                self.chains_listener = listener
+
+            def remove_chains_listener(self, listener):
+                if self.chains_listener == listener:
+                    self.chains_listener = None
+
+        class View:
+            def __init__(self):
+                self.listener = None
+
+            def selected_drum_pad_has_listener(self, listener):
+                return self.listener == listener
+
+            def add_selected_drum_pad_listener(self, listener):
+                self.listener = listener
+
+            def remove_selected_drum_pad_listener(self, listener):
+                if self.listener == listener:
+                    self.listener = None
+
+        class Harness:
+            _setup_drum_pad_listeners = extracted_method("_setup_drum_pad_listeners")
+            _remove_drum_pad_name_listeners = extracted_method("_remove_drum_pad_name_listeners")
+            _on_drum_pad_name_changed = extracted_method("_on_drum_pad_name_changed")
+            _on_drum_pad_chains_changed = extracted_method("_on_drum_pad_chains_changed")
+
+            def __init__(self):
+                self._drum_rack_device = type("Rack", (), {
+                    "drum_pads": [Pad(), Pad()], "view": View()
+                })()
+                self._drum_rack_device_listener_owner = self._drum_rack_device
+                self._drum_pad_chain_listeners = {}
+                self._drum_pad_names_refresh_scheduled = False
+                self._last_drum_pad_names_payload = None
+                self._performance_diagnostics = TapPerformanceDiagnostics(enabled=True)
+
+            def _send_all_drum_pad_names(self):
+                pass
+
+            def _send_selected_drum_pad_number(self):
+                pass
+
+            def _queue_drum_pad_names_refresh(self):
+                pass
+
+        harness = Harness()
+        harness._setup_drum_pad_listeners()
+        self.assertEqual(
+            harness._performance_diagnostics.snapshot()["listener_totals"],
+            {"drum_pad": 5},
+        )
+        harness._remove_drum_pad_name_listeners()
+        self.assertEqual(
+            harness._performance_diagnostics.snapshot()["listener_totals"],
+            {"drum_pad": 0},
+        )
+        self.assertTrue(all(pad.listener is None for pad in harness._drum_rack_device.drum_pads))
+        self.assertTrue(all(pad.chains_listener is None for pad in harness._drum_rack_device.drum_pads))
+
+    def test_drum_pad_chain_changes_coalesce_population_updates_and_clear_last_pad(self):
+        class Pad:
+            def __init__(self, note, name):
+                self.note = note
+                self.name = name
+                self.chains = ()
+                self.name_listener = None
+                self.chains_listener = None
+
+            def name_has_listener(self, listener):
+                return self.name_listener == listener
+
+            def add_name_listener(self, listener):
+                self.name_listener = listener
+
+            def remove_name_listener(self, listener):
+                if self.name_listener == listener:
+                    self.name_listener = None
+
+            def chains_has_listener(self, listener):
+                return self.chains_listener == listener
+
+            def add_chains_listener(self, listener):
+                self.chains_listener = listener
+
+            def remove_chains_listener(self, listener):
+                if self.chains_listener == listener:
+                    self.chains_listener = None
+
+        class View:
+            def __init__(self):
+                self.listener = None
+
+            def selected_drum_pad_has_listener(self, listener):
+                return self.listener == listener
+
+            def add_selected_drum_pad_listener(self, listener):
+                self.listener = listener
+
+            def remove_selected_drum_pad_listener(self, listener):
+                if self.listener == listener:
+                    self.listener = None
+
+        class Harness:
+            _setup_drum_pad_listeners = extracted_method("_setup_drum_pad_listeners")
+            _remove_drum_pad_name_listeners = extracted_method("_remove_drum_pad_name_listeners")
+            _send_all_drum_pad_names = extracted_method("_send_all_drum_pad_names")
+            _on_drum_pad_chains_changed = extracted_method("_on_drum_pad_chains_changed")
+            _queue_drum_pad_names_refresh = extracted_method("_queue_drum_pad_names_refresh")
+
+            def __init__(self):
+                self.pads = [Pad(36, "Kick"), Pad(37, "Snare")]
+                self._drum_rack_device = type("Rack", (), {
+                    "drum_pads": self.pads,
+                    "view": View(),
+                })()
+                self._drum_rack_device_listener_owner = self._drum_rack_device
+                self._drum_pad_chain_listeners = {}
+                self._drum_pad_names_refresh_scheduled = False
+                self._last_drum_pad_names_payload = None
+                self._remote_refresh_generation = 0
+                self.scheduled = []
+                self.sent = []
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _send_selected_drum_pad_number(self):
+                pass
+
+            def _send_sys_ex_message(self, payload, manufacturer_id):
+                self.sent.append((payload, manufacturer_id))
+
+            def _escape_sysex_string(self, value):
+                return value
+
+        harness = Harness()
+        harness._setup_drum_pad_listeners()
+        self.assertEqual(harness.sent[-1], ("", 0x11))
+        self.assertTrue(all(pad.chains_listener is not None for pad in harness.pads))
+
+        harness.pads[0].chains = (object(),)
+        harness.pads[0].chains_listener()
+        harness.pads[0].chains_listener()
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled.pop()[1]()
+        self.assertEqual(harness.sent[-1], ("36,Kick", 0x11))
+
+        harness.pads[0].chains = ()
+        harness.pads[0].chains_listener()
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled.pop()[1]()
+        self.assertEqual(harness.sent[-1], ("", 0x11))
+
+        harness._remove_drum_pad_name_listeners()
+        self.assertTrue(all(pad.chains_listener is None for pad in harness.pads))
+
+    def test_nested_topology_refresh_is_coalesced_and_generation_guarded(self):
+        class Harness:
+            _on_selected_track_device_topology_changed = extracted_method(
+                "_on_selected_track_device_topology_changed"
+            )
+            _queue_selected_track_device_topology_refresh = extracted_method(
+                "_queue_selected_track_device_topology_refresh"
+            )
+
+            def __init__(self):
+                self._selected_track_device_topology_refresh_scheduled = False
+                self._remote_refresh_generation = 5
+                self.scheduled = []
+                self.invalidated = 0
+                self.remote_flushes = 0
+                self.device_refreshes = 0
+
+            def _invalidate_track_sliced_simpler(self):
+                self.invalidated += 1
+
+            def _sync_selected_track_device_topology_listener(self):
+                pass
+
+            def _queue_remote_state_flush(self):
+                self.remote_flushes += 1
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _on_device_changed(self):
+                self.device_refreshes += 1
+
+            def _debug_log(self, _message):
+                pass
+
+        harness = Harness()
+        harness._on_selected_track_device_topology_changed()
+        harness._on_selected_track_device_topology_changed()
+        self.assertEqual(harness.invalidated, 2)
+        self.assertEqual(harness.remote_flushes, 2)
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.device_refreshes, 1)
+        self.assertFalse(harness._selected_track_device_topology_refresh_scheduled)
+
+        stale = Harness()
+        stale._on_selected_track_device_topology_changed()
+        stale._remote_refresh_generation += 1
+        stale.scheduled[0][1]()
+        self.assertEqual(stale.device_refreshes, 0)
+
+    def test_nested_topology_refresh_does_not_duplicate_simpler_snapshot(self):
+        class Harness:
+            _on_selected_track_device_topology_changed = extracted_method(
+                "_on_selected_track_device_topology_changed"
+            )
+            _queue_selected_track_device_topology_refresh = extracted_method(
+                "_queue_selected_track_device_topology_refresh"
+            )
+            _queue_remote_state_flush = extracted_method("_queue_remote_state_flush")
+            _flush_remote_state_updates = extracted_method("_flush_remote_state_updates")
+
+            def __init__(self):
+                self._selected_track_device_topology_refresh_scheduled = False
+                self._remote_state_flush_scheduled = False
+                self._remote_refresh_generation = 2
+                self._track_simpler_slice_dirty = True
+                self._group_state_dirty = False
+                self.mixer_status = False
+                self.scheduled = []
+                self.sent = []
+
+            def _invalidate_track_sliced_simpler(self):
+                self._track_simpler_slice_dirty = True
+
+            def _sync_selected_track_device_topology_listener(self):
+                pass
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _send_track_simpler_slice_state(self, force=False):
+                self._track_simpler_slice_dirty = False
+                self.sent.append("simpler")
+
+            def _send_group_fold_states_if_changed(self):
+                self.sent.append("groups")
+
+            def _set_up_mixer_controls(self):
+                self.sent.append("mixer")
+
+            def _on_device_changed(self):
+                self.sent.append("device")
+                self._send_track_simpler_slice_state(force=True)
+
+            def _debug_log(self, _message):
+                pass
+
+        harness = Harness()
+        harness._on_selected_track_device_topology_changed()
+        self.assertEqual(len(harness.scheduled), 2)
+        # The remote flush is queued first, but must defer Simpler because the
+        # authoritative device refresh is still pending.
+        harness.scheduled[0][1]()
+        harness.scheduled[1][1]()
+        self.assertEqual(harness.sent, ["device", "simpler"])
+
+    def test_periodic_check_has_no_clip_slot_or_selected_track_scan(self):
+        method = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_periodic_check"
+        )
+        calls = [
+            child.func.attr
+            for child in ast.walk(method)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+        self.assertNotIn("_update_clip_slots", calls)
+        self.assertNotIn("_send_track_simpler_slice_state", calls)
+        self.assertNotIn("_send_group_fold_states_if_changed", calls)
 
     def test_incremental_pencil_seeds_authored_layer_from_live_once(self):
         parameter = object()
@@ -2617,7 +3836,6 @@ class TransportTests(unittest.TestCase):
                 self.deletes.append((start, end))
 
         class Harness:
-            AUTOMATION_EXACT_MAX_FULL_REPLAYS = 3
             AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
             _automation_events_in_closed_range = extracted_method(
                 "_automation_events_in_closed_range"
@@ -2668,7 +3886,6 @@ class TransportTests(unittest.TestCase):
             "write_start": 0.0,
             "write_end": 2.0,
             "time_groups": (group,),
-            "full_replays": 0,
             "batch_settle_polls": 0,
             "group_creation_reversed": {},
             "next_group_index": 1,
@@ -2676,7 +3893,6 @@ class TransportTests(unittest.TestCase):
             "cleared": True,
             "awaiting_final_audit": True,
             "undo_step_started": False,
-            "allow_full_replay": False,
             "completed": False,
         }
         harness = Harness()
@@ -2777,7 +3993,6 @@ class TransportTests(unittest.TestCase):
             "active_batch": (group,),
             "batch_settle_polls": 2,
             "batch_write_attempts": 3,
-            "full_replays": 0,
             "group_creation_reversed": {},
             "context": {"device_param": object()},
             "next_group_index": 1,
@@ -2787,7 +4002,6 @@ class TransportTests(unittest.TestCase):
         harness = Harness()
         harness._verify_exact_automation_full_batch(state)
 
-        self.assertEqual(state["full_replays"], 0)
         self.assertEqual(state["next_group_index"], 1)
         self.assertTrue(state["cleared"])
         self.assertEqual(harness.scheduled, [])
@@ -3044,7 +4258,6 @@ class TransportTests(unittest.TestCase):
 
     def test_final_full_range_audit_never_acknowledges_exhausted_mismatch(self):
         class Harness:
-            AUTOMATION_EXACT_MAX_FULL_REPLAYS = 3
             _retry_exact_automation_full_write = extracted_method(
                 "_retry_exact_automation_full_write"
             )
@@ -3058,7 +4271,10 @@ class TransportTests(unittest.TestCase):
             def _debug_log(self, _message):
                 pass
 
-        state = {"full_replays": 3, "completed": False}
+            def _automation_trace(self, *_args):
+                pass
+
+        state = {"completed": False}
         harness = Harness()
         harness._retry_exact_automation_full_write(
             state,
@@ -3378,57 +4594,6 @@ class TransportTests(unittest.TestCase):
         )
         self.assertTrue(harness.response[0].startswith("0|0|0.400000|"))
         self.assertEqual(harness.response[1], 0x31)
-
-    def test_exact_delta_multiple_intervals_share_one_undo_group(self):
-        class Harness:
-            _apply_exact_automation_delta = extracted_method(
-                "_apply_exact_automation_delta"
-            )
-
-            def __init__(self):
-                self.begin_count = 0
-                self.end_count = 0
-                self.writes = []
-                self.reenable_count = 0
-
-            def _begin_undo_step(self):
-                self.begin_count += 1
-                return True
-
-            def _end_undo_step(self, started):
-                if started:
-                    self.end_count += 1
-
-            def _write_exact_automation_events_to_envelope(
-                    self, _envelope, _parameter, start, end, steps,
-                    allow_empty=False, endpoint_padding=0.0001):
-                self.writes.append((start, end, tuple(steps), allow_empty, endpoint_padding))
-                return True
-
-            def _parameter_automation_is_enabled(self, _parameter):
-                return False
-
-            def _re_enable_parameter_automation(self, _parameter):
-                self.assert_undo_is_open = self.begin_count > self.end_count
-                self.reenable_count += 1
-
-        steps = (
-            (1.0, 0.125, 0.2, 0.0, 0, 1, True, 0.5, 0.5, 0.5, 0.5),
-            (6.0, 0.125, 0.8, 0.0, 0, 2, True, 0.5, 0.5, 0.5, 0.5),
-        )
-        harness = Harness()
-        self.assertTrue(
-            harness._apply_exact_automation_delta(
-                {"device_param": object()}, object(), steps,
-                ((0.0, 2.0), (5.0, 7.0)), True
-            )
-        )
-        self.assertEqual(harness.begin_count, 1)
-        self.assertEqual(harness.end_count, 1)
-        self.assertEqual(harness.reenable_count, 1)
-        self.assertTrue(harness.assert_undo_is_open)
-        self.assertEqual(len(harness.writes), 2)
-        self.assertTrue(all(write[4] == 0.0000001 for write in harness.writes))
 
     def test_exact_delta_pure_insert_creates_only_the_new_event(self):
         class Harness:
@@ -3982,114 +5147,6 @@ class TransportTests(unittest.TestCase):
             [stage for _transaction, stage, _details in harness.traces]
         )
 
-    def test_repeating_exact_write_expands_one_cycle_before_live_write(self):
-        class Harness:
-            AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
-            _automation_step_id = extracted_method("_automation_step_id")
-            _automation_step_order = extracted_method("_automation_step_order")
-            _automation_step_tuple = extracted_method("_automation_step_tuple")
-            _automation_sort_key = extracted_method("_automation_sort_key")
-            _automation_sorted_steps = extracted_method("_automation_sorted_steps")
-            _automation_step_entry = extracted_method("_automation_step_entry")
-            _automation_step_from_entry = extracted_method("_automation_step_from_entry")
-            _automation_payload_checksum = extracted_method("_automation_payload_checksum")
-            _handle_repeating_exact_automation_full_write = extracted_method(
-                "_handle_repeating_exact_automation_full_write"
-            )
-
-            def __init__(self):
-                self.forwarded = None
-                self.errors = []
-
-            def _handle_exact_automation_full_write(self, fields, compact_response=False):
-                self.forwarded = (fields, compact_response)
-
-            def _automation_write_error_response(self, *args, **kwargs):
-                self.errors.append((args, kwargs))
-
-        exact = ":1:0.500000000:0.500000000:0.500000000:0.500000000"
-        # A phase-shifted saw: the finite start owns the split point, the core
-        # repeats only authored verticals, and the suffix replaces the final
-        # vertical plus its clipped endpoint.
-        start = "0.000000:0.062500:0.250000:0.000000:0:1" + exact
-        cycle = ",".join((
-            "0.187500:0.062500:1.000000:0.000000:0:1" + exact,
-            "0.187500:0.062500:0.000000:0.000000:0:2" + exact,
-        ))
-        end = ",".join((
-            "0.937500:0.062500:1.000000:0.000000:0:1" + exact,
-            "0.937500:0.062500:0.000000:0.000000:0:2" + exact,
-            "1.000000:0.062500:0.250000:0.000000:0:3" + exact,
-        ))
-        base_fields = [
-            "R", "2", "CTX", "REV", "0.000000", "1.000000", "0.003906",
-            "0.000000000000", "0.250000000000", start, cycle, end,
-        ]
-        harness = Harness()
-        checksum = harness._automation_payload_checksum("|".join(base_fields))
-        fields = base_fields + ["1", "2", "3", "10", "{:08X}".format(checksum), "12"]
-
-        harness._handle_repeating_exact_automation_full_write(fields)
-
-        self.assertEqual(harness.errors, [])
-        self.assertIsNotNone(harness.forwarded)
-        forwarded, compact_response = harness.forwarded
-        self.assertTrue(compact_response)
-        self.assertEqual(forwarded[0], "F")
-        self.assertEqual(forwarded[8], "10")
-        expanded_entries = forwarded[7].split(",")
-        self.assertEqual(
-            [float(entry.split(":", 1)[0]) for entry in expanded_entries],
-            [
-                0.0, 0.1875, 0.1875,
-                0.4375, 0.4375,
-                0.6875, 0.6875,
-                0.9375, 0.9375,
-                1.0,
-            ]
-        )
-
-    def test_repeating_exact_write_rejects_a_bad_expanded_count(self):
-        class Harness:
-            AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
-            _automation_step_id = extracted_method("_automation_step_id")
-            _automation_step_order = extracted_method("_automation_step_order")
-            _automation_step_tuple = extracted_method("_automation_step_tuple")
-            _automation_sort_key = extracted_method("_automation_sort_key")
-            _automation_sorted_steps = extracted_method("_automation_sorted_steps")
-            _automation_step_entry = extracted_method("_automation_step_entry")
-            _automation_step_from_entry = extracted_method("_automation_step_from_entry")
-            _automation_payload_checksum = extracted_method("_automation_payload_checksum")
-            _handle_repeating_exact_automation_full_write = extracted_method(
-                "_handle_repeating_exact_automation_full_write"
-            )
-
-            def __init__(self):
-                self.forwarded = False
-                self.errors = []
-
-            def _handle_exact_automation_full_write(self, *_args, **_kwargs):
-                self.forwarded = True
-
-            def _automation_write_error_response(self, *args, **kwargs):
-                self.errors.append((args, kwargs))
-
-        exact = ":1:0.500000000:0.500000000:0.500000000:0.500000000"
-        entry = "0.000000:0.062500:0.500000:0.000000:0:1" + exact
-        end = "1.000000:0.062500:0.500000:0.000000:0:1" + exact
-        base_fields = [
-            "R", "2", "CTX", "REV", "0.000000", "1.000000", "0.003906",
-            "0.000000000000", "0.250000000000", entry, entry, end,
-        ]
-        harness = Harness()
-        checksum = harness._automation_payload_checksum("|".join(base_fields))
-        fields = base_fields + ["1", "1", "1", "999", "{:08X}".format(checksum), "12"]
-
-        harness._handle_repeating_exact_automation_full_write(fields)
-
-        self.assertFalse(harness.forwarded)
-        self.assertEqual(len(harness.errors), 1)
-
     def test_automation_context_keeps_original_parameter_after_bank_change(self):
         parameter_a = type("Parameter", (), {"automation_state": 1})()
         parameter_b = type("Parameter", (), {"automation_state": 1})()
@@ -4615,15 +5672,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(harness._sysex_buffers, {})
 
     def test_note_modify_and_remove_keep_committed_chunk_framing(self):
-        assignment = next(
-            node for node in tap_class_node().body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "CHUNKED_INCOMING_SYSEX_IDS"
-                for target in node.targets
-            )
-        )
-        chunked_ids = ast.literal_eval(assignment.value)
+        specs = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
+        chunked_ids = {
+            spec.manufacturer_id
+            for spec in specs.values()
+            if spec.framing in ("chunkedText", "chunkedBinary", "chunkedMixed")
+        }
         self.assertIn(15, chunked_ids)
         self.assertIn(16, chunked_ids)
 
@@ -4659,6 +5713,7 @@ class TransportTests(unittest.TestCase):
         song = type("Song", (), {"view": type("View", (), {"highlighted_clip_slot": slot})()})()
 
         class Harness:
+            SYSEX_APP_TO_REMOTE = PROTOCOL_REGISTRY["TAP_SYSEX_APP_TO_REMOTE"]
             CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16)
             SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
             SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 1024
@@ -4753,6 +5808,9 @@ class TransportTests(unittest.TestCase):
 
             def _send_midi(self, message):
                 self.messages.append(tuple(message))
+
+            def _send_tap_midi(self, message):
+                self._send_midi(message)
 
         payload = tuple(index & 0x7F for index in range(600))
         harness = Harness()
@@ -5554,6 +6612,66 @@ class TransportTests(unittest.TestCase):
         method_source = ast.get_source_segment(SOURCE.read_text(encoding="utf-8"), method)
         self.assertIn("state = 4 if clip_slot.has_clip else 6", method_source)
 
+    def test_stop_all_button_calls_song_directly_and_clears_runtime_actions(self):
+        class Song:
+            def __init__(self):
+                self.stop_count = 0
+
+            def stop_all_clips(self):
+                self.stop_count += 1
+
+        class Harness:
+            _stop_all_clips_value = extracted_method("_stop_all_clips_value")
+
+            def __init__(self):
+                self._song = Song()
+                self._active_follow_actions = {("clip", 0, 0): object()}
+                self._handled_follow_action_launches = {("clip", 0, 0)}
+                self.follow_action_updates = 0
+
+            def song(self):
+                return self._song
+
+            def _send_follow_action_state(self):
+                self.follow_action_updates += 1
+
+        harness = Harness()
+        harness._stop_all_clips_value(0)
+        self.assertEqual(harness._song.stop_count, 0)
+
+        harness._stop_all_clips_value(100)
+        self.assertEqual(harness._song.stop_count, 1)
+        self.assertEqual(harness._active_follow_actions, {})
+        self.assertEqual(harness._handled_follow_action_launches, set())
+        self.assertEqual(harness.follow_action_updates, 1)
+
+    def test_track_playback_listener_refreshes_clip_state_without_per_slot_playing_listeners(self):
+        class Harness:
+            _make_track_playing_slot_listener = extracted_method(
+                "_make_track_playing_slot_listener"
+            )
+
+            def __init__(self):
+                self.refreshed = []
+
+            def _on_clip_playing_status_changed(self, track):
+                self.refreshed.append(track)
+
+        harness = Harness()
+        track = object()
+        harness._make_track_playing_slot_listener(track)()
+        self.assertEqual(harness.refreshed, [track])
+
+        register_method = next(
+            node for node in tap_class_node().body
+            if isinstance(node, ast.FunctionDef) and node.name == "_register_clip_listeners"
+        )
+        register_source = ast.get_source_segment(
+            SOURCE.read_text(encoding="utf-8"), register_method
+        )
+        self.assertIn("add_playing_slot_index_listener", register_source)
+        self.assertNotIn("_make_clip_playing_listener", register_source)
+
     def test_dormant_groove_feature_does_not_add_project_or_topology_traffic(self):
         for method_name in ("_send_current_project_state", "_on_follow_action_topology_changed"):
             method = next(
@@ -5597,6 +6715,9 @@ class TransportTests(unittest.TestCase):
 
             def _send_midi(self, message):
                 self.sent.append(message)
+
+            def _send_tap_midi(self, message):
+                self._send_midi(message)
 
             def _clip_slots_string_for_track(self, _track):
                 self.cache_rebuilds += 1
@@ -5705,6 +6826,103 @@ class TransportTests(unittest.TestCase):
         marked = Harness("Clip [TapFA:v1|1|100|next||none|]")
         marked._on_clip_has_clip_changed(marked.track, 0, marked.slot)
         self.assertEqual(marked.rescans, 3)
+
+    def test_highlighted_clip_replacement_queues_one_step_seq_rebind(self):
+        class Slot:
+            def __init__(self, clip):
+                self.clip = clip
+                self.listener = None
+
+            @property
+            def has_clip(self):
+                return self.clip is not None
+
+            def has_clip_has_listener(self, listener):
+                return self.listener == listener
+
+            def add_has_clip_listener(self, listener):
+                self.listener = listener
+
+            def remove_has_clip_listener(self, listener):
+                if self.listener == listener:
+                    self.listener = None
+
+        class Harness:
+            FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
+            _on_clip_has_clip_changed = extracted_method("_on_clip_has_clip_changed")
+            _queue_highlighted_step_seq_rebind = extracted_method(
+                "_queue_highlighted_step_seq_rebind"
+            )
+            on_highlighted_slot_changed = extracted_method("on_highlighted_slot_changed")
+
+            def __init__(self):
+                self.track = object()
+                self.slot = Slot(type("Clip", (), {"name": "Replacement"})())
+                self._song = type("Song", (), {
+                    "view": type("View", (), {"highlighted_clip_slot": self.slot})()
+                })()
+                self.seq_status = True
+                self._remote_refresh_generation = 4
+                self._step_seq_rebind_scheduled = False
+                self._follow_action_rules = {}
+                self.scheduled = []
+                self.started = 0
+
+            def song(self):
+                return self._song
+
+            def _get_track_index(self, _track):
+                return 0
+
+            def _follow_action_key(self, *_args):
+                return ("clip", 0, 0)
+
+            def _sync_follow_action_name_listeners(self):
+                pass
+
+            def _load_follow_actions_from_names(self):
+                pass
+
+            def _sync_follow_action_runtime_listeners(self):
+                pass
+
+            def _refresh_parameter_metadata_on_automation_change(self):
+                pass
+
+            def _queue_clip_slot_delta(self, *_args):
+                pass
+
+            def _sync_clip_color_listeners_for_track(self, _track):
+                pass
+
+            def _set_up_notes_playing(self, _value):
+                pass
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def start_step_seq(self):
+                self.started += 1
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        harness = Harness()
+        harness.slot.listener = harness.on_highlighted_slot_changed
+        # The authoritative slot listener and the empty-slot listener can both
+        # observe a transition; they must produce one rebind/snapshot boundary.
+        harness._on_clip_has_clip_changed(harness.track, 0, harness.slot)
+        harness.on_highlighted_slot_changed()
+        self.assertEqual(len(harness.scheduled), 1)
+        harness.scheduled[0][1]()
+        self.assertEqual(harness.started, 1)
+        self.assertFalse(harness._step_seq_rebind_scheduled)
+
+        stale = Harness()
+        stale._on_clip_has_clip_changed(stale.track, 0, stale.slot)
+        stale._remote_refresh_generation += 1
+        stale.scheduled[0][1]()
+        self.assertEqual(stale.started, 0)
 
     def test_playing_status_does_not_scan_slots_without_follow_rules(self):
         class NoIterationSlots:

@@ -5,59 +5,39 @@ import Live
 from _Framework.ControlSurface import ControlSurface
 from _Framework.MixerComponent import MixerComponent
 from _Framework.TransportComponent import TransportComponent
-from _Framework.SessionComponent import SessionComponent
 from _Framework.EncoderElement import *
 from _Framework.ButtonElement import ButtonElement
 from _Framework.SliderElement import SliderElement
 from _Framework.InputControlElement import MIDI_NOTE_TYPE, MIDI_NOTE_ON_STATUS, MIDI_NOTE_OFF_STATUS, MIDI_CC_TYPE
-from _Framework.DeviceComponent import DeviceComponent
 from ableton.v2.base import listens, liveobj_valid, liveobj_changed
-try:
-    from ableton.v2.control_surface import SimplerDeviceDecorator
-except ImportError:
-    SimplerDeviceDecorator = None
 try:
     from ableton.v2.control_surface.simpler_slice_nudging import SimplerSliceNudging
 except ImportError:
     SimplerSliceNudging = None
-try:
-    # Push's decorator exposes all of Drift's API-backed selectors (mod
-    # sources/targets, shape source, voice mode/count, and on/off options).
-    # The generic decorator only exposes four of these controls.
-    from Push2.drift import DriftDeviceDecorator
-    from ableton.v2.control_surface.drift_decoration import DriftDeviceDecorator as BaseDriftDeviceDecorator
-except ImportError:
-    try:
-        from ableton.v2.control_surface.drift_decoration import DriftDeviceDecorator
-        BaseDriftDeviceDecorator = DriftDeviceDecorator
-    except ImportError:
-        DriftDeviceDecorator = None
-        BaseDriftDeviceDecorator = None
-try:
-    from Push2.meld import MeldDeviceDecorator
-except ImportError:
-    MeldDeviceDecorator = None
-try:
-    from Push2.hybrid_reverb import HybridReverbDeviceDecorator
-except ImportError:
-    HybridReverbDeviceDecorator = None
-try:
-    from ableton.v2.control_surface import BankingInfo, DescribedDeviceParameterBank
-    from Push2.custom_bank_definitions import BANK_DEFINITIONS as PUSH_BANK_DEFINITIONS
-    from Push2.device_decorator_factory import DeviceDecoratorFactory as PushDeviceDecoratorFactory
-except Exception:
-    BankingInfo = None
-    DescribedDeviceParameterBank = None
-    PUSH_BANK_DEFINITIONS = {}
-    PushDeviceDecoratorFactory = None
-try:
-    from Push2.device_parameter_bank_with_options import DescribedDeviceParameterBankWithOptions
-except Exception:
-    DescribedDeviceParameterBankWithOptions = None
-try:
-    from Move.custom_bank_definitions import CUSTOM_BANK_DEFINITIONS as MOVE_BANK_DEFINITIONS
-except Exception:
-    MOVE_BANK_DEFINITIONS = {}
+from .device_banks import TapDeviceComponent
+from .tap_runtime import (
+    PERFORMANCE_DIAGNOSTICS_ENABLED,
+    TapPerformanceDiagnostics,
+    TapScheduledCall,
+)
+from .tap_protocol import (
+    TAP_SYSEX_APP_TO_REMOTE,
+    TAP_SYSEX_APP_TO_REMOTE_SPECS,
+    TAP_SYSEX_REMOTE_TO_APP,
+    TAP_SYSEX_REMOTE_TO_APP_SPECS,
+)
+from .automation import (
+    AutomationContextRegistry,
+    AutomationEvent,
+    AutomationPencilTransaction,
+    AutomationTargetContext,
+    AutomationTransferCoordinator,
+    AutomationUndoLease,
+    ExactAutomationWriteMode,
+    ExactAutomationWritePhase,
+    ExactAutomationWriteTransaction,
+    LiveAutomationWriter,
+)
 from Live.Clip import MidiNoteSpecification
 
 import threading
@@ -77,2278 +57,16 @@ except ImportError:
     audioop = None
 from itertools import zip_longest
 import time
+from types import MappingProxyType
+
 
 secret_version_number = 58
 
-mixer, transport, session_component = None, None, None
+
+mixer, transport = None, None
 quantize_grid_value = 5
 quantize_strength_value = 1.0
 swing_amount_value = 0.0
-
-
-class TapDeviceComponent(DeviceComponent):
-    SAFE_PARAMETER_BANK_SIZE = 8
-    CURATED_PUSH_BANK_CLASSES = frozenset((
-        'Chorus2',
-        'Tube',
-        'PhaserNew',
-        'Reverb',
-        'Roar',
-        'Shifter',
-        'Transmute',
-        'Spectral',
-        'Saturator',
-        'MidiRandom',
-        'MidiScale',
-        'Eq8',
-    ))
-    CURATED_MOVE_BANK_CLASSES = frozenset((
-        'AutoPan2',
-        'AutoShift',
-        'FilterEQ3',
-        'Redux2',
-        'Resonator',
-        'Vinyl',
-    ))
-    AUTO_SHIFT_DETAILS_BANK_NAME = "Shift"
-    AUTO_PAN_MODE_BANK_NAME = "Mode"
-    CHORUS_MODE_BANK_NAME = "Mode"
-    CHORD_SHIFT_SCALE_BANK_NAME = "Shift Scale"
-    CHORD_STRUM_BANK_NAME = "Strum"
-    CURATED_OPTIONS_BANK_NAME = "Options"
-    OPERATOR_WAVES_BANK_NAME = "Waveforms"
-    OPERATOR_FILTER_PLUS_BANK_NAME = "Filter +"
-    OPERATOR_LFO_PLUS_BANK_NAME = "LFO +"
-    WAVETABLE_OSC_BANK_NAME = "Waves"
-    WAVETABLE_ENV_2_BANK_NAME = "Envelope 2"
-    WAVETABLE_ENV_3_BANK_NAME = "Envelope 3"
-    SIMPLER_MAIN_BANK_NAME = "Main"
-    SIMPLER_ACTIONS_BANK_NAME = "Actions"
-    SIMPLER_WARP_BANK_NAME = "Controls"
-    SIMPLER_CONTROLS_2_BANK_NAME = "Controls 2"
-    SIMPLER_BROWSE_BANK_NAME = "Browse"
-    SIMPLER_BROWSE_PLUS_BANK_NAME = "Browse +"
-    SIMPLER_AMP_BANK_NAME = "Volume"
-    SIMPLER_SLICE_DETAIL_BANK_NAME = "Pitch & Fade"
-    SIMPLER_AMP_BANK_INDEX = 3
-    DRUMCELL_SAMPLE_BANK_NAME = "Sample"
-    DRUMCELL_FX_FILTER_BANK_NAME = "FX & Filter"
-    DRUMCELL_REST_BANK_NAME = "Main & Mod"
-    DRUMCELL_FX_2_BANK_NAME = "FX P"
-    DRUMCELL_FX_3_BANK_NAME = "FX P2"
-    DELAY_BANK_NAMES = ("Main", "Time / Flt", "Flt / LFO", "LFO Wave")
-    GRAIN_DELAY_BANK_NAMES = ("Pitch", "Time")
-    AUTO_FILTER_BANK_NAMES = ("Main", "Envelope", "LFO", "Sidechain")
-    AUTO_FILTER_2_BANK_NAMES = ("Main", "LFO", "Envelope", "Quantization")
-    BEAT_REPEAT_BANK_NAMES = ("Main", "Filt/Mix", "Repeat Rate")
-    HYBRID_REVERB_BANK_NAMES = (
-        "Main", "Convolution", "Algorithm Pg1", "Algorithm Pg2",
-        "EQ Pg1", "EQ Pg2", "Global",
-    )
-    DRIFT_BANK_NAMES = (
-        "Main", "Oscillators", "Osc 2 / Noise", "Osc Mod", "Filters", "Filter Mod",
-        "Envelope 1", "Envelope 2", "Envelope 2 Cyc", "LFO", "Mod 1 & 2", "Mod 3",
-        "Global", "Global / Out",
-    )
-    MELD_ENGINE_BANK_NAME = "A | B"
-    MELD_BANK_NAMES = (
-        MELD_ENGINE_BANK_NAME,
-        "Main",
-        "Osc / Mix",
-        "Filter",
-        "Amp Envelope",
-        "Mod Envelope",
-        "Envelope Setup",
-        "LFO 1 Generator",
-        "LFO 1 FX",
-        "LFO 2",
-        "Global / Out",
-    )
-    ANALOG_OSC_1_BANK_NAME = "OSC 1"
-    ANALOG_OSC_2_BANK_NAME = "OSC 2"
-    ANALOG_NOISE_BANK_NAME = "Noise"
-    ANALOG_OSC_PLUS_BANK_NAME = "OSC +"
-    ANALOG_MIX_LFO_BANK_NAME = "Mix / LFO"
-    ANALOG_LFO_PLUS_BANK_NAME = "LFO +"
-    ANALOG_LOOPS_FILTER_BANK_NAME = "Loops / Filter"
-
-    def __init__(self, *a, **k):
-        DeviceComponent.__init__(self, *a, **k)
-        self._use_safe_parameter_banks = False
-        self._parameter_bank_cache = None
-        self._parameter_bank_cache_device = None
-        self._curated_parameter_display_names = ()
-        self._curated_bank_names_cache = None
-        self._curated_option_pages_cache = None
-        self._curated_dynamic_parameter_keys_cache = None
-        self._drift_decorator = None
-        self._drift_decorator_device = None
-        self._drift_base_decorator = None
-        self._meld_decorator = None
-        self._meld_decorator_device = None
-        self._hybrid_reverb_decorator = None
-        self._hybrid_reverb_decorator_device = None
-        self._simpler_bank_decorator = None
-        self._simpler_bank_decorator_device = None
-        self._curated_decorator_factory = None
-        if PushDeviceDecoratorFactory is not None:
-            try:
-                self._curated_decorator_factory = PushDeviceDecoratorFactory()
-            except Exception:
-                pass
-
-    def invalidate_parameter_bank_cache(self):
-        self._parameter_bank_cache = None
-        self._parameter_bank_cache_device = None
-        self._curated_parameter_display_names = ()
-        self._curated_bank_names_cache = None
-        self._curated_option_pages_cache = None
-        self._curated_dynamic_parameter_keys_cache = None
-
-    def set_device(self, device):
-        if device != getattr(self, '_device', None):
-            self._disconnect_drift_decorator()
-            self._disconnect_meld_decorator()
-            self._disconnect_hybrid_reverb_decorator()
-            self._disconnect_simpler_bank_decorator()
-            self._sync_curated_decorators(device)
-        self.invalidate_parameter_bank_cache()
-        self._use_safe_parameter_banks = False
-        try:
-            result = DeviceComponent.set_device(self, device)
-            if self._is_meld() and self._bank_index == 0:
-                self._bank_index = 1
-                self.update()
-            return result
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            self._bank_index = 1 if self._is_meld() else 0
-            try:
-                self.update()
-            except Exception:
-                pass
-            try:
-                self.notify_device()
-            except Exception:
-                pass
-
-    def disconnect(self):
-        self._disconnect_drift_decorator()
-        self._disconnect_meld_decorator()
-        self._disconnect_hybrid_reverb_decorator()
-        self._disconnect_simpler_bank_decorator()
-        factory = self._curated_decorator_factory
-        self._curated_decorator_factory = None
-        if factory:
-            try:
-                factory.disconnect()
-            except Exception:
-                pass
-        DeviceComponent.disconnect(self)
-
-    def update(self):
-        try:
-            return DeviceComponent.update(self)
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            self._clamp_bank_index_to_safe_banks()
-            try:
-                return DeviceComponent.update(self)
-            except IndexError:
-                pass
-
-    def _current_bank_details(self):
-        try:
-            return DeviceComponent._current_bank_details(self)
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            self._clamp_bank_index_to_safe_banks()
-            try:
-                return DeviceComponent._current_bank_details(self)
-            except IndexError:
-                return '', tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-
-    def _parameter_banks(self):
-        device = getattr(self, '_device', None)
-        uses_curated_banks = self._uses_curated_banks()
-        uses_cache = (
-            self._is_operator() or self._is_chord() or self._is_drift() or self._is_meld() or
-            self._is_hybrid_reverb() or uses_curated_banks
-        )
-        if (uses_cache and self._parameter_bank_cache is not None and
-                self._parameter_bank_cache_device == device):
-            return list(self._parameter_bank_cache)
-
-        if uses_curated_banks:
-            curated_banks = self._curated_parameter_banks()
-            if curated_banks:
-                self._parameter_bank_cache = tuple(curated_banks)
-                self._parameter_bank_cache_device = device
-                return list(curated_banks)
-            try:
-                return list(DeviceComponent._parameter_banks(self))
-            except IndexError:
-                self._use_safe_parameter_banks = True
-                return self._safe_parameter_banks()
-
-        base_names = self._base_parameter_bank_names()
-        if self._use_safe_parameter_banks:
-            banks = self._safe_parameter_banks()
-        else:
-            try:
-                banks = DeviceComponent._parameter_banks(self)
-            except IndexError:
-                self._use_safe_parameter_banks = True
-                base_names = self._safe_parameter_bank_names_base()
-                banks = self._safe_parameter_banks()
-        banks = self._add_tap_custom_banks(banks, base_names)
-        if uses_cache:
-            self._parameter_bank_cache = tuple(banks)
-            self._parameter_bank_cache_device = device
-        return banks
-
-    def _parameter_bank_names(self):
-        if self._uses_curated_banks():
-            curated_names = self._curated_bank_names()
-            if curated_names:
-                return curated_names
-        return self._add_tap_custom_bank_names(self._base_parameter_bank_names())
-
-    def _best_of_parameter_bank(self):
-        if self._use_safe_parameter_banks:
-            return []
-        try:
-            return DeviceComponent._best_of_parameter_bank(self)
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            return []
-
-    def _number_of_parameter_banks(self):
-        return len(self._parameter_banks())
-
-    def _base_parameter_bank_names(self):
-        if self._use_safe_parameter_banks:
-            # Simpler's native parameter lookup can briefly fail while its
-            # sample mode is changing.  Keep Live's curated names even when
-            # the safer parameter lookup is needed; otherwise the fallback
-            # leaks unstable "Bank 1" ... "Bank 7" labels to Tap.
-            if self._is_simpler():
-                try:
-                    return tuple(DeviceComponent._parameter_bank_names(self))
-                except IndexError:
-                    pass
-            return self._safe_parameter_bank_names_base()
-        try:
-            return tuple(DeviceComponent._parameter_bank_names(self))
-        except IndexError:
-            self._use_safe_parameter_banks = True
-            return self._safe_parameter_bank_names_base()
-
-    def _safe_parameter_bank_names_base(self):
-        bank_count = len(self._safe_parameter_banks())
-        device = getattr(self, '_device', None)
-        names = []
-        for index in range(bank_count):
-            name = None
-            if device and hasattr(device, 'get_bank_name'):
-                try:
-                    name = device.get_bank_name(index)
-                except Exception:
-                    pass
-            if name:
-                name = ''.join(char for char in str(name) if ord(char) < 128)
-            names.append(name or "Bank {}".format(index + 1))
-        return tuple(names)
-
-    def _device_class_name(self):
-        try:
-            return str(self._device.class_name)
-        except Exception:
-            return ""
-
-    def _is_operator(self):
-        return self._device_class_name() == 'Operator'
-
-    def _is_chord(self):
-        return self._device_class_name() == 'MidiChord'
-
-    def _is_wavetable(self):
-        device = getattr(self, '_device', None)
-        try:
-            return (
-                self._device_class_name() in ('Wavetable', 'InstrumentVector') or
-                str(device.class_display_name) == 'Wavetable' or
-                hasattr(device, 'oscillator_1_wavetables')
-            )
-        except Exception:
-            return False
-
-    def _is_simpler(self):
-        return self._device_class_name() == 'OriginalSimpler'
-
-    def _simpler_uses_native_banks(self):
-        if not self._is_simpler():
-            return False
-        try:
-            return bool(self._device.multi_sample_mode)
-        except Exception:
-            # If this Live version cannot expose multisample mode, a missing
-            # sample is ambiguous. Keep the normal parameter banks instead of
-            # presenting Simpler as empty; Browse remains available in its own
-            # bank.
-            try:
-                return not liveobj_valid(self._device.sample)
-            except Exception:
-                return True
-
-    def _is_drumcell(self):
-        return self._device_class_name() == 'DrumCell'
-
-    def _is_delay(self):
-        return self._device_class_name() == 'Delay'
-
-    def _is_grain_delay(self):
-        return self._device_class_name() == 'GrainDelay'
-
-    def _is_analog(self):
-        return self._device_class_name() == 'UltraAnalog'
-
-    def _is_auto_filter(self):
-        try:
-            return (
-                self._device_class_name() == 'AutoFilter' or
-                (str(self._device.class_display_name) == 'Auto Filter' and
-                 not self._is_auto_filter_2())
-            )
-        except Exception:
-            return False
-
-    def _is_auto_filter_2(self):
-        return self._device_class_name() == 'AutoFilter2'
-
-    def _is_beat_repeat(self):
-        try:
-            return (
-                self._device_class_name() == 'BeatRepeat' or
-                str(self._device.class_display_name) == 'Beat Repeat'
-            )
-        except Exception:
-            return False
-
-    def _is_hybrid_reverb(self):
-        try:
-            return (
-                self._device_class_name() in ('Hybrid', 'HybridReverb') or
-                str(self._device.class_display_name) == 'Hybrid Reverb'
-            )
-        except Exception:
-            return False
-
-    def _is_drift(self):
-        try:
-            return self._device_class_name() == 'Drift' or str(self._device.class_display_name) == 'Drift'
-        except Exception:
-            return False
-
-    def _is_meld(self):
-        device = getattr(self, '_device', None)
-        try:
-            return (
-                self._device_class_name() in ('InstrumentMeld', 'Meld') or
-                str(device.class_display_name) == 'Meld' or
-                hasattr(device, 'selected_engine')
-            )
-        except Exception:
-            return False
-
-    def _curated_bank_source(self):
-        class_name = self._device_class_name()
-        if class_name in self.CURATED_MOVE_BANK_CLASSES and class_name in MOVE_BANK_DEFINITIONS:
-            return MOVE_BANK_DEFINITIONS
-        if class_name in self.CURATED_PUSH_BANK_CLASSES and class_name in PUSH_BANK_DEFINITIONS:
-            return PUSH_BANK_DEFINITIONS
-        return None
-
-    def _curated_bank_definition(self):
-        source = self._curated_bank_source()
-        return source.get(self._device_class_name()) if source else None
-
-    def _curated_dynamic_parameter_keys(self):
-        cached = self._curated_dynamic_parameter_keys_cache
-        if cached is not None:
-            return cached
-
-        condition_names = set()
-        definitions = []
-        for definition in (
-                self._curated_bank_definition(),
-                PUSH_BANK_DEFINITIONS.get(self._device_class_name())):
-            if definition and not any(definition is existing for existing in definitions):
-                definitions.append(definition)
-        for definition in definitions:
-            for bank_definition in definition.values():
-                for slots in bank_definition.values():
-                    if not isinstance(slots, (tuple, list)):
-                        continue
-                    for slot in slots:
-                        for condition in getattr(slot, '_conditions', ()) or ():
-                            condition_list = condition.get('ConditionsListName', ())
-                            for subcondition in condition_list:
-                                name = subcondition.get('ConditionName')
-                                if name:
-                                    condition_names.add(str(name))
-
-        # These custom pages switch parameter identity with the device mode.
-        if self._device_class_name() in ('AutoPan2', 'Chorus2'):
-            condition_names.add('Mode')
-
-        self._curated_dynamic_parameter_keys_cache = frozenset(
-            re.sub(r'[^a-z0-9]+', '', name.lower())
-            for name in condition_names
-        )
-        return self._curated_dynamic_parameter_keys_cache
-
-    def curated_parameter_drives_bank(self, parameter):
-        if parameter is None or not self._uses_curated_banks():
-            return False
-        names = (
-            str(getattr(parameter, 'name', '')),
-            str(getattr(parameter, 'original_name', '')),
-        )
-        parameter_keys = set(
-            re.sub(r'[^a-z0-9]+', '', name.lower())
-            for name in names
-        )
-        return bool(parameter_keys.intersection(self._curated_dynamic_parameter_keys()))
-
-    def _uses_curated_banks(self):
-        return (
-            BankingInfo is not None and
-            DescribedDeviceParameterBank is not None and
-            self._curated_bank_definition() is not None
-        )
-
-    def _sync_curated_decorators(self, device):
-        factory = self._curated_decorator_factory
-        if not factory:
-            return
-        try:
-            factory.sync_decorated_objects([device] if liveobj_valid(device) else [])
-        except Exception:
-            pass
-
-    def _curated_decorated_device(self):
-        device = getattr(self, '_device', None)
-        factory = self._curated_decorator_factory
-        if not factory or not liveobj_valid(device):
-            return device
-        try:
-            return factory.decorate(device)
-        except Exception:
-            return device
-
-    def _curated_bank_names(self):
-        if self._curated_bank_names_cache is not None:
-            return self._curated_bank_names_cache
-        definition = self._curated_bank_definition()
-        names = list(definition.keys()) if definition else []
-        if self._device_class_name() == 'AutoShift' and names:
-            names.append(self.AUTO_SHIFT_DETAILS_BANK_NAME)
-        elif self._device_class_name() == 'AutoPan2' and names:
-            names.append(self.AUTO_PAN_MODE_BANK_NAME)
-        elif self._device_class_name() == 'Chorus2' and names:
-            names.append(self.CHORUS_MODE_BANK_NAME)
-        option_page_count = len(self._curated_option_pages())
-        if option_page_count == 1:
-            names.append(self.CURATED_OPTIONS_BANK_NAME)
-        elif option_page_count > 1:
-            names.extend(
-                "{} {}".format(self.CURATED_OPTIONS_BANK_NAME, index + 1)
-                for index in range(option_page_count)
-            )
-        self._curated_bank_names_cache = tuple(names)
-        return self._curated_bank_names_cache
-
-    def _set_curated_shift_state(self, bank, shifted):
-        has_shift_slots = False
-        for slot in getattr(bank, '_dynamic_slots', ()):
-            setter = getattr(slot, 'set_shifted_state', None)
-            if callable(setter):
-                has_shift_slots = True
-                try:
-                    setter(bool(shifted))
-                except Exception:
-                    pass
-        if has_shift_slots:
-            try:
-                bank._update_parameters()
-            except Exception:
-                pass
-
-    def _curated_bank_parameters(self, bank, index, shifted=False):
-        bank.index = index
-        self._set_curated_shift_state(bank, shifted)
-        parameters = []
-        display_names = []
-        for item in getattr(bank, 'parameters', ()) or ():
-            if isinstance(item, (tuple, list)):
-                parameters.append(item[0] if item else None)
-                display_names.append(item[1] if len(item) > 1 and item[1] else None)
-            else:
-                parameters.append(item)
-                display_names.append(None)
-        parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
-        display_names.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(display_names)))
-        return (
-            tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE]),
-            tuple(display_names[:self.SAFE_PARAMETER_BANK_SIZE]),
-        )
-
-    def _curated_option_parameter(self, option):
-        parameter = getattr(option, '_parameter', None)
-        if parameter is None:
-            parameter = getattr(option, '_property_host', None)
-        return parameter
-
-    def _curated_option_pages(self):
-        if self._curated_option_pages_cache is not None:
-            return self._curated_option_pages_cache
-        definition = PUSH_BANK_DEFINITIONS.get(self._device_class_name())
-        has_option_slots = bool(definition) and any(
-            any(bool(slot) for slot in bank_definition.get('Options', ()))
-            for bank_definition in definition.values()
-        )
-        if not has_option_slots:
-            self._curated_option_pages_cache = ()
-            return ()
-        device = self._curated_decorated_device()
-        if (
-            not liveobj_valid(device) or
-            BankingInfo is None or
-            DescribedDeviceParameterBankWithOptions is None
-        ):
-            self._curated_option_pages_cache = ()
-            return ()
-        banking_info = BankingInfo({self._device_class_name(): definition})
-        bank = None
-        try:
-            bank = DescribedDeviceParameterBankWithOptions(
-                device=device,
-                size=self.SAFE_PARAMETER_BANK_SIZE,
-                banking_info=banking_info,
-            )
-            option_parameters = []
-            option_names = []
-            seen_parameters = set()
-            for index in range(len(definition)):
-                bank.index = index
-                for option in getattr(bank, 'options', ()) or ():
-                    if option is None:
-                        continue
-                    parameter = self._curated_option_parameter(option)
-                    if parameter is None:
-                        continue
-                    parameter_key = id(parameter)
-                    if parameter_key in seen_parameters:
-                        continue
-                    seen_parameters.add(parameter_key)
-                    option_parameters.append(parameter)
-                    name = str(getattr(option, 'name', '') or getattr(parameter, 'name', ''))
-                    if name == 'frequency_dial_mode_opt':
-                        name = 'Frequency Mode'
-                    option_names.append(name)
-            pages = []
-            for start in range(0, len(option_parameters), self.SAFE_PARAMETER_BANK_SIZE):
-                parameters = option_parameters[start:start + self.SAFE_PARAMETER_BANK_SIZE]
-                display_names = option_names[start:start + self.SAFE_PARAMETER_BANK_SIZE]
-                parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
-                display_names.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(display_names)))
-                pages.append((tuple(parameters), tuple(display_names)))
-            self._curated_option_pages_cache = tuple(pages)
-            return self._curated_option_pages_cache
-        except Exception:
-            self._curated_option_pages_cache = ()
-            return ()
-        finally:
-            if bank:
-                try:
-                    bank.disconnect()
-                except Exception:
-                    pass
-
-    def _curated_auto_pan_mode_bank(self):
-        mode = self._parameter_by_names('Mode')
-        mode_name = self._parameter_display(mode).strip().lower()
-        is_tremolo = 'tremolo' in mode_name
-        is_panning = 'panning' in mode_name or 'pan' in mode_name
-        parameters = (
-            mode,
-            self._parameter_by_names('Vintage') if is_tremolo else None,
-            self._parameter_by_names('Stereo Mode') if is_panning else None,
-        ) + tuple([None] * 5)
-        display_names = ('Mode', 'Vintage' if is_tremolo else None,
-                         'Stereo Mode' if is_panning else None) + tuple([None] * 5)
-        return parameters, display_names
-
-    def _curated_chorus_mode_bank(self):
-        mode = self._parameter_by_names('Mode')
-        mode_name = self._parameter_display(mode).strip().lower()
-        is_chorus = 'classic' in mode_name or 'chorus' in mode_name
-        parameters = (
-            mode,
-            self._parameter_by_names('Delay Time') if is_chorus else None,
-            self._parameter_by_names('Delay Taps') if is_chorus else None,
-            self._parameter_by_names('HP Enabled', 'HP On'),
-            self._parameter_by_names('HP Freq'),
-            None,
-            None,
-            self._parameter_by_names('Dry/Wet'),
-        )
-        display_names = (
-            'Mode',
-            'Delay Time' if is_chorus else None,
-            'Delay Taps' if is_chorus else None,
-            'HP On',
-            'HP Freq',
-            None,
-            None,
-            None,
-        )
-        return parameters, display_names
-
-    def _add_internal_scale_parameter(self, resolved_banks):
-        if self._device_class_name() != 'MidiScale' or not resolved_banks:
-            return
-        internal_scale = self._parameter_by_names('Internal Scale', 'InternalScale', 'Scale')
-        if internal_scale is None:
-            return
-        parameters, display_names = resolved_banks[0]
-        parameters = tuple((parameters[0], internal_scale) + parameters[1:7])
-        display_names = tuple((display_names[0], 'Internal Scale') + display_names[1:7])
-        resolved_banks[0] = parameters, display_names
-
-    def _curated_parameter_banks(self):
-        definition = self._curated_bank_definition()
-        device = self._curated_decorated_device()
-        if not definition or not liveobj_valid(device):
-            return ()
-        banking_info = BankingInfo({self._device_class_name(): definition})
-        bank = None
-        try:
-            bank = DescribedDeviceParameterBank(
-                device=device,
-                size=self.SAFE_PARAMETER_BANK_SIZE,
-                banking_info=banking_info,
-            )
-            resolved_banks = [
-                self._curated_bank_parameters(bank, index)
-                for index in range(len(definition))
-            ]
-            if self._device_class_name() == 'AutoShift' and resolved_banks:
-                resolved_banks.append(self._curated_bank_parameters(bank, 0, shifted=True))
-            elif self._device_class_name() == 'AutoPan2' and resolved_banks:
-                resolved_banks.append(self._curated_auto_pan_mode_bank())
-            elif self._device_class_name() == 'Chorus2' and resolved_banks:
-                resolved_banks.append(self._curated_chorus_mode_bank())
-            self._add_internal_scale_parameter(resolved_banks)
-            resolved_banks.extend(self._curated_option_pages())
-            self._curated_parameter_display_names = tuple(
-                display_names for _, display_names in resolved_banks
-            )
-            return tuple(parameters for parameters, _ in resolved_banks)
-        except Exception:
-            self._curated_parameter_display_names = ()
-            return ()
-        finally:
-            if bank:
-                try:
-                    bank.disconnect()
-                except Exception:
-                    pass
-
-    def curated_parameter_display_name(self, parameter):
-        try:
-            bank_index = self._bank_index
-            display_names = self._curated_parameter_display_names[bank_index]
-            parameter_bank = self._parameter_bank_cache[bank_index]
-            for index, candidate in enumerate(parameter_bank):
-                if candidate is parameter and index < len(display_names):
-                    return display_names[index]
-        except Exception:
-            pass
-        return None
-
-    def _disconnect_drift_decorator(self):
-        decorator = self._drift_decorator
-        base_decorator = self._drift_base_decorator
-        self._drift_decorator = None
-        self._drift_decorator_device = None
-        self._drift_base_decorator = None
-        if decorator:
-            try:
-                decorator.disconnect()
-            except Exception:
-                pass
-        if base_decorator and base_decorator is not decorator:
-            try:
-                base_decorator.disconnect()
-            except Exception:
-                pass
-
-    def _disconnect_meld_decorator(self):
-        decorator = self._meld_decorator
-        self._meld_decorator = None
-        self._meld_decorator_device = None
-        if decorator:
-            try:
-                decorator.disconnect()
-            except Exception:
-                pass
-
-    def _disconnect_hybrid_reverb_decorator(self):
-        decorator = self._hybrid_reverb_decorator
-        self._hybrid_reverb_decorator = None
-        self._hybrid_reverb_decorator_device = None
-        if decorator:
-            try:
-                decorator.disconnect()
-            except Exception:
-                pass
-
-    def _disconnect_simpler_bank_decorator(self):
-        decorator = self._simpler_bank_decorator
-        self._simpler_bank_decorator = None
-        self._simpler_bank_decorator_device = None
-        if decorator:
-            try:
-                decorator.disconnect()
-            except Exception:
-                pass
-
-    def simpler_decorator(self):
-        """Return the bank decorator so Simpler support does not create a duplicate."""
-        if not self._is_simpler() or SimplerDeviceDecorator is None:
-            return None
-        self._decorated_parameters()
-        return self._simpler_bank_decorator
-
-    def _decorated_parameters(self):
-        device = getattr(self, '_device', None)
-        if self._uses_curated_banks():
-            decorated = self._curated_decorated_device()
-            return tuple(getattr(decorated, 'parameters', getattr(device, 'parameters', ())))
-        if self._is_hybrid_reverb() and HybridReverbDeviceDecorator is not None:
-            if (self._hybrid_reverb_decorator is None or
-                    self._hybrid_reverb_decorator_device != device):
-                self._disconnect_hybrid_reverb_decorator()
-                try:
-                    self._hybrid_reverb_decorator = HybridReverbDeviceDecorator(live_object=device)
-                    self._hybrid_reverb_decorator_device = device
-                except TypeError:
-                    try:
-                        self._hybrid_reverb_decorator = HybridReverbDeviceDecorator(
-                            live_object=device, additional_properties={}
-                        )
-                        self._hybrid_reverb_decorator_device = device
-                    except Exception:
-                        self._hybrid_reverb_decorator = None
-                except Exception:
-                    self._hybrid_reverb_decorator = None
-            if self._hybrid_reverb_decorator:
-                return tuple(self._hybrid_reverb_decorator.parameters)
-        if self._is_simpler():
-            decorated = []
-            if SimplerDeviceDecorator is not None:
-                if self._simpler_bank_decorator is None or self._simpler_bank_decorator_device != device:
-                    self._disconnect_simpler_bank_decorator()
-                    try:
-                        self._simpler_bank_decorator = SimplerDeviceDecorator(
-                            live_object=device, additional_properties={}
-                        )
-                        self._simpler_bank_decorator_device = device
-                    except Exception:
-                        self._simpler_bank_decorator = None
-                if self._simpler_bank_decorator:
-                    decorated.extend(self._simpler_bank_decorator.parameters)
-
-            decorated_ids = set(id(parameter) for parameter in decorated)
-            decorated.extend(
-                parameter for parameter in getattr(device, 'parameters', ())
-                if id(parameter) not in decorated_ids
-            )
-            # In multisample mode Simpler exposes the actual Sampler as a
-            # nested device. Parameters such as "F On" and "Pe On" live there
-            # rather than in OriginalSimpler's parameter list.
-            sampler = getattr(device, 'sampler', None)
-            if sampler and liveobj_valid(sampler):
-                decorated_ids.update(id(parameter) for parameter in decorated)
-                decorated.extend(
-                    parameter for parameter in getattr(sampler, 'parameters', ())
-                    if id(parameter) not in decorated_ids
-                )
-            return tuple(decorated)
-        if self._is_drift() and DriftDeviceDecorator is not None:
-            if self._drift_decorator is None or self._drift_decorator_device != device:
-                self._disconnect_drift_decorator()
-                try:
-                    voice_mode = None
-                    if BaseDriftDeviceDecorator is not None:
-                        self._drift_base_decorator = BaseDriftDeviceDecorator(live_object=device)
-                        voice_mode = next(
-                            (parameter for parameter in self._drift_base_decorator.parameters
-                             if str(getattr(parameter, 'name', '')) == 'Voice Mode'),
-                            None
-                        )
-                    additional_properties = {'voice_mode': voice_mode} if voice_mode else {}
-                    self._drift_decorator = DriftDeviceDecorator(
-                        live_object=device, additional_properties=additional_properties
-                    )
-                    self._drift_decorator_device = device
-                except Exception:
-                    self._drift_decorator = None
-            if self._drift_decorator:
-                parameters = list(self._drift_decorator.parameters)
-                if self._drift_base_decorator:
-                    voice_mode = next(
-                        (parameter for parameter in self._drift_base_decorator.parameters
-                         if str(getattr(parameter, 'name', '')) == 'Voice Mode'),
-                        None
-                    )
-                    if voice_mode:
-                        parameters.append(voice_mode)
-                return tuple(parameters)
-        if self._is_meld() and MeldDeviceDecorator is not None:
-            if self._meld_decorator is None or self._meld_decorator_device != device:
-                self._disconnect_meld_decorator()
-                try:
-                    self._meld_decorator = MeldDeviceDecorator(live_object=device)
-                    self._meld_decorator_device = device
-                except Exception:
-                    self._meld_decorator = None
-            if self._meld_decorator:
-                return tuple(self._meld_decorator.parameters)
-        return tuple(getattr(device, 'parameters', ()))
-
-    def _simpler_is_classic(self):
-        try:
-            return self._is_simpler() and int(self._device.playback_mode) == 0
-        except Exception:
-            return False
-
-    def _simpler_is_slice(self):
-        try:
-            return self._is_simpler() and int(self._device.playback_mode) == 2
-        except Exception:
-            return False
-
-    def _simpler_is_warped(self):
-        try:
-            sample = self._device.sample
-            return liveobj_valid(sample) and bool(sample.warping)
-        except Exception:
-            return False
-
-    def _simpler_browse_bank_name(self):
-        return (
-            self.SIMPLER_BROWSE_PLUS_BANK_NAME
-            if self._simpler_uses_native_banks()
-            else self.SIMPLER_BROWSE_BANK_NAME
-        )
-
-    def _custom_bank_insert_index(self, bank_names, anchor_name):
-        anchor_name = re.sub(r'[^a-z0-9]+', '', anchor_name.lower())
-        for index, name in enumerate(bank_names):
-            normalized_name = re.sub(r'[^a-z0-9]+', '', str(name).lower())
-            if anchor_name in normalized_name:
-                return index + 1
-        return len(bank_names)
-
-    def _operator_waves_insert_index(self, bank_names):
-        for index, name in enumerate(bank_names):
-            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
-            if normalized in ('oscd', 'oscillatord') or normalized.endswith('oscillatord'):
-                return index + 1
-        return len(bank_names)
-
-    def _add_tap_custom_bank_names(self, bank_names):
-        names = list(bank_names)
-        if self._uses_curated_banks():
-            names = list(self._curated_bank_names())
-        elif self._is_auto_filter_2():
-            names = list(self.AUTO_FILTER_2_BANK_NAMES)
-        elif self._is_auto_filter():
-            names = list(self.AUTO_FILTER_BANK_NAMES)
-        elif self._is_beat_repeat():
-            names = list(self.BEAT_REPEAT_BANK_NAMES)
-        elif self._is_hybrid_reverb():
-            names = list(self.HYBRID_REVERB_BANK_NAMES)
-        elif self._is_drift():
-            names = list(self.DRIFT_BANK_NAMES)
-        elif self._is_meld():
-            names = list(self.MELD_BANK_NAMES)
-        elif self._is_chord():
-            names.extend((
-                self.CHORD_SHIFT_SCALE_BANK_NAME,
-                self.CHORD_STRUM_BANK_NAME,
-            ))
-        elif self._is_operator():
-            index = self._operator_waves_insert_index(names)
-            names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
-            filter_index = self._operator_filter_bank_insert_index(names)
-            names.insert(filter_index, self.OPERATOR_FILTER_PLUS_BANK_NAME)
-            lfo_index = self._operator_lfo_bank_insert_index(names)
-            names.insert(lfo_index, self.OPERATOR_LFO_PLUS_BANK_NAME)
-        elif self._is_wavetable():
-            self._replace_wavetable_envelope_bank_names(names)
-            index = self._wavetable_waves_insert_index(names)
-            names.insert(index, self.WAVETABLE_OSC_BANK_NAME)
-        elif self._is_simpler():
-            if not self._simpler_uses_native_banks():
-                # Keep Live's native bank count and indices intact. Tap's
-                # Push-like page replaces bank zero in place instead of
-                # inserting a bank.
-                if names:
-                    names[0] = self.SIMPLER_MAIN_BANK_NAME
-                else:
-                    names.append(self.SIMPLER_MAIN_BANK_NAME)
-                if self._simpler_is_classic() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
-                    names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_AMP_BANK_NAME
-                elif self._simpler_is_slice() and len(names) > self.SIMPLER_AMP_BANK_INDEX:
-                    names[self.SIMPLER_AMP_BANK_INDEX] = self.SIMPLER_SLICE_DETAIL_BANK_NAME
-                self._configure_simpler_control_bank_names(names)
-                names.insert(1, self.SIMPLER_ACTIONS_BANK_NAME)
-            else:
-                # Multisample Simpler uses Live's native banks, but its Warp
-                # As parameter is still a quantized encoder. Replace the
-                # native control pages so Tap can expose Warp As as a real
-                # momentary action here as well.
-                self._configure_simpler_control_bank_names(names)
-            names.append(self._simpler_browse_bank_name())
-        elif self._is_analog():
-            names = self._analog_bank_names(names)
-        elif self._is_drumcell():
-            custom_names = (
-                self.DRUMCELL_SAMPLE_BANK_NAME,
-                self.DRUMCELL_FX_FILTER_BANK_NAME,
-                self.DRUMCELL_REST_BANK_NAME,
-            )
-            while len(names) < len(custom_names):
-                names.append('Bank {}'.format(len(names) + 1))
-            names[:len(custom_names)] = custom_names
-            if len(names) > 3:
-                names[3] = self.DRUMCELL_FX_2_BANK_NAME
-            if len(names) > 4:
-                names[4] = self.DRUMCELL_FX_3_BANK_NAME
-        elif self._is_grain_delay():
-            names = list(self.GRAIN_DELAY_BANK_NAMES)
-        elif self._is_delay():
-            names = list(self.DELAY_BANK_NAMES)
-        return tuple(names)
-
-    def _add_tap_custom_banks(self, banks, base_names):
-        banks = list(banks)
-        names = list(base_names)
-        if self._uses_curated_banks():
-            curated_banks = self._curated_parameter_banks()
-            if curated_banks:
-                banks = list(curated_banks)
-        elif self._is_auto_filter_2():
-            banks = list(self._auto_filter_2_parameter_banks())
-        elif self._is_auto_filter():
-            banks = list(self._auto_filter_parameter_banks())
-        elif self._is_beat_repeat():
-            banks = list(self._beat_repeat_parameter_banks())
-        elif self._is_hybrid_reverb():
-            banks = list(self._hybrid_reverb_parameter_banks())
-        elif self._is_drift():
-            banks = list(self._drift_parameter_banks())
-        elif self._is_meld():
-            banks = list(self._meld_parameter_banks())
-        elif self._is_chord():
-            banks.extend((
-                self._chord_shift_scale_parameters(),
-                self._chord_strum_parameters(),
-            ))
-        elif self._is_operator():
-            self._replace_operator_lfo_bank(banks, names)
-            waves = self._operator_wave_parameters(banks)
-            index = self._operator_waves_insert_index(names)
-            banks.insert(index, tuple(waves + [None] * (self.SAFE_PARAMETER_BANK_SIZE - len(waves))))
-            names.insert(index, self.OPERATOR_WAVES_BANK_NAME)
-            filter_index = self._operator_filter_bank_insert_index(names)
-            banks.insert(filter_index, self._operator_filter_plus_parameters())
-            names.insert(filter_index, self.OPERATOR_FILTER_PLUS_BANK_NAME)
-            lfo_index = self._operator_lfo_bank_insert_index(names)
-            banks.insert(lfo_index, self._operator_lfo_plus_parameters())
-        elif self._is_wavetable():
-            self._replace_wavetable_envelope_banks(banks, names)
-            # These are Live.WavetableDevice properties, not DeviceParameters.
-            # Tap handles their MIDI mapping and feedback directly.
-            index = self._wavetable_waves_insert_index(names)
-            banks.insert(index, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-        elif self._is_simpler():
-            uses_native_banks = self._simpler_uses_native_banks()
-            if not uses_native_banks:
-                if not banks:
-                    banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-                banks[0] = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-                if self._simpler_is_classic() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
-                    banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_amp_parameters()
-                elif self._simpler_is_slice() and len(banks) > self.SIMPLER_AMP_BANK_INDEX:
-                    banks[self.SIMPLER_AMP_BANK_INDEX] = self._simpler_slice_detail_parameters()
-                self._replace_simpler_lfo_bank(banks, names)
-                self._configure_simpler_control_banks(banks, names)
-                banks.insert(1, tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-            else:
-                self._configure_simpler_control_banks(banks, names)
-                # DeviceComponent can expose more resolved C++ banks than its
-                # stable curated name table. Keep only the banks represented by
-                # that table, then add Browse + at the matching final index.
-                visible_bank_count = len(names)
-                banks = banks[:visible_bank_count]
-                while len(banks) < visible_bank_count:
-                    banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-            banks.append(self._simpler_browse_parameters())
-        elif self._is_analog():
-            banks = self._analog_parameter_banks(banks, names)
-        elif self._is_drumcell():
-            custom_banks = (
-                self._drumcell_sample_parameters(),
-                self._drumcell_fx_filter_parameters(),
-                self._drumcell_rest_parameters(),
-            )
-            while len(banks) < len(custom_banks):
-                banks.append(tuple([None] * self.SAFE_PARAMETER_BANK_SIZE))
-            banks[:len(custom_banks)] = custom_banks
-        elif self._is_grain_delay():
-            banks = list(self._grain_delay_parameter_banks())
-        elif self._is_delay():
-            banks = list(self._delay_parameter_banks())
-        return banks
-
-    def _normalized_bank_name(self, name):
-        return re.sub(r'[^a-z0-9]+', '', str(name).lower())
-
-    def _bank_index_named(self, bank_names, *wanted_names):
-        wanted = set(self._normalized_bank_name(name) for name in wanted_names)
-        return next(
-            (index for index, name in enumerate(bank_names)
-             if self._normalized_bank_name(name) in wanted),
-            None,
-        )
-
-    def _replace_simpler_lfo_bank(self, banks, bank_names):
-        index = self._bank_index_named(bank_names, 'LFO')
-        if index is None or index >= len(banks):
-            return
-        bank = list(banks[index])
-        bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
-        sync = self._parameter_by_names('L Sync')
-        sync_on = False
-        if sync:
-            try:
-                display = str(sync.str_for_value(sync.value)).strip().lower()
-                sync_on = display in ('on', 'yes', 'true', 'sync', 'synced')
-                if display in ('off', 'no', 'false', 'free'):
-                    sync_on = False
-            except Exception:
-                try:
-                    sync_on = float(sync.value) > float(sync.min)
-                except Exception:
-                    pass
-        rate = self._parameter_by_names('L Sync Rate' if sync_on else 'L Rate')
-        for control_index, parameter in enumerate(bank):
-            key = self._normalized_bank_name(getattr(parameter, 'name', '')) if parameter else ''
-            original_key = self._normalized_bank_name(getattr(parameter, 'original_name', '')) if parameter else ''
-            if key == 'lrate' or original_key == 'lrate':
-                bank[control_index] = rate
-            elif key == 'lrkey' or original_key == 'lrkey':
-                bank[control_index] = sync
-        banks[index] = tuple(bank[:self.SAFE_PARAMETER_BANK_SIZE])
-
-    def _simpler_warp_mode_name(self):
-        try:
-            value = int(self._device.sample.warp_mode)
-            modes = (
-                (Live.Clip.WarpMode.beats, 'beats'),
-                (Live.Clip.WarpMode.tones, 'tones'),
-                (Live.Clip.WarpMode.texture, 'texture'),
-                (Live.Clip.WarpMode.repitch, 'repitch'),
-                (Live.Clip.WarpMode.complex, 'complex'),
-                (Live.Clip.WarpMode.complex_pro, 'complexpro'),
-            )
-            return next((name for mode, name in modes if int(mode) == value), '')
-        except Exception:
-            return ''
-
-    def _simpler_control_parameters(self):
-        mode = self._simpler_warp_mode_name() if self._simpler_is_warped() else ''
-        mode_parameters = {
-            'beats': ('Preserve', 'Loop Mode', 'Envelope'),
-            'tones': ('Grain Size Tones',),
-            'texture': ('Grain Size Texture', 'Flux'),
-            'complexpro': ('Formants', 'Envelope Complex Pro'),
-        }.get(mode, ())
-        parameters = [None]
-        parameters.extend(self._parameter_by_names(name) for name in mode_parameters)
-        parameters.append(self._parameter_by_names('Filter Drive'))
-        parameters.extend([None] * max(0, 5 - len(parameters)))
-        parameters.extend((
-            self._parameter_by_names('Pe < Env'),
-            self._parameter_by_names('Pe Attack'),
-            self._parameter_by_names('Pe Decay'),
-        ))
-        return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
-
-    def _simpler_controls_2_parameters(self):
-        return (
-            self._parameter_by_names('Transpose'),
-            self._parameter_by_names('Detune'),
-            self._parameter_by_names('Glide Mode', 'Glide', 'Glide On'),
-            self._parameter_by_names('Glide Time'),
-            self._parameter_by_names('L R < Key'),
-            self._parameter_by_names('L Retrig'),
-            # Live 12.4 exposes Simpler's filter switch as "F On".
-            self._parameter_by_names('F On', 'Filter On', 'Filter On/Off', 'Filter Enable'),
-            self._parameter_by_names('Pe On', 'Pitch Envelope On'),
-        )
-
-    def _simpler_browse_parameters(self):
-        if not self._simpler_uses_native_banks():
-            return tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-        return (
-            None,  # Browse Samples is handled as a Tap action.
-            self._parameter_by_names('F On', 'Filter On', 'Filter On/Off', 'Filter Enable'),
-            self._parameter_by_names('Filter Type', 'Filter Type (Legacy)'),
-            self._parameter_by_names('Pe On', 'Pitch Envelope On'),
-            self._parameter_by_names('Pe < Env', 'Pitch Envelope Amount'),
-            self._parameter_by_names('Transpose'),
-            self._parameter_by_names('Detune'),
-            self._parameter_by_names('Volume'),
-        )
-
-    def _simpler_control_bank_indices(self, bank_names):
-        wanted = {
-            self._normalized_bank_name(self.SIMPLER_WARP_BANK_NAME),
-            self._normalized_bank_name(self.SIMPLER_CONTROLS_2_BANK_NAME),
-            self._normalized_bank_name('Pitch Env'),
-            self._normalized_bank_name('Controls 3'),
-            self._normalized_bank_name('Options'),
-            self._normalized_bank_name('Warp'),
-        }
-        return [
-            index for index, name in enumerate(bank_names)
-            if self._normalized_bank_name(name) in wanted
-        ]
-
-    def _configure_simpler_control_bank_names(self, bank_names):
-        indices = self._simpler_control_bank_indices(bank_names)
-        insertion_index = min(indices) if indices else min(1, len(bank_names))
-        for index in reversed(indices):
-            bank_names.pop(index)
-        bank_names.insert(insertion_index, self.SIMPLER_WARP_BANK_NAME)
-        bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
-
-    def _configure_simpler_control_banks(self, banks, bank_names):
-        indices = self._simpler_control_bank_indices(bank_names)
-        insertion_index = min(indices) if indices else min(1, len(banks))
-        for index in reversed(indices):
-            bank_names.pop(index)
-            if index < len(banks):
-                banks.pop(index)
-        bank_names.insert(insertion_index, self.SIMPLER_WARP_BANK_NAME)
-        banks.insert(insertion_index, self._simpler_control_parameters())
-        bank_names.insert(insertion_index + 1, self.SIMPLER_CONTROLS_2_BANK_NAME)
-        banks.insert(insertion_index + 1, self._simpler_controls_2_parameters())
-
-    def _analog_bank_names(self, bank_names):
-        names = list(bank_names)
-        oscillator_index = self._bank_index_named(names, 'Oscillators')
-        custom = [
-            self.ANALOG_OSC_1_BANK_NAME,
-            self.ANALOG_OSC_2_BANK_NAME,
-            self.ANALOG_NOISE_BANK_NAME,
-            self.ANALOG_OSC_PLUS_BANK_NAME,
-        ]
-        if oscillator_index is None:
-            names = custom + names
-        else:
-            names[oscillator_index:oscillator_index + 1] = custom
-        mix_index = self._bank_index_named(names, 'Mix')
-        if mix_index is not None:
-            names[mix_index] = self.ANALOG_MIX_LFO_BANK_NAME
-            names.insert(mix_index + 1, self.ANALOG_LFO_PLUS_BANK_NAME)
-        else:
-            names.extend((self.ANALOG_MIX_LFO_BANK_NAME, self.ANALOG_LFO_PLUS_BANK_NAME))
-        names.append(self.ANALOG_LOOPS_FILTER_BANK_NAME)
-        return tuple(names)
-
-    def _analog_parameter_banks(self, banks, bank_names):
-        result = list(banks)
-        oscillator_index = self._bank_index_named(bank_names, 'Oscillators')
-        custom = [
-            self._parameter_bank(
-                'OSC1 Level', 'OSC1 Octave', 'OSC1 Semi', 'OSC1 Detune',
-                'OSC1 Shape', 'PEG1 Amount', 'PEG1 Time', 'Volume',
-            ),
-            self._parameter_bank(
-                'OSC2 Level', 'OSC2 Octave', 'OSC2 Semi', 'OSC2 Detune',
-                'OSC2 Shape', 'PEG2 Amount', 'PEG2 Time', 'Volume',
-            ),
-            self._parameter_bank(
-                'Noise On/Off', 'Noise Level', 'Noise Balance', 'Noise Color',
-                None, None, None, None,
-            ),
-            self._parameter_bank(
-                'OSC1 Mode', 'O1 Sub/Sync', 'OSC1 PW', 'O1 PW < LFO',
-                'OSC2 Mode', 'O2 Sub/Sync', 'OSC2 PW', 'O2 PW < LFO',
-            ),
-        ]
-        if oscillator_index is None:
-            result = custom + result
-            working_names = [
-                self.ANALOG_OSC_1_BANK_NAME, self.ANALOG_OSC_2_BANK_NAME,
-                self.ANALOG_NOISE_BANK_NAME, self.ANALOG_OSC_PLUS_BANK_NAME,
-            ] + list(bank_names)
-        else:
-            result[oscillator_index:oscillator_index + 1] = custom
-            working_names = list(bank_names)
-            working_names[oscillator_index:oscillator_index + 1] = [
-                self.ANALOG_OSC_1_BANK_NAME, self.ANALOG_OSC_2_BANK_NAME,
-                self.ANALOG_NOISE_BANK_NAME, self.ANALOG_OSC_PLUS_BANK_NAME,
-            ]
-
-        mix_index = self._bank_index_named(working_names, 'Mix')
-        mix_bank = self._parameter_bank(
-            'AMP1 Level', 'AMP1 Pan', 'AMP2 Level', 'AMP2 Pan',
-            'LFO1 Shape', 'LFO1 Speed', 'LFO1 SncRate', 'LFO1 Sync',
-        )
-        lfo_plus_bank = self._parameter_bank(
-            'LFO2 Shape', 'LFO2 Speed', 'LFO2 SncRate', 'LFO2 Sync',
-            'LFO1 On/Off', 'LFO2 On/Off', None, None,
-        )
-        if mix_index is None:
-            result.extend((mix_bank, lfo_plus_bank))
-            working_names.extend((self.ANALOG_MIX_LFO_BANK_NAME, self.ANALOG_LFO_PLUS_BANK_NAME))
-        else:
-            result[mix_index] = mix_bank
-            result.insert(mix_index + 1, lfo_plus_bank)
-            working_names[mix_index] = self.ANALOG_MIX_LFO_BANK_NAME
-            working_names.insert(mix_index + 1, self.ANALOG_LFO_PLUS_BANK_NAME)
-
-        output_index = self._bank_index_named(working_names, 'Output')
-        if output_index is not None and output_index < len(result):
-            result[output_index] = self._parameter_bank(
-                'Volume', 'Glide On/Off', 'Glide Time', 'Glide Legato',
-                'Unison On/Off', 'Unison Detune', 'Vib On/Off', 'Vib Amount',
-            )
-        result.append(self._parameter_bank(
-            'FEG1 Loop', 'F1 Drive', 'FEG2 Loop', 'F2 Drive',
-            'AEG1 Loop', 'AEG2 Loop', 'F1 On/Off', 'F2 On/Off',
-        ))
-        return result
-
-    def _parameter_bank(self, *specifications):
-        parameters = []
-        for specification in specifications:
-            if not specification:
-                parameters.append(None)
-            elif isinstance(specification, (tuple, list)):
-                parameters.append(self._parameter_by_names(*specification))
-            elif isinstance(specification, str):
-                parameters.append(self._parameter_by_names(specification))
-            else:
-                parameters.append(specification)
-        parameters.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
-        return tuple(parameters[:self.SAFE_PARAMETER_BANK_SIZE])
-
-    def _auto_filter_2_parameter_banks(self):
-        filter_type = self._parameter_value_text('Filter Type')
-        filter_type_key = re.sub(r'[^a-z0-9]+', '', filter_type)
-        uses_morph = any(
-            name in filter_type_key
-            for name in ('morph', 'comb', 'notchlp', 'notchlowpass', 'vowel')
-        )
-        slope = self._parameter_by_names('Slope', 'Filter Slope')
-        morph_or_slope = self._parameter_by_names('Filter Morph') if uses_morph else slope
-        if 'dj' in filter_type:
-            frequency = self._parameter_by_names('Control')
-        elif 'vowel' in filter_type:
-            frequency = self._parameter_by_names('Pitch')
-        else:
-            frequency = self._parameter_by_names('Frequency')
-        resonance = self._parameter_by_names('Formant') if 'vowel' in filter_type else self._parameter_by_names('Resonance')
-
-        lfo_time_mode = self._parameter_value_text('LFO T Mode')
-        if 'sixteenth' in lfo_time_mode or '16' in lfo_time_mode:
-            lfo_rate = self._parameter_by_names('LFO 16th')
-        elif 'time' in lfo_time_mode:
-            lfo_rate = self._parameter_by_names('LFO Time')
-        elif lfo_time_mode == 'rate':
-            lfo_rate = self._parameter_by_names('LFO Freq')
-        else:
-            lfo_rate = self._parameter_by_names('LFO Rate')
-        lfo_spatial_mode = self._parameter_value_text('LFO S Mode')
-        lfo_phase_or_spin = self._parameter_by_names('LFO Phase') if 'phase' in lfo_spatial_mode else self._parameter_by_names('LFO Spin')
-
-        sidechain_eq_type = self._parameter_value_text('S/C EQ Type')
-        sidechain_q_or_gain = self._parameter_by_names('S/C EQ Q') if 'pass' in sidechain_eq_type else self._parameter_by_names('S/C EQ Gain')
-        quantize_mode = self._parameter_value_text('LFO Q Mode')
-        quantize_amount = self._parameter_by_names('LFO Steps') if 'step' in quantize_mode else self._parameter_by_names('LFO S&H')
-
-        return (
-            self._parameter_bank(
-                'Filter Type', frequency, resonance, morph_or_slope,
-                'Circuit', 'Drive', 'Output', ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'LFO Wave', 'LFO Amount', 'LFO T Mode', lfo_rate,
-                'LFO S Mode', lfo_phase_or_spin, 'LFO Offset', 'LFO Morph',
-            ),
-            self._parameter_bank(
-                'Env Amount', 'Env Hold On', 'Env Attack', 'Env Release',
-                'S/C EQ On', 'S/C EQ Type', 'S/C EQ Freq', sidechain_q_or_gain,
-            ),
-            self._parameter_bank(
-                'LFO Q Mode', quantize_amount, 'Env S&H On', 'Env S&H',
-                None, None, None, None,
-            ),
-        )
-
-    def _auto_filter_parameter_banks(self):
-        filter_type_text = self._parameter_value_text('Filter Type', 'Filter Type (Legacy)')
-        filter_type_key = re.sub(r'[^a-z0-9]+', '', filter_type_text)
-        if 'lowpass' in filter_type_key or 'highpass' in filter_type_key:
-            circuit = self._parameter_by_names('Filter Circuit - LP/HP')
-        else:
-            circuit = self._parameter_by_names('Filter Circuit - BP/NO/Morph')
-        morph_or_drive = self._parameter_by_names('Morph') if 'morph' in filter_type_key else self._parameter_by_names('Drive')
-
-        lfo_sync_text = self._parameter_value_text('LFO Sync')
-        lfo_rate = self._parameter_by_names('LFO Frequency') if 'free' in lfo_sync_text else self._parameter_by_names('LFO Sync Rate')
-        lfo_is_synced = 'sync' in lfo_sync_text and 'free' not in lfo_sync_text
-        stereo_mode_text = self._parameter_value_text('LFO Stereo Mode')
-        lfo_stereo = self._parameter_by_names('LFO Offset') if lfo_is_synced else self._parameter_by_names('LFO Stereo Mode')
-        lfo_phase = self._parameter_by_names('LFO Phase') if lfo_is_synced or 'phase' in stereo_mode_text else self._parameter_by_names('LFO Spin')
-
-        return (
-            self._parameter_bank(
-                ('Filter Type', 'Filter Type (Legacy)'), 'Frequency',
-                ('Resonance', 'Resonance (Legacy)'), circuit, morph_or_drive,
-                'LFO Amount', 'LFO Sync', lfo_rate,
-            ),
-            self._parameter_bank(
-                ('Filter Type', 'Filter Type (Legacy)'), 'Frequency',
-                ('Resonance', 'Resonance (Legacy)'), morph_or_drive, 'Slope',
-                'Env. Attack', 'Env. Release', 'Env. Modulation',
-            ),
-            self._parameter_bank(
-                'LFO Amount', 'LFO Waveform', 'LFO Sync', lfo_rate,
-                lfo_stereo, lfo_phase, 'LFO Quantize On', 'LFO Quantize Rate',
-            ),
-            self._parameter_bank(
-                'S/C On', 'S/C Mix', 'S/C Gain', None, None, None, None, None,
-            ),
-        )
-
-    def _beat_repeat_parameter_banks(self):
-        return (
-            self._parameter_bank(
-                'Grid', 'Interval', 'Offset', 'Gate',
-                'Pitch', 'Pitch Decay', 'Variation', 'Chance',
-            ),
-            self._parameter_bank(
-                'Filter On', 'Filter Freq', 'Filter Width', None,
-                'Mix Type', 'Volume', 'Decay', 'Chance',
-            ),
-            self._parameter_bank(
-                'Repeat', 'Interval', 'Offset', 'Gate',
-                'Grid', 'Block Triplets', 'Variation', 'Variation Type',
-            ),
-        )
-
-    def _hybrid_algorithm_type_key(self):
-        return re.sub(r'[^a-z0-9]+', '', self._parameter_value_text('Algo Type'))
-
-    def _hybrid_algorithm_modulation_parameter(self, algorithm):
-        if 'prism' in algorithm:
-            return None
-        if 'tides' in algorithm:
-            return self._parameter_by_names('Ti Waveform')
-        return self._parameter_by_names('Modulation')
-
-    def _hybrid_algorithm_page_one_parameters(self, algorithm):
-        if 'darkhall' in algorithm:
-            character_one = self._parameter_by_names('DH Shape')
-            character_two = self._parameter_by_names('DH BassMult', 'DH Bass Mult')
-        elif 'quartz' in algorithm:
-            character_one = self._parameter_by_names('Qz Low Damp')
-            character_two = self._parameter_by_names('Qz Distance')
-        elif 'shimmer' in algorithm:
-            character_one = self._parameter_by_names('Sh Pitch Shift')
-            character_two = self._parameter_by_names('Sh Shimmer')
-        elif 'tides' in algorithm:
-            character_one = self._parameter_by_names('Ti Tide')
-            character_two = self._parameter_by_names('Ti Rate')
-        elif 'prism' in algorithm:
-            character_one = self._parameter_by_names('Pr High Mult')
-            character_two = self._parameter_by_names('Pr X Over')
-        else:
-            character_one = None
-            character_two = None
-        return character_one, character_two
-
-    def _hybrid_algorithm_page_two_character(self, algorithm):
-        if 'darkhall' in algorithm:
-            return self._parameter_by_names('DH Bass X')
-        if 'quartz' in algorithm or 'shimmer' in algorithm:
-            return self._parameter_by_names('Diffusion')
-        if 'tides' in algorithm:
-            return self._parameter_by_names('Ti Phase')
-        return None
-
-    def _hybrid_predelay_is_synced(self):
-        text = self._parameter_value_text('P.Dly Sync', 'Predelay Sync')
-        return 'sync' in text or text == 'on'
-
-    def _hybrid_reverb_parameter_banks(self):
-        algorithm = self._hybrid_algorithm_type_key()
-        algorithm_one, algorithm_two = self._hybrid_algorithm_page_one_parameters(algorithm)
-        algorithm_modulation = self._hybrid_algorithm_modulation_parameter(algorithm)
-        damping_or_low_mult = self._parameter_by_names('Pr Low Mult') if 'prism' in algorithm else self._parameter_by_names('Damping')
-
-        low_type = self._parameter_value_text('EQ Low Type', 'EQ Lo Type')
-        low_gain_or_slope = self._parameter_by_names(
-            'EQ Low Slope', 'EQ Lo Slope'
-        ) if 'cut' in low_type else self._parameter_by_names('EQ Low Gain', 'EQ Lo Gain')
-        high_type = self._parameter_value_text('EQ High Type', 'EQ Hi Type')
-        high_gain_or_slope = self._parameter_by_names(
-            'EQ High Slope', 'EQ Hi Slope'
-        ) if 'cut' in high_type else self._parameter_by_names('EQ High Gain', 'EQ Hi Gain')
-        predelay_synced = self._hybrid_predelay_is_synced()
-        predelay = self._parameter_by_names(
-            'P.Dly 16th', 'Predelay 16th'
-        ) if predelay_synced else self._parameter_by_names('P.Dly Time', 'Predelay')
-        predelay_feedback = self._parameter_by_names(
-            'P.Dly Fb 16th', 'Predel. FB 16th', 'Predelay FB 16th'
-        ) if predelay_synced else self._parameter_by_names('P.Dly Fb Time', 'Predelay FB')
-
-        return (
-            self._parameter_bank(
-                ('Send Gain', 'Send'), 'Routing', 'Blend', 'Algo Type',
-                'Decay', 'Size', algorithm_modulation, ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'IR Category', 'IR', 'Ir Attack Time', 'Ir Decay Time',
-                'Ir Size Factor', 'Blend', 'Routing', ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'Algo Type', 'Decay', 'Size', algorithm_one,
-                algorithm_two, algorithm_modulation, 'Width', ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'Algo Type', damping_or_low_mult,
-                self._hybrid_algorithm_page_two_character(algorithm), 'EQ Pre Algo',
-                ('Send Gain', 'Send'), 'Blend', 'Routing', ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'EQ Pre Algo', ('EQ Low Type', 'EQ Lo Type'),
-                ('EQ Low Freq', 'EQ Lo Freq'), low_gain_or_slope,
-                ('EQ High Type', 'EQ Hi Type'), ('EQ High Freq', 'EQ Hi Freq'),
-                high_gain_or_slope, ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'EQ Pre Algo', ('EQ P1 Freq', 'EQ Peak 1 Freq'),
-                ('EQ P1 Q', 'EQ Peak 1 Q'), ('EQ P1 Gain', 'EQ Peak 1 Gain'),
-                ('EQ P2 Freq', 'EQ Peak 2 Freq'), ('EQ P2 Q', 'EQ Peak 2 Q'),
-                ('EQ P2 Gain', 'EQ Peak 2 Gain'), ('Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                ('Send Gain', 'Send'), ('P.Dly Sync', 'Predelay Sync'),
-                predelay, predelay_feedback, ('Vintage', 'Vintage Copy'),
-                'Width', 'Blend', ('Dry/Wet', 'Dry Wet'),
-            ),
-        )
-
-    def _drift_parameter_banks(self):
-        envelope_2 = self._drift_envelope_2_parameters()
-        return (
-            self._parameter_bank(
-                'Osc 1 Wave', 'Osc 1 Shape', 'Osc 1 Gain', 'Osc 2 Gain',
-                'LP Freq', 'LP Res', 'LP Mod Amt 1', 'LP Mod Amt 2',
-            ),
-            self._parameter_bank(
-                'Osc 1 Wave', 'Osc 1 Shape', 'Osc 1 Oct', 'Osc 1 Gain',
-                'Osc 2 Wave', 'Osc 2 Oct', 'Osc 2 Detune', 'Osc 2 Gain',
-            ),
-            self._parameter_bank(
-                'Osc Retrig On', None, 'Noise Gain', 'Noise On',
-                'Noise Flt On', None, None, None,
-            ),
-            self._parameter_bank(
-                'Pitch Mod Src 1', 'Pitch Mod Amt 1', 'Pitch Mod Src 2', 'Pitch Mod Amt 2',
-                'Shape Mod Src', 'Osc 1 Shape Mod Amt', 'Osc Retrig On', 'Noise Gain',
-            ),
-            self._parameter_bank(
-                'LP Freq', 'LP Res', 'LP Type', 'HP Freq',
-                'Osc 1 Flt On', 'Osc 2 Flt On', 'Noise Flt On', 'Noise On',
-            ),
-            self._parameter_bank(
-                'Key > LPF', 'LP Mod Src 1', 'LP Mod Amt 1', 'LP Mod Src 2',
-                'LP Mod Amt 2', None, None, None,
-            ),
-            self._parameter_bank(
-                'Env 1 Attack', 'Env 1 Decay', 'Env 1 Sustain', 'Env 1 Release',
-                None, None, None, None,
-            ),
-            envelope_2,
-            self._parameter_bank(
-                'Env 2 Cyc On', ('Cyc Env Tilt', 'Cyc Tilt'), ('Cyc Env Hold', 'Cyc Hold'),
-                ('Cyc Env Time Mode', 'Cyc Mode'), ('Cyc Env Rate', 'Cyc Rate'),
-                ('Cyc Env Ratio', 'Cyc Ratio'), ('Cyc Env Time', 'Cyc Time'),
-                ('Cyc Env Synced', 'Cyc Synced'),
-            ),
-            self._parameter_bank(
-                'LFO Wave', 'LFO Time Mode', self._drift_lfo_rate_parameter(),
-                'LFO Amt', 'LFO Retrig On', 'LFO Mod Src', 'LFO Mod Amt', None,
-            ),
-            self._parameter_bank(
-                'Mod Source 1', 'Mod Dest 1', 'Mod Matrix Amt 1',
-                'Mod Source 2', 'Mod Dest 2', 'Mod Matrix Amt 2', None, None,
-            ),
-            self._parameter_bank(
-                'Mod Source 3', 'Mod Dest 3', 'Mod Matrix Amt 3', 'Vel > Vol',
-                None, None, None, None,
-            ),
-            self._parameter_bank(
-                'Voice Mode', 'Voice Count', 'Thickness', 'Spread',
-                'Strength', 'Legato On', 'Glide Time', 'Drift',
-            ),
-            self._parameter_bank(
-                'Transpose', 'Volume', 'PB Range', 'Note Pitch Bend On',
-                None, None, None, None,
-            ),
-        )
-
-    def _drift_envelope_2_parameters(self):
-        cycle_enabled = self._parameter_by_names('Env 2 Cyc On')
-        try:
-            is_cycling = cycle_enabled.value > cycle_enabled.min
-        except Exception:
-            is_cycling = 'on' in self._parameter_display(cycle_enabled).lower()
-        if is_cycling:
-            return self._parameter_bank(
-                'Env 2 Cyc On', ('Cyc Env Tilt', 'Cyc Tilt'), ('Cyc Env Hold', 'Cyc Hold'),
-                ('Cyc Env Time Mode', 'Cyc Mode'), ('Cyc Env Rate', 'Cyc Rate'),
-                ('Cyc Env Ratio', 'Cyc Ratio'), ('Cyc Env Time', 'Cyc Time'),
-                ('Cyc Env Synced', 'Cyc Synced'),
-            )
-        return self._parameter_bank(
-            'Env 2 Attack', 'Env 2 Decay', 'Env 2 Sustain', 'Env 2 Release',
-            'Env 2 Cyc On', None, None, None,
-        )
-
-    def _parameter_value_text(self, *names):
-        return self._parameter_display(self._parameter_by_names(*names)).lower()
-
-    def _drift_lfo_rate_parameter(self):
-        mode = self._parameter_value_text('LFO Time Mode')
-        if 'ratio' in mode:
-            return self._parameter_by_names('LFO Ratio')
-        if 'time' in mode:
-            return self._parameter_by_names('LFO Time')
-        if 'sync' in mode:
-            return self._parameter_by_names('LFO Synced')
-        return self._parameter_by_names('LFO Rate')
-
-    def _drift_voice_mode_parameter(self):
-        mode = self._parameter_value_text('Voice Mode')
-        if 'mono' in mode:
-            return self._parameter_by_names('Thickness')
-        if 'stereo' in mode:
-            return self._parameter_by_names('Spread')
-        if 'unison' in mode:
-            return self._parameter_by_names('Strength')
-        return None
-
-    def _meld_engine_letter(self):
-        try:
-            return 'B' if int(self._device.selected_engine) == 1 else 'A'
-        except Exception:
-            return 'A'
-
-    def _meld_original_name(self, suffix):
-        return 'MeldVoice_Engine{}_{}'.format(self._meld_engine_letter(), suffix)
-
-    def _meld_parameter(self, suffix, *aliases):
-        return self._parameter_by_names(self._meld_original_name(suffix), *aliases)
-
-    def _meld_parameter_banks(self):
-        engine = self._meld_engine_letter()
-        sync_1 = self._parameter_by_names('LFO 1 {} Sync'.format(engine), self._meld_original_name('Lfo1_Sync'))
-        retrigger_1 = self._meld_parameter('Lfo1_Retrigger', 'LFO 1 {} Retrigger'.format(engine))
-        sync_2 = self._parameter_by_names('LFO 2 {} Sync'.format(engine), self._meld_original_name('Lfo2_Sync'))
-        retrigger_2 = self._meld_parameter('Lfo2_Retrigger', 'LFO 2 {} Retrigger'.format(engine))
-        glide_mode = self._parameter_by_names('Glide {}'.format(engine))
-        mono_poly = self._parameter_by_names('Mono Poly')
-        try:
-            mono_voice_parameter = self._parameter_by_names('Legato', 'MonoLegato') if int(mono_poly.value) == 0 else self._parameter_by_names('Poly Voices')
-        except Exception:
-            mono_voice_parameter = self._parameter_by_names('Poly Voices')
-        envelope_delay_aliases = ('MeldVoice_EngineBDelay',) if engine == 'B' else ()
-        return (
-            tuple([None] * self.SAFE_PARAMETER_BANK_SIZE),
-            self._parameter_bank(
-                (self._meld_original_name('Oscillator_OscillatorType'),),
-                (self._meld_original_name('Oscillator_Macro1'),),
-                (self._meld_original_name('Oscillator_Macro2'),),
-                (self._meld_original_name('Filter_Frequency'),),
-                (self._meld_original_name('Filter_Macro1'),),
-                (self._meld_original_name('ToneFilter'),),
-                (self._meld_original_name('Pan'),),
-                (self._meld_original_name('Volume'),),
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('Oscillator_OscillatorType'),),
-                (self._meld_original_name('Oscillator_Pitch_Transpose'),),
-                (self._meld_original_name('Oscillator_Pitch_Detune'),),
-                (self._meld_original_name('Oscillator_Macro1'),),
-                (self._meld_original_name('Oscillator_Macro2'),),
-                (self._meld_original_name('ToneFilter'),),
-                (self._meld_original_name('Pan'),),
-                (self._meld_original_name('Volume'),),
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('Filter_FilterType'),),
-                (self._meld_original_name('Filter_Frequency'),),
-                (self._meld_original_name('Filter_Macro1'),),
-                (self._meld_original_name('Filter_Macro2'),),
-                (self._meld_original_name('ToneFilter'),),
-                (self._meld_original_name('Pan'),),
-                (self._meld_original_name('Volume'),),
-                None,
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('AmpEnvelope_Times_Attack'),),
-                (self._meld_original_name('AmpEnvelope_Slopes_Attack'),),
-                (self._meld_original_name('AmpEnvelope_Times_Decay'),),
-                (self._meld_original_name('AmpEnvelope_Slopes_Decay'),),
-                (self._meld_original_name('AmpEnvelope_Sustain'),),
-                (self._meld_original_name('AmpEnvelope_Times_Release'),),
-                (self._meld_original_name('AmpEnvelope_Slopes_Release'),),
-                (self._meld_original_name('AmpEnvelope_LoopMode'),),
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('FilterEnvelope_Times_Attack'),),
-                (self._meld_original_name('FilterEnvelope_Slopes_Attack'),),
-                (self._meld_original_name('FilterEnvelope_Times_Decay'),),
-                (self._meld_original_name('FilterEnvelope_Slopes_Decay'),),
-                (self._meld_original_name('FilterEnvelope_Values_Sustain'),),
-                (self._meld_original_name('FilterEnvelope_Times_Release'),),
-                (self._meld_original_name('FilterEnvelope_Values_Peak'),),
-                (self._meld_original_name('FilterEnvelope_LoopMode'),),
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('EnvelopeDelay'),) + envelope_delay_aliases,
-                ('Link Envelopes',), None, None, None, None, None, None,
-            ),
-            (
-                self._meld_parameter('Lfo1_GeneratorType'),
-                sync_1,
-                self._meld_parameter('Lfo1_SyncedRate'),
-                self._meld_parameter('Lfo1_Rate'),
-                self._meld_parameter('Lfo1_PhaseOffset'),
-                self._meld_parameter('Lfo1_GeneratorMacro1'),
-                self._meld_parameter('Lfo1_GeneratorMacro2'),
-                retrigger_1,
-            ),
-            self._parameter_bank(
-                (self._meld_original_name('Lfo1_Transformer1Type'),),
-                (self._meld_original_name('Lfo1_Transformer1Macro'),),
-                (self._meld_original_name('Lfo1_Transformer2Type'),),
-                (self._meld_original_name('Lfo1_Transformer2Macro'),),
-                None, None, None, None,
-            ),
-            (
-                self._meld_parameter('Lfo2_Waveform'),
-                sync_2,
-                self._meld_parameter('Lfo2_SyncedRate'),
-                self._meld_parameter('Lfo2_Rate'),
-                retrigger_2,
-                self._meld_parameter('Lfo2_PhaseOffset'),
-                None, None,
-            ),
-            (
-                self._parameter_by_names('Stack Voices'),
-                self._parameter_by_names('MeldVoice_VoiceSpreadAmount'),
-                mono_poly,
-                mono_voice_parameter,
-                self._meld_parameter('GlideTime'),
-                glide_mode,
-                self._parameter_by_names('MeldVoice_Drive'),
-                self._parameter_by_names('Volume'),
-            ),
-        )
-
-    def _delay_parameter_banks(self):
-        main = tuple(self._parameter_by_names(*names) for names in (
-            ('Feedback',),
-            ('Dry/Wet', 'Dry Wet'),
-            ('Smoothing', 'Delay Smoothing Mode'),
-            ('Link', 'Stereo Time Link'),
-            ('Ping Pong',),
-            ('Freeze',),
-            ('L Sync', 'L Delay Sync'),
-            ('R Sync', 'R Delay Sync'),
-        ))
-        time_bank = tuple(self._parameter_by_names(*names) for names in (
-            ('L Time', 'L Delay Time'),
-            ('R Time', 'R Delay Time'),
-            ('L 16th', 'L Delay 16th'),
-            ('R 16th', 'R Delay 16th'),
-            ('L Offset', 'L Delay Offset'),
-            ('R Offset', 'R Delay Offset'),
-            ('Filter Freq', 'Filter Frequency'),
-            ('Filter Width', 'Filter Bandwidth'),
-        ))
-
-        filter_lfo_bank = tuple(self._parameter_by_names(*names) for names in (
-            ('Filter On', 'Filter On/Off'),
-            ('LFO Mode', 'LF Mode', 'Mod LFO Mode', 'LFO Time Mode'),
-            ('LFO Freq', 'Mod LFO Freq', 'Modulation Frequency', 'LFO Rate'),
-            ('LFO Time', 'Mod LFO Time', 'Modulation Time'),
-            ('LFO Synced', 'LFO Sync', 'Mod LFO Synced', 'Modulation Synced Rate', 'LFO Synced Rate'),
-            ('LFO 16th', 'Mod LFO 16th', 'Modulation 16th'),
-            ('LFO > Delay', 'Delay < Modulation'),
-            ('LFO > Filter', 'Filter < Modulation'),
-        ))
-        lfo_wave_bank = (
-            self._parameter_by_names('LFO Wave', 'Mod LFO Wave', 'Modulation Waveform', 'LFO Waveform'),
-            self._parameter_by_names('LFO Morph', 'Mod LFO Morph', 'Modulation Morph'),
-        ) + tuple([None] * 6)
-        return (
-            main,
-            time_bank,
-            filter_lfo_bank,
-            lfo_wave_bank,
-        )
-
-    def _grain_delay_uses_beat_delay(self):
-        mode = self._parameter_by_names('Delay Mode')
-        display = self._parameter_display(mode).lower()
-        if display in ('off', 'no', 'false', 'time'):
-            return False
-        if display in ('on', 'yes', 'true', 'sync', 'beat'):
-            return True
-        try:
-            return float(mode.value) > float(mode.min)
-        except Exception:
-            return False
-
-    def _grain_delay_parameter_banks(self):
-        delay_time = (
-            self._parameter_by_names('Beat Delay')
-            if self._grain_delay_uses_beat_delay()
-            else self._parameter_by_names('Time Delay')
-        )
-        return (
-            self._parameter_bank(
-                'Frequency', 'Pitch', 'Delay Mode', delay_time,
-                'Random', 'Spray', 'Feedback', ('DryWet', 'Dry/Wet', 'Dry Wet'),
-            ),
-            self._parameter_bank(
-                'Delay Mode', delay_time, 'Beat Swing', 'Feedback',
-                None, None, None, ('DryWet', 'Dry/Wet', 'Dry Wet'),
-            ),
-        )
-
-    def _simpler_amp_parameters(self):
-        names = (
-            'Ve Attack', 'Ve Decay', 'Ve Sustain', 'Ve Release',
-            'Glide Time', 'Spread', 'Pan', 'Volume',
-        )
-        return tuple(self._parameter_by_names(name) for name in names)
-
-    def _simpler_slice_detail_parameters(self):
-        names = ('Transpose', 'Detune', 'Fade In', 'Fade Out')
-        parameters = [self._parameter_by_names(name) for name in names]
-        return tuple(parameters + [None] * (self.SAFE_PARAMETER_BANK_SIZE - len(parameters)))
-
-    def _parameter_display(self, parameter):
-        if not parameter:
-            return ''
-        try:
-            return str(parameter.str_for_value(parameter.value)).strip()
-        except Exception:
-            pass
-        try:
-            display_value = parameter.display_value
-            if display_value is not None:
-                return str(display_value).strip()
-        except Exception:
-            pass
-        return str(getattr(parameter, 'value', '')).strip()
-
-    def _drumcell_sample_parameters(self):
-        env_mode = self._parameter_by_names('Env Mode')
-        hold = self._parameter_by_names('Hold') if 'trigger' in self._parameter_display(env_mode).lower() else None
-        return (
-            self._parameter_by_names('Start'),
-            self._parameter_by_names('Length'),
-            self._parameter_by_names('Attack'),
-            hold,
-            self._parameter_by_names('Decay'),
-            self._parameter_by_names('Transpose'),
-            self._parameter_by_names('Detune'),
-            env_mode,
-        )
-
-    def _drumcell_effect_parameter_names(self):
-        fx_type = self._parameter_display(self._parameter_by_names('FX Type')).lower()
-        if 'pitch' in fx_type:
-            return 'Pitch Env Amt', 'Pitch Env Decay'
-        if 'sub' in fx_type:
-            return 'Sub Amt', 'Sub Freq'
-        if 'noise' in fx_type:
-            return 'Noise Amt', 'Noise Color'
-        if 'loop' in fx_type:
-            return 'Loop Offset', 'Loop Length'
-        if 'stretch' in fx_type:
-            return 'Stretch Factor', 'Grain Size'
-        if 'punch' in fx_type:
-            return 'Punch Amt', 'Punch Release'
-        if '8-bit' in fx_type or '8 bit' in fx_type:
-            return '8-Bit Rate', '8-Bit Flt Decay'
-        if fx_type == 'fm' or 'frequency mod' in fx_type:
-            return 'FM Amt', 'FM Freq'
-        return 'RM Amt', 'RM Freq'
-
-    def _drumcell_filter_gain_or_resonance(self):
-        filter_type = self._parameter_display(self._parameter_by_names('Filter Type')).lower()
-        return self._parameter_by_names('Filter Gain') if 'peak' in filter_type else self._parameter_by_names('Filter Res')
-
-    def _drumcell_fx_filter_parameters(self):
-        effect_one, effect_two = self._drumcell_effect_parameter_names()
-        return (
-            self._parameter_by_names('FX On'),
-            self._parameter_by_names('FX Type'),
-            self._parameter_by_names(effect_one),
-            self._parameter_by_names(effect_two),
-            self._parameter_by_names('Filter On'),
-            self._parameter_by_names('Filter Type'),
-            self._parameter_by_names('Filter Freq'),
-            self._drumcell_filter_gain_or_resonance(),
-        )
-
-    def _drumcell_rest_parameters(self):
-        return (
-            self._parameter_by_names('Volume'),
-            self._parameter_by_names('Pan'),
-            self._parameter_by_names('Vel > Vol'),
-            self._parameter_by_names('Mod Src', 'Mod Source', 'Modulation Source'),
-            self._parameter_by_names('Mod Dest'),
-            self._parameter_by_names('Mod Amt'),
-            None,
-            None,
-        )
-
-    def _chord_shift_scale_parameters(self):
-        parameters = [
-            self._parameter_by_names(
-                'Shift{} Scale Degrees'.format(index),
-                'ShiftScaleDegrees{}'.format(index),
-            )
-            for index in range(1, 7)
-        ]
-        return tuple(parameters + [None, None])
-
-    def _chord_strum_parameters(self):
-        return (
-            self._parameter_by_names('Strum'),
-            self._parameter_by_names('Tension', 'Strum Tension', 'StrumTension'),
-            self._parameter_by_names('Crescendo', 'Strum Crescendo', 'StrumCrescendo'),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-    def _parameter_by_names(self, *names):
-        wanted = set(re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names)
-        fallback = None
-        for parameter in self._decorated_parameters():
-            parameter_names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
-            if any(re.sub(r'[^a-z0-9]+', '', name.lower()) in wanted for name in parameter_names):
-                if self._operator_parameter_is_active(parameter):
-                    return parameter
-                if fallback is None:
-                    fallback = parameter
-        return fallback
-
-    def _operator_filter_bank_insert_index(self, bank_names):
-        for index, name in enumerate(bank_names):
-            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) == 'filter':
-                return index + 1
-        return self._custom_bank_insert_index(bank_names, 'filter')
-
-    def _operator_lfo_bank_insert_index(self, bank_names):
-        for index, name in enumerate(bank_names):
-            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) == 'lfo':
-                return index + 1
-        return len(bank_names)
-
-    def _operator_filter_plus_parameters(self):
-        filter_type = self._parameter_by_names('Filter Type', 'Filter Type (Legacy)')
-        circuit_candidates = (
-            self._parameter_by_names('Filter Circuit - LP/HP'),
-            self._parameter_by_names('Filter Circuit - BP/NO/Morph'),
-        )
-        filter_type_display = self._operator_filter_type_display(filter_type)
-        preferred_circuit_index = 0 if any(name in filter_type_display for name in ('lowpass', 'highpass')) else 1
-        circuit = circuit_candidates[preferred_circuit_index]
-        if not circuit:
-            circuit = next((parameter for parameter in circuit_candidates if parameter and self._operator_parameter_is_active(parameter)), None)
-        circuit = circuit or next((parameter for parameter in circuit_candidates if parameter), None)
-        slope = self._parameter_by_names('Filter Slope')
-        # Live's Operator schema calls these AntiAlias and Interpolation, but
-        # some versions do not expose either one as a DeviceParameter.
-        quality = (
-            self._parameter_by_names('AntiAlias', 'Antialias', 'Anti Alias') or
-            self._parameter_by_names('Interpolation', 'Interpol', 'UseLinearInterpolation') or
-            self._parameter_by_names('Fe Amount')
-        )
-        return (
-            filter_type,
-            circuit,
-            slope,
-            self._parameter_by_names('Filter Drive'),
-            self._parameter_by_names('LFO Retrigger'),
-            self._parameter_by_names('Filter On'),
-            quality,
-            self._parameter_by_names('Pe On'),
-        )
-
-    def _operator_filter_type_display(self, filter_type):
-        try:
-            return str(filter_type.str_for_value(filter_type.value)).strip().lower()
-        except Exception:
-            return ''
-
-    def _operator_lfo_plus_parameters(self):
-        return tuple(self._parameter_by_names(name) for name in (
-            'Osc-A < LFO',
-            'Osc-B < LFO',
-            'Osc-C < LFO',
-            'Osc-D < LFO',
-            'Filt < LFO',
-            'LFO Dst B',
-            'LFO Amt B',
-            'LFO On',
-        ))
-
-    def _wavetable_waves_insert_index(self, bank_names):
-        for index, name in enumerate(bank_names):
-            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
-            if normalized in ('osc2', 'oscillator2') or normalized.endswith('oscillator2'):
-                return index + 1
-        return min(2, len(bank_names))
-
-    def _wavetable_envelope_bank_index(self, bank_names):
-        for index, name in enumerate(bank_names):
-            normalized = re.sub(r'[^a-z0-9]+', '', str(name).lower())
-            if normalized in ('env23', 'envelope23', 'envelopes23'):
-                return index
-        return None
-
-    def _replace_wavetable_envelope_bank_names(self, bank_names):
-        index = self._wavetable_envelope_bank_index(bank_names)
-        if index is not None:
-            bank_names[index] = self.WAVETABLE_ENV_2_BANK_NAME
-            bank_names.insert(index + 1, self.WAVETABLE_ENV_3_BANK_NAME)
-
-    def _wavetable_envelope_parameters(self, envelope_number):
-        prefix = 'Env {}'.format(envelope_number)
-        return tuple(self._parameter_by_names(name) for name in (
-            '{} Attack'.format(prefix),
-            '{} Decay'.format(prefix),
-            '{} Sustain'.format(prefix),
-            '{} Release'.format(prefix),
-            '{} Peak'.format(prefix),
-            '{} Loop Mode'.format(prefix),
-            '{} A Slope'.format(prefix),
-            'LFO {} Retrigger'.format(envelope_number - 1),
-        ))
-
-    def _replace_wavetable_envelope_banks(self, banks, bank_names):
-        index = self._wavetable_envelope_bank_index(bank_names)
-        if index is not None and index < len(banks):
-            banks[index] = self._wavetable_envelope_parameters(2)
-            banks.insert(index + 1, self._wavetable_envelope_parameters(3))
-            bank_names[index] = self.WAVETABLE_ENV_2_BANK_NAME
-            bank_names.insert(index + 1, self.WAVETABLE_ENV_3_BANK_NAME)
-
-    def _operator_lfo_is_synced(self, range_parameter):
-        try:
-            return str(range_parameter.str_for_value(range_parameter.value)).strip().lower() == 'sync'
-        except Exception:
-            return False
-
-    def _replace_operator_lfo_bank(self, banks, bank_names):
-        if banks is None:
-            return
-        for index, name in enumerate(bank_names):
-            if re.sub(r'[^a-z0-9]+', '', str(name).lower()) != 'lfo' or index >= len(banks):
-                continue
-            bank = list(banks[index])
-            bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
-            lfo_range = self._parameter_by_names('LFO Range')
-            lfo_rate = self._parameter_by_names('LFO Sync' if self._operator_lfo_is_synced(lfo_range) else 'LFO Rate')
-            bank[4] = lfo_rate
-            bank[7] = lfo_range
-            banks[index] = tuple(bank[:self.SAFE_PARAMETER_BANK_SIZE])
-            return
-
-    def _operator_source_parameters(self, raw_banks=None):
-        parameters = list(getattr(self._device, 'parameters', ()))
-        identities = set(id(parameter) for parameter in parameters)
-        for bank in raw_banks or ():
-            for parameter in bank or ():
-                if parameter is not None and id(parameter) not in identities:
-                    identities.add(id(parameter))
-                    parameters.append(parameter)
-        return parameters
-
-    def _operator_wave_parameters(self, raw_banks=None):
-        try:
-            by_name = {}
-            parameters = self._operator_source_parameters(raw_banks)
-            for parameter in parameters:
-                by_name[parameter.name] = parameter
-                try:
-                    by_name[parameter.original_name] = parameter
-                except Exception:
-                    pass
-            feedback_by_oscillator = self._operator_feedback_parameters(parameters, by_name)
-            parameters = []
-            for oscillator in ('A', 'B', 'C', 'D'):
-                wave = by_name.get('Osc-{} Wave'.format(oscillator))
-                feedback = feedback_by_oscillator.get(oscillator)
-                parameters.extend((wave, feedback))
-            return parameters
-        except Exception:
-            return []
-
-    def _operator_feedback_parameters(self, parameters=None, by_name=None):
-        parameters = list(parameters if parameters is not None else self._operator_source_parameters())
-        by_name = by_name or {}
-        if not by_name:
-            for parameter in parameters:
-                by_name[parameter.name] = parameter
-                try:
-                    by_name[parameter.original_name] = parameter
-                except Exception:
-                    pass
-
-        result = {}
-        feedback_parameters = []
-        for index, parameter in enumerate(parameters):
-            names = [str(getattr(parameter, 'name', ''))]
-            try:
-                names.append(str(parameter.original_name))
-            except Exception:
-                pass
-            normalized_names = [re.sub(r'[^a-z0-9]+', '', name.lower()) for name in names]
-            if any(
-                    'feedback' in name or 'feedb' in name or 'fdbk' in name or 'feedbk' in name or
-                    name.endswith('fb') for name in normalized_names):
-                feedback_parameters.append((index, parameter, normalized_names))
-
-        for oscillator in ('A', 'B', 'C', 'D'):
-            key = oscillator.lower()
-            for _, parameter, normalized_names in feedback_parameters:
-                if any(name in (
-                        '{}feedback'.format(key), 'osc{}feedback'.format(key),
-                        'oscillator{}feedback'.format(key),
-                        '{}feedb'.format(key), 'osc{}feedb'.format(key),
-                        'oscillator{}feedb'.format(key),
-                        '{}fdbk'.format(key), 'osc{}fdbk'.format(key),
-                        'oscillator{}fdbk'.format(key),
-                        '{}feedbk'.format(key), 'osc{}feedbk'.format(key),
-                        'oscillator{}feedbk'.format(key),
-                        '{}fb'.format(key), 'osc{}fb'.format(key),
-                        'oscillator{}fb'.format(key),
-                        'feedback{}'.format(key), 'fdbk{}'.format(key),
-                        'feedbk{}'.format(key), 'fb{}'.format(key),
-                ) for name in normalized_names):
-                    result[oscillator] = parameter
-                    break
-
-        wave_positions = {}
-        for index, parameter in enumerate(parameters):
-            names = (str(getattr(parameter, 'name', '')), str(getattr(parameter, 'original_name', '')))
-            for oscillator in ('A', 'B', 'C', 'D'):
-                normalized_wave_name = 'osc{}wave'.format(oscillator.lower())
-                if any(re.sub(r'[^a-z0-9]+', '', name.lower()) == normalized_wave_name for name in names):
-                    wave_positions[oscillator] = index
-
-        unassigned = [(index, parameter) for index, parameter, _ in feedback_parameters if parameter not in result.values()]
-        for oscillator_index, oscillator in enumerate(('A', 'B', 'C', 'D')):
-            if oscillator in result or oscillator not in wave_positions:
-                continue
-            start = wave_positions[oscillator]
-            next_positions = [wave_positions[name] for name in ('A', 'B', 'C', 'D')[oscillator_index + 1:] if name in wave_positions]
-            end = min(next_positions) if next_positions else len(parameters)
-            for parameter_index, parameter in unassigned:
-                if start <= parameter_index < end:
-                    result[oscillator] = parameter
-                    unassigned.remove((parameter_index, parameter))
-                    break
-
-        unresolved = [oscillator for oscillator in ('A', 'B', 'C', 'D') if oscillator not in result]
-        if len(unassigned) == len(unresolved):
-            for oscillator, (_, parameter) in zip(unresolved, unassigned):
-                result[oscillator] = parameter
-        return result
-
-    def _operator_parameter_is_active(self, parameter):
-        try:
-            if hasattr(parameter, 'is_enabled') and not parameter.is_enabled:
-                return False
-            if hasattr(parameter, 'state'):
-                return parameter.state == Live.DeviceParameter.ParameterState.enabled
-        except Exception:
-            return False
-        return True
-
-    def tap_custom_bank_kind(self):
-        names = self._parameter_bank_names()
-        try:
-            name = names[self._bank_index]
-        except Exception:
-            return None
-        if name == self.WAVETABLE_OSC_BANK_NAME:
-            return 'wavetable_osc'
-        if name == self.OPERATOR_WAVES_BANK_NAME:
-            return 'operator_waves'
-        if name == self.OPERATOR_FILTER_PLUS_BANK_NAME:
-            return 'operator_filter_plus'
-        if name == self.OPERATOR_LFO_PLUS_BANK_NAME:
-            return 'operator_lfo_plus'
-        custom_simpler = self._is_simpler() and not self._simpler_uses_native_banks()
-        if name == self.SIMPLER_MAIN_BANK_NAME and custom_simpler:
-            return 'simpler_main'
-        if name == self.SIMPLER_ACTIONS_BANK_NAME and custom_simpler:
-            return 'simpler_actions'
-        if name == self.SIMPLER_WARP_BANK_NAME and self._is_simpler():
-            return 'simpler_warp'
-        if (
-                name in (self.SIMPLER_BROWSE_BANK_NAME, self.SIMPLER_BROWSE_PLUS_BANK_NAME)
-                and self._is_simpler()):
-            return 'simpler_browse'
-        if self._is_drumcell():
-            if name == self.DRUMCELL_SAMPLE_BANK_NAME:
-                return 'drumcell_sample'
-            if name == self.DRUMCELL_FX_FILTER_BANK_NAME:
-                return 'drumcell_fx_filter'
-            if name == self.DRUMCELL_REST_BANK_NAME:
-                return 'drumcell_rest'
-        return None
-
-    def _clamp_bank_index_to_safe_banks(self):
-        bank_count = len(self._parameter_banks())
-        if bank_count == 0:
-            self._bank_index = 0
-        else:
-            self._bank_index = max(0, min(self._bank_index, bank_count - 1))
-
-    def _safe_parameter_banks(self):
-        device = getattr(self, '_device', None)
-        if not device or not liveobj_valid(device) or not hasattr(device, 'parameters'):
-            return []
-
-        parameters = list(device.parameters)
-        if not parameters:
-            return []
-
-        live_banks = self._safe_live_parameter_banks(device, parameters)
-        if live_banks:
-            return live_banks
-
-        parameters = parameters[1:]
-        if not parameters:
-            return []
-
-        banks = []
-        for index in range(0, len(parameters), self.SAFE_PARAMETER_BANK_SIZE):
-            bank = list(parameters[index:index + self.SAFE_PARAMETER_BANK_SIZE])
-            bank.extend([None] * (self.SAFE_PARAMETER_BANK_SIZE - len(bank)))
-            banks.append(tuple(bank))
-        return banks
-
-    def _safe_live_parameter_banks(self, device, parameters):
-        if not hasattr(device, 'get_bank_count') or not hasattr(device, 'get_bank_parameters'):
-            return []
-
-        try:
-            bank_count = int(device.get_bank_count())
-        except Exception:
-            bank_count = 0
-
-        if bank_count <= 0:
-            return []
-
-        banks = []
-        empty_bank = tuple([None] * self.SAFE_PARAMETER_BANK_SIZE)
-        for bank_index in range(bank_count):
-            try:
-                parameter_indices = list(device.get_bank_parameters(bank_index))
-            except Exception:
-                parameter_indices = []
-
-            if len(parameter_indices) != self.SAFE_PARAMETER_BANK_SIZE:
-                banks.append(empty_bank)
-                continue
-
-            bank = []
-            for parameter_index in parameter_indices:
-                if parameter_index == -1:
-                    bank.append(None)
-                elif 0 <= parameter_index < len(parameters):
-                    bank.append(parameters[parameter_index])
-                else:
-                    bank.append(None)
-            banks.append(tuple(bank))
-
-        return banks
-
-    def _safe_parameter_bank_names(self):
-        return self._safe_parameter_bank_names_base()
-
-
-class TapScheduledCall:
-    """Cancellable adapter for ControlSurface.schedule_message."""
-
-    TICKS_PER_SECOND = 10.0
-
-    def __init__(self, surface, delay_seconds, callback, args=()):
-        self._active = True
-        self._callback = callback
-        self._args = tuple(args)
-        delay_ticks = max(1, int(math.ceil(max(0.0, delay_seconds) * self.TICKS_PER_SECOND)))
-        surface.schedule_message(delay_ticks, self._run)
-
-    def _run(self):
-        if not self._active:
-            return
-        self._active = False
-        self._callback(*self._args)
-
-    def cancel(self):
-        self._active = False
-
-    def is_alive(self):
-        return self._active
 
 
 class Tap(ControlSurface):
@@ -2433,17 +151,21 @@ class Tap(ControlSurface):
     VISUAL_FEEDBACK_INTERVAL = 0.1
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
-    CHUNKED_INCOMING_SYSEX_IDS = (14, 15, 16, 35, 36, 49, 50, 51, 55, 57, 58, 60, 62, 82, 88, 92, 96)
+    SYSEX_APP_TO_REMOTE = TAP_SYSEX_APP_TO_REMOTE
+    SYSEX_REMOTE_TO_APP = TAP_SYSEX_REMOTE_TO_APP
+    CHUNKED_INCOMING_SYSEX_IDS = tuple(
+        spec.manufacturer_id
+        for spec in TAP_SYSEX_APP_TO_REMOTE_SPECS
+        if spec.framing in ("chunkedText", "chunkedBinary", "chunkedMixed")
+    )
     SYSEX_CHUNK_INACTIVITY_TIMEOUT = 2.0
     SYSEX_CHUNK_MAX_ASSEMBLED_BYTES = 1048576
-    SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = {
-        14: 262144, 15: 262144, 16: 524288,
-        35: 65536, 36: 65536,
-        49: 1048576, 50: 1048576, 51: 65536,
-        55: 262144, 57: 262144, 58: 262144,
-        60: 262144, 62: 262144, 92: 524288,
-        82: 524288, 88: 262144, 96: 65536,
-    }
+    SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID = MappingProxyType({
+        spec.manufacturer_id: spec.maximum_assembled_bytes
+        for spec in TAP_SYSEX_APP_TO_REMOTE_SPECS
+        if spec.framing in ("chunkedText", "chunkedBinary", "chunkedMixed")
+        and spec.maximum_assembled_bytes is not None
+    })
     SYSEX_OUTGOING_MAX_CHUNK_LENGTH = 240
     SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL = 0.05
     SYSEX_21_BIT_MAX_MAGNITUDE = 0x1FFFFF
@@ -2513,7 +235,6 @@ class Tap(ControlSurface):
     AUTOMATION_EXACT_EVENT_BATCH_MAX_SETTLE_POLLS = 2
     AUTOMATION_EXACT_STREAM_MAX_SETTLE_POLLS = 2
     AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS = 3
-    AUTOMATION_EXACT_MAX_FULL_REPLAYS = 3
     AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS = 2
     AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
     
@@ -2523,7 +244,9 @@ class Tap(ControlSurface):
         with self.component_guard():
             global mixer
             global transport
-            global session_component
+            self._performance_diagnostics = TapPerformanceDiagnostics(
+                emit=self.log_message
+            )
             self.mixer_status = False
             self.mixer_reset = True
             self.visible_channels = (0, 3)
@@ -2549,10 +272,12 @@ class Tap(ControlSurface):
             self.clip_length_trick = 110.0
             mixer = MixerComponent(track_count, return_count)
             transport = TransportComponent()
-            session_component = SessionComponent()
             self.old_clips_array = []
             self._drum_rack_device = None
             self._drum_rack_device_listener_owner = None
+            self._drum_pad_chain_listeners = {}
+            self._drum_pad_names_refresh_scheduled = False
+            self._last_drum_pad_names_payload = None
             self.was_initialized = False
             self._track_level_listeners = {}
             self._return_level_listeners = {}
@@ -2715,8 +440,11 @@ class Tap(ControlSurface):
             self._selected_clip_update_suppression_depth = 0
             self._selected_clip_update_pending_metadata = False
             self._selected_clip_update_pending_notes = False
+            self._selected_clip_dirty_fields = set()
+            self._selected_clip_flush_scheduled = False
             self._clip_slot_listeners = {}
             self._track_arm_listeners = {}
+            self._track_playing_slot_listeners = {}
             self._registered_track_ids = set()
             self._clip_color_listeners = {}
             self._clip_listener_track_slots = {}
@@ -2731,6 +459,12 @@ class Tap(ControlSurface):
             self._track_list_signature = None
             self._last_group_fold_states = None
             self._last_group_hidden_states = None
+            self._group_state_dirty = True
+            self._group_fold_listeners = {}
+            self._remote_state_flush_scheduled = False
+            self._remote_refresh_generation = 0
+            self._scene_topology_refresh_scheduled = False
+            self._step_seq_rebind_scheduled = False
             self._previous_selected_track = None
             self._periodic_timer_ref = None
             self._last_clip_slot_integrity_check = 0.0
@@ -2745,10 +479,10 @@ class Tap(ControlSurface):
             self._automation_parameter_action = None
             self._automation_removal_suppressed_controls = set()
             self._automation_authored_steps = {}
-            self._automation_pencil_stroke = None
-            self._automation_exact_stream = None
-            self._automation_contexts = {}
-            self._automation_context_counter = 0
+            self._automation_transfer = AutomationTransferCoordinator()
+            self._automation_pencil_stroke = self._automation_transfer.pencil
+            self._automation_exact_stream = self._automation_transfer.writer.transaction
+            self._automation_contexts = self._automation_transfer.contexts
             self._mixer_automation_controls = []
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
@@ -2780,6 +514,13 @@ class Tap(ControlSurface):
             self._simpler_playhead_low = -1
             self._simpler_playhead_enabled = None
             self._last_track_simpler_slice_signature = None
+            self._selected_track_sliced_simpler_track = None
+            self._selected_track_sliced_simpler = None
+            self._track_simpler_slice_dirty = True
+            self._selected_track_device_topology_track = None
+            self._selected_track_device_topology_listener = None
+            self._selected_track_device_topology_bindings = []
+            self._selected_track_device_topology_refresh_scheduled = False
             self._audio_clip_waveform_generation = 0
             self._audio_clip_listener_bindings = []
             self._audio_clip_listener_clip = None
@@ -3730,23 +1471,20 @@ class Tap(ControlSurface):
         return self._automation_step_id(step, fallback_index)
 
     def _automation_step_tuple(self, step, fallback_index=0):
-        base = (
+        uses_exact_controls = len(step) >= 11 and bool(int(step[6]))
+        return AutomationEvent(
             float(step[0]),
             float(step[1]),
             max(0.0, min(1.0, float(step[2]))),
             max(-1.0, min(1.0, float(step[3]) if len(step) >= 4 else 0.0)),
             self._automation_step_id(step, fallback_index),
             self._automation_step_order(step, fallback_index),
+            uses_exact_controls,
+            float(step[7]) if uses_exact_controls else 0.5,
+            float(step[8]) if uses_exact_controls else 0.5,
+            float(step[9]) if uses_exact_controls else 0.5,
+            float(step[10]) if uses_exact_controls else 0.5,
         )
-        if len(step) >= 11 and bool(int(step[6])):
-            return base + (
-                True,
-                float(step[7]),
-                float(step[8]),
-                float(step[9]),
-                float(step[10]),
-            )
-        return base
 
     def _automation_sort_key(self, indexed_step):
         index, step = indexed_step
@@ -4170,15 +1908,106 @@ class Tap(ControlSurface):
             current = getattr(current, 'canonical_parent', None)
         return None
     
+    def _queue_drum_pad_names_refresh(self):
+        if not self._drum_rack_device or self._drum_pad_names_refresh_scheduled:
+            return
+        self._drum_pad_names_refresh_scheduled = True
+        generation = self._remote_refresh_generation
+        rack = self._drum_rack_device
+
+        def refresh_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._drum_pad_names_refresh_scheduled = False
+            if self._drum_rack_device is rack:
+                self._send_all_drum_pad_names()
+
+        try:
+            self.schedule_message(1, refresh_if_current)
+        except Exception:
+            refresh_if_current()
+
+    def _on_drum_pad_name_changed(self, *_args):
+        self._queue_drum_pad_names_refresh()
+
+    def _on_drum_pad_chains_changed(self, *_args):
+        self._queue_drum_pad_names_refresh()
+
     def _setup_drum_pad_listeners(self):
-        if self._drum_rack_device:
-            self._send_all_drum_pad_names()
-            self._send_selected_drum_pad_number()
-            for pad in self._drum_rack_device.drum_pads:
-                if not pad.name_has_listener(self._send_all_drum_pad_names):
-                    pad.add_name_listener(self._send_all_drum_pad_names)
-            if not self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
-                self._drum_rack_device.view.add_selected_drum_pad_listener(self._send_selected_drum_pad_number)
+        if not self._drum_rack_device:
+            return
+
+        self._send_all_drum_pad_names()
+        self._send_selected_drum_pad_number()
+        binding_count = 0
+        pads = tuple(getattr(self._drum_rack_device, 'drum_pads', ()))
+        for pad, listener in list(self._drum_pad_chain_listeners.items()):
+            if pad in pads:
+                continue
+            try:
+                chains_has_listener = getattr(pad, 'chains_has_listener', None)
+                remove_chains_listener = getattr(pad, 'remove_chains_listener', None)
+                if callable(remove_chains_listener) and (
+                    not callable(chains_has_listener) or chains_has_listener(listener)
+                ):
+                    remove_chains_listener(listener)
+            except Exception:
+                pass
+            self._drum_pad_chain_listeners.pop(pad, None)
+
+        for pad in pads:
+            try:
+                name_has_listener = getattr(pad, 'name_has_listener', None)
+                add_name_listener = getattr(pad, 'add_name_listener', None)
+                if callable(add_name_listener) and (
+                    not callable(name_has_listener)
+                    or not name_has_listener(self._on_drum_pad_name_changed)
+                ):
+                    add_name_listener(self._on_drum_pad_name_changed)
+                if callable(name_has_listener) and name_has_listener(self._on_drum_pad_name_changed):
+                    binding_count += 1
+            except Exception:
+                pass
+
+            # DrumPad.chains is the authoritative population signal for the
+            # pad-name payload. Bind only when this Live proxy exposes it.
+            try:
+                chains_has_listener = getattr(pad, 'chains_has_listener', None)
+                add_chains_listener = getattr(pad, 'add_chains_listener', None)
+                if callable(add_chains_listener) and (
+                    not callable(chains_has_listener)
+                    or not chains_has_listener(self._on_drum_pad_chains_changed)
+                ):
+                    add_chains_listener(self._on_drum_pad_chains_changed)
+                if callable(add_chains_listener) and (
+                    not callable(chains_has_listener)
+                    or chains_has_listener(self._on_drum_pad_chains_changed)
+                ):
+                    self._drum_pad_chain_listeners[pad] = self._on_drum_pad_chains_changed
+            except Exception:
+                pass
+
+        view = getattr(self._drum_rack_device, 'view', None)
+        try:
+            selected_has_listener = getattr(view, 'selected_drum_pad_has_listener', None)
+            add_selected_listener = getattr(view, 'add_selected_drum_pad_listener', None)
+            if callable(add_selected_listener) and (
+                not callable(selected_has_listener)
+                or not selected_has_listener(self._send_selected_drum_pad_number)
+            ):
+                add_selected_listener(self._send_selected_drum_pad_number)
+            if callable(selected_has_listener) and selected_has_listener(
+                self._send_selected_drum_pad_number
+            ):
+                binding_count += 1
+        except Exception:
+            pass
+
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total(
+                'drum_pad', binding_count + len(self._drum_pad_chain_listeners)
+            )
 
     def _sync_drum_rack_device(self, drum_rack_device):
         if drum_rack_device != self._drum_rack_device:
@@ -4197,12 +2026,32 @@ class Tap(ControlSurface):
                 try:
                     view = self._drum_rack_device.view
                     pads = self._drum_rack_device.drum_pads
-                    needs_listener_setup = not view.selected_drum_pad_has_listener(
-                        self._send_selected_drum_pad_number
+                    selected_has_listener = getattr(
+                        view, 'selected_drum_pad_has_listener', None
+                    )
+                    needs_listener_setup = (
+                        not callable(selected_has_listener)
+                        or not selected_has_listener(self._send_selected_drum_pad_number)
                     )
                     if not needs_listener_setup and pads:
-                        needs_listener_setup = not pads[0].name_has_listener(
-                            self._send_all_drum_pad_names
+                        name_has_listener = getattr(pads[0], 'name_has_listener', None)
+                        needs_listener_setup = (
+                            not callable(name_has_listener)
+                            or not name_has_listener(self._on_drum_pad_name_changed)
+                        )
+                    if not needs_listener_setup:
+                        needs_listener_setup = any(
+                            callable(getattr(pad, 'add_chains_listener', None))
+                            and (
+                                pad not in self._drum_pad_chain_listeners
+                                or (
+                                    callable(getattr(pad, 'chains_has_listener', None))
+                                    and not pad.chains_has_listener(
+                                        self._on_drum_pad_chains_changed
+                                    )
+                                )
+                            )
+                            for pad in pads
                         )
                 except Exception:
                     needs_listener_setup = True
@@ -4217,12 +2066,49 @@ class Tap(ControlSurface):
 
     def _remove_drum_pad_name_listeners(self):
         if self._drum_rack_device:
-            for pad in self._drum_rack_device.drum_pads:
-                if pad.name_has_listener(self._send_all_drum_pad_names):
-                    pad.remove_name_listener(self._send_all_drum_pad_names)
-            if self._drum_rack_device.view.selected_drum_pad_has_listener(self._send_selected_drum_pad_number):
-                self._drum_rack_device.view.remove_selected_drum_pad_listener(self._send_selected_drum_pad_number)
+            for pad in tuple(getattr(self._drum_rack_device, 'drum_pads', ())):
+                try:
+                    name_has_listener = getattr(pad, 'name_has_listener', None)
+                    remove_name_listener = getattr(pad, 'remove_name_listener', None)
+                    if callable(remove_name_listener) and (
+                        not callable(name_has_listener)
+                        or name_has_listener(self._on_drum_pad_name_changed)
+                    ):
+                        remove_name_listener(self._on_drum_pad_name_changed)
+                except Exception:
+                    pass
+
+            for pad, listener in list(self._drum_pad_chain_listeners.items()):
+                try:
+                    chains_has_listener = getattr(pad, 'chains_has_listener', None)
+                    remove_chains_listener = getattr(pad, 'remove_chains_listener', None)
+                    if callable(remove_chains_listener) and (
+                        not callable(chains_has_listener)
+                        or chains_has_listener(listener)
+                    ):
+                        remove_chains_listener(listener)
+                except Exception:
+                    pass
+
+            view = getattr(self._drum_rack_device, 'view', None)
+            try:
+                selected_has_listener = getattr(view, 'selected_drum_pad_has_listener', None)
+                remove_selected_listener = getattr(view, 'remove_selected_drum_pad_listener', None)
+                if callable(remove_selected_listener) and (
+                    not callable(selected_has_listener)
+                    or selected_has_listener(self._send_selected_drum_pad_number)
+                ):
+                    remove_selected_listener(self._send_selected_drum_pad_number)
+            except Exception:
+                pass
+
+        self._drum_pad_chain_listeners = {}
+        self._drum_pad_names_refresh_scheduled = False
+        self._last_drum_pad_names_payload = None
         self._drum_rack_device_listener_owner = None
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total('drum_pad', 0)
 
     def _send_all_drum_pad_names(self):
         if not self._drum_rack_device:
@@ -4270,7 +2156,15 @@ class Tap(ControlSurface):
                 else:
                     pad_names.append(str(pad.note))
             payload = ",".join(pad_names)
-            self._send_sys_ex_message(payload, 0x11)
+        else:
+            # Explicitly clear the previous populated-pad payload when the
+            # last Drum Pad chain is removed.
+            payload = ''
+
+        if payload == getattr(self, '_last_drum_pad_names_payload', None):
+            return
+        self._last_drum_pad_names_payload = payload
+        self._send_sys_ex_message(payload, 0x11)
     
     def _update_tempo(self):
         new_tempo = round(self.song().tempo, 2)
@@ -5691,15 +3585,264 @@ class Tap(ControlSurface):
             track = track or self.song().view.selected_track
             if not track or not hasattr(track, 'devices'):
                 return None
+            # The selected track's device topology does not change during an
+            # ordinary periodic tick.  Cache the discovery and invalidate it
+            # from the selected-track/device topology paths instead of walking
+            # nested racks every 300 ms.
+            if (
+                all_devices is None
+                and track is self._selected_track_sliced_simpler_track
+                and not self._track_simpler_slice_dirty
+            ):
+                return self._selected_track_sliced_simpler
             devices = all_devices
             if devices is None:
                 devices = self._get_all_nested_devices(track.devices)[0]
+            if self._performance_diagnostics.enabled:
+                self._performance_diagnostics.record_traversal(
+                    "nested_devices", len(devices)
+                )
             for device in devices:
                 if self._is_simpler_device(device) and int(device.playback_mode) == 2:
+                    if all_devices is None:
+                        self._selected_track_sliced_simpler_track = track
+                        self._selected_track_sliced_simpler = device
+                        self._track_simpler_slice_dirty = False
                     return device
+            if all_devices is None:
+                self._selected_track_sliced_simpler_track = track
+                self._selected_track_sliced_simpler = None
+                self._track_simpler_slice_dirty = False
         except Exception:
             pass
         return None
+
+    def _invalidate_track_sliced_simpler(self):
+        self._selected_track_sliced_simpler_track = None
+        self._selected_track_sliced_simpler = None
+        self._track_simpler_slice_dirty = True
+
+    def _on_selected_track_device_topology_changed(self):
+        self._invalidate_track_sliced_simpler()
+        self._sync_selected_track_device_topology_listener()
+        self._queue_remote_state_flush()
+        self._queue_selected_track_device_topology_refresh()
+
+    def _queue_selected_track_device_topology_refresh(self):
+        if self._selected_track_device_topology_refresh_scheduled:
+            return
+        self._selected_track_device_topology_refresh_scheduled = True
+        generation = self._remote_refresh_generation
+
+        def refresh_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._selected_track_device_topology_refresh_scheduled = False
+            try:
+                # The full device refresh owns navigation, rack snapshots,
+                # bank metadata, and control listeners.  Coalescing here
+                # keeps a burst of nested-chain events to one refresh.
+                self._on_device_changed()
+            except Exception as error:
+                self._debug_log(
+                    'Exception refreshing nested device topology: {}'.format(str(error))
+                )
+
+        try:
+            self.schedule_message(1, refresh_if_current)
+        except Exception:
+            refresh_if_current()
+
+    def _sync_selected_track_device_topology_listener(self):
+        try:
+            track = self.song().view.selected_track
+        except Exception:
+            track = None
+        self._remove_selected_track_device_topology_listener()
+        self._selected_track_device_topology_track = track
+        self._selected_track_device_topology_listener = None
+        if track is None:
+            return
+        listener = self._on_selected_track_device_topology_changed
+        self._selected_track_device_topology_listener = listener
+
+        def bind(subject, property_name):
+            if subject is None or not liveobj_valid(subject):
+                return
+            add_listener = getattr(subject, 'add_{}_listener'.format(property_name), None)
+            if not callable(add_listener):
+                return
+            has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+            try:
+                if not callable(has_listener) or not has_listener(listener):
+                    add_listener(listener)
+                self._selected_track_device_topology_bindings.append(
+                    (subject, property_name, listener)
+                )
+            except Exception:
+                pass
+
+        # Devices added to or removed from a nested rack chain do not
+        # necessarily notify Track.devices. Watch the bounded, selected-track
+        # topology that _get_all_nested_devices actually traverses: track
+        # devices, rack chains, chain devices, and a drum rack's selected pad.
+        bind(track, 'devices')
+
+        def visit_devices(devices):
+            for device in tuple(devices or ()):
+                if not liveobj_valid(device):
+                    continue
+                bind(device, 'chains')
+                chains = ()
+                try:
+                    is_drum_rack = bool(
+                        getattr(device, 'can_have_drum_pads', False)
+                        and getattr(device, 'drum_pads', ())
+                    )
+                    if is_drum_rack:
+                        view = getattr(device, 'view', None)
+                        bind(view, 'selected_drum_pad')
+                        selected_pad = self._get_selected_drum_pad(device)
+                        bind(selected_pad, 'chains')
+                        chains = getattr(selected_pad, 'chains', ()) if selected_pad else ()
+                    else:
+                        chains = getattr(device, 'chains', ())
+                except Exception:
+                    chains = ()
+                for chain in tuple(chains or ()):
+                    if not liveobj_valid(chain):
+                        continue
+                    bind(chain, 'devices')
+                    visit_devices(getattr(chain, 'devices', ()))
+
+        visit_devices(getattr(track, 'devices', ()))
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total(
+                'selected_topology', len(self._selected_track_device_topology_bindings)
+            )
+
+    def _remove_selected_track_device_topology_listener(self):
+        for subject, property_name, listener in list(
+            getattr(self, '_selected_track_device_topology_bindings', ())
+        ):
+            try:
+                has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
+                remove_listener = getattr(subject, 'remove_{}_listener'.format(property_name), None)
+                if not callable(has_listener) or has_listener(listener):
+                    if callable(remove_listener):
+                        remove_listener(listener)
+            except Exception:
+                pass
+        self._selected_track_device_topology_bindings = []
+        self._selected_track_device_topology_track = None
+        self._selected_track_device_topology_listener = None
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total('selected_topology', 0)
+
+    def _queue_remote_state_flush(self):
+        if self._remote_state_flush_scheduled:
+            return
+        self._remote_state_flush_scheduled = True
+        generation = self._remote_refresh_generation
+
+        def flush_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._flush_remote_state_updates()
+
+        try:
+            self.schedule_message(1, flush_if_current)
+        except Exception:
+            flush_if_current()
+
+    def _flush_remote_state_updates(self):
+        self._remote_state_flush_scheduled = False
+        if (
+            self._track_simpler_slice_dirty
+            and not getattr(
+                self, '_selected_track_device_topology_refresh_scheduled', False
+            )
+        ):
+            self._send_track_simpler_slice_state()
+        if self._group_state_dirty:
+            self._group_state_dirty = False
+            self._send_group_fold_states_if_changed()
+            if self.mixer_status:
+                self._set_up_mixer_controls()
+
+    def _invalidate_deferred_remote_refreshes(self):
+        # Live cannot cancel schedule_message callbacks. A generation makes any
+        # callback owned by the old connection/Set lifecycle a harmless no-op.
+        self._remote_refresh_generation += 1
+        self._remote_state_flush_scheduled = False
+        self._selected_clip_flush_scheduled = False
+        self._selected_clip_dirty_fields = set()
+        self._selected_clip_update_pending_metadata = False
+        self._selected_clip_update_pending_notes = False
+        self._scene_topology_refresh_scheduled = False
+        self._step_seq_rebind_scheduled = False
+        self._selected_track_device_topology_refresh_scheduled = False
+        self._drum_pad_names_refresh_scheduled = False
+        self._last_selected_clip_notes_signature = None
+        self._last_selected_clip_notes_sent_at = 0.0
+        self.last_raw_notes = None
+
+    def _mark_group_state_dirty(self):
+        self._group_state_dirty = True
+        self._queue_remote_state_flush()
+
+    def _on_group_fold_state_changed(self):
+        self._mark_group_state_dirty()
+
+    def _sync_group_fold_state_listeners(self, tracks=None):
+        tracks = list(self.song().tracks) if tracks is None else list(tracks)
+        expected = set()
+        for track in tracks:
+            group_track = self._foldable_group_track_for_track(track)
+            if group_track is None or group_track in expected:
+                continue
+            expected.add(group_track)
+            if group_track in self._group_fold_listeners:
+                continue
+            try:
+                listener = self._on_group_fold_state_changed
+                has_listener = getattr(group_track, 'fold_state_has_listener', None)
+                if not callable(has_listener) or not has_listener(listener):
+                    group_track.add_fold_state_listener(listener)
+                self._group_fold_listeners[group_track] = listener
+            except Exception:
+                pass
+
+        for group_track, listener in list(self._group_fold_listeners.items()):
+            if group_track in expected:
+                continue
+            try:
+                has_listener = getattr(group_track, 'fold_state_has_listener', None)
+                if not callable(has_listener) or has_listener(listener):
+                    group_track.remove_fold_state_listener(listener)
+            except Exception:
+                pass
+            self._group_fold_listeners.pop(group_track, None)
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total(
+                'group_fold', len(self._group_fold_listeners)
+            )
+
+    def _remove_group_fold_state_listeners(self):
+        for group_track, listener in list(self._group_fold_listeners.items()):
+            try:
+                has_listener = getattr(group_track, 'fold_state_has_listener', None)
+                if not callable(has_listener) or has_listener(listener):
+                    group_track.remove_fold_state_listener(listener)
+            except Exception:
+                pass
+        self._group_fold_listeners = {}
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total('group_fold', 0)
 
     def _send_track_simpler_slice_state(self, force=False, all_devices=None):
         track = None
@@ -5708,6 +3851,7 @@ class Tap(ControlSurface):
         except Exception:
             pass
         simpler = self._track_sliced_simpler(track, all_devices=all_devices)
+        self._track_simpler_slice_dirty = False
         slice_count = 0
         if simpler:
             try:
@@ -5767,10 +3911,14 @@ class Tap(ControlSurface):
             if not callable(has_listener) or not has_listener(callback):
                 add_listener(callback)
             self._simpler_listener_bindings.append((subject, property_name, callback))
+            performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+            if performance_diagnostics is not None:
+                performance_diagnostics.record_listener_binding("simpler", 1)
         except Exception:
             pass
 
     def _remove_simpler_listeners(self):
+        binding_count = len(getattr(self, '_simpler_listener_bindings', []))
         for subject, property_name, callback in list(getattr(self, '_simpler_listener_bindings', [])):
             if not liveobj_valid(subject):
                 continue
@@ -5782,6 +3930,9 @@ class Tap(ControlSurface):
             except Exception:
                 pass
         self._simpler_listener_bindings = []
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.record_listener_binding("simpler", -binding_count)
 
     def _disconnect_simpler_decorator(self):
         nudging = getattr(self, '_simpler_slice_nudging', None)
@@ -5911,6 +4062,7 @@ class Tap(ControlSurface):
 
     def _on_simpler_state_changed(self):
         self._send_simpler_state()
+        self._invalidate_track_sliced_simpler()
         self._send_track_simpler_slice_state()
         self._send_simpler_virtual_feedback_all()
         if self._simpler_actions_active():
@@ -5922,6 +4074,7 @@ class Tap(ControlSurface):
     def _on_simpler_configuration_changed(self):
         self.schedule_message(1, self._sync_simpler_pad_slicing)
         self._send_simpler_state()
+        self._invalidate_track_sliced_simpler()
         self._send_track_simpler_slice_state()
         try:
             selected_track = self.song().view.selected_track
@@ -6908,7 +5061,7 @@ class Tap(ControlSurface):
             try:
                 info = os.stat(path)
                 return (info.st_size, getattr(info, 'st_mtime_ns', int(info.st_mtime * 1000000000)))
-            except Exception:
+            except OSError:
                 return None
         return (file_signature(file_path), file_signature(file_path + '.asd'))
 
@@ -6963,7 +5116,7 @@ class Tap(ControlSurface):
                 or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)
                 or header[4:8] == b'ftyp'
             )
-        except Exception:
+        except OSError:
             return False
 
     def _decode_audio_waveform(self, file_path, temp_prefix, cancelled=None):
@@ -7033,7 +5186,8 @@ class Tap(ControlSurface):
             if maximum_peak > 0:
                 return [max(0, min(127, int(round(float(value) * 127.0 / maximum_peak)))) for value in peaks]
             return [0 for _ in peaks]
-        except Exception as error:
+        except (EOFError, OSError, TypeError, ValueError, wave.Error,
+                subprocess.SubprocessError) as error:
             self._debug_log('Waveform decode failed for {}: {}'.format(file_path, str(error)))
             return []
         finally:
@@ -7182,7 +5336,7 @@ class Tap(ControlSurface):
             if maximum <= 0.0:
                 return [0 for _ in amplitudes]
             return [max(0, min(127, int(round(value * 127.0 / maximum)))) for value in amplitudes]
-        except Exception as error:
+        except (EOFError, OSError, TypeError, ValueError, struct.error) as error:
             self._debug_log('Simpler ASD waveform decode failed for {}: {}'.format(analysis_path, str(error)))
             return []
 
@@ -7215,6 +5369,7 @@ class Tap(ControlSurface):
 
     @subject_slot('device')
     def _on_device_changed(self, send_device_navigation=True):
+        self._invalidate_track_sliced_simpler()
         self._remove_wavetable_virtual_property_listeners()
         self._remove_dynamic_parameter_state_listeners()
         self._remove_meld_engine_listener()
@@ -7953,6 +6108,19 @@ class Tap(ControlSurface):
                 return True
         return False
 
+    def _send_tap_midi(self, message):
+        """Forward one existing MIDI message and aggregate SysEx diagnostics."""
+        self._send_midi(message)
+        if not PERFORMANCE_DIAGNOSTICS_ENABLED:
+            return
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if (
+            performance_diagnostics is not None
+            and len(message) >= 2
+            and message[0] == 0xF0
+        ):
+            performance_diagnostics.record_outgoing_sysex(message)
+
     def _send_sys_ex_message(self, name_string, manufacturer_id):
         status_byte = 0xF0  # SysEx message start
         end_byte = 0xF7  # SysEx message end
@@ -7962,7 +6130,7 @@ class Tap(ControlSurface):
         max_chunk_length = self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH
         if len(data) <= max_chunk_length:
             sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(data) + (end_byte, )
-            self._send_midi(sys_ex_message)
+            self._send_tap_midi(sys_ex_message)
         else:
             num_of_chunks = (len(data) + max_chunk_length - 1) // max_chunk_length
             for chunk_index in range(num_of_chunks):
@@ -7974,11 +6142,12 @@ class Tap(ControlSurface):
                 chunk_data = prefix.encode('ascii') + data[start_index:end_index]
 
                 sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte, )
-                self._send_midi(sys_ex_message)
+                self._send_tap_midi(sys_ex_message)
 
     def _initialize_buttons(self):
         transport.set_metronome_button(ButtonElement(1, MIDI_CC_TYPE, 0, 58))
-        session_component.set_stop_all_clips_button(ButtonElement(1, MIDI_NOTE_TYPE, 15, 96))
+        self.stop_all_clips_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 96)
+        self.stop_all_clips_button.add_value_listener(self._stop_all_clips_value)
         self.capture_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 100)
         self.capture_button.add_value_listener(self._capture_button_value)
         self.quantize_button = ButtonElement(True, MIDI_NOTE_TYPE, 15, 99)
@@ -8921,7 +7090,7 @@ class Tap(ControlSurface):
         values = tuple(int(value) for value in values)
         if any(value < 0 or value > 127 for value in values):
             return
-        self._send_midi((0xF0, manufacturer_id, 0x01) + values + (0xF7,))
+        self._send_tap_midi((0xF0, manufacturer_id, 0x01) + values + (0xF7,))
 
     def _send_chunked_binary_sys_ex_message(self, values, manufacturer_id):
         values = tuple(int(value) for value in values)
@@ -8937,7 +7106,7 @@ class Tap(ControlSurface):
                 ord("!") if len(chunks) == 1
                 else (ord("_") if index == len(chunks) - 1 else ord("$"))
             )
-            self._send_midi(
+            self._send_tap_midi(
                 (0xF0, manufacturer_id, 0x01, marker) + chunk + (0xF7,)
             )
 
@@ -8963,12 +7132,18 @@ class Tap(ControlSurface):
             )
 
     def _periodic_check(self):
+        periodic_started_at = self._performance_diagnostics.start_operation()
+        set_detection_started_at = self._performance_diagnostics.start_operation()
         if self.was_initialized:
             self._check_for_new_song()
         else:
             self._check_for_follow_action_song_change()
+        self._performance_diagnostics.finish_operation(
+            "set_detection", set_detection_started_at
+        )
 
         now = time.monotonic()
+        follow_started_at = self._performance_diagnostics.start_operation()
         has_follow_work = self._has_follow_action_runtime_work()
         if has_follow_work:
             self._sync_follow_actions_to_track_topology()
@@ -8978,22 +7153,33 @@ class Tap(ControlSurface):
             self._evaluate_follow_actions()
         elif now - self._last_periodic_integrity_check >= 1.0:
             self._sync_follow_actions_to_track_topology()
-
-        if self._has_mutator_clips or self._mutator_clip_presence_dirty or self._queued_mutator_work:
-            self._evaluate_mutator_regeneration()
-
+        self._performance_diagnostics.finish_operation(
+            "follow_actions", follow_started_at
+        )
         if now - self._last_periodic_integrity_check >= 1.0:
             self._last_periodic_integrity_check = now
+
+        mutator_started_at = self._performance_diagnostics.start_operation()
+        if self._has_mutator_clips or self._mutator_clip_presence_dirty or self._queued_mutator_work:
+            self._evaluate_mutator_regeneration()
+        self._performance_diagnostics.finish_operation(
+            "mutator", mutator_started_at
+        )
+
         if not self.was_initialized:
+            self._performance_diagnostics.finish_operation(
+                "periodic", periodic_started_at
+            )
+            self._performance_diagnostics.maybe_emit_summary()
             return
-        self._send_track_simpler_slice_state()
-        self._send_group_fold_states_if_changed()
-        # update clip slots
-        # we only need to update clip slots periodically when we are in clip slots view
-        # meaning not in the device view
-        if self.device_status is False and now - self._last_clip_slot_integrity_check >= 1.0:
-            self._last_clip_slot_integrity_check = now
-            self._update_clip_slots()
+        # Selected-track Simpler, group-fold state, and clip-slot changes are
+        # listener-driven.  Do not periodically traverse an unchanged Live Set
+        # as a speculative integrity scan; initial state and explicit resync
+        # still use the complete project snapshot below.
+        self._performance_diagnostics.finish_operation(
+            "periodic", periodic_started_at
+        )
+        self._performance_diagnostics.maybe_emit_summary()
 
     def _has_follow_action_runtime_work(self):
         return bool(
@@ -9011,11 +7197,15 @@ class Tap(ControlSurface):
             add_listener = getattr(song, "add_{}_listener".format(listener_name), None)
             if add_listener and (not has_listener or not has_listener(listener)):
                 add_listener(listener)
+                performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+                if performance_diagnostics is not None:
+                    performance_diagnostics.record_listener_binding("song", 1)
         except Exception:
             pass
 
     def _ensure_song_listeners(self, song):
         self._ensure_song_listener(song, "tracks", self._on_tracks_changed)
+        self._ensure_song_listener(song, "scenes", self._on_scenes_changed)
         self._ensure_song_listener(song, "scale_name", self._on_scale_changed)
         self._ensure_song_listener(song, "root_note", self._on_scale_changed)
         self._ensure_song_listener(song, "tempo", self._update_tempo)
@@ -9026,6 +7216,9 @@ class Tap(ControlSurface):
             if (not hasattr(song, "is_playing_has_listener")
                     or not song.is_playing_has_listener(self._on_song_is_playing_changed)):
                 song.add_is_playing_listener(self._on_song_is_playing_changed)
+            performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+            if performance_diagnostics is not None:
+                performance_diagnostics.set_listener_total('song_is_playing', 1)
         except Exception:
             pass
         self._ensure_song_listener(song, "re_enable_automation_enabled", self._on_re_enable_automation_enabled_changed)
@@ -9036,6 +7229,9 @@ class Tap(ControlSurface):
             remove_listener = getattr(song, "remove_{}_listener".format(listener_name), None)
             if remove_listener and (not has_listener or has_listener(listener)):
                 remove_listener(listener)
+                performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+                if performance_diagnostics is not None:
+                    performance_diagnostics.record_listener_binding("song", -1)
         except Exception:
             pass
 
@@ -9044,6 +7240,7 @@ class Tap(ControlSurface):
             return
         for listener_name, listener in (
             ("tracks", self._on_tracks_changed),
+            ("scenes", self._on_scenes_changed),
             ("scale_name", self._on_scale_changed),
             ("root_note", self._on_scale_changed),
             ("tempo", self._update_tempo),
@@ -9061,6 +7258,9 @@ class Tap(ControlSurface):
                 song.remove_is_playing_listener(self._on_song_is_playing_changed)
         except Exception:
             pass
+        performance_diagnostics = getattr(self, '_performance_diagnostics', None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total('song_is_playing', 0)
 
     def _ensure_follow_action_song_listeners(self, song):
         if self._follow_action_song_listener_subject is not None and self._follow_action_song_listener_subject != song:
@@ -9128,6 +7328,9 @@ class Tap(ControlSurface):
 
     def _send_current_project_state(self):
         self.old_clips_array = []
+        self._invalidate_track_sliced_simpler()
+        self._sync_selected_track_device_topology_listener()
+        self._group_state_dirty = True
         self._project_snapshot_generation += 1
         snapshot_generation = self._project_snapshot_generation
         self._send_sys_ex_message(
@@ -9144,6 +7347,7 @@ class Tap(ControlSurface):
         self._update_metronome()
         self._send_re_enable_automation_enabled()
         self._update_mixer_and_tracks()
+        self._sync_group_fold_state_listeners()
         self._send_selected_track_state()
         # Send repeat feedback after the selected-track message so Tap cannot
         # clear the newly restored state while processing the track change.
@@ -9154,6 +7358,10 @@ class Tap(ControlSurface):
         self._update_clip_slots()
         self._send_sys_ex_message("E|{}".format(snapshot_generation), 0x56)
         self._check_clip_playing_status(force=True)
+        if self.seq_status:
+            # start_step_seq owns the one initial selected-clip snapshot and
+            # listener binding. Do not pre-flush the same families here.
+            self.start_step_seq()
 
     def _send_mpe_state(self):
         # Tap uses MPE lower-zone member channels 2-15. Channel 1 remains the
@@ -9196,6 +7404,9 @@ class Tap(ControlSurface):
             return False
 
         old_song = self.song_instance
+        self._invalidate_deferred_remote_refreshes()
+        self.stop_step_seq()
+        self._remove_drum_pad_name_listeners()
         try:
             if self._note_repeat is not None:
                 self._note_repeat.enabled = False
@@ -9204,6 +7415,8 @@ class Tap(ControlSurface):
         self._note_repeat_last_record_quantization = None
         self._last_note_repeat_feedback = None
         self._remove_all_notes_playing_listeners()
+        self._remove_selected_track_device_topology_listener()
+        self._remove_group_fold_state_listeners()
         self._sysex_buffers.clear()
         self._unregister_clip_and_audio_listeners()
         self._remove_groove_listeners()
@@ -9243,6 +7456,7 @@ class Tap(ControlSurface):
         if current_song == self.song_instance:
             return False
 
+        self._invalidate_deferred_remote_refreshes()
         self.song_instance = current_song
         self._follow_action_track_signature = self._track_signature(current_song.tracks)
         self._follow_action_rules = {}
@@ -13352,6 +11566,18 @@ class Tap(ControlSurface):
                 song.undo()
                 # self._periodic_check()
 
+    def _stop_all_clips_value(self, value):
+        if value == 0:
+            return
+        self.song().stop_all_clips()
+        follow_actions_changed = bool(
+            self._active_follow_actions or self._handled_follow_action_launches
+        )
+        self._active_follow_actions.clear()
+        self._handled_follow_action_launches.clear()
+        if follow_actions_changed:
+            self._send_follow_action_state()
+
     def _sesh_record_value(self, value):
         if value != 0:
             song = self.song()
@@ -13697,6 +11923,9 @@ class Tap(ControlSurface):
     @subject_slot('selected_track')
     def _on_selected_track_changed(self):
         if self.was_initialized:
+            self._invalidate_track_sliced_simpler()
+            self._sync_selected_track_device_topology_listener()
+            self._queue_remote_state_flush()
             self._flush_playing_note_feedback()
             selected_track = self.song().view.selected_track
             track_control_selected = self._track_device_is_selected(selected_track)
@@ -14091,6 +12320,8 @@ class Tap(ControlSurface):
 
     def _on_tracks_changed(self):
         self._mutator_clip_presence_dirty = True
+        self._invalidate_track_sliced_simpler()
+        self._group_state_dirty = True
         if self._metadata_recheck_timer:
             self._metadata_recheck_timer.cancel()
             self._metadata_recheck_timer = None
@@ -14098,8 +12329,32 @@ class Tap(ControlSurface):
         self._metadata_send_seq_by_device.clear()
         self._sync_follow_actions_to_track_topology()
         self._update_mixer_and_tracks()
+        self._sync_group_fold_state_listeners()
         self._register_clip_listeners()
         self._update_clip_slots()
+
+    def _on_scenes_changed(self):
+        if self._scene_topology_refresh_scheduled:
+            return
+        self._scene_topology_refresh_scheduled = True
+        generation = self._remote_refresh_generation
+
+        def refresh_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._scene_topology_refresh_scheduled = False
+            # Scene count changes replace clip-slot objects across every track.
+            # Rebuild the authoritative grid/listener topology once, rather
+            # than relying on the removed periodic integrity scan.
+            self._register_clip_listeners()
+            self._update_clip_slots()
+            if self.seq_status:
+                self.start_step_seq()
+
+        try:
+            self.schedule_message(1, refresh_if_current)
+        except Exception:
+            refresh_if_current()
 
     def _make_color_string(self, color):
         red = (color >> 16) & 255
@@ -14227,6 +12482,8 @@ class Tap(ControlSurface):
     def _send_group_fold_states_if_changed(self, tracks=None, force=False):
         if tracks is None:
             tracks = list(self.song().tracks)
+        if self._performance_diagnostics.enabled:
+            self._performance_diagnostics.record_traversal("tracks", len(tracks))
 
         fold_states = self._group_fold_state_codes(tracks)
         if force or fold_states != self._last_group_fold_states:
@@ -14363,6 +12620,8 @@ class Tap(ControlSurface):
             self._send_sys_ex_message("-".join(return_track_colors), 0x07)
 
         self._send_group_fold_states_if_changed(tracks)
+        self._group_state_dirty = False
+        self._sync_group_fold_state_listeners(tracks)
         
         for track in tracks:
             if not track.color_has_listener(self._on_color_name_changed):
@@ -14646,12 +12905,27 @@ class Tap(ControlSurface):
             self._on_track_arm_changed(track)
         return listener
 
+    def _make_track_playing_slot_listener(self, track):
+        def listener():
+            self._on_clip_playing_status_changed(track)
+        return listener
+
     def _remove_track_arm_listener(self, track, listener):
         try:
             if not liveobj_valid(track) or not hasattr(track, 'remove_arm_listener'):
                 return
             if not hasattr(track, 'arm_has_listener') or track.arm_has_listener(listener):
                 track.remove_arm_listener(listener)
+        except Exception:
+            pass
+
+    def _remove_track_playing_slot_listener(self, track, listener):
+        try:
+            if not liveobj_valid(track) or not hasattr(track, 'remove_playing_slot_index_listener'):
+                return
+            if (not hasattr(track, 'playing_slot_index_has_listener')
+                    or track.playing_slot_index_has_listener(listener)):
+                track.remove_playing_slot_index_listener(listener)
         except Exception:
             pass
 
@@ -14670,11 +12944,6 @@ class Tap(ControlSurface):
         return listener
 
     def _make_clip_triggered_listener(self, track, scene_index, clip_slot):
-        def listener():
-            self._on_clip_playing_status_changed(track, scene_index, clip_slot)
-        return listener
-
-    def _make_clip_playing_listener(self, track, scene_index, clip_slot):
         def listener():
             self._on_clip_playing_status_changed(track, scene_index, clip_slot)
         return listener
@@ -14769,9 +13038,24 @@ class Tap(ControlSurface):
         expected_clip_slots = set()
         expected_clips = set()
         expected_arm_tracks = set()
+        expected_playing_slot_tracks = set()
         for track in self.song().tracks:
             track_id = id(track)
             current_track_ids.add(track_id)
+
+            if hasattr(track, 'add_playing_slot_index_listener'):
+                expected_playing_slot_tracks.add(track)
+                if track not in self._track_playing_slot_listeners:
+                    listener = self._make_track_playing_slot_listener(track)
+                    try:
+                        if (not hasattr(track, 'playing_slot_index_has_listener')
+                                or not track.playing_slot_index_has_listener(listener)):
+                            track.add_playing_slot_index_listener(listener)
+                        self._track_playing_slot_listeners[track] = listener
+                    except Exception as e:
+                        self._debug_log(
+                            "Error adding track playing-slot listener: {}".format(str(e))
+                        )
 
             try:
                 supports_arm_feedback = (
@@ -14811,13 +13095,6 @@ class Tap(ControlSurface):
                     if self._add_clip_slot_listener(clip_slot, 'is_triggered', listener):
                         self._clip_slot_listeners[listener_key] = listener
 
-                listener_key = (clip_slot, 'is_playing')
-                expected_listener_keys.add(listener_key)
-                if listener_key not in self._clip_slot_listeners:
-                    listener = self._make_clip_playing_listener(track, scene_index, clip_slot)
-                    if self._add_clip_slot_listener(clip_slot, 'is_playing', listener):
-                        self._clip_slot_listeners[listener_key] = listener
-
             self._sync_clip_color_listeners_for_track(track)
             for clip_slot in track.clip_slots:
                 if clip_slot is not None and clip_slot.has_clip:
@@ -14848,7 +13125,27 @@ class Tap(ControlSurface):
                 if listener is not None:
                     self._remove_track_arm_listener(track, listener)
 
+        for track in list(self._track_playing_slot_listeners.keys()):
+            if track not in expected_playing_slot_tracks:
+                listener = self._track_playing_slot_listeners.pop(track, None)
+                if listener is not None:
+                    self._remove_track_playing_slot_listener(track, listener)
+
         self._registered_track_ids = current_track_ids
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.set_listener_total(
+                "clip_slot", len(self._clip_slot_listeners)
+            )
+            performance_diagnostics.set_listener_total(
+                "track_arm", len(self._track_arm_listeners)
+            )
+            performance_diagnostics.set_listener_total(
+                "track_playing_slot", len(self._track_playing_slot_listeners)
+            )
+            performance_diagnostics.set_listener_total(
+                "clip_color", len(self._clip_color_listeners)
+            )
 
     def _unregister_clip_and_audio_listeners(self):
         self._pending_clip_slot_deltas = {}
@@ -14863,6 +13160,9 @@ class Tap(ControlSurface):
         for track, listener in list(self._track_arm_listeners.items()):
             self._remove_track_arm_listener(track, listener)
 
+        for track, listener in list(self._track_playing_slot_listeners.items()):
+            self._remove_track_playing_slot_listener(track, listener)
+
         for track, (left_listener, right_listener) in list(self._track_level_listeners.items()):
             self._remove_output_meter_listener_pair(track, left_listener, right_listener)
 
@@ -14874,9 +13174,14 @@ class Tap(ControlSurface):
         self._clip_listener_track_slots.clear()
         self._clip_slot_listeners.clear()
         self._track_arm_listeners.clear()
+        self._track_playing_slot_listeners.clear()
         self._clip_color_listeners.clear()
         self._clip_slot_color_map.clear()
         self._registered_track_ids.clear()
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            for feature in ("clip_slot", "track_arm", "track_playing_slot", "clip_color"):
+                performance_diagnostics.set_listener_total(feature, 0)
 
     # def _on_playing_position_changed(self):
     #     # self.log_message("trying to log the playing position")
@@ -15266,9 +13571,47 @@ class Tap(ControlSurface):
                     self._update_clip_slots(track_index)
                 self._sync_clip_color_listeners_for_track(track)
                 self._set_up_notes_playing("clip")
+                if getattr(self, "seq_status", False):
+                    self._queue_highlighted_step_seq_rebind(clip_slot)
                 return
         self._update_clip_slots()
         self._set_up_notes_playing("clip")
+
+    def _queue_highlighted_step_seq_rebind(self, clip_slot):
+        """Coalesce selected-slot clip replacement after Live settles."""
+        if not getattr(self, "seq_status", False):
+            return
+        try:
+            if self.song().view.highlighted_clip_slot is not clip_slot:
+                return
+        except Exception:
+            return
+        if self._step_seq_rebind_scheduled:
+            return
+        self._step_seq_rebind_scheduled = True
+        generation = self._remote_refresh_generation
+
+        def rebind_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._step_seq_rebind_scheduled = False
+            try:
+                if (
+                    self.seq_status
+                    and self.song().view.highlighted_clip_slot is clip_slot
+                ):
+                    self.start_step_seq()
+            except Exception as error:
+                self._debug_log(
+                    "Exception rebinding highlighted step-sequencer clip: {}".format(
+                        str(error)
+                    )
+                )
+
+        try:
+            self.schedule_message(1, rebind_if_current)
+        except Exception:
+            rebind_if_current()
 
     def _clip_slot_state_and_color(self, track, clip_slot):
         try:
@@ -15305,6 +13648,8 @@ class Tap(ControlSurface):
     def _clip_slots_string_for_track(self, track):
         values = []
         for clip_slot in track.clip_slots:
+            if self._performance_diagnostics.enabled:
+                self._performance_diagnostics.record_traversal("clip_slots", 1)
             state, color = self._clip_slot_state_and_color(track, clip_slot)
             color_string = self._make_color_string(color) if color else "0"
             values.append("{}:{}".format(state, color_string))
@@ -15344,7 +13689,7 @@ class Tap(ControlSurface):
                 + self._to_3_7bit_magnitude(scene_index)
                 + [state, red >> 7, red & 0x7F, green >> 7, green & 0x7F, blue >> 7, blue & 0x7F]
             )
-            self._send_midi(tuple([0xF0, 0x55, 0x01] + data + [0xF7]))
+            self._send_tap_midi(tuple([0xF0, 0x55, 0x01] + data + [0xF7]))
             changed_track_indexes.add(track_index)
 
         if len(self.old_clips_array) == len(tracks):
@@ -15966,6 +14311,26 @@ class Tap(ControlSurface):
                     )
 
         manufacturer_id = message[1]
+        message_spec = self.SYSEX_APP_TO_REMOTE.get(manufacturer_id)
+        if message_spec is None:
+            # Reserved and unknown IDs fail closed before they can allocate a
+            # multipart buffer or reach a semantic handler.
+            return
+
+        def record_accepted_packet(packet):
+            # Baseline traffic is physical MIDI traffic in both directions.
+            # Count each accepted packet/chunk exactly once after its framing
+            # and assembled-size checks; never count synthetic reconstruction.
+            if PERFORMANCE_DIAGNOSTICS_ENABLED:
+                performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+                if performance_diagnostics is not None:
+                    performance_diagnostics.record_incoming_sysex(
+                        packet[1], len(packet)
+                    )
+
+        def dispatch_validated(full_message):
+            self._handle_full_sysex(full_message, message_spec)
+
         prefix = message[2]
         maximum_assembled_bytes = self.SYSEX_CHUNK_MAX_ASSEMBLED_BYTES_BY_ID.get(
             manufacturer_id,
@@ -15977,14 +14342,21 @@ class Tap(ControlSurface):
         # the low byte of a Live note ID for edits). Recognize the compact
         # direct record shape before looking for chunk markers so those notes
         # are never swallowed as an incomplete transfer.
+        direct_record_width = message_spec.direct_binary_record_width
+        direct_record_length = len(message) - 3
         direct_binary_record = (
-            (manufacturer_id == 14 and len(message) == 14)
-            or (manufacturer_id == 15 and len(message) >= 8 and (len(message) - 3) % 5 == 0)
-            or (manufacturer_id == 16 and len(message) == 19)
+            direct_record_width is not None
+            and direct_record_length > 0
+            and direct_record_length % direct_record_width == 0
+            and (
+                not message_spec.direct_binary_record_must_be_single
+                or direct_record_length == direct_record_width
+            )
         )
         if direct_binary_record:
             self._sysex_buffers.pop(manufacturer_id, None)
-            self._handle_full_sysex(message)
+            record_accepted_packet(message)
+            dispatch_validated(message)
             return
 
         # Check if this message is chunked. Existing Tap app -> script chunks
@@ -16038,6 +14410,7 @@ class Tap(ControlSurface):
                                 len(buffer_info["bytes"])
                             )
                         )
+                record_accepted_packet(message)
                 return
 
             elif prefix == 95:
@@ -16055,7 +14428,7 @@ class Tap(ControlSurface):
                             )
                         )
                         return
-                    record_width = {14: 11, 15: 5, 16: 16}.get(manufacturer_id)
+                    record_width = message_spec.direct_binary_record_width
                     final_length = len(message[3:-1])
                     if manufacturer_id == 92:
                         if final_length < 21:
@@ -16096,7 +14469,8 @@ class Tap(ControlSurface):
                 full_message = [0xF0, manufacturer_id] + buffer_info["bytes"] + [0xF7]
 
                 # Now call the original handler
-                self._handle_full_sysex(full_message)
+                record_accepted_packet(message)
+                dispatch_validated(full_message)
                 return
 
             else:
@@ -16119,111 +14493,121 @@ class Tap(ControlSurface):
                         "transfer_direct",
                         "bytes={}".format(len(message[2:-1]))
                     )
-                self._handle_full_sysex(message)
+                record_accepted_packet(message)
+                dispatch_validated(message)
                 return
 
         else:
             # Non-chunked streams never cancel an unrelated in-flight stream.
             self._sysex_buffers.pop(manufacturer_id, None)
-            self._handle_full_sysex(message)
+            record_accepted_packet(message)
+            dispatch_validated(message)
 
-    def _handle_full_sysex(self, message):
+    def _handle_full_sysex(self, message, message_spec=None):
+        if message_spec is None:
+            if len(message) < 3:
+                return
+            message_spec = self.SYSEX_APP_TO_REMOTE.get(message[1])
+            if message_spec is None:
+                return
+        route = message_spec.route
+
         # Direct manipulation from Tap's synthetic EQ Eight overview bank.
-        if len(message) >= 3 and message[1] == 0x65:
+        if len(message) >= 3 and route == "eqEightVisualizationEdit":
             self._handle_eq8_visualization_edit(message)
             return
 
         # Selected audio-clip editing, sample loading and conversion commands.
-        if len(message) >= 3 and message[1] == 0x52:
+        if len(message) >= 3 and route == "audioClip":
             self._handle_audio_clip_command(message)
             return
 
         # Select the expression encoder shown in Track Controls.
-        if len(message) >= 3 and message[1] == 0x4F:
+        if len(message) >= 3 and route == "selectTrackExpressionControl":
             self._handle_track_expression_control_command(message)
             return
 
         # Native Live note repeat always targets the selected MIDI track.
-        if len(message) >= 3 and message[1] == 0x4B:
+        if len(message) >= 3 and route == "noteRepeat":
             self._handle_note_repeat_command(message)
             return
 
         # Clip/Mixer views explicitly provide the raw track indexes currently
         # visible in the app. Keep position work completely dormant elsewhere.
-        if len(message) >= 3 and message[1] == 0x47:
+        if len(message) >= 3 and route == "setClipPositionFeedback":
             self._set_clip_position_feedback(self.extract_values_from_sysex_message(message))
             return
         # Push-style Simpler option row.
-        if len(message) >= 4 and message[1] == 0x43:
+        if len(message) >= 4 and route == "simplerAction":
             values = self.extract_values_from_sysex_message(message)
             if values:
                 self._trigger_simpler_action(values[0])
             return
         # Simpler's two-axis Zoom control sends zoom and waveform center as
         # two 14-bit normalized values.
-        if len(message) >= 7 and message[1] == 0x46:
+        if len(message) >= 7 and route == "setSimplerViewport":
             self._set_simpler_viewport(self.extract_values_from_sysex_message(message))
             return
         # The app may connect after the one-time sample-change waveform send.
-        if len(message) >= 4 and message[1] == 0x45:
+        if len(message) >= 4 and route == "requestSimplerWaveform":
             self._debug_log('Simpler waveform requested by app')
             self._request_simpler_waveform()
             return
         # A long browser hold previews page numbers locally in Tap, then sends
         # one absolute destination when the finger is released. This avoids a
         # SysEx page payload for every accelerated intermediate page.
-        if len(message) >= 3 and message[1] == 0x54:
+        if len(message) >= 3 and route == "browserJumpToPage":
             self._browser_jump_to_page(self.extract_values_from_sysex_message(message))
             return
         # Browser name search and content-tag filtering are performed here in the
         # Remote Script so the app only ever receives the current 12-item page.
-        if len(message) >= 3 and message[1] == 0x3C:
+        if len(message) >= 3 and route == "browserSearch":
             self._browser_search(message)
             return
         # Preview the item at the supplied one-based row index, or stop at zero.
-        if len(message) >= 3 and message[1] == 0x3D:
+        if len(message) >= 3 and route == "browserPreview":
             values = self.extract_values_from_sysex_message(message)
             self._browser_preview(values[0] if values else 0)
             return
         # Flin owns the MIDI notes of a marked clip while the mode is active.
-        if len(message) >= 3 and message[1] == 0x3E:
+        if len(message) >= 3 and route == "flin":
             self._handle_flin_command(message)
             return
         # start stop clip
-        if len(message) >= 2 and message[1] == 9:
+        if len(message) >= 2 and route == "fireClip":
             decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=2)
             if decoded is not None and decoded[0][0] in (0, 1):
                 self._fire_clip(decoded[0][0], decoded[1][0], decoded[1][1])
             return
         # delete clip
-        if len(message) >= 2 and message[1] == 10:
+        if len(message) >= 2 and route == "deleteClip":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
             if decoded is not None:
                 self._delete_clip(decoded[1][0], decoded[1][1])
             return
         # copy paste clip
-        if len(message) >= 2 and message[1] == 11:
+        if len(message) >= 2 and route == "copyClip":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=4)
             if decoded is not None:
                 self._copy_paste_clip(*decoded[1])
             return
         # scale and rootnote
-        if len(message) >= 2 and message[1] == 12:
+        if len(message) >= 2 and route == "scaleAndRoot":
             values = self.decode_sys_ex_scale_root(message)
             if len(values) == 2:
                 self._set_scale_root_note(values[0], values[1])
         # duplicate loop
-        if len(message) >= 2 and message[1] == 13:
+        if len(message) >= 2 and route == "duplicateLoop":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
             if decoded is not None:
                 self._duplicate_loop(decoded[1][0], decoded[1][1])
             return
         # request selected track local controls (ModWheel/Pressure)
-        if len(message) >= 2 and message[1] == 59:
+        if len(message) >= 2 and route == "requestTrackLocalControls":
             self._send_track_local_control_state()
         
         # add MULTIPLE notes
-        if len(message) >= 2 and message[1] == 14:
+        if len(message) >= 2 and route == "addNotes":
             transaction = self._pending_note_add_transaction
             self._pending_note_add_transaction = None
             transaction_id = transaction[0] if transaction is not None else None
@@ -16374,7 +14758,7 @@ class Tap(ControlSurface):
             return
         
         # remove note (also multiple)
-        if len(message) >= 2 and message[1] == 15:
+        if len(message) >= 2 and route == "removeNotes":
             note_ids = []
             index = 2
             while index + 5 <= (len(message) - 1):
@@ -16423,7 +14807,7 @@ class Tap(ControlSurface):
                     clip.remove_notes_by_id(note_ids)
         
         # modify MULTIPLE notes
-        if len(message) >= 3 and message[1] == 16:
+        if len(message) >= 3 and route == "modifyNotes":
             if (len(message) - 3) <= 0 or (len(message) - 3) % 16 != 0:
                 return
             index = 2
@@ -16536,7 +14920,7 @@ class Tap(ControlSurface):
                     clip.apply_note_modifications(notes)
         
         # markers
-        if len(message) >= 7 and message[1] == 17:
+        if len(message) >= 7 and route == "clipMarker":
             # Decode the note ID and data
             marker_flags = message[2]
             marker_id = marker_flags & self.MARKER_ID_MASK
@@ -16577,7 +14961,7 @@ class Tap(ControlSurface):
                         clip.loop_end = marker_time
         
         # visible channel and mixer status true
-        if len(message) >= 5 and message[1] == 18:
+        if len(message) >= 5 and route == "visibleMixerRange":
             start = message[2]
             end = message[3]
             self.visible_channels = (start, end)
@@ -16587,14 +14971,14 @@ class Tap(ControlSurface):
             self._set_up_mixer_controls()
             
         # combine clips
-        if len(message) >= 2 and message[1] == 19:
+        if len(message) >= 2 and route == "combineClips":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=4)
             if decoded is not None:
                 self._append_and_remove_clip(*decoded[1])
             return
         
         # set arm state for audio tracks
-        if len(message) >= 2 and message[1] == 20:
+        if len(message) >= 2 and route == "setTrackArm":
             decoded = self._decode_wide_index_message(message, prefix_count=1, index_count=1)
             if decoded is None or decoded[0][0] not in (0, 1):
                 return
@@ -16607,7 +14991,7 @@ class Tap(ControlSurface):
             return
         
         # select next clip
-        if len(message) >= 4 and message[1] == 21:
+        if len(message) >= 4 and route == "selectAdjacentClip":
             upValue = message[2]
             track = self.song().view.selected_track
             current_clip_slot = self.song().view.highlighted_clip_slot
@@ -16629,7 +15013,7 @@ class Tap(ControlSurface):
                     if clip_slots[i].has_clip:
                         self.song().view.highlighted_clip_slot = clip_slots[i]
                         break
-        if len(message) >= 2 and message[1] == 22:
+        if len(message) >= 2 and route == "tempo":
             tempo_bytes = message[2:-1]
             try:
                 tempo_string = bytes(tempo_bytes).decode('ascii')
@@ -16641,81 +15025,81 @@ class Tap(ControlSurface):
                 # Optional: log error
                 # self.canonical_parent.log_message("Tempo decode error: " + str(e))
                 pass
-        if len(message) >= 3 and message[1] == 23:
+        if len(message) >= 3 and route == "metronome":
             try:
                 self.song().metronome = bool(message[2])
             except Exception:
                 pass
-        if len(message) >= 2 and message[1] == 43:
+        if len(message) >= 2 and route == "tapTempo":
             self._handle_tap_tempo()
-        if len(message) >= 2 and message[1] == 35:
+        if len(message) >= 2 and route == "setFollowAction":
             self._set_follow_action_rule(message)
-        if len(message) >= 2 and message[1] == 36:
+        if len(message) >= 2 and route == "deleteFollowAction":
             self._delete_follow_action_rule(message)
-        if len(message) >= 2 and message[1] == 37:
+        if len(message) >= 2 and route == "requestFollowActions":
             self._send_follow_action_state(force=True)
-        if len(message) >= 2 and message[1] == 38:
+        if len(message) >= 2 and route == "stopTrackClips":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
             if decoded is not None:
                 self._stop_track_clips(decoded[1][0])
             return
-        if len(message) >= 2 and message[1] == 39:
+        if len(message) >= 2 and route == "highResolutionDeviceControl":
             self._set_device_control_high_resolution(message)
-        if len(message) >= 2 and message[1] == 44:
+        if len(message) >= 2 and route == "toggleGroupFold":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
             if decoded is not None:
                 self._toggle_group_fold(decoded[1][0])
             return
-        if len(message) >= 2 and message[1] == 0x55:
+        if len(message) >= 2 and route == "wideSession":
             self._handle_wide_session_command(message)
             return
-        if len(message) >= 2 and message[1] == 0x5A:
+        if len(message) >= 2 and route == "beginNoteAddTransaction":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=2)
             if decoded is None or decoded[1][1] <= 0:
                 self._pending_note_add_transaction = None
             else:
                 self._pending_note_add_transaction = (decoded[1][0], decoded[1][1])
             return
-        if len(message) >= 2 and message[1] == 0x5C:
+        if len(message) >= 2 and route == "nativeNoteTransfer":
             self._handle_note_transfer_command(message)
             return
-        if len(message) >= 2 and message[1] == 0x60:
+        if len(message) >= 2 and route == "grooveEdit":
             self._handle_groove_edit(message)
             return
-        if len(message) >= 2 and message[1] == 0x62:
+        if len(message) >= 2 and route == "grooveFocus":
             self._handle_groove_focus(message)
             return
-        if len(message) >= 3 and message[1] == 45:
+        if len(message) >= 3 and route == "addRandomEffect":
             self._add_random_effect_after_device(message[2])
-        if len(message) >= 3 and message[1] == 46:
+        if len(message) >= 3 and route == "setBrowserInsertTarget":
             self._set_browser_insert_after_device(message[2])
-        if len(message) >= 4 and message[1] == 47:
+        if len(message) >= 4 and route == "moveDevice":
             self._move_device_after_index(message[2], message[3])
-        if len(message) >= 4 and message[1] == 48:
+        if len(message) >= 4 and route == "rackSnapshot":
             self._handle_rack_snapshot_command(message)
-        if len(message) >= 2 and message[1] == 49:
+        if len(message) >= 2 and route == "requestAutomationEnvelope":
             self._send_automation_envelope(message)
-        if len(message) >= 2 and message[1] == 50:
+        if len(message) >= 2 and route == "writeAutomationEnvelope":
             self._set_automation_envelope(message)
-        if len(message) >= 2 and message[1] == 51:
+        if len(message) >= 2 and route == "setDecoupledAutomationLength":
             self._set_decoupled_automation_length(message)
-        if len(message) >= 2 and message[1] == 52:
+        if len(message) >= 2 and route == "unfoldDecoupledAutomation":
             self._unfold_decoupled_automation_clip()
-        if len(message) >= 2 and message[1] == 53:
+        if len(message) >= 2 and route == "clearAutomationEnvelope":
             self._clear_automation_envelope(message)
-        if len(message) >= 2 and message[1] == 54:
+        if len(message) >= 2 and route == "clearAllAutomationEnvelopes":
             self._clear_all_automation_envelopes(message)
-        if len(message) >= 2 and message[1] == 55:
+        if len(message) >= 2 and route == "setMutatorClip":
             self._set_mutator_clip(message)
-        if len(message) >= 2 and message[1] == 56:
+        if len(message) >= 2 and route == "finishMutatorClip":
             action = message[2] if len(message) >= 3 else 0
             if action == 1:
                 self._unfold_mutator_clip()
             else:
                 self._end_mutator_clip()
-        if len(message) >= 2 and message[1] == 57:
+        if len(message) >= 2 and route == "updateMutatorSettings":
             self._update_mutator_clip_settings(message)
-        if len(message) >= 2 and message[1] == 58:
+        if len(message) >= 2 and route == "replaceRhythmLane":
             self._replace_rhythm_generator_lane(message)
     def _replace_rhythm_generator_lane(self, message):
         try:
@@ -18894,8 +17278,16 @@ class Tap(ControlSurface):
     def _end_selected_clip_update_batch(self):
         self._selected_clip_update_suppression_depth = max(0, self._selected_clip_update_suppression_depth - 1)
         if self._selected_clip_update_suppression_depth == 0:
+            pending_metadata = self._selected_clip_update_pending_metadata
+            pending_notes = self._selected_clip_update_pending_notes
             self._selected_clip_update_pending_metadata = False
             self._selected_clip_update_pending_notes = False
+            if pending_metadata:
+                self._selected_clip_dirty_fields.update(("metadata", "audio"))
+            if pending_notes:
+                self._selected_clip_dirty_fields.add("notes")
+            if self._selected_clip_dirty_fields:
+                self._invalidate_selected_clip(*tuple(self._selected_clip_dirty_fields))
 
     def _selected_clip_updates_are_suppressed(self):
         return self._selected_clip_update_suppression_depth > 0
@@ -19865,12 +18257,10 @@ class Tap(ControlSurface):
         if not contexts:
             return
         now = time.monotonic() if now is None else float(now)
-        expired = [
-            token for token, context in contexts.items()
-            if now - float(context.get("last_activity", 0.0)) > self.AUTOMATION_CONTEXT_MAX_AGE
-        ]
-        for token in expired:
-            contexts.pop(token, None)
+        if not isinstance(contexts, AutomationContextRegistry):
+            contexts = AutomationContextRegistry(contexts)
+            self._automation_contexts = contexts
+        contexts.expire(now, self.AUTOMATION_CONTEXT_MAX_AGE)
 
     def _clear_automation_contexts(self):
         contexts = getattr(self, "_automation_contexts", None)
@@ -19882,6 +18272,9 @@ class Tap(ControlSurface):
             domain, steps, revision, point_duration, preferred_token=""):
         self._expire_automation_contexts()
         contexts = self._automation_contexts
+        if not isinstance(contexts, AutomationContextRegistry):
+            contexts = AutomationContextRegistry(contexts)
+            self._automation_contexts = contexts
         clip_identity = self._live_object_identity(clip)
         parameter_identity = self._live_object_identity(device_param)
         slot_identity = self._live_object_identity(clip_slot) if clip_slot is not None else None
@@ -19893,13 +18286,7 @@ class Tap(ControlSurface):
             context = None
 
         if context is None:
-            self._automation_context_counter = (
-                1 if self._automation_context_counter >= 0x7FFFFFFF
-                else self._automation_context_counter + 1
-            )
-            token = "{:08X}".format(self._automation_context_counter)
-            context = {"token": token}
-            contexts[token] = context
+            context = contexts.create()
 
         point_duration = max(0.0001, float(point_duration))
         cached_read_method = getattr(self, "_cached_automation_event_read", None)
@@ -19945,12 +18332,7 @@ class Tap(ControlSurface):
             "target_identity": self._automation_target_identity(clip, device_param),
             "last_activity": time.monotonic(),
         })
-        while len(contexts) > self.AUTOMATION_CONTEXT_MAX_COUNT:
-            oldest_token = min(
-                contexts,
-                key=lambda token: float(contexts[token].get("last_activity", 0.0))
-            )
-            contexts.pop(oldest_token, None)
+        contexts.trim(self.AUTOMATION_CONTEXT_MAX_COUNT)
         return context
 
     def _resolve_automation_context(self, token, expected_revision=""):
@@ -20480,12 +18862,17 @@ class Tap(ControlSurface):
             return
         if getattr(self, "_automation_pencil_stroke", None) is state:
             self._automation_pencil_stroke = None
+            coordinator = getattr(self, "_automation_transfer", None)
+            if coordinator is not None:
+                coordinator.pencil = None
         undo_step_started = bool(state.get("undo_step_started", False))
         # Clear before calling Live so a reentrant error/end packet cannot close
         # a later transaction's undo group.
         state["undo_step_started"] = False
         if undo_step_started:
             self._end_undo_step(True)
+        if isinstance(state, AutomationPencilTransaction):
+            state.phase = "completed"
 
     def _expire_automation_pencil_stroke(self, now=None):
         state = getattr(self, "_automation_pencil_stroke", None)
@@ -20606,7 +18993,7 @@ class Tap(ControlSurface):
                     sample_duration
                 )
 
-        self._automation_pencil_stroke = {
+        self._automation_pencil_stroke = AutomationPencilTransaction({
             "stroke_id": stroke_id,
             "control_index": control_index,
             "clip_slot": clip_slot,
@@ -20628,7 +19015,10 @@ class Tap(ControlSurface):
             "undo_step_attempted": False,
             "undo_step_started": False,
             "last_activity": time.monotonic(),
-        }
+        })
+        coordinator = getattr(self, "_automation_transfer", None)
+        if coordinator is not None:
+            coordinator.pencil = self._automation_pencil_stroke
 
     def _append_automation_pencil_point(self, stroke_id, fields):
         state = getattr(self, "_automation_pencil_stroke", None)
@@ -20976,6 +19366,8 @@ class Tap(ControlSurface):
         state["failed"] = True
         self._automation_write_error_response(state["control_index"])
         self._finalize_automation_pencil_stroke(state)
+        if isinstance(state, AutomationPencilTransaction):
+            state.phase = "failed"
 
     def _automation_step_from_entry(self, entry, domain=None, fallback_order=0):
         components = str(entry or "").split(":")
@@ -21137,37 +19529,6 @@ class Tap(ControlSurface):
             else:
                 merged_intervals.append((interval_start, interval_end))
         return (tuple(final_steps), tuple(merged_intervals))
-
-    def _apply_exact_automation_delta(
-            self, context, envelope, final_steps, intervals,
-            automation_should_re_enable=False):
-        if not intervals:
-            return True
-        undo_step_started = self._begin_undo_step()
-        try:
-            for interval_start, interval_end in intervals:
-                interval_steps = tuple(
-                    step for step in final_steps
-                    if (step[0] >= interval_start - 0.000001
-                        and step[0] <= interval_end + 0.000001)
-                )
-                if not self._write_exact_automation_events_to_envelope(
-                        envelope,
-                        context["device_param"],
-                        interval_start,
-                        interval_end,
-                        interval_steps,
-                        allow_empty=True,
-                        endpoint_padding=0.0000001):
-                    return False
-            if (automation_should_re_enable
-                    and not self._parameter_automation_is_enabled(
-                        context["device_param"]
-                    )):
-                self._re_enable_parameter_automation(context["device_param"])
-            return True
-        finally:
-            self._end_undo_step(undo_step_started)
 
     def _apply_direct_exact_automation_delta(
             self, context, envelope, baseline, final_steps, operation_entries,
@@ -21773,68 +20134,23 @@ class Tap(ControlSurface):
             self._end_undo_step(True)
 
     def _retry_exact_automation_full_write(self, state, status):
-        if not state.get("allow_full_replay", True):
-            self._debug_log(
-                "Streamed exact automation audit failed: {}".format(
-                    status.get("reason", "mismatch")
-                )
+        self._debug_log(
+            "Exact automation final audit failed: {}".format(
+                status.get("reason", "mismatch")
             )
-            self._automation_trace(
-                state.get("stream_id", state.get("write_token", "?")),
-                "final_audit_reject",
-                "reason={} mismatch_groups={}".format(
-                    status.get("reason", "mismatch"),
-                    ",".join(
-                        "{:.6f}".format(float(group[0][0]))
-                        for group in tuple(status.get("mismatch_groups", ()))[:16]
-                    ) or "none"
-                )
-            )
-            self._fail_exact_automation_full_write(state)
-            return
-        if state["full_replays"] >= self.AUTOMATION_EXACT_MAX_FULL_REPLAYS:
-            self._debug_log(
-                "Exact automation final audit did not settle: {}".format(
-                    status.get("reason", "mismatch")
-                )
-            )
-            self._fail_exact_automation_full_write(state)
-            return
-
-        # A replay before the committed final audit is still part of the same
-        # user action. Keep its undo group open while clearing and rebuilding;
-        # closing here made every recovered vertical edge another Undo entry.
-        state["full_replays"] += 1
-        reversed_times = tuple(status.get("reversed_times", ()))
-        for time_value in reversed_times:
-            state["group_creation_reversed"][time_value] = not state[
-                "group_creation_reversed"
-            ].get(time_value, False)
-
-        # Replay the complete right-to-left write scope. For a delta this is
-        # only its affected intervals; generated/full writes use their complete
-        # domain. No new SysEx request or response is needed.
-        try:
-            device_param = state["context"]["device_param"]
-            if (state.get("automation_should_re_enable", False)
-                    and not self._parameter_automation_is_enabled(device_param)):
-                self._re_enable_parameter_automation(device_param)
-        except Exception:
-            pass
-        envelope_refresher = getattr(
-            self, "_refresh_exact_automation_write_envelope", None
         )
-        if envelope_refresher is not None:
-            envelope_refresher(state, allow_create=True)
-        state["next_group_index"] = 0
-        state["active_batch"] = ()
-        state["batch_settle_polls"] = 0
-        state["cleared"] = False
-        state["awaiting_final_audit"] = False
-        self.schedule_message(
-            self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
-            lambda state=state: self._perform_exact_automation_full_write(state)
+        self._automation_trace(
+            state.get("stream_id", state.get("write_token", "?")),
+            "final_audit_reject",
+            "reason={} mismatch_groups={}".format(
+                status.get("reason", "mismatch"),
+                ",".join(
+                    "{:.6f}".format(float(group[0][0]))
+                    for group in tuple(status.get("mismatch_groups", ()))[:16]
+                ) or "none"
+            )
         )
+        self._fail_exact_automation_full_write(state)
 
     def _finalize_exact_automation_stream(self, state=None):
         state = state or getattr(self, "_automation_exact_stream", None)
@@ -21852,6 +20168,9 @@ class Tap(ControlSurface):
                     state["context"]["device_param"]
                 )
             self._close_exact_automation_write_attempt(state)
+        coordinator = getattr(self, "_automation_transfer", None)
+        if coordinator is not None:
+            coordinator.writer.finish(state, failed=True)
 
     def _expire_exact_automation_stream(self, now=None):
         state = getattr(self, "_automation_exact_stream", None)
@@ -22693,7 +21012,9 @@ class Tap(ControlSurface):
             )
             return
 
-        state = {
+        state = ExactAutomationWriteTransaction(
+            ExactAutomationWriteMode.STREAMED_TWO_PASS,
+            {
             "stream_id": stream_id,
             "context": context,
             "envelope": envelope,
@@ -22720,7 +21041,6 @@ class Tap(ControlSurface):
             "next_group_index": 0,
             "active_batch": (),
             "batch_settle_polls": 0,
-            "full_replays": 0,
             # Live prepends a second event at an occupied timestamp. Author
             # vertical pairs in reverse so their first settled enumeration is
             # already the app's authored order instead of requiring a replay.
@@ -22732,13 +21052,15 @@ class Tap(ControlSurface):
             "undo_step_attempted": False,
             "undo_step_started": False,
             "awaiting_final_audit": False,
-            "allow_full_replay": False,
             "stream_processing": True,
             "completed": False,
             "last_activity": time.monotonic(),
-        }
+        })
         context["envelope"] = envelope
         self._automation_exact_stream = state
+        coordinator = getattr(self, "_automation_transfer", None)
+        if coordinator is not None:
+            coordinator.writer.begin(state)
         self._automation_trace(
             stream_id,
             "steps_ready",
@@ -22872,6 +21194,8 @@ class Tap(ControlSurface):
                 or state.get("completed", False)
                 or getattr(self, "_automation_exact_stream", None) is not state):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.VERIFYING
         try:
             self._refresh_exact_automation_write_envelope(state, allow_create=False)
             clear_status = self._streamed_exact_automation_range_is_empty(state)
@@ -22941,6 +21265,8 @@ class Tap(ControlSurface):
                 or state.get("completed", False)
                 or getattr(self, "_automation_exact_stream", None) is not state):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.WRITING
         context = state["context"]
         if (not liveobj_valid(context.get("clip"))
                 or not liveobj_valid(context.get("device_param"))):
@@ -23061,6 +21387,8 @@ class Tap(ControlSurface):
             self._close_exact_automation_write_attempt(state)
             state["stream_processing"] = False
             state["awaiting_final_audit"] = True
+            if isinstance(state, ExactAutomationWriteTransaction):
+                state.phase = ExactAutomationWritePhase.SETTLING
             state["last_activity"] = time.monotonic()
             self._automation_trace(
                 state["stream_id"], "write_passes_complete", "final_audit_ticks={}".format(
@@ -23089,6 +21417,8 @@ class Tap(ControlSurface):
                 or state.get("completed", False)
                 or getattr(self, "_automation_exact_stream", None) is not state):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.VERIFYING
         pending_group = state.get("pending_group")
         if pending_group is None:
             self._fail_exact_automation_full_write(state)
@@ -23199,150 +21529,6 @@ class Tap(ControlSurface):
                 )
             )
             self._fail_exact_automation_full_write(state)
-
-    def _handle_repeating_exact_automation_full_write(self, fields):
-        # V43 `R` field order and suffix semantics mirror
-        # `repeatingFullPayload` in TapProtocol.swift.
-        if len(fields) != 18:
-            return
-        try:
-            control_index = max(0, min(7, int(fields[1])))
-            context_token = fields[2]
-            base_revision = fields[3]
-            requested_start = float(fields[4])
-            requested_end = float(fields[5])
-            sample_duration = max(0.0001, float(fields[6]))
-            origin = float(fields[7])
-            period = float(fields[8])
-            start_entries = fields[9].split(",") if fields[9] else []
-            cycle_entries = fields[10].split(",") if fields[10] else []
-            end_entries = fields[11].split(",") if fields[11] else []
-            expected_start_count = int(fields[12])
-            expected_cycle_count = int(fields[13])
-            expected_end_count = int(fields[14])
-            expected_expanded_count = int(fields[15])
-            expected_checksum = int(fields[16], 16)
-            write_token = fields[17]
-            actual_checksum = self._automation_payload_checksum("|".join(fields[:12]))
-        except Exception:
-            return
-
-        valid_header = (
-            math.isfinite(requested_start)
-            and math.isfinite(requested_end)
-            and math.isfinite(sample_duration)
-            and math.isfinite(origin)
-            and math.isfinite(period)
-            and requested_end > requested_start
-            and period >= 0.0001
-            and expected_start_count == len(start_entries)
-            and expected_cycle_count == len(cycle_entries)
-            and expected_end_count == len(end_entries)
-            and expected_expanded_count >= 0
-            and expected_expanded_count <= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS
-            and expected_start_count + expected_cycle_count + expected_end_count
-                <= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS
-            and expected_checksum == actual_checksum
-            and bool(cycle_entries)
-        )
-        if not valid_header:
-            self._automation_write_error_response(control_index, write_token)
-            return
-
-        start_steps = [
-            self._automation_step_from_entry(entry, fallback_order=index + 1)
-            for index, entry in enumerate(start_entries)
-        ]
-        cycle_steps = [
-            self._automation_step_from_entry(entry, fallback_order=index + 1)
-            for index, entry in enumerate(cycle_entries)
-        ]
-        end_steps = [
-            self._automation_step_from_entry(entry, fallback_order=index + 1)
-            for index, entry in enumerate(end_entries)
-        ]
-        all_steps = start_steps + cycle_steps + end_steps
-        epsilon = 0.000001
-        valid_steps = (
-            all(step is not None for step in all_steps)
-            and all(bool(step[6]) for step in all_steps)
-            and all(abs(float(step[0]) - requested_start) <= epsilon for step in start_steps)
-            and all(
-                float(step[0]) >= -epsilon and float(step[0]) < period - epsilon
-                for step in cycle_steps
-            )
-            and bool(end_steps)
-            and all(
-                float(step[0]) >= requested_start - epsilon
-                and float(step[0]) <= requested_end + epsilon
-                for step in end_steps
-            )
-            and any(
-                abs(float(step[0]) - requested_end) <= epsilon
-                for step in end_steps
-            )
-        )
-        if not valid_steps:
-            self._automation_write_error_response(control_index, write_token)
-            return
-
-        end_replacement_start = min(float(step[0]) for step in end_steps)
-        first_cycle = int(math.floor((requested_start - origin) / period)) - 1
-        last_cycle = int(math.ceil((requested_end - origin) / period)) + 1
-        if last_cycle < first_cycle or last_cycle - first_cycle > 1000000:
-            self._automation_write_error_response(control_index, write_token)
-            return
-
-        expanded_steps = list(start_steps)
-        for cycle_index in range(first_cycle, last_cycle + 1):
-            cycle_start = origin + (float(cycle_index) * period)
-            for relative_step in cycle_steps:
-                time_value = cycle_start + float(relative_step[0])
-                if (time_value <= requested_start + epsilon
-                        or time_value >= end_replacement_start - epsilon):
-                    continue
-                if len(expanded_steps) >= self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS:
-                    self._automation_write_error_response(control_index, write_token)
-                    return
-                expanded_steps.append(tuple(
-                    [time_value]
-                    + list(relative_step[1:4])
-                    + [0, int(relative_step[5])]
-                    + list(relative_step[6:])
-                ))
-        if (len(expanded_steps) + len(end_steps)
-                > self.AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS):
-            self._automation_write_error_response(control_index, write_token)
-            return
-        expanded_steps.extend(end_steps)
-        expanded_steps = self._automation_sorted_steps(expanded_steps)
-        expanded_steps = tuple(
-            tuple(list(step[:4]) + [0, index + 1] + list(step[6:]))
-            for index, step in enumerate(expanded_steps)
-        )
-        if len(expanded_steps) != expected_expanded_count:
-            self._automation_write_error_response(control_index, write_token)
-            return
-
-        full_base_fields = [
-            "F",
-            str(control_index),
-            context_token,
-            base_revision,
-            "{:.6f}".format(requested_start),
-            "{:.6f}".format(requested_end),
-            "{:.6f}".format(sample_duration),
-            ",".join(self._automation_step_entry(step) for step in expanded_steps),
-        ]
-        full_checksum = self._automation_payload_checksum("|".join(full_base_fields))
-        self._handle_exact_automation_full_write(
-            full_base_fields + [
-                str(len(expanded_steps)),
-                "{:08X}".format(full_checksum),
-                write_token,
-            ],
-            compact_response=True
-        )
 
     def _handle_exact_automation_full_write(
             self, fields, compact_response=False, write_intervals=None,
@@ -23463,7 +21649,9 @@ class Tap(ControlSurface):
         audit_time_groups = tuple(reversed(self._exact_automation_time_groups(
             physical_audit_steps, write_start, write_end
         )))
-        state = {
+        state = ExactAutomationWriteTransaction(
+            ExactAutomationWriteMode.BATCHED_FULL,
+            {
             "context": context,
             "envelope": envelope,
             "logical_steps": audit_logical_steps,
@@ -23481,7 +21669,6 @@ class Tap(ControlSurface):
             "active_batch": (),
             "batch_settle_polls": 0,
             "batch_write_attempts": 0,
-            "full_replays": 0,
             # Live 12 may prepend one equal-time creation and append another
             # even in the same envelope, especially at free-time/phase-shifted
             # positions. Each vertical therefore owns its settled direction.
@@ -23490,13 +21677,12 @@ class Tap(ControlSurface):
             "undo_step_attempted": undo_step_attempted,
             "undo_step_started": undo_step_started,
             "awaiting_final_audit": False,
-            # Each batch is read back before the writer advances. A committed
-            # whole-envelope replay would create another Undo item, so fail
-            # closed instead of mutating again after the transaction closes.
-            "allow_full_replay": False,
             "completed": False,
-        }
+        })
         self._automation_exact_stream = state
+        coordinator = getattr(self, "_automation_transfer", None)
+        if coordinator is not None:
+            coordinator.writer.begin(state)
         # Pencil edits reach Live as small writes on separate MIDI callbacks.
         # Do the same locally for a generated shape: no extra wire traffic, but
         # no thousands-of-events burst in one Live callback either.
@@ -23639,6 +21825,8 @@ class Tap(ControlSurface):
     def _perform_exact_automation_full_write(self, state):
         if not state or state.get("completed"):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.WRITING
         context = state["context"]
         envelope_refresher = getattr(
             self, "_refresh_exact_automation_write_envelope", None
@@ -23696,6 +21884,8 @@ class Tap(ControlSurface):
                     )
                 self._close_exact_automation_write_attempt(state)
                 state["awaiting_final_audit"] = True
+                if isinstance(state, ExactAutomationWriteTransaction):
+                    state.phase = ExactAutomationWritePhase.SETTLING
                 self.schedule_message(
                     self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
                     lambda state=state: self._verify_exact_automation_full_write(state)
@@ -23745,6 +21935,8 @@ class Tap(ControlSurface):
     def _verify_exact_automation_full_batch(self, state):
         if not state or state.get("completed"):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.VERIFYING
         envelope = state["envelope"]
         mismatches = [
             (time_group, self._exact_automation_group_status(
@@ -23868,6 +22060,8 @@ class Tap(ControlSurface):
     def _verify_exact_automation_full_write(self, state):
         if not state or state.get("completed"):
             return
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.VERIFYING
         state["awaiting_final_audit"] = False
         context = state["context"]
         envelope = state["envelope"]
@@ -23999,6 +22193,11 @@ class Tap(ControlSurface):
         if getattr(self, "_automation_exact_stream", None) is state:
             self._automation_exact_stream = None
         self._close_exact_automation_write_attempt(state)
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.COMPLETED
+        coordinator = getattr(self, "_automation_transfer", None)
+        if coordinator is not None:
+            coordinator.writer.finish(state)
 
     def _fail_exact_automation_full_write(self, state):
         if not state or state.get("completed"):
@@ -24019,6 +22218,8 @@ class Tap(ControlSurface):
             )
         )
         self._complete_exact_automation_full_write(state)
+        if isinstance(state, ExactAutomationWriteTransaction):
+            state.phase = ExactAutomationWritePhase.FAILED
         self._automation_write_error_response(
             context["control_index"], state["write_token"], context=context
         )
@@ -25736,9 +23937,7 @@ class Tap(ControlSurface):
                 return
 
             group_track.fold_state = not bool(group_track.fold_state)
-            self._send_group_fold_states_if_changed(tracks, force=True)
-            if self.mixer_status:
-                self._set_up_mixer_controls()
+            self._mark_group_state_dirty()
         except Exception:
             pass
 
@@ -25790,18 +23989,17 @@ class Tap(ControlSurface):
         # getting the highlighted clip
         song = self.song()
         selected_clip_slot = song.view.highlighted_clip_slot
-        self.send_selected_clip_metadata()
-        if (
-            selected_clip_slot is not None
-            and (
-                not selected_clip_slot.has_clip
-                or bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
-            )
-        ):
-            self.send_selected_clip_notes()
-        self._check_clip_playing_status(force=True)
-        # self.log_message("Starting step seq")
-        if self.last_selected_clip_slot is not selected_clip_slot:
+        selected_clip = (
+            selected_clip_slot.clip
+            if selected_clip_slot is not None and selected_clip_slot.has_clip
+            else None
+        )
+        previous_clip = self._step_seq_listener_clip
+        selection_changed = (
+            self.last_selected_clip_slot is not selected_clip_slot
+            or previous_clip is not selected_clip
+        )
+        if selection_changed:
             previous_slot = self.last_selected_clip_slot
             if previous_slot is not None:
                 try:
@@ -25810,7 +24008,6 @@ class Tap(ControlSurface):
                 except Exception:
                     pass
 
-            previous_clip = self._step_seq_listener_clip
             if previous_clip is not None:
                 try:
                     if (
@@ -25824,6 +24021,9 @@ class Tap(ControlSurface):
                 except Exception as e:
                     self._debug_log("Exception changing step-sequencer clip listeners: {}".format(str(e)))
             self._step_seq_listener_clip = None
+            self._last_selected_clip_notes_signature = None
+            self._last_selected_clip_notes_sent_at = 0.0
+            self.last_raw_notes = None
             
             # updating last selected clip
             self.last_selected_clip_slot = selected_clip_slot
@@ -25832,18 +24032,37 @@ class Tap(ControlSurface):
                     # Audio clips share the selected-clip screen, but do not
                     # expose MIDI-note listeners.
                     if (
-                        bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
-                        and not selected_clip_slot.clip.notes_has_listener(self.send_selected_clip_notes)
+                        bool(getattr(selected_clip, 'is_midi_clip', False))
+                        and not selected_clip.notes_has_listener(self.send_selected_clip_notes)
                     ):
-                        selected_clip_slot.clip.add_notes_listener(self.send_selected_clip_notes)
-                    self._step_seq_listener_clip = selected_clip_slot.clip
+                        selected_clip.add_notes_listener(self.send_selected_clip_notes)
+                    self._step_seq_listener_clip = selected_clip
                     
-                    self.add_clip_metadata_listeners(selected_clip_slot.clip)
+                    self.add_clip_metadata_listeners(selected_clip)
                 else:
                     # create a clip slot listener that listens to clip changes
                     if not selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                         selected_clip_slot.add_has_clip_listener(self.on_highlighted_slot_changed)
                         # self.log_message("added a has clip listener")
+
+        # A same-slot clip replacement must tear down the old clip and reset
+        # its note de-duplication state before this initial snapshot.  That
+        # guarantees the data below comes from the newly bound clip even when
+        # its serialized notes happen to match the old clip exactly.
+        self.send_selected_clip_metadata()
+        if (
+            selected_clip_slot is not None
+            and (
+                not selected_clip_slot.has_clip
+                or bool(getattr(selected_clip_slot.clip, 'is_midi_clip', False))
+            )
+        ):
+            self.send_selected_clip_notes()
+        # Entering the sequencer is an initial snapshot boundary, not a
+        # listener echo.  Flush the selected families together now so Tap has
+        # complete state before the next interaction.
+        self._flush_selected_clip_updates()
+        self._check_clip_playing_status(force=True)
     
     def add_clip_metadata_listeners(self, clip):
         if not clip.end_marker_has_listener(self.send_selected_clip_metadata):
@@ -25890,6 +24109,13 @@ class Tap(ControlSurface):
         if selected_clip_slot is not None and selected_clip_slot.has_clip:
             if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                 selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
+
+            # The authoritative clip-slot listener queues the same rebind.
+            # Keep this path coalesced so an empty-to-clip transition cannot
+            # serialize one snapshot here and another on the next Live tick.
+            if self.seq_status:
+                self._queue_highlighted_step_seq_rebind(selected_clip_slot)
+                return
 
             selected_clip = selected_clip_slot.clip
             self.send_selected_clip_metadata()
@@ -26150,10 +24376,14 @@ class Tap(ControlSurface):
                 return
             add_listener(callback)
             self._audio_clip_listener_bindings.append((subject, property_name, callback))
+            performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+            if performance_diagnostics is not None:
+                performance_diagnostics.record_listener_binding("audio_clip", 1)
         except Exception:
             pass
 
     def _remove_audio_clip_listeners(self):
+        binding_count = len(self._audio_clip_listener_bindings)
         for subject, property_name, callback in self._audio_clip_listener_bindings:
             remove_listener = getattr(subject, 'remove_{}_listener'.format(property_name), None)
             has_listener = getattr(subject, '{}_has_listener'.format(property_name), None)
@@ -26163,6 +24393,9 @@ class Tap(ControlSurface):
             except Exception:
                 pass
         self._audio_clip_listener_bindings = []
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.record_listener_binding("audio_clip", -binding_count)
 
     def _connect_audio_clip_listeners(self, slot, clip):
         current_clip = getattr(self, '_audio_clip_listener_clip', None)
@@ -26642,7 +24875,7 @@ class Tap(ControlSurface):
             # `_on_selected_track_changed` normally installs this rack through
             # `_on_device_changed`. Keep the refresh deterministic when Live's
             # selected-device notification arrives a tick later.
-            self._drum_rack_device = drum_rack
+            self._sync_drum_rack_device(drum_rack)
             self._send_all_drum_pad_names()
 
     def _handle_audio_clip_command(self, message):
@@ -26776,13 +25009,72 @@ class Tap(ControlSurface):
                 str(error),
             )
     
+    def _invalidate_selected_clip(self, *fields, immediate=False):
+        fields = fields or ("metadata",)
+        self._selected_clip_dirty_fields.update(fields)
+        if "metadata" in fields:
+            self._selected_clip_update_pending_metadata = True
+        if "notes" in fields:
+            self._selected_clip_update_pending_notes = True
+        if self._selected_clip_updates_are_suppressed():
+            return
+        if immediate:
+            self._flush_selected_clip_updates()
+            return
+        if self._selected_clip_flush_scheduled:
+            performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+            if performance_diagnostics is not None:
+                performance_diagnostics.record_selected_clip_metadata_coalesced()
+            return
+        self._selected_clip_flush_scheduled = True
+        generation = self._remote_refresh_generation
+
+        def flush_if_current():
+            if generation != self._remote_refresh_generation:
+                return
+            self._flush_selected_clip_updates()
+
+        try:
+            self.schedule_message(1, flush_if_current)
+        except Exception:
+            flush_if_current()
+
+    def _flush_selected_clip_updates(self):
+        self._selected_clip_flush_scheduled = False
+        if self._selected_clip_updates_are_suppressed():
+            return
+        dirty_fields = self._selected_clip_dirty_fields
+        self._selected_clip_dirty_fields = set()
+        self._selected_clip_update_pending_metadata = False
+        self._selected_clip_update_pending_notes = False
+        if not dirty_fields:
+            return
+        # Audio state belongs to the same selected-clip transaction.  Fetch or
+        # serialize every family at most once per Live scheduler tick.
+        if "audio" in dirty_fields:
+            self._send_audio_clip_state()
+        if "metadata" in dirty_fields:
+            self._send_selected_clip_metadata_now()
+        if "notes" in dirty_fields:
+            self._send_selected_clip_notes_now()
+
     def send_selected_clip_metadata(self):
+        self._invalidate_selected_clip("metadata", "audio")
+
+    def send_selected_clip_notes(self):
+        self._invalidate_selected_clip("notes")
+
+    def _send_selected_clip_metadata_now(self):
         """
         Encode clip metadata into a compact SysEx message and send it out.
         """
-        self._send_audio_clip_state()
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.record_selected_clip_metadata_call()
         if self._selected_clip_updates_are_suppressed():
             self._selected_clip_update_pending_metadata = True
+            if performance_diagnostics is not None:
+                performance_diagnostics.record_selected_clip_metadata_coalesced()
             return
         if self.seq_status:
             # self.log_message("sending clip metadata")
@@ -26989,14 +25281,26 @@ class Tap(ControlSurface):
                     # Mutator/Flin metadata can exceed one safe Remote -> app
                     # packet. Use the same strict binary framing as clip-note
                     # snapshots instead of relying on one oversized SysEx.
+                    metadata_chunk_count = max(
+                        1,
+                        (len(note_data) + self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH - 1)
+                        // self.SYSEX_OUTGOING_MAX_CHUNK_LENGTH,
+                    )
+                    if performance_diagnostics is not None:
+                        performance_diagnostics.record_selected_clip_metadata_payload(
+                            len(note_data), metadata_chunk_count
+                        )
                     self._send_chunked_binary_sys_ex_message(
                         tuple(note_data), manufacturer_id
                     )
     
-    def send_selected_clip_notes(self):
+    def _send_selected_clip_notes_now(self):
         """
         Encode a full clip with all notes into a compact SysEx message and send it out.
         """
+        performance_diagnostics = getattr(self, "_performance_diagnostics", None)
+        if performance_diagnostics is not None:
+            performance_diagnostics.record_selected_clip_notes_call()
         if self._selected_clip_updates_are_suppressed():
             self._selected_clip_update_pending_notes = True
             return
@@ -27026,7 +25330,20 @@ class Tap(ControlSurface):
                     clip_length = (max(selected_clip.loop_end, selected_clip.end_marker, selected_clip.length) + self.clip_length_trick) - clip_start
                     
                     # Get notes
+                    notes_fetch_started_at = (
+                        performance_diagnostics.start_operation()
+                        if performance_diagnostics is not None else None
+                    )
                     notes = selected_clip.get_notes_extended(0, 128, clip_start, clip_length)
+                    if performance_diagnostics is not None:
+                        notes_fetch_duration = performance_diagnostics.finish_operation(
+                            "selected_clip_notes_get_notes_extended",
+                            notes_fetch_started_at,
+                        )
+                        performance_diagnostics.record_selected_clip_notes_fetch(
+                            notes_fetch_duration,
+                            len(notes),
+                        )
                     decoupled_info = self._decoupled_automation_info(selected_clip)
                     if decoupled_info:
                         notes = [
@@ -27088,28 +25405,34 @@ class Tap(ControlSurface):
                 and snapshot_request_started_at - self._last_selected_clip_notes_sent_at
                     < self.SELECTED_CLIP_IDENTICAL_SNAPSHOT_INTERVAL
             ):
+                if performance_diagnostics is not None:
+                    performance_diagnostics.record_selected_clip_notes_suppression()
                 return
             self._last_selected_clip_notes_signature = snapshot_signature
             self._last_selected_clip_notes_sent_at = time.monotonic()
                 
             # Split data if it's too large for a single SysEx message
             num_of_chunks = max(1, (len(data) + max_chunk_length - 1) // max_chunk_length)
+            if performance_diagnostics is not None:
+                performance_diagnostics.record_selected_clip_notes_payload(
+                    len(data), num_of_chunks
+                )
             for chunk_index in range(num_of_chunks):
                 start_index = chunk_index * max_chunk_length
                 end_index = start_index + max_chunk_length
                 chunk_data = data[start_index:end_index]
-                
+
                 # Add prefix and suffix to chunks
                 prefix = (
                     "!" if num_of_chunks == 1
                     else ("_" if chunk_index == num_of_chunks - 1 else "$")
                 )
                 chunk_data = prefix.encode('ascii') + chunk_data
-            
+
                 # Send the SysEx message
                 sys_ex_message = (status_byte, manufacturer_id, device_id) + tuple(chunk_data) + (end_byte,)
-                self._send_midi(sys_ex_message)
-    
+                self._send_tap_midi(sys_ex_message)
+
     def send_out_playing_pos(self, value, beats_per_bar, force=False, hidden=False):
         if hidden:
             cc_pair = (127, 0)
@@ -28123,7 +26446,12 @@ class Tap(ControlSurface):
 
     def disconnect(self):
         # Cancel all pending timers
+        self._invalidate_deferred_remote_refreshes()
+        self._remove_selected_track_device_topology_listener()
+        self._remove_group_fold_state_listeners()
+        self.stop_step_seq()
         self._flush_playing_note_feedback()
+        self._remove_drum_pad_name_listeners()
         self._finalize_automation_pencil_stroke()
         self._finalize_exact_automation_stream()
         self._clear_automation_contexts()
@@ -28196,6 +26524,8 @@ class Tap(ControlSurface):
 #        self.quantize_button.remove_value_listener(self._quantize_button_value)
         if hasattr(self, 'duplicate_button'):
             self.duplicate_button.remove_value_listener(self._duplicate_button_value)
+        if hasattr(self, 'stop_all_clips_button'):
+            self.stop_all_clips_button.remove_value_listener(self._stop_all_clips_value)
         if hasattr(self, 'duplicate_scene_button'):
             self.duplicate_scene_button.remove_value_listener(self._duplicate_scene_button_value)
         if hasattr(self, 'sesh_record_button'):
