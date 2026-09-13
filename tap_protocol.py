@@ -73,6 +73,7 @@ TAP_SYSEX_APP_TO_REMOTE_SPECS = (
     _tap_sysex_spec(0x25, "requestFollowActions", "session"),
     _tap_sysex_spec(0x26, "stopTrackClips", "session"),
     _tap_sysex_spec(0x27, "highResolutionDeviceControl", "device", "binary"),
+    _tap_sysex_spec(0x28, "mixerControl", "session", "binary"),
     _tap_sysex_spec(0x2B, "tapTempo", "session"),
     _tap_sysex_spec(0x2C, "toggleGroupFold", "session"),
     _tap_sysex_spec(0x2D, "addRandomEffect", "browser"),

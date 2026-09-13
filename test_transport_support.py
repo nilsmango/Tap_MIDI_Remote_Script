@@ -573,7 +573,7 @@ class FlinColumnHarness:
     def _save_flin_info_to_name(self, _clip, _info):
         self.saved = True
 
-    def send_selected_clip_metadata(self):
+    def _invalidate_selected_clip(self, *_fields, **_options):
         pass
 
     def _debug_log(self, message):
@@ -769,7 +769,7 @@ class TransportTests(unittest.TestCase):
         expected_app_ids = {
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
             0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x23,
-            0x24, 0x25, 0x26, 0x27, 0x2B, 0x2C, 0x2D, 0x2E,
+            0x24, 0x25, 0x26, 0x27, 0x28, 0x2B, 0x2C, 0x2D, 0x2E,
             0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
             0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
             0x43, 0x45, 0x46, 0x47, 0x4B, 0x4F, 0x52, 0x54,
@@ -835,6 +835,7 @@ class TransportTests(unittest.TestCase):
             0x0E: ("addNotes", "selectedClipMetadata"),
             0x0F: ("removeNotes", "selectedClipPlayingPosition"),
             0x10: ("modifyNotes", "selectedClip"),
+            0x28: ("mixerControl", "deviceParameterLiveValue"),
             0x31: ("requestAutomationEnvelope", "automationEnvelope"),
             0x3E: ("flin", "browserSearchProgress"),
             0x47: ("setClipPositionFeedback", "clipPlayingPositions"),
@@ -844,6 +845,154 @@ class TransportTests(unittest.TestCase):
         for manufacturer_id, routes in expected.items():
             self.assertEqual(app[manufacturer_id].route, routes[0])
             self.assertEqual(remote[manufacturer_id].route, routes[1])
+
+    def test_protocol_58_mixer_gesture_groups_all_values_into_one_undo(self):
+        class Parameter:
+            min = 0.0
+            max = 1.0
+
+            def __init__(self):
+                self.value = 0.25
+                self.begin_count = 0
+                self.end_count = 0
+
+            def begin_gesture(self):
+                self.begin_count += 1
+
+            def end_gesture(self):
+                self.end_count += 1
+
+        class Harness:
+            _handle_mixer_control = extracted_method("_handle_mixer_control")
+            _finish_mixer_control_gesture = extracted_method("_finish_mixer_control_gesture")
+
+            def __init__(self):
+                self.parameter = Parameter()
+                self._active_mixer_control_gestures = {}
+                self.undo_begins = 0
+                self.undo_ends = 0
+
+            def _mixer_parameter_for_control(self, midi_channel, cc):
+                return self.parameter if (midi_channel, cc) == (5, 7) else None
+
+            def _begin_undo_step(self):
+                self.undo_begins += 1
+                return True
+
+            def _end_undo_step(self, started):
+                if started:
+                    self.undo_ends += 1
+
+            def _parameter_target_value_from_normalized(self, parameter, normalized):
+                return parameter.min + (parameter.max - parameter.min) * normalized
+
+        harness = Harness()
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 0, 20, 0xF7])
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 1, 32, 0xF7])
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 0, 64, 0xF7])
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 0, 100, 0xF7])
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 2, 100, 0xF7])
+        harness._handle_mixer_control([0xF0, 0x28, 5, 7, 2, 100, 0xF7])
+
+        self.assertEqual(SECRET_VERSION_NUMBER, 58)
+        self.assertAlmostEqual(harness.parameter.value, 100.0 / 127.0)
+        self.assertEqual(harness.parameter.begin_count, 1)
+        self.assertEqual(harness.parameter.end_count, 1)
+        self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 1))
+        self.assertEqual(harness._active_mixer_control_gestures, {})
+
+    def test_inactive_meter_expiry_repairs_a_missed_zero_without_clearing_a_tail(self):
+        class Harness:
+            MIXER_METER_INACTIVITY_TIMEOUT = 0.75
+            _expire_inactive_mixer_meters = extracted_method("_expire_inactive_mixer_meters")
+
+            def __init__(self):
+                self.mixer_status = True
+                self._last_meter_values = {
+                    (2, "left"): 73,
+                    (2, "right"): 68,
+                    (3, "left"): 73,
+                    (3, "right"): 68,
+                }
+                self._last_meter_activity_times = {
+                    (2, "left"): 1.0,
+                    (2, "right"): 1.0,
+                    (3, "left"): 1.5,
+                    (3, "right"): 1.5,
+                }
+                self.sent = []
+
+            def _song_is_playing(self):
+                return False
+
+            def _send_midi(self, message):
+                self.sent.append(message)
+
+        harness = Harness()
+        harness._expire_inactive_mixer_meters(now=2.0)
+
+        self.assertEqual(harness.sent, [
+            (0xB0 | 9, 2, 0),
+            (0xB0 | 10, 2, 0),
+        ])
+        self.assertEqual(harness._last_meter_values[(3, "left")], 73)
+        self.assertEqual(harness._last_meter_values[(3, "right")], 68)
+
+        harness._expire_inactive_mixer_meters(now=2.0)
+        self.assertEqual(len(harness.sent), 2)
+
+    def test_repeated_identical_low_meter_callback_extends_tail_activity(self):
+        class Track:
+            has_audio_output = True
+            output_meter_left = 0.01
+
+        class Harness:
+            _on_output_level_changed = extracted_method("_on_output_level_changed")
+
+            def __init__(self):
+                self.mixer_status = True
+                self._mixer_meter_targets = {2: Track()}
+                self._last_meter_values = {(2, "left"): 1}
+                self._last_meter_activity_times = {(2, "left"): 12.0}
+                self.sent = []
+
+            def _track_has_output_meter(self, track):
+                return bool(track and track.has_audio_output)
+
+            def _send_midi(self, message):
+                self.sent.append(message)
+
+        harness = Harness()
+        harness._on_output_level_changed(2, "left")
+        self.assertGreater(harness._last_meter_activity_times[(2, "left")], 12.0)
+        self.assertEqual(harness.sent, [])
+
+    def test_song_stop_does_not_clear_meters_while_tails_can_still_arrive(self):
+        class Harness:
+            _on_song_is_playing_changed = extracted_method("_on_song_is_playing_changed")
+
+            def __init__(self):
+                self.events = []
+
+            def _send_transport_state(self):
+                self.events.append("transport")
+
+            def _song_is_playing(self):
+                return False
+
+            def _flush_playing_note_feedback(self):
+                self.events.append("notes")
+
+            def _sync_follow_actions_to_transport(self):
+                self.events.append("follow-actions")
+
+        harness = Harness()
+        harness._on_song_is_playing_changed()
+
+        self.assertEqual(
+            harness.events,
+            ["transport", "notes", "follow-actions"],
+        )
 
     def test_every_registered_app_route_is_present_in_semantic_dispatch(self):
         full_handler = next(
@@ -1109,7 +1258,7 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(harness.currently_playing_notes[38])
         self.assertEqual(harness.seq_clip_playing_status, 0)
 
-    def test_v58_eq8_visualization_payload_has_fixed_compact_band_order_and_scale(self):
+    def test_eq8_visualization_payload_has_fixed_compact_band_order_and_scale(self):
         payload = EQ8VisualizationHarness()._eq8_visualization_payload()
         self.assertEqual(len(payload), 43)
         self.assertEqual(payload[:3], (1, 1, 95))
@@ -1117,7 +1266,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(payload[23], 0)  # Band 5 disabled flag.
         self.assertEqual(payload[-5:], (1, 127, 102, 64, 32))
 
-    def test_v58_eq8_overview_drag_edits_frequency_and_gain_in_one_undo(self):
+    def test_eq8_overview_drag_edits_frequency_and_gain_in_one_undo(self):
         harness = EQ8VisualizationHarness()
         harness._handle_eq8_visualization_edit(
             [0xF0, 0x65, 1, 1, 2, 0, 64, 96, 0, 0xF7]
@@ -1141,7 +1290,7 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(gain.value, 100.0 / 127.0)
         self.assertEqual((harness.undo_begins, harness.undo_ends), (1, 1))
 
-    def test_v58_eq8_overview_multitouch_waits_for_last_band_before_closing_undo(self):
+    def test_eq8_overview_multitouch_waits_for_last_band_before_closing_undo(self):
         harness = EQ8VisualizationHarness()
         harness._handle_eq8_visualization_edit(
             [0xF0, 0x65, 1, 1, 2, 0, 64, 96, 0, 0xF7]
@@ -5729,6 +5878,9 @@ class TransportTests(unittest.TestCase):
             _from_3_7bit_magnitude = extracted_method("_from_3_7bit_magnitude")
             _value_from_magnitude = extracted_method("_value_from_magnitude")
 
+            def __init__(self):
+                self.invalidations = []
+
             def song(self):
                 return song
 
@@ -5740,6 +5892,9 @@ class TransportTests(unittest.TestCase):
 
             def _mutator_allows_source_note_time(self, _clip, _time):
                 return True
+
+            def _invalidate_selected_clip(self, *fields, **options):
+                self.invalidations.append((fields, options))
 
         def five_byte(value):
             return [(value >> (shift * 7)) & 0x7F for shift in range(5)]
@@ -5754,7 +5909,8 @@ class TransportTests(unittest.TestCase):
             + magnitude(750)
             + [111, 96, 27, 0x08]
         )
-        Harness().handle_sysex([0xF0, 16, ord("_")] + record + [0xF7])
+        harness = Harness()
+        harness.handle_sysex([0xF0, 16, ord("_")] + record + [0xF7])
 
         self.assertEqual(note.pitch, 64)
         self.assertEqual(note.start_time, 0.5)
@@ -5763,6 +5919,7 @@ class TransportTests(unittest.TestCase):
         self.assertAlmostEqual(note.probability, 96 / 127.0)
         self.assertEqual(note.velocity_deviation, -27)
         self.assertEqual(clip.applied, (note,))
+        self.assertEqual(harness.invalidations, [(("notes",), {"immediate": True})])
 
     def test_unrelated_non_chunked_message_does_not_cancel_active_stream(self):
         harness = SysExHarness()
@@ -5870,13 +6027,41 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(flags & harness.NOTE_FLAG_NEGATIVE_VELOCITY_DEVIATION, 0x08)
         self.assertEqual(flags & harness.NOTE_FLAG_NEGATIVE_START, 0)
 
-    def test_note_addition_reports_exact_ids_only_for_selection_transactions(self):
+    def test_direct_note_edits_publish_authoritative_state_immediately(self):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertIn("before_ids = {", source)
         self.assertIn("added_ids = [int(note.note_id)", source)
         addition = source[source.index("# add MULTIPLE notes"):source.index("# remove note (also multiple)")]
         self.assertIn("if transaction_id is not None:", addition)
         self.assertNotIn("self.send_selected_clip_notes()", addition)
+        self.assertIn('self._invalidate_selected_clip("notes", immediate=True)', addition)
+
+        modification = source[source.index("# modify MULTIPLE notes"):source.index("# markers")]
+        self.assertIn('self._invalidate_selected_clip("notes", immediate=True)', modification)
+
+        removal = source[source.index("# remove note (also multiple)"):source.index("# modify MULTIPLE notes")]
+        self.assertIn('self._invalidate_selected_clip("notes", immediate=True)', removal)
+
+        markers = source[source.index("# markers"):source.index("# visible channel and mixer status true")]
+        self.assertIn('"metadata", "audio", immediate=True', markers)
+
+    def test_completed_clip_edit_paths_bypass_the_scheduler_tick(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        for method_name in (
+            "_flin_rebuild_clip",
+            "_replace_rhythm_generator_lane",
+            "_refresh_visible_mutator_clip",
+            "_apply_decoupled_note_loop",
+            "_apply_decoupled_automation_length",
+            "_duplicate_loop",
+            "_multiply_loop_by_two",
+        ):
+            method = next(
+                node for node in tap_class_node().body
+                if isinstance(node, ast.FunctionDef) and node.name == method_name
+            )
+            method_source = ast.get_source_segment(source, method)
+            self.assertIn("immediate=True", method_source, method_name)
 
     def test_native_note_duplicate_preserves_live_owned_expression(self):
         expression = object()
@@ -6013,11 +6198,10 @@ class TransportTests(unittest.TestCase):
             def _debug_log(self, message):
                 raise AssertionError(message)
 
-            def send_selected_clip_metadata(self):
-                self.sent_metadata = True
-
-            def send_selected_clip_notes(self):
-                self.sent_notes = True
+            def _invalidate_selected_clip(self, *fields, **options):
+                self.sent_metadata = "metadata" in fields
+                self.sent_notes = "notes" in fields
+                self.immediate = options.get("immediate", False)
 
         harness = Harness()
         harness._multiply_loop_by_two(0, 0)
@@ -6031,6 +6215,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(harness.stretched_automation, (0.0, 4.0, 8.0, None, None))
         self.assertTrue(harness.sent_metadata)
         self.assertTrue(harness.sent_notes)
+        self.assertTrue(harness.immediate)
 
     def test_native_duplicate_loop_invalidates_authored_cache_and_publishes_new_length(self):
         class Clip:
@@ -6075,11 +6260,10 @@ class TransportTests(unittest.TestCase):
             def _end_undo_step(self, _started):
                 pass
 
-            def send_selected_clip_metadata(self):
-                self.sent_metadata = True
-
-            def send_selected_clip_notes(self):
-                self.sent_notes = True
+            def _invalidate_selected_clip(self, *fields, **options):
+                self.sent_metadata = "metadata" in fields
+                self.sent_notes = "notes" in fields
+                self.immediate = options.get("immediate", False)
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -6092,6 +6276,7 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(harness.cleared)
         self.assertTrue(harness.sent_metadata)
         self.assertTrue(harness.sent_notes)
+        self.assertTrue(harness.immediate)
 
     def test_decoupled_duplicate_doubles_only_the_logical_note_loop(self):
         previous_info = {
@@ -6395,11 +6580,10 @@ class TransportTests(unittest.TestCase):
             def _end_undo_step(self, _started):
                 pass
 
-            def send_selected_clip_metadata(self):
-                self.sent_metadata = True
-
-            def send_selected_clip_notes(self):
-                self.sent_notes = True
+            def _invalidate_selected_clip(self, *fields, **options):
+                self.sent_metadata = "metadata" in fields
+                self.sent_notes = "notes" in fields
+                self.immediate = options.get("immediate", False)
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -6422,6 +6606,7 @@ class TransportTests(unittest.TestCase):
             harness.stretched_automation,
             (0.0, 16.0, 32.0, previous_info, doubled_info)
         )
+        self.assertTrue(harness.immediate)
         self.assertTrue(harness.sent_metadata)
         self.assertTrue(harness.sent_notes)
 
@@ -6827,7 +7012,7 @@ class TransportTests(unittest.TestCase):
         marked._on_clip_has_clip_changed(marked.track, 0, marked.slot)
         self.assertEqual(marked.rescans, 3)
 
-    def test_highlighted_clip_replacement_queues_one_step_seq_rebind(self):
+    def test_highlighted_clip_replacement_rebinds_immediately_once(self):
         class Slot:
             def __init__(self, clip):
                 self.clip = clip
@@ -6850,8 +7035,8 @@ class TransportTests(unittest.TestCase):
         class Harness:
             FOLLOW_ACTION_NAME_MARKER_RE = re.compile(r"\s*\[TapFA:v1\|([^\]]*)\]")
             _on_clip_has_clip_changed = extracted_method("_on_clip_has_clip_changed")
-            _queue_highlighted_step_seq_rebind = extracted_method(
-                "_queue_highlighted_step_seq_rebind"
+            _rebind_highlighted_step_seq = extracted_method(
+                "_rebind_highlighted_step_seq"
             )
             on_highlighted_slot_changed = extracted_method("on_highlighted_slot_changed")
 
@@ -6862,10 +7047,9 @@ class TransportTests(unittest.TestCase):
                     "view": type("View", (), {"highlighted_clip_slot": self.slot})()
                 })()
                 self.seq_status = True
-                self._remote_refresh_generation = 4
-                self._step_seq_rebind_scheduled = False
+                self.last_selected_clip_slot = self.slot
+                self._step_seq_listener_clip = None
                 self._follow_action_rules = {}
-                self.scheduled = []
                 self.started = 0
 
             def song(self):
@@ -6898,11 +7082,10 @@ class TransportTests(unittest.TestCase):
             def _set_up_notes_playing(self, _value):
                 pass
 
-            def schedule_message(self, ticks, callback):
-                self.scheduled.append((ticks, callback))
-
             def start_step_seq(self):
                 self.started += 1
+                self.last_selected_clip_slot = self.slot
+                self._step_seq_listener_clip = self.slot.clip
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -6913,16 +7096,7 @@ class TransportTests(unittest.TestCase):
         # observe a transition; they must produce one rebind/snapshot boundary.
         harness._on_clip_has_clip_changed(harness.track, 0, harness.slot)
         harness.on_highlighted_slot_changed()
-        self.assertEqual(len(harness.scheduled), 1)
-        harness.scheduled[0][1]()
         self.assertEqual(harness.started, 1)
-        self.assertFalse(harness._step_seq_rebind_scheduled)
-
-        stale = Harness()
-        stale._on_clip_has_clip_changed(stale.track, 0, stale.slot)
-        stale._remote_refresh_generation += 1
-        stale.scheduled[0][1]()
-        self.assertEqual(stale.started, 0)
 
     def test_playing_status_does_not_scan_slots_without_follow_rules(self):
         class NoIterationSlots:

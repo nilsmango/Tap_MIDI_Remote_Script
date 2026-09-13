@@ -149,6 +149,7 @@ class Tap(ControlSurface):
     DECOUPLED_AUTOMATION_MAX_PHYSICAL_BARS = 64
     PARAMETER_DISPLAY_FEEDBACK_INTERVAL = 0.03
     VISUAL_FEEDBACK_INTERVAL = 0.1
+    MIXER_METER_INACTIVITY_TIMEOUT = 0.75
     CLIP_PLAYING_STATUS_CC = 70
     CLIP_PLAYING_STATUS_CHANNEL = 11
     SYSEX_APP_TO_REMOTE = TAP_SYSEX_APP_TO_REMOTE
@@ -284,6 +285,7 @@ class Tap(ControlSurface):
             self._master_level_listeners = {}
             self._mixer_meter_targets = {}
             self._last_meter_values = {}
+            self._last_meter_activity_times = {}
             self._disabled_parameter_listeners = {}
             self._disabled_parameters = []
             self._current_disabled_controls = []
@@ -464,7 +466,6 @@ class Tap(ControlSurface):
             self._remote_state_flush_scheduled = False
             self._remote_refresh_generation = 0
             self._scene_topology_refresh_scheduled = False
-            self._step_seq_rebind_scheduled = False
             self._previous_selected_track = None
             self._periodic_timer_ref = None
             self._last_clip_slot_integrity_check = 0.0
@@ -487,6 +488,7 @@ class Tap(ControlSurface):
             self._mixer_automation_status_specs = []
             self._mixer_automation_state_listeners = []
             self._mixer_automation_status_timers = []
+            self._active_mixer_control_gestures = {}
             self._track_device_selected = False
             self._track_control_selection_by_track = {}
             self._track_control_bank_index_by_track = {}
@@ -3782,7 +3784,6 @@ class Tap(ControlSurface):
         self._selected_clip_update_pending_metadata = False
         self._selected_clip_update_pending_notes = False
         self._scene_topology_refresh_scheduled = False
-        self._step_seq_rebind_scheduled = False
         self._selected_track_device_topology_refresh_scheduled = False
         self._drum_pad_names_refresh_scheduled = False
         self._last_selected_clip_notes_signature = None
@@ -7172,6 +7173,7 @@ class Tap(ControlSurface):
             )
             self._performance_diagnostics.maybe_emit_summary()
             return
+        self._expire_inactive_mixer_meters()
         # Selected-track Simpler, group-fold state, and clip-slot changes are
         # listener-driven.  Do not periodically traverse an unchanged Live Set
         # as a speculative integrity scan; initial state and explicit resync
@@ -8660,7 +8662,7 @@ class Tap(ControlSurface):
 
         if recorded_parameter_found:
             self._refresh_parameter_metadata_on_automation_change()
-            self.send_selected_clip_metadata()
+            self._invalidate_selected_clip("metadata", "audio", immediate=True)
 
     def _decoupled_automation_marker(self, info):
         return "[TapAuto:v2|{:.6f}|{:.6f}|{}]".format(
@@ -12446,6 +12448,29 @@ class Tap(ControlSurface):
             key: value for key, value in self._last_meter_values.items()
             if key[0] in visible_indexes
         }
+        self._last_meter_activity_times = {
+            key: value for key, value in self._last_meter_activity_times.items()
+            if key[0] in visible_indexes
+        }
+
+    def _expire_inactive_mixer_meters(self, now=None):
+        # Live occasionally omits the listener callback for the final
+        # transition to silence. After transport stops, preserve every meter
+        # that is still producing callbacks (including long effect tails) and
+        # clear only values whose individual callback stream has gone quiet.
+        if not self.mixer_status or self._song_is_playing():
+            return
+        current_time = time.monotonic() if now is None else float(now)
+        for key, value in list(self._last_meter_values.items()):
+            if value == 0:
+                continue
+            last_activity = self._last_meter_activity_times.get(key, current_time)
+            if current_time - last_activity < self.MIXER_METER_INACTIVITY_TIMEOUT:
+                continue
+            index, side = key
+            self._last_meter_values[key] = 0
+            channel = 9 if side == "left" else 10
+            self._send_midi((0xB0 | channel, index, 0))
 
     def _foldable_group_track_for_track(self, track):
         try:
@@ -12591,6 +12616,7 @@ class Tap(ControlSurface):
                 self._remove_output_meter_listener_pair(master_track, left_listener, right_listener)
                 self._master_level_listeners.clear()
             self._last_meter_values.clear()
+            self._last_meter_activity_times.clear()
             self._track_list_signature = track_signature
 
             # 2. Build track names, types, colors and send via SysEx
@@ -12671,12 +12697,85 @@ class Tap(ControlSurface):
             pass
 
     def _release_mixer_controls(self):
+        self._finish_all_mixer_control_gestures()
         for control in list(getattr(self, '_mixer_automation_controls', [])):
             try:
                 control.release_parameter()
             except Exception:
                 pass
         self._mixer_automation_controls = []
+
+    def _mixer_parameter_for_control(self, midi_channel, cc):
+        for spec in self._mixer_automation_status_specs:
+            if spec[0] == midi_channel and spec[1] == cc:
+                return self._mixer_parameter(*spec[2:])
+        return None
+
+    def _finish_mixer_control_gesture(self, key):
+        active = self._active_mixer_control_gestures.pop(key, None)
+        if active is None:
+            return
+
+        parameter, undo_step_started = active
+        try:
+            if parameter and liveobj_valid(parameter) and hasattr(parameter, 'end_gesture'):
+                parameter.end_gesture()
+        except Exception:
+            pass
+        self._end_undo_step(undo_step_started)
+
+    def _finish_all_mixer_control_gestures(self):
+        for key in list(getattr(self, '_active_mixer_control_gestures', {})):
+            self._finish_mixer_control_gesture(key)
+
+    def _handle_mixer_control(self, message):
+        # Strict v58 order mirrored by TapMixerControlWire:
+        # F0, 28, channel, CC, gesture state, 7-bit value, F7.
+        if (len(message) != 7 or message[0] != 0xF0 or message[1] != 0x28
+                or message[-1] != 0xF7):
+            return
+
+        midi_channel, cc, gesture_state, value = message[2:6]
+        if (not 0 <= midi_channel <= 15 or not 0 <= cc <= 127
+                or gesture_state not in (0, 1, 2) or not 0 <= value <= 127):
+            return
+
+        key = (midi_channel, cc)
+        if gesture_state == 1:
+            if key in self._active_mixer_control_gestures:
+                return
+            parameter = self._mixer_parameter_for_control(midi_channel, cc)
+            if parameter is None or not liveobj_valid(parameter):
+                return
+
+            undo_step_started = self._begin_undo_step()
+            try:
+                if hasattr(parameter, 'begin_gesture'):
+                    parameter.begin_gesture()
+            except Exception:
+                self._end_undo_step(undo_step_started)
+                return
+            self._active_mixer_control_gestures[key] = (parameter, undo_step_started)
+            return
+
+        if gesture_state == 2:
+            self._finish_mixer_control_gesture(key)
+            return
+
+        active = self._active_mixer_control_gestures.get(key)
+        if active is None:
+            return
+        parameter = active[0]
+        try:
+            if not liveobj_valid(parameter) or parameter.max == parameter.min:
+                return
+            target_value = self._parameter_target_value_from_normalized(
+                parameter, float(value) / 127.0
+            )
+            if parameter.value != target_value:
+                parameter.value = target_value
+        except Exception:
+            pass
 
     def _disconnect_mixer_component_controls(self):
         try:
@@ -12885,6 +12984,10 @@ class Tap(ControlSurface):
             return
 
         cache_key = (index, side)
+        # The listener firing is the activity signal, even when multiple raw
+        # levels quantize to the same 0...100 MIDI value. That preserves real
+        # post-stop tails; expiry is reserved for an actual callback gap.
+        self._last_meter_activity_times[cache_key] = time.monotonic()
         if not force and self._last_meter_values.get(cache_key) == value:
             return
         self._last_meter_values[cache_key] = value
@@ -13572,46 +13675,39 @@ class Tap(ControlSurface):
                 self._sync_clip_color_listeners_for_track(track)
                 self._set_up_notes_playing("clip")
                 if getattr(self, "seq_status", False):
-                    self._queue_highlighted_step_seq_rebind(clip_slot)
+                    self._rebind_highlighted_step_seq(clip_slot)
                 return
         self._update_clip_slots()
         self._set_up_notes_playing("clip")
 
-    def _queue_highlighted_step_seq_rebind(self, clip_slot):
-        """Coalesce selected-slot clip replacement after Live settles."""
+    def _rebind_highlighted_step_seq(self, clip_slot):
+        """Bind a newly materialized highlighted clip without a scheduler delay."""
         if not getattr(self, "seq_status", False):
             return
         try:
             if self.song().view.highlighted_clip_slot is not clip_slot:
                 return
+            selected_clip = clip_slot.clip if clip_slot.has_clip else None
         except Exception:
             return
-        if self._step_seq_rebind_scheduled:
+
+        # Both the authoritative clip-slot listener and the temporary
+        # empty-slot listener can observe the same transition. start_step_seq
+        # updates these identities synchronously, so the second callback is a
+        # cheap no-op without holding the first one for a Live scheduler tick.
+        if (
+            getattr(self, "last_selected_clip_slot", None) is clip_slot
+            and getattr(self, "_step_seq_listener_clip", None) is selected_clip
+        ):
             return
-        self._step_seq_rebind_scheduled = True
-        generation = self._remote_refresh_generation
-
-        def rebind_if_current():
-            if generation != self._remote_refresh_generation:
-                return
-            self._step_seq_rebind_scheduled = False
-            try:
-                if (
-                    self.seq_status
-                    and self.song().view.highlighted_clip_slot is clip_slot
-                ):
-                    self.start_step_seq()
-            except Exception as error:
-                self._debug_log(
-                    "Exception rebinding highlighted step-sequencer clip: {}".format(
-                        str(error)
-                    )
-                )
-
         try:
-            self.schedule_message(1, rebind_if_current)
-        except Exception:
-            rebind_if_current()
+            self.start_step_seq()
+        except Exception as error:
+            self._debug_log(
+                "Exception rebinding highlighted step-sequencer clip: {}".format(
+                    str(error)
+                )
+            )
 
     def _clip_slot_state_and_color(self, track, clip_slot):
         try:
@@ -13744,7 +13840,7 @@ class Tap(ControlSurface):
         rebuilt_flin = self._rebuild_visible_melodic_flin()
         if not rebuilt_flin:
             try:
-                self.send_selected_clip_metadata()
+                self._invalidate_selected_clip("metadata", "audio", immediate=True)
             except Exception:
                 pass
 
@@ -14044,8 +14140,9 @@ class Tap(ControlSurface):
             self._end_undo_step(undo_step_started)
             self._end_selected_clip_update_batch()
         if send_updates:
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            self._invalidate_selected_clip(
+                "metadata", "audio", "notes", immediate=True
+            )
         return True
 
     def _flin_settings_from_payload(self, parts):
@@ -14136,7 +14233,9 @@ class Tap(ControlSurface):
                     not 0 <= self._flin_raw_pitch(info, column) <= 127
                     for column in info.get("columns", []) if column.get("active", False)
                 ):
-                    self.send_selected_clip_metadata()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
                     return
                 self._flin_rebuild_clip(clip, info)
                 return
@@ -14204,7 +14303,9 @@ class Tap(ControlSurface):
                     self._flin_rebuild_clip(clip, info)
                 else:
                     self._save_flin_info_to_name(clip, info)
-                    self.send_selected_clip_metadata()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
             elif action == "transpose" and len(parts) >= 3:
                 amount = max(-64, min(63, int(parts[2])))
                 candidate = dict(info)
@@ -14219,7 +14320,9 @@ class Tap(ControlSurface):
                     info["global_offset"] = candidate["global_offset"]
                     self._flin_rebuild_clip(clip, info)
                 else:
-                    self.send_selected_clip_metadata()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
             elif action == "density" and len(parts) >= 3:
                 target_mode = max(0, min(3, int(parts[2])))
                 self._flin_remap_density(info, target_mode)
@@ -14227,7 +14330,9 @@ class Tap(ControlSurface):
                     not 0 <= self._flin_raw_pitch(info, column) <= 127
                     for column in info.get("columns", []) if column.get("active", False)
                 ):
-                    self.send_selected_clip_metadata()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
                     return
                 self._flin_rebuild_clip(clip, info)
             elif action == "view" and len(parts) >= 3:
@@ -14237,7 +14342,9 @@ class Tap(ControlSurface):
                 if all(0 <= self._flin_raw_pitch(candidate, column) <= 127 for column in self._flin_visible_columns(candidate)):
                     info["view_page"] = target
                     self._save_flin_info_to_name(clip, info)
-                    self.send_selected_clip_metadata()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
             elif action == "velocity" and len(parts) >= 3:
                 delta = max(-127, min(127, int(parts[2])))
                 info["default_velocity"] = max(1, min(127, int(info.get("default_velocity", 100)) + delta))
@@ -14265,8 +14372,9 @@ class Tap(ControlSurface):
                 self._flin_rebuild_clip(clip, info)
             elif action == "exit":
                 self._remove_flin_info_from_name(clip)
-                self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                self._invalidate_selected_clip(
+                    "metadata", "audio", "notes", immediate=True
+                )
         except Exception as e:
             self._debug_log("Error handling Flin command: {}".format(str(e)))
 
@@ -14745,6 +14853,11 @@ class Tap(ControlSurface):
                         clip.add_new_notes(repeated_notes)
                 else:
                     clip.add_new_notes(new_notes)
+                # The note-listener coalescer adds a full Live scheduler tick
+                # to Tap's visible response. Publish the authoritative
+                # post-edit snapshot now; any listener duplicate is still
+                # suppressed by the snapshot signature.
+                self._invalidate_selected_clip("notes", immediate=True)
                 if transaction_id is not None:
                     after_notes = list(clip.get_notes_extended(0, 128, clip_start, clip_length))
                     added_ids = [int(note.note_id) for note in after_notes if int(note.note_id) not in before_ids]
@@ -14760,6 +14873,7 @@ class Tap(ControlSurface):
         # remove note (also multiple)
         if len(message) >= 2 and route == "removeNotes":
             note_ids = []
+            did_remove_notes = False
             index = 2
             while index + 5 <= (len(message) - 1):
                 note_id = self._from_5_7bit_bytes(message, index)
@@ -14793,6 +14907,7 @@ class Tap(ControlSurface):
                                 break
                     if matching_ids:
                         clip.remove_notes_by_id(tuple(matching_ids))
+                        did_remove_notes = True
                 else:
                     clip_start = min(clip.start_time, clip.start_marker, clip.loop_start) - self.clip_length_trick
                     clip_length = (max(clip.loop_end, clip.end_marker, clip.length) + self.clip_length_trick) - clip_start
@@ -14805,6 +14920,9 @@ class Tap(ControlSurface):
                         return
                     # Remove the note by ID
                     clip.remove_notes_by_id(note_ids)
+                    did_remove_notes = True
+                if did_remove_notes:
+                    self._invalidate_selected_clip("notes", immediate=True)
         
         # modify MULTIPLE notes
         if len(message) >= 3 and route == "modifyNotes":
@@ -14918,6 +15036,7 @@ class Tap(ControlSurface):
                 # Apply the modified notes back to the clip
                 if did_modify_notes:
                     clip.apply_note_modifications(notes)
+                    self._invalidate_selected_clip("notes", immediate=True)
         
         # markers
         if len(message) >= 7 and route == "clipMarker":
@@ -14940,10 +15059,13 @@ class Tap(ControlSurface):
             clip_slot = song.view.highlighted_clip_slot
             if clip_slot is not None and clip_slot.has_clip:
                 clip = clip_slot.clip
+                refresh_metadata_immediately = False
                 if marker_id == 0:
                     clip.start_marker = marker_time
+                    refresh_metadata_immediately = True
                 elif marker_id == 1:
                     clip.end_marker = marker_time
+                    refresh_metadata_immediately = True
                 elif marker_id == 2:
                     decoupled_info = self._decoupled_automation_info(clip)
                     if decoupled_info:
@@ -14952,6 +15074,7 @@ class Tap(ControlSurface):
                         self._apply_decoupled_note_loop(clip, marker_time, note_length, send_updates=True)
                     else:
                         clip.loop_start = marker_time
+                        refresh_metadata_immediately = True
                 else:
                     decoupled_info = self._decoupled_automation_info(clip)
                     if decoupled_info:
@@ -14959,6 +15082,11 @@ class Tap(ControlSurface):
                         self._apply_decoupled_note_loop(clip, decoupled_info["note_start"], note_length, send_updates=True)
                     else:
                         clip.loop_end = marker_time
+                        refresh_metadata_immediately = True
+                if refresh_metadata_immediately:
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", immediate=True
+                    )
         
         # visible channel and mixer status true
         if len(message) >= 5 and route == "visibleMixerRange":
@@ -15045,6 +15173,9 @@ class Tap(ControlSurface):
             return
         if len(message) >= 2 and route == "highResolutionDeviceControl":
             self._set_device_control_high_resolution(message)
+        if len(message) >= 2 and route == "mixerControl":
+            self._handle_mixer_control(message)
+            return
         if len(message) >= 2 and route == "toggleGroupFold":
             decoded = self._decode_wide_index_message(message, prefix_count=0, index_count=1)
             if decoded is not None:
@@ -15145,8 +15276,9 @@ class Tap(ControlSurface):
 
             if specs:
                 clip.add_new_notes(tuple(specs))
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            self._invalidate_selected_clip(
+                "metadata", "audio", "notes", immediate=True
+            )
         except Exception as e:
             self._debug_log("Error replacing rhythm generator lane: {}".format(str(e)))
 
@@ -17321,9 +17453,10 @@ class Tap(ControlSurface):
                 and highlighted_clip_slot.has_clip
                 and self._live_object_identity(highlighted_clip_slot.clip) == self._live_object_identity(clip)
             ):
-                self.send_selected_clip_metadata()
-                if send_notes:
-                    self.send_selected_clip_notes()
+                fields = ("metadata", "audio", "notes") if send_notes else (
+                    "metadata", "audio"
+                )
+                self._invalidate_selected_clip(*fields, immediate=True)
         except Exception:
             pass
 
@@ -17951,8 +18084,9 @@ class Tap(ControlSurface):
             clip.loop_end = source_end
             clip.end_marker = clip.loop_end
             self._remove_mutator_info_from_name(clip)
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            self._invalidate_selected_clip(
+                "metadata", "audio", "notes", immediate=True
+            )
         except Exception as e:
             self._debug_log("Error ending mutator clip: {}".format(str(e)))
 
@@ -17972,8 +18106,9 @@ class Tap(ControlSurface):
             clip.loop_end = source_start + max(0.0001, structure_length)
             clip.end_marker = clip.loop_end
             self._remove_mutator_info_from_name(clip)
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            self._invalidate_selected_clip(
+                "metadata", "audio", "notes", immediate=True
+            )
         except Exception as e:
             self._debug_log("Error unfolding mutator clip: {}".format(str(e)))
 
@@ -18022,8 +18157,9 @@ class Tap(ControlSurface):
                 clip.loop_end = note_start + note_length
                 clip.end_marker = note_start + note_length
                 if send_updates:
-                    self.send_selected_clip_metadata()
-                    self.send_selected_clip_notes()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", "notes", immediate=True
+                    )
                 return
 
             max_physical_length = self._decoupled_automation_max_physical_length(clip, note_length)
@@ -18050,8 +18186,9 @@ class Tap(ControlSurface):
             clip.end_marker = info["physical_end"]
             self._save_decoupled_automation_info_to_name(clip, info)
             if send_updates:
-                self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                self._invalidate_selected_clip(
+                    "metadata", "audio", "notes", immediate=True
+                )
         except Exception as e:
             self._debug_log("Error applying decoupled note loop: {}".format(str(e)))
 
@@ -18119,8 +18256,9 @@ class Tap(ControlSurface):
                 clip.loop_end = note_start + note_length
                 clip.end_marker = note_start + note_length
                 if send_updates:
-                    self.send_selected_clip_metadata()
-                    self.send_selected_clip_notes()
+                    self._invalidate_selected_clip(
+                        "metadata", "audio", "notes", immediate=True
+                    )
                 return
 
             physical_length = self._decoupled_physical_length(note_length, automation_lengths.values(), max_physical_length)
@@ -18148,8 +18286,9 @@ class Tap(ControlSurface):
             clip.end_marker = info["physical_end"]
             self._save_decoupled_automation_info_to_name(clip, info)
             if send_updates:
-                self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                self._invalidate_selected_clip(
+                    "metadata", "audio", "notes", immediate=True
+                )
         except Exception as e:
             self._debug_log("Error applying decoupled automation length: {}".format(str(e)))
 
@@ -18169,8 +18308,9 @@ class Tap(ControlSurface):
             clip.loop_end = info["physical_end"]
             clip.end_marker = info["physical_end"]
             self._remove_decoupled_automation_info_from_name(clip)
-            self.send_selected_clip_metadata()
-            self.send_selected_clip_notes()
+            self._invalidate_selected_clip(
+                "metadata", "audio", "notes", immediate=True
+            )
         except Exception as e:
             self._debug_log("Error unfolding decoupled automation clip: {}".format(str(e)))
 
@@ -18603,8 +18743,9 @@ class Tap(ControlSurface):
                 clip.start_marker = min(float(getattr(clip, "start_marker", note_start)), note_start)
                 clip.loop_end = note_start + note_length
                 clip.end_marker = note_start + note_length
-                self.send_selected_clip_metadata()
-                self.send_selected_clip_notes()
+                self._invalidate_selected_clip(
+                    "metadata", "audio", "notes", immediate=True
+                )
 
             self._automation_clear_response(control_index, current_value)
             self._refresh_parameter_metadata_on_automation_change()
@@ -23117,8 +23258,9 @@ class Tap(ControlSurface):
 
         # Listener callbacks were intentionally suppressed during the atomic
         # operation, so publish the new loop length and notes in both modes.
-        self.send_selected_clip_metadata()
-        self.send_selected_clip_notes()
+        self._invalidate_selected_clip(
+            "metadata", "audio", "notes", immediate=True
+        )
 
     def _multiply_loop_by_two(self, track_index, clip_index):
         tracks = list(self.song().tracks)
@@ -23202,8 +23344,9 @@ class Tap(ControlSurface):
             self._end_undo_step(undo_step_started)
             self._end_selected_clip_update_batch()
 
-        self.send_selected_clip_metadata()
-        self.send_selected_clip_notes()
+        self._invalidate_selected_clip(
+            "metadata", "audio", "notes", immediate=True
+        )
 
     def _set_midi_clip_looping(self, track_index, clip_index, looping):
         tracks = list(self.song().tracks)
@@ -23221,6 +23364,7 @@ class Tap(ControlSurface):
             clip.looping = bool(looping)
         finally:
             self._end_undo_step(undo_step_started)
+        self._invalidate_selected_clip("metadata", "audio", immediate=True)
 
     def _copy_paste_clip(self, from_track, from_clip, to_track, to_clip):
         tracks = list(self.song().tracks)
@@ -24110,11 +24254,11 @@ class Tap(ControlSurface):
             if selected_clip_slot.has_clip_has_listener(self.on_highlighted_slot_changed):
                 selected_clip_slot.remove_has_clip_listener(self.on_highlighted_slot_changed)
 
-            # The authoritative clip-slot listener queues the same rebind.
-            # Keep this path coalesced so an empty-to-clip transition cannot
-            # serialize one snapshot here and another on the next Live tick.
+            # The authoritative clip-slot listener may observe the same
+            # transition. The identity guard makes that second callback a
+            # no-op while allowing this first callback to bind immediately.
             if self.seq_status:
-                self._queue_highlighted_step_seq_rebind(selected_clip_slot)
+                self._rebind_highlighted_step_seq(selected_clip_slot)
                 return
 
             selected_clip = selected_clip_slot.clip
@@ -26508,6 +26652,7 @@ class Tap(ControlSurface):
         self._active_high_resolution_gestures.clear()
         for control_index in list(getattr(self, '_active_high_resolution_undo_steps', set())):
             self._end_high_resolution_undo_step(control_index)
+        self._finish_all_mixer_control_gestures()
         
         self._finish_eq8_visualization_edit()
         self._remove_parameter_value_listeners()
