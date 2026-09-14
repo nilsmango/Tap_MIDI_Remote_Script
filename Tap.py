@@ -223,7 +223,16 @@ class Tap(ControlSurface):
     AUTOMATION_PENCIL_INACTIVITY_TIMEOUT = 8.0
     AUTOMATION_EXACT_STREAM_INACTIVITY_TIMEOUT = 8.0
     AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
+    # Nearby reads need a wider guard because Live can round a requested time
+    # by a few microbeats. That guard is not the definition of one timestamp:
+    # micro-spread verticals and close shape endpoints remain distinct groups.
+    AUTOMATION_EXACT_SAME_TIME_TOLERANCE = 0.000001
     AUTOMATION_EXACT_EVENT_TIME_TOLERANCE = 0.00001
+    # Live can append one equal-time create_event pair and prepend another,
+    # even inside the same envelope. Ordinary delta edits cannot safely probe
+    # and rewrite those groups, so make affected verticals microscopically
+    # distinct before their one creation pass. At 60 BPM this is 20 us.
+    AUTOMATION_EXACT_VERTICAL_TIME_SPACING = 0.00002
     # Keep False for normal use. To restore the complete automation transport
     # trace, set this to True and also set
     # TapAutomationExactWire.diagnosticTracingEnabled = true in TapProtocol.swift,
@@ -9983,32 +9992,48 @@ class Tap(ControlSurface):
             start = float(start)
             minimum_span = max(0.0000001, float(endpoint_padding))
             end = max(start + minimum_span, float(end))
-            envelope.delete_events_in_range(start, end + max(0.0000001, float(endpoint_padding)))
-            # A point's coefficients describe its outgoing segment. Create the
-            # right-hand endpoint first so that segment already exists when
-            # Live validates and stores the left point's coefficients. Creating
-            # left-to-right can silently leave that point linear until the next
-            # full rewrite/refresh exposes the loss.
             sorted_steps = self._automation_sorted_steps(steps)
             time_groups = []
             for step in sorted_steps:
                 if not time_groups or abs(float(step[0]) - float(time_groups[-1][0][0])) > 0.000001:
                     time_groups.append([])
                 time_groups[-1].append(step)
-            # Descend by time, but retain authored order within a same-time
-            # group: those pairs encode a real vertical edge.
-            for time_group in reversed(time_groups):
-                for step in time_group:
-                    if step[0] < start - 0.000001 or step[0] > end + 0.000001:
-                        continue
-                    raw_value = self._parameter_target_value_from_normalized(
-                        device_param,
-                        step[2]
+
+            def create_complete_pass(reversed_group_times):
+                envelope.delete_events_in_range(
+                    start,
+                    end + max(0.0000001, float(endpoint_padding))
+                )
+                # A point's coefficients describe its outgoing segment. Create
+                # the right-hand endpoint first so it exists when Live stores
+                # the left point's controls. Equal-time direction is chosen
+                # per group from the probe pass below.
+                for time_group in reversed(time_groups):
+                    group_time = float(time_group[0][0])
+                    creation_steps = (
+                        tuple(reversed(time_group))
+                        if group_time in reversed_group_times
+                        else time_group
                     )
-                    self._create_automation_event(envelope, step[0], raw_value, step)
+                    for step in creation_steps:
+                        if step[0] < start - 0.000001 or step[0] > end + 0.000001:
+                            continue
+                        raw_value = self._parameter_target_value_from_normalized(
+                            device_param,
+                            step[2]
+                        )
+                        self._create_automation_event(
+                            envelope, step[0], raw_value, step
+                        )
+
+            # The first pass is both a valid write for envelopes that append
+            # equal-time events and a cheap orientation probe for runtimes that
+            # prepend them.
+            create_complete_pass(())
+            reversed_group_times = set()
 
             # Live versions have differed in whether consecutive same-time
-            # create_event calls append or prepend. Verify using the returned
+            # create_event calls append or prepend. Probe using the returned
             # raw event order, whose value mapping is monotonic. Sampling the
             # audible sides is unsafe here because a neighbouring exact corner
             # can already have jumped toward another event.
@@ -10026,46 +10051,39 @@ class Tap(ControlSurface):
                         continue
                     group_time = float(time_group[0][0])
                     try:
-                        def stored_group():
-                            return tuple(
-                                event for event in envelope.events_in_range(
-                                    group_time - guard, group_time + guard
-                                )
-                                if abs(float(event.time) - group_time) <= guard
+                        stored_group = tuple(
+                            event for event in envelope.events_in_range(
+                                group_time - guard, group_time + guard
                             )
-
-                        def direction_matches(events):
-                            if len(events) != len(time_group):
-                                return False
-                            authored_direction = (
-                                float(time_group[-1][2]) - float(time_group[0][2])
-                            )
-                            stored_direction = (
-                                float(events[-1].value) - float(events[0].value)
-                            )
-                            return authored_direction * stored_direction >= 0
-
-                        if direction_matches(stored_group()):
-                            continue
-                        envelope.delete_events_in_range(
-                            group_time - guard, group_time + guard
+                            if abs(float(event.time) - group_time) <= guard
                         )
-                        for step in reversed(time_group):
-                            raw_value = self._parameter_target_value_from_normalized(
-                                device_param, step[2]
-                            )
-                            self._create_automation_event(
-                                envelope, step[0], raw_value, step
-                            )
-                        # Do not report success merely because the corrective
-                        # calls completed. Some device envelopes expose their
-                        # final equal-time order only on the following read.
-                        if not direction_matches(stored_group()):
+                        if len(stored_group) != len(time_group):
                             return False
+                        authored_direction = (
+                            float(time_group[-1][2]) - float(time_group[0][2])
+                        )
+                        stored_direction = (
+                            float(stored_group[-1].value)
+                            - float(stored_group[0].value)
+                        )
+                        if authored_direction * stored_direction < 0:
+                            reversed_group_times.add(group_time)
                     except Exception as e:
                         self._debug_log(
                             "Could not verify same-time automation event order: {}".format(str(e))
                         )
+                if reversed_group_times:
+                    # Never correct a vertical in isolation after its left
+                    # neighbour exists: deleting that later endpoint flattens
+                    # the neighbour. Clear once and perform a final complete
+                    # right-to-left pass using the orientations learned above.
+                    create_complete_pass(reversed_group_times)
+            self._last_exact_automation_range_write_passes = (
+                2 if reversed_group_times else 1
+            )
+            self._last_exact_automation_range_reversed_groups = len(
+                reversed_group_times
+            )
             return True
         except Exception as e:
             self._debug_log("Error writing exact automation envelope events: {}".format(str(e)))
@@ -18669,6 +18687,12 @@ class Tap(ControlSurface):
             "{:.6f}".format(info.get("physical_end", info.get("note_end", 0.0))),
         ]
 
+    def _automation_wire_domain(self, domain):
+        """Return the exact domain precision shared with the app."""
+        return tuple(
+            float("{:.6f}".format(float(value))) for value in domain
+        )
+
     def _automation_response_fields(
             self, clip, device_param, envelope=None, write_token="", status="",
             context=None, revision="", domain=None, request_token=""):
@@ -19717,58 +19741,141 @@ class Tap(ControlSurface):
                 merged_intervals.append((interval_start, interval_end))
         return (tuple(final_steps), tuple(merged_intervals))
 
-    def _apply_direct_exact_automation_delta(
-            self, context, envelope, baseline, final_steps, operation_entries,
-            automation_should_re_enable=False, required_domain_end=None):
-        """Apply a delta only at event timestamps named by the delta.
+    def _spread_exact_automation_verticals(self, steps, intervals):
+        """Make affected same-time groups deterministic without a retry.
 
-        Generated shapes deliberately replace a complete envelope. Point
-        edits do not: rebuild only the old/new same-time groups containing a
-        changed event. In particular, never clear the continuous range between
-        moved or scaled points; doing so made an ordinary edit destructive if
-        a later create_event call did not settle.
+        Live 12.4 does not expose a stable insertion direction for multiple
+        create_event calls at one timestamp. The last authored event owns the
+        real outgoing segment, so keep it at the boundary and move the earlier
+        events a few microbeats left whenever that fits inside the dependency
+        range. At the left edge, spread right instead. The resulting ramp is
+        microscopically finite but visually and audibly vertical, and every
+        event has an unambiguous owner/order in one write pass.
         """
-        operation_entries = tuple(operation_entries or ())
-        if not operation_entries:
+        sorted_steps = list(self._automation_sorted_steps(steps))
+        intervals = tuple(
+            (float(interval_start), float(interval_end))
+            for interval_start, interval_end in intervals or ()
+        )
+        if len(sorted_steps) < 2 or not intervals:
+            return (tuple(sorted_steps), intervals, 0, 0.0)
+
+        same_time_epsilon = 0.000001
+        minimum_distinct_spacing = 0.000002
+        target_spacing = max(
+            minimum_distinct_spacing,
+            float(getattr(
+                self, "AUTOMATION_EXACT_VERTICAL_TIME_SPACING", 0.00002
+            ))
+        )
+        groups = []
+        for index, step in enumerate(sorted_steps):
+            if (not groups
+                    or abs(float(step[0])
+                           - float(sorted_steps[groups[-1][-1]][0]))
+                        > same_time_epsilon):
+                groups.append([])
+            groups[-1].append(index)
+
+        spread_group_count = 0
+        maximum_offset = 0.0
+        for group in groups:
+            if len(group) < 2:
+                continue
+            group_time = float(sorted_steps[group[0]][0])
+            containing_interval = next((
+                (interval_start, interval_end)
+                for interval_start, interval_end in intervals
+                if (group_time >= interval_start - same_time_epsilon
+                    and group_time <= interval_end + same_time_epsilon)
+            ), None)
+            if containing_interval is None:
+                continue
+
+            interval_start, interval_end = containing_interval
+            previous_time = (
+                float(sorted_steps[group[0] - 1][0])
+                if group[0] > 0 else None
+            )
+            next_time = (
+                float(sorted_steps[group[-1] + 1][0])
+                if group[-1] + 1 < len(sorted_steps) else None
+            )
+            left_limit = float(interval_start)
+            if previous_time is not None:
+                left_limit = max(
+                    left_limit,
+                    previous_time + minimum_distinct_spacing
+                )
+            right_limit = float(interval_end)
+            if next_time is not None:
+                right_limit = min(
+                    right_limit,
+                    next_time - minimum_distinct_spacing
+                )
+
+            divisor = float(len(group) - 1)
+            left_spacing = min(
+                target_spacing,
+                max(0.0, group_time - left_limit) / divisor
+            )
+            right_spacing = min(
+                target_spacing,
+                max(0.0, right_limit - group_time) / divisor
+            )
+            if left_spacing >= minimum_distinct_spacing - 0.0000000001:
+                spacing = left_spacing
+                first_time = group_time - (spacing * divisor)
+            elif right_spacing >= minimum_distinct_spacing - 0.0000000001:
+                spacing = right_spacing
+                first_time = group_time
+            else:
+                # An already sub-microbeat cluster has no independently
+                # writable space. Preserve it rather than moving neighbours
+                # or growing the affected range unpredictably.
+                continue
+
+            for offset, step_index in enumerate(group):
+                adjusted_time = first_time + (spacing * float(offset))
+                adjusted_step = list(sorted_steps[step_index])
+                adjusted_step[0] = adjusted_time
+                sorted_steps[step_index] = tuple(adjusted_step)
+                maximum_offset = max(
+                    maximum_offset,
+                    abs(adjusted_time - group_time)
+                )
+            spread_group_count += 1
+
+        return (
+            self._automation_sorted_steps(sorted_steps),
+            intervals,
+            spread_group_count,
+            maximum_offset,
+        )
+
+    def _apply_exact_automation_delta(
+            self, context, envelope, final_steps, intervals,
+            automation_should_re_enable=False, required_domain_end=None,
+            trace_token=None, range_already_cleared=False,
+            manage_undo=True, group_creation_reversed=None):
+        """Synchronously rewrite each curve-dependent edit range.
+
+        Live resets the outgoing controls of a point when an endpoint to its
+        right is deleted. Reconstruction has already extended each interval
+        left through that connected curved chain and stopped at a linear
+        boundary. Recreate the complete interval right-to-left in one callback
+        and one undo step: unlike transport and generated-shape streaming, an
+        already decoded local edit does not need per-batch scheduler delays.
+        """
+        intervals = tuple(intervals or ())
+        if not intervals:
             return True
-        # Reconstruction already returns authoritative timeline order. Keep
-        # it intact so equal-time groups retain their authored direction.
-        baseline = tuple(baseline)
         final_steps = tuple(final_steps)
-        touched_times = set()
-        try:
-            for operation_entry in operation_entries:
-                components = operation_entry.split(":", 3)
-                action = components[0] if components else ""
-                if action == "D" and len(components) == 2:
-                    ordinal = int(components[1])
-                    touched_times.add(float(baseline[ordinal][0]))
-                elif action == "R" and len(components) == 4:
-                    ordinal = int(components[1])
-                    final_position = int(components[2])
-                    touched_times.add(float(baseline[ordinal][0]))
-                    touched_times.add(float(final_steps[final_position][0]))
-                elif action == "I" and len(components) >= 3:
-                    final_position = int(operation_entry.split(":", 2)[1])
-                    touched_times.add(float(final_steps[final_position][0]))
-                else:
-                    return False
-        except Exception:
-            return False
-
-        transitions = []
-        for time_value in sorted(touched_times, reverse=True):
-            baseline_group = tuple(
-                step for step in baseline
-                if abs(float(step[0]) - time_value) <= 0.000001
-            )
-            final_group = tuple(
-                step for step in final_steps
-                if abs(float(step[0]) - time_value) <= 0.000001
-            )
-            transitions.append((time_value, baseline_group, final_group))
-
-        undo_step_started = self._begin_undo_step()
+        write_started_at = time.monotonic()
+        written_event_count = 0
+        write_pass_count = 0
+        reversed_group_count = 0
+        undo_step_started = self._begin_undo_step() if manage_undo else False
         try:
             if required_domain_end is not None:
                 clip = context.get("clip")
@@ -19791,24 +19898,57 @@ class Tap(ControlSurface):
                     if abs(float(getattr(clip, "loop_end"))
                            - float(previous_loop_end)) > 0.000001:
                         return False
-            guard = getattr(
-                self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
-            )
-            for time_value, baseline_group, final_group in transitions:
-                if baseline_group:
-                    envelope.delete_events_in_range(
-                        time_value - guard, time_value + guard
+            for interval_start, interval_end in sorted(
+                    intervals, key=lambda item: float(item[0]), reverse=True):
+                interval_steps = tuple(
+                    step for step in final_steps
+                    if (float(step[0]) >= float(interval_start) - 0.000001
+                        and float(step[0]) <= float(interval_end) + 0.000001)
+                )
+                written_event_count += len(interval_steps)
+                if range_already_cleared:
+                    time_groups = self._exact_automation_time_groups(
+                        interval_steps,
+                        float(interval_start),
+                        float(interval_end)
                     )
-                # Descend by timestamp, but retain the authored order within a
-                # vertical. This is the same ordering used by the established
-                # exact-event range writer and matches current Live bindings.
-                for step in final_group:
-                    raw_value = self._parameter_target_value_from_normalized(
-                        context["device_param"], step[2]
+                    directions = (
+                        group_creation_reversed
+                        if group_creation_reversed is not None else {}
                     )
-                    self._create_automation_event(
-                        envelope, step[0], raw_value, step
+                    creation_state = {
+                        "context": context,
+                        "envelope": envelope,
+                        "group_creation_reversed": directions,
+                    }
+                    for time_group in reversed(time_groups):
+                        self._create_exact_automation_group(
+                            creation_state, time_group
+                        )
+                    self._last_exact_automation_range_write_passes = 1
+                    self._last_exact_automation_range_reversed_groups = sum(
+                        1 for time_group in time_groups
+                        if len(time_group) > 1
+                        and directions.get(float(time_group[0][0]), False)
                     )
+                else:
+                    self._last_exact_automation_range_write_passes = 1
+                    self._last_exact_automation_range_reversed_groups = 0
+                    if not self._write_exact_automation_events_to_envelope(
+                            envelope,
+                            context["device_param"],
+                            float(interval_start),
+                            float(interval_end),
+                            interval_steps,
+                            allow_empty=True,
+                            endpoint_padding=0.0000001):
+                        return False
+                write_pass_count += int(getattr(
+                    self, "_last_exact_automation_range_write_passes", 1
+                ))
+                reversed_group_count += int(getattr(
+                    self, "_last_exact_automation_range_reversed_groups", 0
+                ))
             if (automation_should_re_enable
                     and not self._parameter_automation_is_enabled(
                         context["device_param"]
@@ -19817,11 +19957,169 @@ class Tap(ControlSurface):
             return True
         except Exception as e:
             self._debug_log(
-                "Error applying direct exact automation delta: {}".format(str(e))
+                "Error applying exact automation delta ranges: {}".format(str(e))
             )
             return False
         finally:
-            self._end_undo_step(undo_step_started)
+            if manage_undo:
+                self._end_undo_step(undo_step_started)
+            tracer = getattr(self, "_automation_trace", None)
+            if tracer is not None and trace_token is not None:
+                tracer(
+                    trace_token,
+                    "delta_range_write",
+                    "ranges={} events={} passes={} reversed_groups={} elapsed_ms={:.3f}".format(
+                        len(intervals),
+                        written_event_count,
+                        write_pass_count,
+                        reversed_group_count,
+                        (time.monotonic() - write_started_at) * 1000.0
+                    )
+                )
+
+    def _clear_settled_exact_automation_delta_ranges(self, state):
+        """Clear once, then create once on the following Live callback."""
+        envelope = state["envelope"]
+        padding = 0.0000001
+        for interval_start, interval_end in state["intervals"]:
+            envelope.delete_events_in_range(
+                float(interval_start),
+                max(float(interval_start) + padding, float(interval_end))
+                    + padding
+            )
+        self._automation_trace(
+            state["write_token"],
+            "delta_range_clear",
+            "ranges={} mode=single_pass".format(len(state["intervals"]))
+        )
+        self.schedule_message(
+            1,
+            lambda state=state:
+                self._write_settled_exact_automation_delta_ranges(state)
+        )
+
+    def _write_settled_exact_automation_delta_ranges(self, state):
+        """Create every affected range once, without probing or correction."""
+        try:
+            if not state or state.get("completed", False):
+                return
+            if (not liveobj_valid(state["context"].get("clip"))
+                    or not liveobj_valid(state["context"].get("device_param"))):
+                raise RuntimeError("automation context expired")
+            # Affected verticals are normally micro-spread before this state
+            # starts, leaving only singleton time groups. Keep authored order
+            # as a conservative fallback for a pathological group that had no
+            # writable space. The complete range is still created right-to-
+            # left so every curved point sees its right endpoint exactly once.
+            for interval_start, interval_end in state["intervals"]:
+                interval_steps = tuple(
+                    step for step in state["final_steps"]
+                    if (float(step[0]) >= float(interval_start) - 0.000001
+                        and float(step[0]) <= float(interval_end) + 0.000001)
+                )
+                for time_group in self._exact_automation_time_groups(
+                        interval_steps, interval_start, interval_end):
+                    if len(time_group) > 1:
+                        state["group_creation_reversed"][
+                            float(time_group[0][0])
+                        ] = False
+            if not self._apply_exact_automation_delta(
+                    state["context"],
+                    state["envelope"],
+                    state["final_steps"],
+                    state["intervals"],
+                    False,
+                    None,
+                    trace_token=state["write_token"],
+                    range_already_cleared=True,
+                    manage_undo=False,
+                    group_creation_reversed=state[
+                        "group_creation_reversed"
+                    ]):
+                raise RuntimeError("range creation failed")
+            state["completed"] = True
+            self._close_exact_automation_write_attempt(state)
+            self._automation_trace(
+                state["write_token"],
+                "delta_single_pass",
+                "ranges={} ticks={} correction_writes=0".format(
+                    len(state["intervals"]),
+                    self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS
+                )
+            )
+            self.schedule_message(
+                self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
+                lambda state=state:
+                    self._finalize_exact_automation_delta(state)
+            )
+        except Exception as e:
+            self._fail_settled_exact_automation_delta(
+                state, "write error={}".format(str(e))
+            )
+
+    def _fail_settled_exact_automation_delta(self, state, reason):
+        if not state or state.get("completed", False):
+            return
+        state["completed"] = True
+        self._close_exact_automation_write_attempt(state)
+        self._debug_log(
+            "Exact automation delta failed: {}".format(str(reason))
+        )
+        self._automation_trace(
+            state.get("write_token", "?"),
+            "delta_reject",
+            "reason={}".format(str(reason))
+        )
+        context = state.get("context") or {}
+        self._automation_write_error_response(
+            context.get("control_index", 0),
+            state.get("write_token", ""),
+            context=context
+        )
+
+    def _start_settled_exact_automation_delta(
+            self, context, envelope, final_steps, intervals,
+            automation_should_re_enable=False, required_domain_end=None,
+            trace_token=None):
+        """Start one undo-grouped clear/wait/create delta transaction."""
+        state = {
+            "context": context,
+            "envelope": envelope,
+            "final_steps": tuple(final_steps),
+            "intervals": tuple(intervals),
+            "write_token": str(trace_token or ""),
+            "automation_should_re_enable": bool(
+                automation_should_re_enable
+            ),
+            "group_creation_reversed": {},
+            "undo_step_attempted": True,
+            "undo_step_started": self._begin_undo_step(),
+            "completed": False,
+        }
+        try:
+            if required_domain_end is not None:
+                clip = context.get("clip")
+                if clip is None or not liveobj_valid(clip):
+                    raise RuntimeError("clip unavailable for domain extension")
+                previous_loop_end = getattr(clip, "loop_end", None)
+                clip.end_marker = float(required_domain_end)
+                if previous_loop_end is not None:
+                    if (abs(float(getattr(clip, "loop_end"))
+                            - float(previous_loop_end)) > 0.000001):
+                        clip.loop_end = previous_loop_end
+                    if (abs(float(getattr(clip, "loop_end"))
+                            - float(previous_loop_end)) > 0.000001):
+                        raise RuntimeError("loop changed during domain extension")
+            self._clear_settled_exact_automation_delta_ranges(state)
+            return state
+        except Exception as e:
+            self._close_exact_automation_write_attempt(state)
+            self._debug_log(
+                "Error starting settled exact automation delta: {}".format(
+                    str(e)
+                )
+            )
+            return None
 
     def _accepted_exact_automation_delta_snapshot(
             self, context, envelope, intended_steps, intervals, point_duration,
@@ -19930,6 +20228,179 @@ class Tap(ControlSurface):
         )
         self._send_sys_ex_message(response, 0x31)
 
+    def _finalize_exact_automation_delta(self, state):
+        """Audit and acknowledge a delta only after Live has committed it.
+
+        create_event returns before Live has necessarily published the final
+        envelope enumeration. Reading in the mutation callback can therefore
+        omit a newly created point, which makes the app discard that point's
+        stable selection ID. Keep the write itself synchronous and fast, but
+        defer the one read-back/response by a fixed two Live ticks.
+        """
+        context = state["context"]
+        envelope = state["envelope"]
+        write_token = state["write_token"]
+        automation_was_enabled = state["automation_was_enabled"]
+        try:
+            if (not liveobj_valid(context.get("clip"))
+                    or not liveobj_valid(context.get("device_param"))
+                    or not self._automation_envelope_supports_point_events(envelope)):
+                raise RuntimeError("automation context expired while settling")
+
+            if state["expands_domain"]:
+                expanded_domain = self._automation_domain_for_clip(
+                    context["clip"], context["device_param"]
+                )
+                current_loop_end = float(getattr(
+                    context["clip"], "loop_end", state["previous_loop_end"]
+                ))
+                if (float(expanded_domain[1])
+                        < state["required_domain_end"] - 0.000001
+                        or abs(current_loop_end - state["previous_loop_end"])
+                            > 0.000001):
+                    self._automation_trace(
+                        write_token,
+                        "delta_reject",
+                        "reason=domain_extension requested={:.6f} actual={:.6f} loop={:.6f}/{:.6f}".format(
+                            state["required_domain_end"],
+                            float(expanded_domain[1]),
+                            current_loop_end,
+                            state["previous_loop_end"]
+                        )
+                    )
+                    self._automation_write_error_response(
+                        context["control_index"], write_token, context=context
+                    )
+                    return
+                context["domain"] = expanded_domain
+                self._automation_trace(
+                    write_token,
+                    "delta_domain_extended",
+                    "from={:.6f} to={:.6f} loop_unchanged=1".format(
+                        float(state["previous_domain"][1]),
+                        float(expanded_domain[1])
+                    )
+                )
+
+            self._automation_trace(
+                write_token,
+                "delta_settled",
+                "ticks={} elapsed_ms={:.3f}".format(
+                    self.AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS,
+                    (time.monotonic() - state["write_started_at"]) * 1000.0
+                )
+            )
+            accepted_result = self._accepted_exact_automation_delta_snapshot(
+                context,
+                envelope,
+                state["final_steps"],
+                state["intervals"],
+                state["sample_duration"],
+                include_live_event_records=True
+            )
+            if accepted_result is None:
+                self._automation_write_error_response(
+                    context["control_index"], write_token, context=context
+                )
+                return
+            accepted_steps, accepted_event_records = accepted_result
+            trace_patch_events = getattr(
+                self, "_automation_trace_exact_patch_events", None
+            )
+            if trace_patch_events is not None:
+                trace_patch_events(
+                    write_token,
+                    "delta_accepted_events",
+                    accepted_steps,
+                    state["intervals"]
+                )
+            accepted_revision = self._automation_snapshot_revision(
+                context["clip"],
+                context["device_param"],
+                context["domain"],
+                accepted_steps
+            )
+            intended_revision = self._automation_snapshot_revision(
+                context["clip"],
+                context["device_param"],
+                context["domain"],
+                state["final_steps"]
+            )
+            self._automation_trace(
+                write_token,
+                "delta_audit",
+                "exact={} accepted_steps={} intended_steps={} elapsed_ms={:.3f}".format(
+                    1 if accepted_revision == intended_revision else 0,
+                    len(accepted_steps),
+                    len(state["final_steps"]),
+                    (time.monotonic() - state["write_started_at"]) * 1000.0
+                )
+            )
+            merged_event_records = self._merged_automation_event_records(
+                context.get("live_event_records"),
+                accepted_event_records,
+                state["intervals"]
+            )
+            if merged_event_records is None:
+                accepted_live_fingerprint = self._automation_live_event_fingerprint(
+                    envelope, context["domain"], state["sample_duration"]
+                )
+                cached_read = self._cached_automation_event_read(
+                    envelope,
+                    context["domain"][0],
+                    context["domain"][1],
+                    state["sample_duration"]
+                )
+                merged_event_records = (
+                    cached_read.get("records") if cached_read is not None else None
+                )
+            else:
+                accepted_live_fingerprint = self._automation_event_fingerprint_from_records(
+                    merged_event_records
+                )
+            context.update({
+                "envelope": envelope,
+                "snapshot": self._automation_sorted_steps(accepted_steps),
+                "revision": accepted_revision,
+                "point_duration": state["sample_duration"],
+                "live_fingerprint": accepted_live_fingerprint,
+                "live_event_records": merged_event_records,
+                "last_activity": time.monotonic(),
+            })
+            if accepted_steps:
+                self._store_authored_automation_steps(
+                    context["clip"], context["device_param"],
+                    context["control_index"], accepted_steps
+                )
+            else:
+                self._clear_authored_automation_steps(
+                    context["clip"], context["device_param"],
+                    context["control_index"]
+                )
+            self._send_exact_automation_delta_response(
+                context,
+                envelope,
+                accepted_steps,
+                accepted_revision,
+                state["intervals"],
+                write_token
+            )
+            self._re_enable_after_automation_write(
+                context["device_param"],
+                automation_was_enabled or envelope is not None
+            )
+            self._refresh_parameter_metadata_on_automation_change()
+        except Exception as e:
+            self._debug_log(
+                "Error finalizing exact automation delta: {}".format(str(e))
+            )
+            self._automation_trace(
+                write_token, "delta_reject", "reason=settle error={}".format(str(e))
+            )
+            self._automation_write_error_response(
+                context["control_index"], write_token, context=context
+            )
+
     def _handle_exact_automation_delta(self, fields):
         trace = getattr(self, "_automation_trace_pending_transfer", None) or {}
         self._automation_trace_pending_transfer = None
@@ -20026,6 +20497,21 @@ class Tap(ControlSurface):
             )
             return
         final_steps, intervals = reconstructed
+        (
+            final_steps,
+            intervals,
+            spread_vertical_count,
+            maximum_vertical_offset,
+        ) = self._spread_exact_automation_verticals(final_steps, intervals)
+        if spread_vertical_count:
+            self._automation_trace(
+                write_token,
+                "delta_vertical_spread",
+                "groups={} max_offset_beats={:.9f}".format(
+                    spread_vertical_count,
+                    maximum_vertical_offset,
+                )
+            )
         previous_domain = tuple(context["domain"])
         required_domain_end = max(
             [float(previous_domain[1])]
@@ -20071,150 +20557,45 @@ class Tap(ControlSurface):
             )
             return
 
-        applied = self._apply_direct_exact_automation_delta(
+        delta_write_started_at = time.monotonic()
+        delta_state = self._start_settled_exact_automation_delta(
             context,
             envelope,
-            baseline,
             final_steps,
-            operation_entries,
+            intervals,
             automation_was_enabled or envelope is not None,
-            required_domain_end if expands_domain else None
+            required_domain_end if expands_domain else None,
+            trace_token=write_token
         )
-        if not applied:
+        if not delta_state:
             self._automation_write_error_response(
                 context["control_index"], write_token, context=context
             )
             return
 
-        if expands_domain:
-            expanded_domain = self._automation_domain_for_clip(
-                context["clip"], context["device_param"]
-            )
-            current_loop_end = float(getattr(
-                context["clip"], "loop_end", previous_loop_end
-            ))
-            if (float(expanded_domain[1]) < required_domain_end - 0.000001
-                    or abs(current_loop_end - previous_loop_end) > 0.000001):
-                self._automation_trace(
-                    write_token,
-                    "delta_reject",
-                    "reason=domain_extension requested={:.6f} actual={:.6f} loop={:.6f}/{:.6f}".format(
-                        required_domain_end, float(expanded_domain[1]),
-                        current_loop_end, previous_loop_end
-                    )
-                )
-                self._automation_write_error_response(
-                    context["control_index"], write_token, context=context
-                )
-                return
-            context["domain"] = expanded_domain
-            self._automation_trace(
-                write_token,
-                "delta_domain_extended",
-                "from={:.6f} to={:.6f} loop_unchanged=1".format(
-                    float(previous_domain[1]), float(expanded_domain[1])
-                )
-            )
-
         self._automation_trace(
             write_token,
-            "delta_write_direct",
-            "operations={} touched_ranges={}".format(
-                len(operation_entries), len(intervals)
+            "delta_clear_sync",
+            "operations={} ranges={} elapsed_ms={:.3f}".format(
+                len(operation_entries),
+                len(intervals),
+                (time.monotonic() - delta_write_started_at) * 1000.0
             )
         )
-
-        accepted_result = self._accepted_exact_automation_delta_snapshot(
-            context,
-            envelope,
-            final_steps,
-            intervals,
-            sample_duration,
-            include_live_event_records=True
-        )
-        if accepted_result is None:
-            self._automation_write_error_response(
-                context["control_index"], write_token, context=context
-            )
-            return
-        accepted_steps, accepted_event_records = accepted_result
-        if trace_patch_events is not None:
-            trace_patch_events(
-                write_token, "delta_accepted_events", accepted_steps, intervals
-            )
-        accepted_revision = self._automation_snapshot_revision(
-            context["clip"],
-            context["device_param"],
-            context["domain"],
-            accepted_steps
-        )
-        intended_revision = self._automation_snapshot_revision(
-            context["clip"],
-            context["device_param"],
-            context["domain"],
-            final_steps
-        )
-        self._automation_trace(
-            write_token,
-            "delta_audit",
-            "exact={} accepted_steps={} intended_steps={}".format(
-                1 if accepted_revision == intended_revision else 0,
-                len(accepted_steps),
-                len(final_steps)
-            )
-        )
-        merged_event_records = self._merged_automation_event_records(
-            context.get("live_event_records"),
-            accepted_event_records,
-            intervals
-        )
-        if merged_event_records is None:
-            accepted_live_fingerprint = self._automation_live_event_fingerprint(
-                envelope, context["domain"], sample_duration
-            )
-            cached_read = self._cached_automation_event_read(
-                envelope,
-                context["domain"][0],
-                context["domain"][1],
-                sample_duration
-            )
-            merged_event_records = (
-                cached_read.get("records") if cached_read is not None else None
-            )
-        else:
-            accepted_live_fingerprint = self._automation_event_fingerprint_from_records(
-                merged_event_records
-            )
-        context.update({
+        delta_state.update({
+            "context": context,
             "envelope": envelope,
-            "snapshot": self._automation_sorted_steps(accepted_steps),
-            "revision": accepted_revision,
-            "point_duration": sample_duration,
-            "live_fingerprint": accepted_live_fingerprint,
-            "live_event_records": merged_event_records,
-            "last_activity": time.monotonic(),
+            "final_steps": final_steps,
+            "intervals": intervals,
+            "sample_duration": sample_duration,
+            "write_token": write_token,
+            "automation_was_enabled": automation_was_enabled,
+            "expands_domain": expands_domain,
+            "previous_domain": previous_domain,
+            "required_domain_end": required_domain_end,
+            "previous_loop_end": previous_loop_end,
+            "write_started_at": delta_write_started_at,
         })
-        if accepted_steps:
-            self._store_authored_automation_steps(
-                context["clip"], context["device_param"],
-                context["control_index"], accepted_steps
-            )
-        else:
-            self._clear_authored_automation_steps(
-                context["clip"], context["device_param"], context["control_index"]
-            )
-        self._send_exact_automation_delta_response(
-            context,
-            envelope,
-            accepted_steps,
-            accepted_revision,
-            intervals,
-            write_token
-        )
-        self._re_enable_after_automation_write(
-            context["device_param"], automation_was_enabled or envelope is not None
-        )
-        self._refresh_parameter_metadata_on_automation_change()
 
     def _exact_automation_final_event_status(self, state):
         """Audit the final full-range event representation returned by Live.
@@ -20225,8 +20606,11 @@ class Tap(ControlSurface):
         is the only read that may authorize a successful full-write response.
         """
         envelope = state["envelope"]
-        epsilon = getattr(
+        time_tolerance = getattr(
             self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
+        )
+        same_time_tolerance = getattr(
+            self, "AUTOMATION_EXACT_SAME_TIME_TOLERANCE", 0.000001
         )
         try:
             events = tuple(
@@ -20253,7 +20637,7 @@ class Tap(ControlSurface):
         for _index, event in indexed_events:
             if (not stored_groups
                     or abs(float(event.time) - float(stored_groups[-1][0].time))
-                        > epsilon):
+                        > same_time_tolerance):
                 stored_groups.append([])
             stored_groups[-1].append(event)
 
@@ -20294,12 +20678,12 @@ class Tap(ControlSurface):
 
             stored_group = stored_groups[stored_index]
             stored_time = float(stored_group[0].time)
-            if stored_time < intended_time - epsilon:
+            if stored_time < intended_time - time_tolerance:
                 structural = True
                 reasons.append("extra")
                 stored_index += 1
                 continue
-            if intended_time < stored_time - epsilon:
+            if intended_time < stored_time - time_tolerance:
                 mismatch_groups.append(intended_group)
                 reasons.append("missing")
                 intended_index += 1
@@ -20514,6 +20898,9 @@ class Tap(ControlSurface):
         guard = getattr(
             self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
         )
+        same_time_tolerance = getattr(
+            self, "AUTOMATION_EXACT_SAME_TIME_TOLERANCE", 0.000001
+        )
         try:
             events = state["envelope"].events_in_range(
                 max(state["write_start"], group_time - guard),
@@ -20522,10 +20909,19 @@ class Tap(ControlSurface):
                     min(state["write_end"] + guard, group_time + guard)
                 )
             )
-            stored = tuple(
-                event for event in events
-                if abs(float(event.time) - group_time) <= guard
-            )
+            nearby_groups = []
+            for event in sorted(events, key=lambda item: float(item.time)):
+                if (not nearby_groups
+                        or abs(float(event.time)
+                               - float(nearby_groups[-1][0].time))
+                            > same_time_tolerance):
+                    nearby_groups.append([])
+                nearby_groups[-1].append(event)
+            stored = tuple(min(
+                nearby_groups,
+                key=lambda group:
+                    abs(float(group[0].time) - group_time)
+            )) if nearby_groups else ()
             entries = []
             for event in stored:
                 controls = event.control_coefficients
@@ -20982,7 +21378,19 @@ class Tap(ControlSurface):
                 control_index, write_token, context=context
             )
             return
-        domain_start, domain_end = context["domain"]
+        # The app generates against the six-decimal domain carried in the
+        # envelope response. Live retains more precision after a duplication
+        # extends end_marker, so canonicalize this side to the same range.
+        domain_start, domain_end = self._automation_wire_domain(
+            context["domain"]
+        )
+        self._automation_trace(
+            write_token,
+            "compact_shape_domain",
+            "domain={:.6f}:{:.6f} padding={:.6f}:{:.6f}".format(
+                domain_start, domain_end, top_padding, bottom_padding
+            )
+        )
         nodes = self._generated_automation_nodes(
             shape, domain_start, domain_end, period, shape_parameter,
             top_padding, bottom_padding, variation, is_decoupled
@@ -21361,17 +21769,59 @@ class Tap(ControlSurface):
             )
             return
 
+        # A streamed full fallback is already completely buffered and
+        # checksummed here. Use the same deterministic coupled writer as a
+        # generated shape: spread ambiguous verticals, clear once, wait one
+        # callback, write every event once right-to-left, and only observe the
+        # final result. The former per-group verifier could fail after clearing
+        # Live and strand a partially reconstructed envelope.
+        (
+            spread_steps,
+            write_intervals,
+            spread_vertical_count,
+            maximum_vertical_offset,
+        ) = self._spread_exact_automation_verticals(
+            logical_steps, ((write_start, write_end),)
+        )
+        spread_time_groups = tuple(reversed(
+            self._exact_automation_time_groups(
+                spread_steps, write_start, write_end
+            )
+        ))
+        state.mode = ExactAutomationWriteMode.BATCHED_FULL
+        state.update({
+            "logical_steps": spread_steps,
+            "write_intervals": write_intervals,
+            "time_groups": spread_time_groups,
+            "audit_time_groups": spread_time_groups,
+            "single_pass_full": True,
+            "group_creation_reversed": {},
+            "next_group_index": 0,
+            "active_batch": (),
+            "batch_settle_polls": 0,
+            "batch_write_attempts": 0,
+        })
         self._automation_trace(
-            stream_id, "write_scheduled", "mode=streamed ticks={}".format(
+            stream_id,
+            "full_vertical_spread",
+            "groups={} max_offset_beats={:.9f}".format(
+                spread_vertical_count, maximum_vertical_offset
+            )
+        )
+        self._automation_trace(
+            stream_id, "write_scheduled", "mode=single_pass ticks={}".format(
                 self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
                     if created_envelope else 1
             )
         )
-        self.schedule_message(
-            self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS
-                if created_envelope else 1,
-            lambda state=state: self._perform_streamed_exact_automation_step(state)
-        )
+        if created_envelope:
+            self.schedule_message(
+                self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS,
+                lambda state=state:
+                    self._perform_exact_automation_full_write(state)
+            )
+        else:
+            self._perform_exact_automation_full_write(state)
 
     def _automation_step_from_compact_stream_entry(self, entry, state, order):
         components = str(entry or "").split(":")
@@ -21902,6 +22352,44 @@ class Tap(ControlSurface):
             )
             return
 
+        single_pass_full = not decoupled_info
+        spread_vertical_count = 0
+        maximum_vertical_offset = 0.0
+        if single_pass_full:
+            (
+                physical_steps,
+                normalized_write_intervals,
+                spread_vertical_count,
+                maximum_vertical_offset,
+            ) = self._spread_exact_automation_verticals(
+                physical_steps, normalized_write_intervals
+            )
+            # Coupled full writes return Live's accepted event timeline, so the
+            # micro-spread is the logical representation as well as the one
+            # authored into Live. An explicit audit snapshot must be spread by
+            # the same deterministic rule.
+            logical_steps = physical_steps
+            if audit_steps is None:
+                audit_logical_steps = physical_steps
+                physical_audit_steps = physical_steps
+            else:
+                (
+                    physical_audit_steps,
+                    _audit_intervals,
+                    _audit_spread_count,
+                    _audit_maximum_offset,
+                ) = self._spread_exact_automation_verticals(
+                    physical_audit_steps, normalized_write_intervals
+                )
+                audit_logical_steps = physical_audit_steps
+            self._automation_trace(
+                write_token,
+                "full_vertical_spread",
+                "groups={} max_offset_beats={:.9f}".format(
+                    spread_vertical_count, maximum_vertical_offset
+                )
+            )
+
         physical_time_groups = tuple(reversed(self._exact_automation_time_groups(
             physical_steps, write_start, write_end
         )))
@@ -21921,6 +22409,7 @@ class Tap(ControlSurface):
             "decoupled_info": decoupled_info,
             "write_token": write_token,
             "compact_response": compact_response,
+            "single_pass_full": single_pass_full,
             "automation_should_re_enable": automation_was_enabled or envelope is not None,
             "time_groups": physical_time_groups,
             "audit_time_groups": audit_time_groups,
@@ -21942,13 +22431,17 @@ class Tap(ControlSurface):
         coordinator = getattr(self, "_automation_transfer", None)
         if coordinator is not None:
             coordinator.writer.begin(state)
-        # Pencil edits reach Live as small writes on separate MIDI callbacks.
-        # Do the same locally for a generated shape: no extra wire traffic, but
-        # no thousands-of-events burst in one Live callback either.
-        self.schedule_message(
-            self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS if created_envelope else 1,
-            lambda state=state: self._perform_exact_automation_full_write(state)
-        )
+        # MIDI delivery has already completed. The Live mutation now uses the
+        # same clear/wait/single-write cadence proven by ordinary edits; its
+        # later full-range audit is observational and never corrects the write.
+        if created_envelope:
+            self.schedule_message(
+                self.AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS,
+                lambda state=state:
+                    self._perform_exact_automation_full_write(state)
+            )
+        else:
+            self._perform_exact_automation_full_write(state)
 
     def _exact_automation_time_groups(self, steps, start, end):
         groups = []
@@ -22006,6 +22499,9 @@ class Tap(ControlSurface):
         guard = getattr(
             self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
         )
+        same_time_tolerance = getattr(
+            self, "AUTOMATION_EXACT_SAME_TIME_TOLERANCE", 0.000001
+        )
         query_start = (
             max(float(write_start), group_time - guard)
             if write_start is not None
@@ -22017,12 +22513,22 @@ class Tap(ControlSurface):
             else group_time + guard
         )
         try:
-            stored_group = tuple(
-                event for event in envelope.events_in_range(
-                    query_start, max(query_start + 0.000000001, query_end)
-                )
-                if abs(float(event.time) - group_time) <= guard
-            )
+            events = tuple(envelope.events_in_range(
+                query_start, max(query_start + 0.000000001, query_end)
+            ))
+            nearby_groups = []
+            for event in sorted(events, key=lambda item: float(item.time)):
+                if (not nearby_groups
+                        or abs(float(event.time)
+                               - float(nearby_groups[-1][0].time))
+                            > same_time_tolerance):
+                    nearby_groups.append([])
+                nearby_groups[-1].append(event)
+            stored_group = tuple(min(
+                nearby_groups,
+                key=lambda group:
+                    abs(float(group[0].time) - group_time)
+            )) if nearby_groups else ()
             if len(stored_group) != len(time_group):
                 return "count"
             if len(time_group) > 1:
@@ -22125,8 +22631,47 @@ class Tap(ControlSurface):
                     )
                 state["cleared"] = True
 
+                if state.get("single_pass_full", False):
+                    self._automation_trace(
+                        state.get("stream_id", state.get("write_token", "?")),
+                        "full_range_clear",
+                        "ranges={} mode=single_pass".format(len(state.get(
+                            "write_intervals",
+                            ((state["write_start"], state["write_end"]),)
+                        )))
+                    )
+                    self.schedule_message(
+                        1,
+                        lambda state=state:
+                            self._perform_exact_automation_full_write(state)
+                    )
+                    return
+
             groups = state["time_groups"]
             index = state["next_group_index"]
+            if state.get("single_pass_full", False) and index < len(groups):
+                write_started_at = time.monotonic()
+                event_count = 0
+                for time_group in groups[index:]:
+                    if len(time_group) > 1:
+                        # Only possible when there was no safe room to spread a
+                        # pathological cluster. Preserve its authored order.
+                        state["group_creation_reversed"][
+                            float(time_group[0][0])
+                        ] = False
+                    self._create_exact_automation_group(state, time_group)
+                    event_count += len(time_group)
+                state["next_group_index"] = len(groups)
+                self._automation_trace(
+                    state.get("stream_id", state.get("write_token", "?")),
+                    "full_single_pass_write",
+                    "groups={} events={} elapsed_ms={:.3f}".format(
+                        len(groups) - index,
+                        event_count,
+                        (time.monotonic() - write_started_at) * 1000.0
+                    )
+                )
+                index = len(groups)
             if index >= len(groups):
                 if state.get("awaiting_final_audit", False):
                     return

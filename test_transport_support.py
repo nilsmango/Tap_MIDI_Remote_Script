@@ -274,6 +274,7 @@ class GeneratedShapeHarness:
     _automation_step_order = extracted_method("_automation_step_order")
     _automation_step_tuple = extracted_method("_automation_step_tuple")
     _automation_step_entry = extracted_method("_automation_step_entry")
+    _automation_wire_domain = extracted_method("_automation_wire_domain")
 
 
 class NoteCodecHarness:
@@ -1349,6 +1350,29 @@ class TransportTests(unittest.TestCase):
                 expected_checksum,
                 shape
             )
+
+    def test_generated_shape_uses_the_response_rounded_domain_after_extension(self):
+        harness = GeneratedShapeHarness()
+        # This is the exact range/padding pair captured after a duplication.
+        # Live retained 6.333334895 while the app correctly received the
+        # protocol's six-decimal 6.333335 domain. Both generators must use the
+        # latter or the clipped sine coefficient hashes differently.
+        domain = harness._automation_wire_domain((0.0, 6.333334895))
+        nodes = harness._generated_automation_nodes(
+            0, domain[0], domain[1], 1.0, 0.0,
+            0.24, 0.29, 0, False
+        )
+        canonical = ",".join(
+            harness._generated_automation_compact_entry(node)
+            for node in nodes
+        )
+
+        self.assertEqual(domain, (0.0, 6.333335))
+        self.assertEqual(len(nodes), 27)
+        self.assertEqual(
+            harness._automation_payload_checksum(canonical),
+            0x42E5810D
+        )
 
     def test_v55_terminal_group_is_always_linear(self):
         harness = GeneratedShapeHarness()
@@ -2788,9 +2812,11 @@ class TransportTests(unittest.TestCase):
                 self.events = []
                 self.deletes = []
                 self.read_count = 0
+                self.operations = []
 
             def delete_events_in_range(self, start, end):
                 self.deletes.append((start, end))
+                self.operations.append(("delete", start, end))
                 self.events = [event for event in self.events if not start <= event.time <= end]
 
             def events_in_range(self, start, end):
@@ -2819,6 +2845,7 @@ class TransportTests(unittest.TestCase):
 
             def _create_automation_event(self, envelope, time_value, raw_value, step):
                 # Simulate a Live binding that prepends equal-time creations.
+                envelope.operations.append(("create", time_value, step[5]))
                 envelope.events.insert(0, type("Event", (), {
                     "time": time_value,
                     "value": raw_value,
@@ -2830,12 +2857,14 @@ class TransportTests(unittest.TestCase):
 
         for first_value, second_value in ((0.2, 0.8), (0.8, 0.2)):
             steps = (
+                (0.5, 0.1, 0.1, 0.0, 3, 1, True, 0.2, 0.8, 0.7, 0.9),
                 (1.0, 0.1, first_value, 0.0, 1, 1, True, 0.5, 0.5, 0.5, 0.5),
                 (1.0, 0.1, second_value, 0.0, 2, 2, True, 0.5, 0.5, 0.5, 0.5),
             )
             envelope = Envelope()
+            harness = Harness()
             self.assertTrue(
-                Harness()._write_exact_automation_events_to_envelope(
+                harness._write_exact_automation_events_to_envelope(
                     envelope,
                     type("Parameter", (), {"min": 0.0, "max": 1.0})(),
                     0.0,
@@ -2844,11 +2873,22 @@ class TransportTests(unittest.TestCase):
                 )
             )
             self.assertEqual(
-                [event.value for event in envelope.events],
-                [first_value, second_value]
+                [(event.time, event.value) for event in envelope.events],
+                [(0.5, 0.1), (1.0, first_value), (1.0, second_value)]
             )
             self.assertEqual(len(envelope.deletes), 2)
-            self.assertEqual(envelope.read_count, 2)
+            self.assertEqual(envelope.read_count, 1)
+            self.assertEqual(harness._last_exact_automation_range_write_passes, 2)
+            self.assertEqual(harness._last_exact_automation_range_reversed_groups, 1)
+            delete_indexes = [
+                index for index, operation in enumerate(envelope.operations)
+                if operation[0] == "delete"
+            ]
+            self.assertEqual(delete_indexes, [0, 4])
+            self.assertTrue(all(
+                operation[0] == "create"
+                for operation in envelope.operations[delete_indexes[-1] + 1:]
+            ))
 
     def test_new_device_envelope_defers_full_write_like_the_first_pencil_point(self):
         envelope = object()
@@ -2863,11 +2903,15 @@ class TransportTests(unittest.TestCase):
 
         class Harness:
             AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS = 2
+            AUTOMATION_EXACT_VERTICAL_TIME_SPACING = 0.00002
             _handle_exact_automation_full_write = extracted_method(
                 "_handle_exact_automation_full_write"
             )
             _exact_automation_time_groups = extracted_method(
                 "_exact_automation_time_groups"
+            )
+            _spread_exact_automation_verticals = extracted_method(
+                "_spread_exact_automation_verticals"
             )
 
             def __init__(self):
@@ -2921,6 +2965,9 @@ class TransportTests(unittest.TestCase):
             def _perform_exact_automation_full_write(self, _state):
                 self.performed += 1
 
+            def _automation_trace(self, *_arguments):
+                pass
+
             def _automation_write_error_response(self, *args, **kwargs):
                 self.errors.append((args, kwargs))
 
@@ -2940,7 +2987,7 @@ class TransportTests(unittest.TestCase):
         harness.scheduled[0][1]()
         self.assertEqual(harness.performed, 1)
 
-    def test_exact_shape_is_validated_before_scheduled_points_and_curves_use_one_undo(self):
+    def test_exact_shape_is_validated_before_one_coupled_single_pass(self):
         class Envelope:
             def __init__(self):
                 self.events = []
@@ -2972,6 +3019,7 @@ class TransportTests(unittest.TestCase):
             AUTOMATION_REPEATING_PATTERN_MAX_EXPANDED_EVENTS = 262144
             AUTOMATION_EXACT_NEW_ENVELOPE_SETTLE_TICKS = 2
             AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
+            AUTOMATION_EXACT_VERTICAL_TIME_SPACING = 0.00002
             AUTOMATION_EXACT_STREAM_MAX_SETTLE_POLLS = 2
             AUTOMATION_EXACT_STREAM_MAX_GROUP_ATTEMPTS = 3
             _handle_exact_automation_stream = extracted_method(
@@ -3006,6 +3054,15 @@ class TransportTests(unittest.TestCase):
             )
             _exact_automation_group_status = extracted_method(
                 "_exact_automation_group_status"
+            )
+            _spread_exact_automation_verticals = extracted_method(
+                "_spread_exact_automation_verticals"
+            )
+            _exact_automation_time_groups = extracted_method(
+                "_exact_automation_time_groups"
+            )
+            _perform_exact_automation_full_write = extracted_method(
+                "_perform_exact_automation_full_write"
             )
             _close_exact_automation_write_attempt = extracted_method(
                 "_close_exact_automation_write_attempt"
@@ -3143,57 +3200,22 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(envelope.deletes), 1)
         self.assertEqual(envelope.events, [])
 
-        # The full-range clear gets its own settled read and an empty callback
-        # before the first point can be created.
+        # The full-range clear gets one empty callback, then all micro-spread
+        # events and their real coefficients are authored exactly once.
         harness.scheduled.pop(0)[1]()
-        self.assertEqual(envelope.events, [])
-        harness.scheduled.pop(0)[1]()
-        self.assertEqual([event.time for event in envelope.events], [0.0])
-        self.assertEqual(envelope.events[0].coefficients, (0.5, 0.5, 0.5, 0.5))
-
-        # A successful read-back only schedules the following mutation.
-        harness.scheduled.pop(0)[1]()
-        self.assertEqual([event.time for event in envelope.events], [0.0])
-        harness.scheduled.pop(0)[1]()
-        self.assertEqual(harness.begin_calls, 1)
         self.assertEqual(
             [(event.time, event.value) for event in envelope.events],
-            [(0.0, 0.5), (1.0, 0.0), (1.0, 1.0)],
+            [(0.0, 0.5), (0.99998, 0.0), (1.0, 1.0), (2.0, 0.5)],
         )
-
-        harness.scheduled.pop(0)[1]()
-        harness.scheduled.pop(0)[1]()
-        self.assertEqual(harness.begin_calls, 1)
-        self.assertEqual([event.time for event in envelope.events], [0.0, 1.0, 1.0, 2.0])
-        self.assertTrue(all(
-            event.coefficients == (0.5, 0.5, 0.5, 0.5)
-            for event in envelope.events
-        ))
-
-        # The final point read switches phase, then a separate callback begins
-        # the right-to-left curved replacements.
-        harness.scheduled.pop(0)[1]()
-        self.assertEqual(harness._automation_exact_stream["stream_phase"], "curves")
-        harness.scheduled.pop(0)[1]()
         right_event = next(event for event in envelope.events if event.time == 2.0)
         self.assertEqual(
             right_event.coefficients,
             (0.25, 0.25, 0.75, 0.75),
         )
-
-        harness.scheduled.pop(0)[1]()
-        harness.scheduled.pop(0)[1]()
         left_event = next(event for event in envelope.events if event.time == 0.0)
         self.assertEqual(left_event.coefficients, (
             0.333333333, 0.523598776, 0.666666667, 1.0,
         ))
-        self.assertEqual(
-            [(event.time, event.value) for event in envelope.events if event.time == 1.0],
-            [(1.0, 0.0), (1.0, 1.0)],
-        )
-
-        harness.scheduled.pop(0)[1]()
-        harness.scheduled.pop(0)[1]()
         self.assertEqual(harness.reenable_calls, 1)
         self.assertEqual(harness.end_calls, 1)
         self.assertEqual(len(harness.scheduled), 1)
@@ -3202,12 +3224,9 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(harness.errors, [])
         trace_stages = [stage for _transaction, stage, _details in harness.traces]
         self.assertIn("payload_valid", trace_stages)
-        self.assertIn("clear_write", trace_stages)
-        self.assertIn("clear_read", trace_stages)
-        self.assertIn("point_write", trace_stages)
-        self.assertIn("point_read", trace_stages)
-        self.assertIn("curve_write", trace_stages)
-        self.assertIn("curve_read", trace_stages)
+        self.assertIn("full_vertical_spread", trace_stages)
+        self.assertIn("full_range_clear", trace_stages)
+        self.assertIn("full_single_pass_write", trace_stages)
 
     def test_malformed_exact_shape_cancels_an_active_write_without_mutating(self):
         class Harness(AutomationTraceSupport):
@@ -3657,6 +3676,121 @@ class TransportTests(unittest.TestCase):
         harness.scheduled = []
         harness._perform_exact_automation_full_write(state)
         self.assertEqual(harness.begin_calls, 2)
+
+    def test_full_shape_clears_once_then_writes_every_group_in_one_callback(self):
+        class Envelope:
+            def __init__(self):
+                self.events = []
+                self.deletes = []
+
+            def delete_events_in_range(self, start, end):
+                self.deletes.append((start, end))
+                self.events = [
+                    event for event in self.events
+                    if not start <= event.time <= end
+                ]
+
+        class Harness:
+            AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
+            _perform_exact_automation_full_write = extracted_method(
+                "_perform_exact_automation_full_write"
+            )
+            _create_exact_automation_group = extracted_method(
+                "_create_exact_automation_group"
+            )
+            _close_exact_automation_write_attempt = extracted_method(
+                "_close_exact_automation_write_attempt"
+            )
+
+            def __init__(self):
+                self.scheduled = []
+                self.begin_calls = 0
+                self.end_calls = 0
+                self.audit_calls = 0
+
+            def _automation_envelope_supports_point_events(self, _envelope):
+                return True
+
+            def _begin_undo_step(self):
+                self.begin_calls += 1
+                return True
+
+            def _end_undo_step(self, started):
+                if started:
+                    self.end_calls += 1
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, envelope, time_value, raw_value, _step):
+                envelope.events.append(type("Event", (), {
+                    "time": time_value,
+                    "value": raw_value,
+                })())
+
+            def _parameter_automation_is_enabled(self, _parameter):
+                return True
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _verify_exact_automation_full_write(self, _state):
+                self.audit_calls += 1
+
+            def _fail_exact_automation_full_write(self, _state):
+                raise AssertionError("write should not fail")
+
+            def _retry_exact_automation_full_write(self, _state, status):
+                raise AssertionError(status)
+
+            def _automation_trace(self, *_arguments):
+                pass
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        steps = tuple(
+            (time_value, 0.1, value, 0.0, index, index, True,
+             0.5, 0.5, 0.5, 0.5)
+            for index, (time_value, value) in enumerate(
+                ((2.0, 0.8), (1.0, 0.4), (0.0, 0.2)), 1
+            )
+        )
+        envelope = Envelope()
+        state = {
+            "context": {"clip": object(), "device_param": object()},
+            "envelope": envelope,
+            "write_start": 0.0,
+            "write_end": 2.0,
+            "write_intervals": ((0.0, 2.0),),
+            "time_groups": tuple((step,) for step in steps),
+            "next_group_index": 0,
+            "group_creation_reversed": {},
+            "single_pass_full": True,
+            "cleared": False,
+            "undo_step_attempted": False,
+            "undo_step_started": False,
+            "awaiting_final_audit": False,
+            "automation_should_re_enable": False,
+            "write_token": "shape",
+            "completed": False,
+        }
+        harness = Harness()
+        harness._perform_exact_automation_full_write(state)
+
+        self.assertEqual(envelope.events, [])
+        self.assertEqual(len(envelope.deletes), 1)
+        self.assertEqual(harness.begin_calls, 1)
+        self.assertEqual([(ticks) for ticks, _callback in harness.scheduled], [1])
+
+        harness.scheduled.pop(0)[1]()
+        self.assertEqual([event.time for event in envelope.events], [2.0, 1.0, 0.0])
+        self.assertEqual(harness.end_calls, 1)
+        self.assertEqual(harness.audit_calls, 0)
+        self.assertEqual([(ticks) for ticks, _callback in harness.scheduled], [2])
+
+        harness.scheduled.pop(0)[1]()
+        self.assertEqual(harness.audit_calls, 1)
 
     def test_delta_writer_clears_only_its_disjoint_affected_intervals(self):
         class Event:
@@ -4405,6 +4539,111 @@ class TransportTests(unittest.TestCase):
 
         self.assertEqual(status, "ok")
 
+    def test_nearby_microspread_points_are_not_one_same_time_group(self):
+        class Controls:
+            x1 = y1 = x2 = y2 = 0.5
+
+        class Event:
+            def __init__(self, time_value, value):
+                self.time = time_value
+                self.value = value
+                self.control_coefficients = Controls()
+
+        class Envelope:
+            def __init__(self):
+                self.events = (
+                    Event(5.0, 0.2),
+                    Event(5.00001, 0.8),
+                )
+
+            def events_in_range(self, start, end):
+                return tuple(
+                    event for event in self.events
+                    if start <= event.time <= end
+                )
+
+        class Harness:
+            AUTOMATION_EXACT_SAME_TIME_TOLERANCE = 0.000001
+            AUTOMATION_EXACT_EVENT_TIME_TOLERANCE = 0.00001
+            _exact_automation_group_status = extracted_method(
+                "_exact_automation_group_status"
+            )
+
+        first = (
+            5.0, 0.0625, 0.2, 0.0, 1, 1, True,
+            0.5, 0.5, 0.5, 0.5,
+        )
+        second = (
+            5.00001, 0.0625, 0.8, 0.0, 2, 2, True,
+            0.5, 0.5, 0.5, 0.5,
+        )
+        harness = Harness()
+        envelope = Envelope()
+
+        self.assertEqual(
+            harness._exact_automation_group_status(
+                envelope, (first,), 0.0, 5.00001, None, False
+            ),
+            "ok"
+        )
+        self.assertEqual(
+            harness._exact_automation_group_status(
+                envelope, (second,), 0.0, 5.00001, None, False
+            ),
+            "ok"
+        )
+
+    def test_final_audit_keeps_ten_microbeat_endpoint_neighbors_distinct(self):
+        class Controls:
+            x1 = y1 = x2 = y2 = 0.5
+
+        class Event:
+            def __init__(self, time_value, value):
+                self.time = time_value
+                self.value = value
+                self.control_coefficients = Controls()
+
+        class Envelope:
+            def __init__(self):
+                self.events = (
+                    Event(5.0, 0.2),
+                    Event(5.00001, 0.8),
+                )
+
+            def events_in_range(self, start, end):
+                return tuple(
+                    event for event in self.events
+                    if start <= event.time <= end
+                )
+
+        class Harness:
+            AUTOMATION_EXACT_SAME_TIME_TOLERANCE = 0.000001
+            AUTOMATION_EXACT_EVENT_TIME_TOLERANCE = 0.00001
+            _automation_events_in_closed_range = extracted_method(
+                "_automation_events_in_closed_range"
+            )
+            _exact_automation_final_event_status = extracted_method(
+                "_exact_automation_final_event_status"
+            )
+
+        first = (
+            5.0, 0.0625, 0.2, 0.0, 1, 1, True,
+            0.5, 0.5, 0.5, 0.5,
+        )
+        second = (
+            5.00001, 0.0625, 0.8, 0.0, 2, 2, True,
+            0.5, 0.5, 0.5, 0.5,
+        )
+        status = Harness()._exact_automation_final_event_status({
+            "envelope": Envelope(),
+            "write_start": 0.0,
+            "write_end": 5.00001,
+            "time_groups": ((second,), (first,)),
+        })
+
+        self.assertTrue(status["exact"])
+        self.assertEqual(status["reason"], "ok")
+
     def test_final_full_range_audit_never_acknowledges_exhausted_mismatch(self):
         class Harness:
             _retry_exact_automation_full_write = extracted_method(
@@ -4686,6 +4925,60 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(final_steps[-1][7:], (0.1, 0.7, 0.8, 0.9))
         self.assertEqual(intervals, ((1.0, 2.0),))
 
+    def test_exact_delta_micro_spreads_affected_verticals_without_losing_controls(self):
+        class Harness:
+            AUTOMATION_EXACT_VERTICAL_TIME_SPACING = 0.00002
+            _automation_step_id = extracted_method("_automation_step_id")
+            _automation_step_order = extracted_method("_automation_step_order")
+            _automation_step_tuple = extracted_method("_automation_step_tuple")
+            _automation_sort_key = extracted_method("_automation_sort_key")
+            _automation_sorted_steps = extracted_method("_automation_sorted_steps")
+            _spread_exact_automation_verticals = extracted_method(
+                "_spread_exact_automation_verticals"
+            )
+
+        linear = (0.5, 0.5, 0.5, 0.5)
+        curved = (0.171368, 0.461610, 0.503336, 0.792348)
+        steps = (
+            (0.0, 0.125, 0.28, 0.0, 1, 1, True, *linear),
+            (0.0, 0.125, 0.78, 0.0, 2, 2, True, *curved),
+            (1.333333, 0.125, 0.28, 0.0, 3, 3, True, *linear),
+            (1.333333, 0.125, 0.78, 0.0, 4, 4, True, *curved),
+            (2.0, 0.125, 0.4, 0.0, 5, 5, True, *linear),
+        )
+
+        spread, intervals, group_count, maximum_offset = (
+            Harness()._spread_exact_automation_verticals(
+                steps, ((0.0, 2.0),)
+            )
+        )
+
+        self.assertEqual(intervals, ((0.0, 2.0),))
+        self.assertEqual(group_count, 2)
+        self.assertAlmostEqual(maximum_offset, 0.00002)
+        self.assertEqual([step[4] for step in spread], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [round(step[0], 6) for step in spread],
+            [0.0, 0.00002, 1.333313, 1.333333, 2.0]
+        )
+        self.assertEqual(spread[1][7:], curved)
+        self.assertEqual(spread[3][7:], curved)
+        self.assertTrue(all(
+            float(right[0]) - float(left[0]) > 0.000001
+            for left, right in zip(spread, spread[1:])
+        ))
+
+        second_only, _intervals, second_count, _offset = (
+            Harness()._spread_exact_automation_verticals(
+                steps, ((1.0, 2.0),)
+            )
+        )
+        self.assertEqual(second_count, 1)
+        self.assertEqual(second_only[0][0], 0.0)
+        self.assertEqual(second_only[1][0], 0.0)
+        self.assertAlmostEqual(second_only[2][0], 1.333313)
+        self.assertAlmostEqual(second_only[3][0], 1.333333)
+
     def test_exact_delta_extends_left_only_across_curves_live_can_reset(self):
         class Harness:
             _automation_step_id = extracted_method("_automation_step_id")
@@ -4773,14 +5066,15 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(harness.response[0].startswith("0|0|0.400000|"))
         self.assertEqual(harness.response[1], 0x31)
 
-    def test_exact_delta_pure_insert_creates_only_the_new_event(self):
+    def test_exact_delta_rewrites_the_complete_dependency_interval(self):
         class Harness:
-            _apply_direct_exact_automation_delta = extracted_method(
-                "_apply_direct_exact_automation_delta"
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
             )
 
             def __init__(self):
                 self.created = []
+                self.writes = []
                 self.begin_count = 0
                 self.end_count = 0
                 self.reenable_count = 0
@@ -4802,6 +5096,14 @@ class TransportTests(unittest.TestCase):
             def _create_automation_event(self, _envelope, time_value, raw_value, step):
                 self.created.append((time_value, raw_value, step[4]))
 
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((
+                    start, end, tuple(steps), allow_empty, endpoint_padding
+                ))
+                return True
+
             def _parameter_automation_is_enabled(self, _parameter):
                 return False
 
@@ -4819,17 +5121,20 @@ class TransportTests(unittest.TestCase):
         inserted = (2.0, 0.125, 0.6, 0.0, 3, 3, True, 0.5, 0.5, 0.5, 0.5)
         harness = Harness()
 
-        applied = harness._apply_direct_exact_automation_delta(
+        applied = harness._apply_exact_automation_delta(
             {"device_param": object()},
             object(),
-            baseline,
             baseline + (inserted,),
-            ["I:2:ignored"],
+            ((1.0, 2.0),),
             True
         )
 
         self.assertTrue(applied)
-        self.assertEqual(harness.created, [(2.0, 0.6, 3)])
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.writes[0][0:2], (1.0, 2.0))
+        self.assertEqual(harness.writes[0][2], (baseline[1], inserted))
+        self.assertTrue(harness.writes[0][3])
+        self.assertEqual(harness.writes[0][4], 0.0000001)
         self.assertEqual(harness.begin_count, 1)
         self.assertEqual(harness.end_count, 1)
         self.assertEqual(harness.reenable_count, 1)
@@ -4853,8 +5158,8 @@ class TransportTests(unittest.TestCase):
                 self.loop_end = float(value)
 
         class Harness:
-            _apply_direct_exact_automation_delta = extracted_method(
-                "_apply_direct_exact_automation_delta"
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
             )
 
             def __init__(self, clip):
@@ -4875,6 +5180,16 @@ class TransportTests(unittest.TestCase):
                     time_value, value, self.clip.end_marker, self.clip.loop_end
                 ))
 
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, _start, _end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.created.append((
+                    len(tuple(steps)), allow_empty,
+                    self.clip.end_marker, self.clip.loop_end,
+                    endpoint_padding,
+                ))
+                return True
+
             def _debug_log(self, message):
                 raise AssertionError(message)
 
@@ -4886,18 +5201,21 @@ class TransportTests(unittest.TestCase):
         clip = Clip()
         harness = Harness(clip)
 
-        applied = harness._apply_direct_exact_automation_delta(
+        applied = harness._apply_exact_automation_delta(
             {"clip": clip, "device_param": object()},
-            object(), baseline, baseline + (inserted,), ["I:2:ignored"],
+            object(), baseline + (inserted,), ((1.0, 2.0),),
             required_domain_end=2.0
         )
 
         self.assertTrue(applied)
         self.assertEqual(clip.end_marker, 2.0)
         self.assertEqual(clip.loop_end, 1.0)
-        self.assertEqual(harness.created, [(2.0, 0.6, 2.0, 1.0)])
+        self.assertEqual(
+            harness.created,
+            [(2, True, 2.0, 1.0, 0.0000001)]
+        )
 
-    def test_exact_delta_pure_unique_delete_removes_only_that_timestamp(self):
+    def test_exact_delta_delete_rewrites_the_supplied_dependency_range(self):
         class Envelope:
             def __init__(self):
                 self.deleted = []
@@ -4906,15 +5224,26 @@ class TransportTests(unittest.TestCase):
                 self.deleted.append((start, end))
 
         class Harness:
-            _apply_direct_exact_automation_delta = extracted_method(
-                "_apply_direct_exact_automation_delta"
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
             )
+
+            def __init__(self):
+                self.writes = []
 
             def _begin_undo_step(self):
                 return True
 
             def _end_undo_step(self, _started):
                 pass
+
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((
+                    start, end, tuple(steps), allow_empty, endpoint_padding
+                ))
+                return True
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -4926,18 +5255,21 @@ class TransportTests(unittest.TestCase):
         )
         envelope = Envelope()
 
-        applied = Harness()._apply_direct_exact_automation_delta(
+        harness = Harness()
+        applied = harness._apply_exact_automation_delta(
             {"device_param": object()},
             envelope,
-            baseline,
             baseline[:3] + baseline[4:],
-            ["D:3"]
+            ((2.0, 4.0),)
         )
 
         self.assertTrue(applied)
-        self.assertEqual(len(envelope.deleted), 1)
-        self.assertAlmostEqual(envelope.deleted[0][0], 3.0 - 0.00001)
-        self.assertAlmostEqual(envelope.deleted[0][1], 3.0 + 0.00001)
+        self.assertEqual(envelope.deleted, [])
+        self.assertEqual(harness.writes[0][0:2], (2.0, 4.0))
+        self.assertEqual(
+            [step[0] for step in harness.writes[0][2]],
+            [2.0, 4.0]
+        )
 
     def test_exact_delta_rebuilds_only_the_touched_vertical_group(self):
         class Envelope:
@@ -4948,12 +5280,13 @@ class TransportTests(unittest.TestCase):
                 self.deleted.append((start, end))
 
         class Harness:
-            _apply_direct_exact_automation_delta = extracted_method(
-                "_apply_direct_exact_automation_delta"
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
             )
 
             def __init__(self):
                 self.created = []
+                self.writes = []
 
             def _begin_undo_step(self):
                 return True
@@ -4966,6 +5299,12 @@ class TransportTests(unittest.TestCase):
 
             def _create_automation_event(self, _envelope, time_value, value, step):
                 self.created.append((time_value, value, step[4]))
+
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((start, end, tuple(steps)))
+                return True
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -4977,15 +5316,16 @@ class TransportTests(unittest.TestCase):
         envelope = Envelope()
         harness = Harness()
         self.assertTrue(
-            harness._apply_direct_exact_automation_delta(
-                {"device_param": object()}, envelope, baseline,
-                baseline[1:], ["D:0"]
+            harness._apply_exact_automation_delta(
+                {"device_param": object()}, envelope,
+                baseline[1:], ((1.0, 1.0),)
             )
         )
-        self.assertEqual(len(envelope.deleted), 1)
-        self.assertEqual(harness.created, [(1.0, 0.8, 2)])
+        self.assertEqual(envelope.deleted, [])
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.writes, [(1.0, 1.0, (baseline[1],))])
 
-    def test_exact_delta_move_rewrites_only_its_old_and_new_event_groups(self):
+    def test_exact_delta_move_rewrites_the_full_curved_dependency_chain(self):
         class Envelope:
             def __init__(self):
                 self.deleted = []
@@ -4994,12 +5334,14 @@ class TransportTests(unittest.TestCase):
                 self.deleted.append((start, end))
 
         class Harness:
-            _apply_direct_exact_automation_delta = extracted_method(
-                "_apply_direct_exact_automation_delta"
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
             )
 
             def __init__(self):
                 self.created = []
+                self.writes = []
+                self.traces = []
 
             def _begin_undo_step(self):
                 return True
@@ -5012,6 +5354,15 @@ class TransportTests(unittest.TestCase):
 
             def _create_automation_event(self, _envelope, time_value, value, step):
                 self.created.append((time_value, value, step[4]))
+
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((start, end, tuple(steps)))
+                return True
+
+            def _automation_trace(self, token, stage, details):
+                self.traces.append((token, stage, details))
 
             def _debug_log(self, message):
                 raise AssertionError(message)
@@ -5028,14 +5379,267 @@ class TransportTests(unittest.TestCase):
         harness = Harness()
 
         self.assertTrue(
-            harness._apply_direct_exact_automation_delta(
-                {"device_param": object()}, envelope, baseline, final_steps,
-                ["R:1:1:ignored"]
+            harness._apply_exact_automation_delta(
+                {"device_param": object()}, envelope, final_steps,
+                ((0.0, 3.0),), trace_token="move-1"
             )
         )
-        self.assertEqual(len(envelope.deleted), 1)
-        self.assertAlmostEqual(envelope.deleted[0][0], 1.0 - 0.00001)
-        self.assertEqual(harness.created, [(2.0, 0.5, 2)])
+        self.assertEqual(envelope.deleted, [])
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.writes, [(0.0, 3.0, final_steps)])
+        self.assertEqual(harness.traces[0][0:2], (
+            "move-1", "delta_range_write"
+        ))
+        self.assertIn(
+            "ranges=1 events=3 passes=1 reversed_groups=0 elapsed_ms=",
+            harness.traces[0][2]
+        )
+
+    def test_exact_delta_uses_one_wait_and_one_write_for_duplicate_seam(self):
+        class Event:
+            def __init__(self, time_value, value):
+                self.time = time_value
+                self.value = value
+
+        class Envelope:
+            def __init__(self):
+                self.events = [Event(1.0, 0.2), Event(2.0, 0.3)]
+                self.deletes = []
+
+            def delete_events_in_range(self, start, end):
+                # Live publishes this mutation only on a later callback.
+                self.deletes.append((start, end))
+
+            def events_in_range(self, start, end):
+                raise AssertionError("single-pass edits do not probe Live")
+
+        class Harness:
+            AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
+            _start_settled_exact_automation_delta = extracted_method(
+                "_start_settled_exact_automation_delta"
+            )
+            _clear_settled_exact_automation_delta_ranges = extracted_method(
+                "_clear_settled_exact_automation_delta_ranges"
+            )
+            _write_settled_exact_automation_delta_ranges = extracted_method(
+                "_write_settled_exact_automation_delta_ranges"
+            )
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
+            )
+            _automation_events_in_closed_range = extracted_method(
+                "_automation_events_in_closed_range"
+            )
+            _exact_automation_time_groups = extracted_method(
+                "_exact_automation_time_groups"
+            )
+            _create_exact_automation_group = extracted_method(
+                "_create_exact_automation_group"
+            )
+
+            def __init__(self):
+                self.scheduled = []
+                self.created = []
+                self.traces = []
+                self.undo_begins = 0
+                self.undo_ends = 0
+
+            def _begin_undo_step(self):
+                self.undo_begins += 1
+                return True
+
+            def _end_undo_step(self, started):
+                self.undo_ends += int(bool(started))
+
+            def _close_exact_automation_write_attempt(self, state):
+                if state.get("undo_step_started"):
+                    state["undo_step_started"] = False
+                    self._end_undo_step(True)
+
+            def _automation_sorted_steps(self, steps):
+                return tuple(sorted(steps, key=lambda step: (step[0], step[5])))
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, envelope, time_value, value, step):
+                self.created.append((time_value, value, step[5]))
+                envelope.events.append(Event(time_value, value))
+
+            def _automation_trace(self, transaction, stage, details=""):
+                self.traces.append((transaction, stage, details))
+
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        curved = (0.12, 0.68, 0.45, 1.0)
+        steps = (
+            (1.0, 0.125, 0.7, 0.0, 1, 1, True, *curved),
+            (2.0, 0.125, 0.7, 0.0, 2, 2, True, 0.5, 0.5, 0.5, 0.5),
+            (2.0, 0.125, 0.2, 0.0, 3, 3, True, *curved),
+            (3.0, 0.125, 0.7, 0.0, 4, 4, True, 0.5, 0.5, 0.5, 0.5),
+        )
+        envelope = Envelope()
+        harness = Harness()
+        state = harness._start_settled_exact_automation_delta(
+            {"clip": object(), "device_param": object()},
+            envelope,
+            steps,
+            ((1.0, 3.0),),
+            trace_token="duplicate-1"
+        )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.undo_begins, 1)
+        self.assertEqual(harness.undo_ends, 0)
+        self.assertEqual(harness.scheduled[0][0], 1)
+
+        harness.scheduled.pop(0)[1]()
+
+        self.assertEqual(
+            harness.created,
+            [(3.0, 0.7, 4), (2.0, 0.7, 2),
+             (2.0, 0.2, 3), (1.0, 0.7, 1)]
+        )
+        self.assertEqual(len(envelope.deletes), 1)
+        self.assertEqual(harness.scheduled[0][0], 2)
+        self.assertEqual(harness.undo_ends, 1)
+        self.assertFalse(state["group_creation_reversed"][2.0])
+        self.assertTrue(all(
+            not reversed_group
+            for reversed_group in state["group_creation_reversed"].values()
+        ))
+        self.assertTrue(any(
+            stage == "delta_single_pass" and "correction_writes=0" in details
+            for _token, stage, details in harness.traces
+        ))
+
+    def test_exact_delta_adjacent_replacements_use_one_merged_range(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
+        class Harness:
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
+            )
+
+            def __init__(self):
+                self.created = []
+                self.writes = []
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, _envelope, time_value, value, step):
+                self.created.append((time_value, value, step[4]))
+
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((start, end, tuple(steps)))
+                return True
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        curved = (0.1, 0.8, 0.7, 0.9)
+        baseline = tuple(
+            (float(index), 0.125, 0.2 + index * 0.1, 0.0,
+             index + 1, index + 1, True, *curved)
+            for index in range(5)
+        )
+        final_steps = tuple(
+            tuple(list(step[:2]) + [step[2] * 0.5] + list(step[3:]))
+            if index in (2, 3) else step
+            for index, step in enumerate(baseline)
+        )
+        harness = Harness()
+
+        self.assertTrue(harness._apply_exact_automation_delta(
+            {"device_param": object()}, Envelope(), final_steps,
+            ((0.0, 4.0),)
+        ))
+
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.writes, [(0.0, 4.0, final_steps)])
+
+    def test_exact_delta_range_keeps_a_vertical_predecessor_atomic(self):
+        class Envelope:
+            def __init__(self):
+                self.deleted = []
+
+            def delete_events_in_range(self, start, end):
+                self.deleted.append((start, end))
+
+        class Harness:
+            _apply_exact_automation_delta = extracted_method(
+                "_apply_exact_automation_delta"
+            )
+
+            def __init__(self):
+                self.created = []
+                self.writes = []
+                self.traces = []
+
+            def _begin_undo_step(self):
+                return True
+
+            def _end_undo_step(self, _started):
+                pass
+
+            def _parameter_target_value_from_normalized(self, _parameter, value):
+                return value
+
+            def _create_automation_event(self, _envelope, time_value, value, step):
+                self.created.append((time_value, value, step[4]))
+
+            def _write_exact_automation_events_to_envelope(
+                    self, _envelope, _parameter, start, end, steps,
+                    allow_empty=False, endpoint_padding=0.0001):
+                self.writes.append((start, end, tuple(steps)))
+                return True
+
+            def _automation_trace(self, token, stage, details):
+                self.traces.append((token, stage, details))
+
+            def _debug_log(self, message):
+                raise AssertionError(message)
+
+        curved = (0.1, 0.8, 0.7, 0.9)
+        baseline = (
+            (0.0, 0.125, 0.2, 0.0, 1, 1, True, *curved),
+            (0.0, 0.125, 0.4, 0.0, 2, 2, True, *curved),
+            (1.0, 0.125, 0.8, 0.0, 3, 3, True, *curved),
+        )
+        moved = tuple([1.5] + list(baseline[2][1:]))
+        harness = Harness()
+
+        final_steps = baseline[:2] + (moved,)
+        self.assertTrue(harness._apply_exact_automation_delta(
+            {"device_param": object()}, Envelope(), final_steps,
+            ((0.0, 1.5),),
+            trace_token="vertical-1"
+        ))
+
+        self.assertEqual(harness.created, [])
+        self.assertEqual(harness.writes, [(0.0, 1.5, final_steps)])
+        self.assertEqual(harness.traces[0][0:2], (
+            "vertical-1", "delta_range_write"
+        ))
 
     def test_exact_delta_acceptance_rereads_only_the_changed_range(self):
         class Harness:
@@ -5271,18 +5875,27 @@ class TransportTests(unittest.TestCase):
         self.assertIsNone(harness._automation_trace_pending_transfer)
         self.assertEqual(harness.errors, [((4, "19"), {"status": "transport"})])
 
-    def test_exact_delta_uses_only_the_pointwise_writer(self):
+    def test_exact_delta_starts_clear_settle_writer_before_reading_acceptance(self):
         class Harness:
+            AUTOMATION_EXACT_POST_COMMIT_SETTLE_TICKS = 2
             _handle_exact_automation_delta = extracted_method(
                 "_handle_exact_automation_delta"
+            )
+            _spread_exact_automation_verticals = extracted_method(
+                "_spread_exact_automation_verticals"
+            )
+            _finalize_exact_automation_delta = extracted_method(
+                "_finalize_exact_automation_delta"
             )
 
             def __init__(self):
                 self._automation_trace_pending_transfer = None
-                self.direct_write = None
+                self.range_write = None
                 self.response = None
                 self.traces = []
                 self.stored = None
+                self.scheduled = []
+                self.accepted_reads = 0
                 self.clip = type("Clip", (), {
                     "end_marker": 4.0,
                     "loop_end": 4.0,
@@ -5312,10 +5925,12 @@ class TransportTests(unittest.TestCase):
                     (0.0, 0.125, 0.2, 0.0, 1, 1, True,
                      0.5, 0.5, 0.5, 0.5),
                     (1.0, 0.125, 0.4, 0.0, 2, 2, True,
-                     0.1, 0.8, 0.7, 0.9),
-                    (2.0, 0.125, 0.6, 0.0, 3, 3, True,
                      0.5, 0.5, 0.5, 0.5),
-                    (5.0, 0.125, 0.8, 0.0, 4, 4, True,
+                    (1.0, 0.125, 0.7, 0.0, 3, 3, True,
+                     0.1, 0.8, 0.7, 0.9),
+                    (2.0, 0.125, 0.6, 0.0, 4, 4, True,
+                     0.5, 0.5, 0.5, 0.5),
+                    (5.0, 0.125, 0.8, 0.0, 5, 5, True,
                      0.5, 0.5, 0.5, 0.5),
                 ), ((0.0, 2.0),))
 
@@ -5325,16 +5940,23 @@ class TransportTests(unittest.TestCase):
             def _automation_envelope_supports_point_events(self, _envelope):
                 return True
 
-            def _apply_direct_exact_automation_delta(
-                    self, context, envelope, baseline, final_steps, entries,
-                    automation_should_re_enable=False, required_domain_end=None):
-                self.direct_write = (
-                    context, envelope, baseline, final_steps, tuple(entries),
-                    automation_should_re_enable, required_domain_end
+            def _start_settled_exact_automation_delta(
+                    self, context, envelope, final_steps, intervals,
+                    automation_should_re_enable=False, required_domain_end=None,
+                    trace_token=None):
+                self.range_write = (
+                    context, envelope, final_steps, tuple(intervals),
+                    automation_should_re_enable, required_domain_end, trace_token
                 )
                 if required_domain_end is not None:
                     context["clip"].end_marker = required_domain_end
-                return True
+                state = {"started": True}
+                self.schedule_message(
+                    1,
+                    lambda state=state:
+                        self._finalize_exact_automation_delta(state)
+                )
+                return state
 
             def _automation_domain_for_clip(self, clip, _parameter):
                 return (0.0, clip.end_marker)
@@ -5342,6 +5964,7 @@ class TransportTests(unittest.TestCase):
             def _accepted_exact_automation_delta_snapshot(
                     self, _context, _envelope, final_steps, _intervals,
                     _duration, include_live_event_records=False):
+                self.accepted_reads += 1
                 self.assert_live_records = include_live_event_records
                 return (tuple(final_steps), ((0.0, "event"),))
 
@@ -5369,6 +5992,9 @@ class TransportTests(unittest.TestCase):
             def _refresh_parameter_metadata_on_automation_change(self):
                 pass
 
+            def schedule_message(self, ticks, callback):
+                self.scheduled.append((ticks, callback))
+
             def _handle_exact_automation_full_write(
                     self, fields, compact_response=False, write_intervals=None,
                     audit_steps=None):
@@ -5383,18 +6009,39 @@ class TransportTests(unittest.TestCase):
         harness = Harness()
         harness._handle_exact_automation_delta(fields)
 
-        self.assertIsNotNone(harness.direct_write)
-        self.assertEqual(harness.direct_write[2], ("baseline",))
-        self.assertEqual(harness.direct_write[4], ("R:0:0:entry",))
-        self.assertTrue(harness.direct_write[5])
-        self.assertEqual(harness.direct_write[6], 5.0)
+        self.assertIsNotNone(harness.range_write)
+        self.assertEqual(harness.range_write[2][-1][0], 5.0)
+        self.assertEqual(
+            [round(step[0], 6) for step in harness.range_write[2][1:3]],
+            [0.99998, 1.0]
+        )
+        self.assertEqual(harness.range_write[3], ((0.0, 2.0),))
+        self.assertTrue(harness.range_write[4])
+        self.assertEqual(harness.range_write[5], 5.0)
+        self.assertEqual(harness.range_write[6], "44")
+        self.assertEqual(harness.accepted_reads, 0)
+        self.assertIsNone(harness.response)
+        self.assertEqual(len(harness.scheduled), 1)
+        self.assertEqual(harness.scheduled[0][0], 1)
+
+        harness.scheduled[0][1]()
+
+        self.assertEqual(harness.accepted_reads, 1)
         self.assertTrue(harness.assert_live_records)
         self.assertEqual(harness.stored[-1][0], 5.0)
         self.assertEqual(harness.response[0]["domain"], (0.0, 5.0))
         self.assertEqual(harness.response[3], "NEW")
         self.assertEqual(harness.response[-1], "44")
         self.assertIn(
-            "delta_write_direct",
+            "delta_clear_sync",
+            [stage for _transaction, stage, _details in harness.traces]
+        )
+        self.assertIn(
+            "delta_vertical_spread",
+            [stage for _transaction, stage, _details in harness.traces]
+        )
+        self.assertIn(
+            "delta_settled",
             [stage for _transaction, stage, _details in harness.traces]
         )
 
