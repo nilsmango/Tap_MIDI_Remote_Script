@@ -60,7 +60,7 @@ import time
 from types import MappingProxyType
 
 
-secret_version_number = 58
+secret_version_number = 59
 
 
 mixer, transport = None, None
@@ -3437,6 +3437,39 @@ class Tap(ControlSurface):
             )
         except Exception:
             pass
+
+    def _automation_trace_exact_patch_events(
+            self, transaction, stage, steps, intervals):
+        """Log exact event/coefficient records around a delta, never samples."""
+        if not getattr(self, "AUTOMATION_TRACE_LOGGING_ENABLED", False):
+            return
+        intervals = tuple(intervals or ())
+        relevant = [
+            self._automation_step_tuple(step, index)
+            for index, step in enumerate(steps or ())
+            if not intervals or any(
+                float(step[0]) >= float(start) - 0.000001
+                and float(step[0]) <= float(end) + 0.000001
+                for start, end in intervals
+            )
+        ]
+        omitted = max(0, len(relevant) - 12)
+        shown = relevant if len(relevant) <= 12 else relevant[:6] + relevant[-6:]
+        records = ";".join(
+            "{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f}".format(
+                float(step[0]), float(step[2]),
+                float(step[7]), float(step[8]),
+                float(step[9]), float(step[10])
+            )
+            for step in shown
+        )
+        self._automation_trace(
+            transaction,
+            stage,
+            "events={} omitted={} records={}".format(
+                len(relevant), omitted, records or "none"
+            )
+        )
 
     def _get_device_cache_key(self, device):
         if not device:
@@ -12729,7 +12762,7 @@ class Tap(ControlSurface):
             self._finish_mixer_control_gesture(key)
 
     def _handle_mixer_control(self, message):
-        # Strict v58 order mirrored by TapMixerControlWire:
+        # Strict v59 order mirrored by TapMixerControlWire:
         # F0, 28, channel, CC, gesture state, 7-bit value, F7.
         if (len(message) != 7 or message[0] != 0xF0 or message[1] != 0x28
                 or message[-1] != 0xF7):
@@ -19516,11 +19549,17 @@ class Tap(ControlSurface):
             return None
         try:
             time_value = float(components[0])
+            duration_value = float(components[1])
+            normalized_value = float(components[2])
+            curve_value = float(components[3]) if len(components) >= 4 else 0.0
+            if not all(math.isfinite(value) for value in (
+                    time_value, duration_value, normalized_value, curve_value)):
+                return None
             if domain is not None:
                 time_value = max(float(domain[0]), min(float(domain[1]), time_value))
-            duration = max(0.0001, float(components[1]))
-            normalized = max(0.0, min(1.0, float(components[2])))
-            curve = max(-1.0, min(1.0, float(components[3]) if len(components) >= 4 else 0.0))
+            duration = max(0.0001, duration_value)
+            normalized = max(0.0, min(1.0, normalized_value))
+            curve = max(-1.0, min(1.0, curve_value))
             step_id = max(0, int(components[4])) if len(components) >= 5 else 0
             step_order = max(0, int(components[5])) if len(components) >= 6 else max(0, int(fallback_order))
             uses_exact_controls = len(components) >= 11 and components[6] == "1"
@@ -19564,7 +19603,7 @@ class Tap(ControlSurface):
                 if ordinal < 0 or ordinal >= len(baseline) or ordinal in removed_ordinals:
                     return None
                 step = self._automation_step_from_entry(
-                    components[3], domain=domain, fallback_order=final_position + 1
+                    components[3], domain=None, fallback_order=final_position + 1
                 )
                 if step is None or final_position in fixed_positions:
                     return None
@@ -19576,7 +19615,7 @@ class Tap(ControlSurface):
                 insertion_components = operation_entry.split(":", 2)
                 final_position = int(insertion_components[1])
                 step = self._automation_step_from_entry(
-                    insertion_components[2], domain=domain, fallback_order=final_position + 1
+                    insertion_components[2], domain=None, fallback_order=final_position + 1
                 )
                 if step is None or final_position in fixed_positions:
                     return None
@@ -19603,6 +19642,10 @@ class Tap(ControlSurface):
         for index in range(1, len(final_steps)):
             if float(final_steps[index][0]) < float(final_steps[index - 1][0]) - 0.000001:
                 return None
+        if any(float(step[0]) < float(domain[0]) - 0.000001 for step in final_steps):
+            # Exact structural edits may expand the authored end, but never
+            # move the clip's start boundary implicitly.
+            return None
         # Snapshot order is authoritative for same-time groups. Live does not
         # store this integer; it is regenerated on read and only guides the
         # deterministic right-to-left recreation order.
@@ -19650,16 +19693,19 @@ class Tap(ControlSurface):
                 left_index = max(0, position - 1)
                 right_index = min(len(final_steps) - 1, position + 1)
                 intervals.append((final_steps[left_index][0], final_steps[right_index][0]))
+        effective_domain_end = max(
+            [float(domain[1])] + [float(step[0]) for step in final_steps]
+        )
         merged_intervals = []
         for interval_start, interval_end in sorted(intervals):
             interval_start = left_boundary_preserving_incoming_curves(
                 interval_start
             )
             interval_start = max(
-                float(domain[0]), min(float(domain[1]), float(interval_start))
+                float(domain[0]), min(effective_domain_end, float(interval_start))
             )
             interval_end = max(
-                interval_start, min(float(domain[1]), float(interval_end))
+                interval_start, min(effective_domain_end, float(interval_end))
             )
             if (merged_intervals
                     and interval_start <= merged_intervals[-1][1] + 0.000001):
@@ -19673,7 +19719,7 @@ class Tap(ControlSurface):
 
     def _apply_direct_exact_automation_delta(
             self, context, envelope, baseline, final_steps, operation_entries,
-            automation_should_re_enable=False):
+            automation_should_re_enable=False, required_domain_end=None):
         """Apply a delta only at event timestamps named by the delta.
 
         Generated shapes deliberately replace a complete envelope. Point
@@ -19724,6 +19770,27 @@ class Tap(ControlSurface):
 
         undo_step_started = self._begin_undo_step()
         try:
+            if required_domain_end is not None:
+                clip = context.get("clip")
+                if clip is None or not liveobj_valid(clip):
+                    return False
+                current_end_marker = float(getattr(clip, "end_marker"))
+                requested_end_marker = float(required_domain_end)
+                if (not math.isfinite(requested_end_marker)
+                        or requested_end_marker <= current_end_marker + 0.000001):
+                    return False
+                # This is intentionally not loop_end. Structural exact edits
+                # expand the authored event canvas while playback keeps the
+                # user's current loop unchanged.
+                previous_loop_end = getattr(clip, "loop_end", None)
+                clip.end_marker = requested_end_marker
+                if previous_loop_end is not None:
+                    current_loop_end = float(getattr(clip, "loop_end"))
+                    if abs(current_loop_end - float(previous_loop_end)) > 0.000001:
+                        clip.loop_end = previous_loop_end
+                    if abs(float(getattr(clip, "loop_end"))
+                           - float(previous_loop_end)) > 0.000001:
+                        return False
             guard = getattr(
                 self, "AUTOMATION_EXACT_EVENT_TIME_TOLERANCE", 0.00001
             )
@@ -19959,6 +20026,15 @@ class Tap(ControlSurface):
             )
             return
         final_steps, intervals = reconstructed
+        previous_domain = tuple(context["domain"])
+        required_domain_end = max(
+            [float(previous_domain[1])]
+            + [float(step[0]) for step in final_steps]
+        )
+        expands_domain = required_domain_end > float(previous_domain[1]) + 0.000001
+        previous_loop_end = float(getattr(
+            context["clip"], "loop_end", previous_domain[1]
+        ))
         self._automation_trace(
             write_token,
             "delta_ready",
@@ -19971,6 +20047,13 @@ class Tap(ControlSurface):
                 ) or "none"
             )
         )
+        trace_patch_events = getattr(
+            self, "_automation_trace_exact_patch_events", None
+        )
+        if trace_patch_events is not None:
+            trace_patch_events(
+                write_token, "delta_expected_events", final_steps, intervals
+            )
 
         automation_was_enabled = self._parameter_automation_is_enabled(
             context["device_param"]
@@ -19994,13 +20077,44 @@ class Tap(ControlSurface):
             baseline,
             final_steps,
             operation_entries,
-            automation_was_enabled or envelope is not None
+            automation_was_enabled or envelope is not None,
+            required_domain_end if expands_domain else None
         )
         if not applied:
             self._automation_write_error_response(
                 context["control_index"], write_token, context=context
             )
             return
+
+        if expands_domain:
+            expanded_domain = self._automation_domain_for_clip(
+                context["clip"], context["device_param"]
+            )
+            current_loop_end = float(getattr(
+                context["clip"], "loop_end", previous_loop_end
+            ))
+            if (float(expanded_domain[1]) < required_domain_end - 0.000001
+                    or abs(current_loop_end - previous_loop_end) > 0.000001):
+                self._automation_trace(
+                    write_token,
+                    "delta_reject",
+                    "reason=domain_extension requested={:.6f} actual={:.6f} loop={:.6f}/{:.6f}".format(
+                        required_domain_end, float(expanded_domain[1]),
+                        current_loop_end, previous_loop_end
+                    )
+                )
+                self._automation_write_error_response(
+                    context["control_index"], write_token, context=context
+                )
+                return
+            context["domain"] = expanded_domain
+            self._automation_trace(
+                write_token,
+                "delta_domain_extended",
+                "from={:.6f} to={:.6f} loop_unchanged=1".format(
+                    float(previous_domain[1]), float(expanded_domain[1])
+                )
+            )
 
         self._automation_trace(
             write_token,
@@ -20024,6 +20138,10 @@ class Tap(ControlSurface):
             )
             return
         accepted_steps, accepted_event_records = accepted_result
+        if trace_patch_events is not None:
+            trace_patch_events(
+                write_token, "delta_accepted_events", accepted_steps, intervals
+            )
         accepted_revision = self._automation_snapshot_revision(
             context["clip"],
             context["device_param"],

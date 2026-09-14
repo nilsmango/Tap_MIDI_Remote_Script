@@ -49,7 +49,7 @@ def _tap_sysex_registry(specs):
     return MappingProxyType(registry)
 
 
-# Keep these v58 tables visibly mirrored with TapSysExRegistry in
+# Keep these v59 tables visibly mirrored with TapSysExRegistry in
 # ProjectMIDI/Model/TapProtocol.swift. Numeric manufacturer IDs are overloaded
 # across directions, so the registries must never be combined.
 TAP_SYSEX_APP_TO_REMOTE_SPECS = (
